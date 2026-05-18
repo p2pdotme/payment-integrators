@@ -17,12 +17,15 @@
     "clean": "hardhat clean",
     "lint": "solhint 'contracts/**/*.sol'",
     "format": "prettier --write 'contracts/**/*.sol' '{test,scripts}/**/*.ts'",
-    "format:check": "prettier --check 'contracts/**/*.sol' '{test,scripts}/**/*.ts'"
+    "format:check": "prettier --check 'contracts/**/*.sol' '{test,scripts}/**/*.ts'",
+    "prepare": "husky"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^4.0.0",
     "dotenv": "^17.4.2",
     "hardhat": "^2.22.14",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.5",
     "prettier": "^3.3.3",
     "prettier-plugin-solidity": "^1.4.1",
     "solhint": "^5.0.3",
@@ -32,5 +35,14 @@
   },
   "dependencies": {
     "@openzeppelin/contracts": "^5.0.1"
+  },
+  "lint-staged": {
+    "contracts/**/*.sol": [
+      "prettier --write",
+      "solhint"
+    ],
+    "{test,scripts}/**/*.{ts,js,json}": [
+      "prettier --write"
+    ]
   }
 }
