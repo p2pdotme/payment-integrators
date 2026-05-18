@@ -2,6 +2,19 @@
 
 This document explains why `UserProxy` exists, what its API actually is, and what an integrator may and may not do with it. Source: [`contracts/base/UserProxy.sol`](../contracts/base/UserProxy.sol).
 
+> ### ⚠ The proxy implementation is **immutable** for the lifetime of an integrator registration
+>
+> When the protocol owner calls `registerIntegrator(integrator, usdcThroughIntegrator, proxyImpl)`, the `proxyImpl` address — and therefore the **bytecode** at that address — is pinned in the Diamond's `IntegratorConfig` for that integrator. The Diamond's CREATE2 authorization check computes the expected per-user proxy address from this pinned bytecode hash. If the bytecode changes (or you ship a fork of `UserProxy.sol`), every per-user proxy address shifts and the Diamond will reject every call from the new proxies as if they were unrelated contracts. Existing per-user proxies that were deployed against the old bytecode continue to work — the registration record is what got bricked, not their deployments.
+>
+> Concrete consequences:
+>
+> 1. **Do not fork `contracts/base/UserProxy.sol`.** Use it unmodified — same SPDX, same pragma, same imports, same compiler settings as in this repo. Reuse the artifact, do not recompile it with a different optimizer profile.
+> 2. **Do not "upgrade" the proxy in place.** There is no upgrade primitive — the proxy has no admin, no `delegatecall` to an implementation slot. If you genuinely need new proxy behavior, deploy a new integrator contract with a new `proxyImpl` address and request a fresh `registerIntegrator`. The old integrator's users keep their old proxies.
+> 3. **Verify bytecode parity before requesting whitelisting.** Run `solc --bin-runtime` (or the equivalent through Hardhat's `getDeployedCode`) against the version in this repo and against your deployed `proxyImpl`, and confirm the hashes match. The whitelist flow in [`WHITELISTING.md`](WHITELISTING.md) requires this hash to match the merged commit.
+> 4. **Pin your compiler.** A Solidity patch-version bump (e.g. 0.8.28 → 0.8.29) can shift bytecode even when the source is identical. Hardhat's `solidity.version` setting and `solidity.settings.optimizer` must match what was used for the previously-whitelisted bytecode.
+>
+> Bottom line: treat `UserProxy.sol` and its compiled bytecode the same way you would treat an EIP-1167 minimal-proxy target — once a clone is deployed against it, the implementation is frozen for the lifetime of that registration.
+
 ## Two jobs
 
 `UserProxy` does two things:
