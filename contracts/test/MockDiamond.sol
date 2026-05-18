@@ -28,7 +28,13 @@ interface IUserProxyView {
 contract MockDiamond {
     using SafeERC20 for IERC20;
 
-    enum SellStatus { PLACED, ACCEPTED, PAID, COMPLETED, CANCELLED }
+    enum SellStatus {
+        PLACED,
+        ACCEPTED,
+        PAID,
+        COMPLETED,
+        CANCELLED
+    }
 
     IERC20 public usdc;
     uint256 public nextOrderId = 1;
@@ -44,11 +50,11 @@ contract MockDiamond {
     }
 
     struct SellOrder {
-        address user;          // = order.user (integrator address in our flow)
+        address user; // = order.user (integrator address in our flow)
         uint256 amount;
         bytes32 currency;
         SellStatus status;
-        string encUpi;         // user's UPI encrypted to merchant
+        string encUpi; // user's UPI encrypted to merchant
         string merchantPubkey;
     }
 
@@ -196,12 +202,14 @@ contract MockDiamond {
         // Transfer USDC to recipientAddr (mirrors usdcThroughIntegrator = false)
         usdc.safeTransfer(order.recipientAddr, order.amount);
 
-        try IP2PIntegrator(order.integrator).onOrderComplete(
-            orderId,
-            order.user,
-            order.amount,
-            order.recipientAddr
-        ) {
+        try
+            IP2PIntegrator(order.integrator).onOrderComplete(
+                orderId,
+                order.user,
+                order.amount,
+                order.recipientAddr
+            )
+        {
             // ok
         } catch (bytes memory reason) {
             emit MockIntegratorCallbackFailed(orderId, order.integrator, reason);
@@ -336,15 +344,18 @@ contract MockDiamond {
         uint256 actualUsdtAmount;
         uint256 actualFiatAmount;
     }
-    function getAdditionalOrderDetails(uint256 orderId) external view returns (AdditionalOrderDetailsView memory) {
-        return AdditionalOrderDetailsView({
-            fixedFeePaid: 0,
-            tipsPaid: 0,
-            acceptedTimestamp: 0,
-            paidTimestamp: 0,
-            reserved2: 0,
-            actualUsdtAmount: sellOrders[orderId].amount,
-            actualFiatAmount: 0
-        });
+    function getAdditionalOrderDetails(
+        uint256 orderId
+    ) external view returns (AdditionalOrderDetailsView memory) {
+        return
+            AdditionalOrderDetailsView({
+                fixedFeePaid: 0,
+                tipsPaid: 0,
+                acceptedTimestamp: 0,
+                paidTimestamp: 0,
+                reserved2: 0,
+                actualUsdtAmount: sellOrders[orderId].amount,
+                actualFiatAmount: 0
+            });
     }
 }

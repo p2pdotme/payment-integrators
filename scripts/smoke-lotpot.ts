@@ -35,7 +35,9 @@ async function main() {
     QUANTITY,
     ethers.encodeBytes32String("INR"),
     CIRCLE_ID,
-    id.publicKey, 0n, 0n,
+    id.publicKey,
+    0n,
+    0n,
   ] as const;
 
   console.log("\nstaticCall userPlaceOrder…");
@@ -47,7 +49,15 @@ async function main() {
   const rcpt = await tx.wait(1);
   console.log("tx:", tx.hash, "status:", rcpt?.status, "gas:", rcpt?.gasUsed.toString());
   const ev = rcpt?.logs.find((l: any) => l.fragment?.name === "LotPotOrderCreated");
-  if (ev) console.log(`LotPotOrderCreated → orderId=${ev.args.orderId} user=${ev.args.user} qty=${ev.args.quantity}`);
+  if (ev)
+    console.log(
+      `LotPotOrderCreated → orderId=${ev.args.orderId} user=${ev.args.user} qty=${ev.args.quantity}`
+    );
   console.log("\n✓ LotPot BUY placement succeeded.");
 }
-main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+main()
+  .then(() => process.exit(0))
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });

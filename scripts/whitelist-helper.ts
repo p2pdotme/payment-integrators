@@ -20,8 +20,13 @@ const ABI = [
 
 async function main() {
   for (const [k, v] of Object.entries({
-    DIAMOND_ADDRESS, NEW_TRADESTARS, NEW_MARKETPLACE, OLD_TRADESTARS, OLD_MARKETPLACE,
-  })) if (!v) throw new Error(`${k} env var required`);
+    DIAMOND_ADDRESS,
+    NEW_TRADESTARS,
+    NEW_MARKETPLACE,
+    OLD_TRADESTARS,
+    OLD_MARKETPLACE,
+  }))
+    if (!v) throw new Error(`${k} env var required`);
 
   const [signer] = await ethers.getSigners();
   console.log("Signer: ", await signer.getAddress());
@@ -49,4 +54,9 @@ async function main() {
   console.log("\nDone.");
 }
 
-main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+main()
+  .then(() => process.exit(0))
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });

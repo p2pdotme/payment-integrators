@@ -156,12 +156,13 @@ contract MyIntegrator is IP2PIntegrator {
     ///         The clone may not yet be deployed — check `code.length` if
     ///         you need to know.
     function proxyAddress(address user) public view returns (address) {
-        return Clones.predictDeterministicAddressWithImmutableArgs(
-            proxyImpl,
-            _proxyArgs(user),
-            _salt(user),
-            address(this)
-        );
+        return
+            Clones.predictDeterministicAddressWithImmutableArgs(
+                proxyImpl,
+                _proxyArgs(user),
+                _salt(user),
+                address(this)
+            );
     }
 
     /// @dev Salt is the user EOA only. The "deployer" component of the

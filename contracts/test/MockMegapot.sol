@@ -37,7 +37,12 @@ contract MockMegapot {
         uint256 quantity,
         bytes32 source
     );
-    event DrawingRolled(uint256 indexed drawingId, uint256 ticketPrice, uint8 ballMax, uint8 bonusballMax);
+    event DrawingRolled(
+        uint256 indexed drawingId,
+        uint256 ticketPrice,
+        uint8 ballMax,
+        uint8 bonusballMax
+    );
 
     IERC20 public immutable usdc;
     MockJackpotNFT public immutable nft;
@@ -119,7 +124,12 @@ contract MockMegapot {
         revertOnBuyTickets = flag;
     }
 
-    function _setDrawing(uint256 id, uint256 ticketPrice, uint8 ballMax, uint8 bonusballMax) internal {
+    function _setDrawing(
+        uint256 id,
+        uint256 ticketPrice,
+        uint8 ballMax,
+        uint8 bonusballMax
+    ) internal {
         IMegapot.DrawingState storage d = _drawings[id];
         d.ticketPrice = ticketPrice;
         d.ballMax = ballMax;
@@ -128,11 +138,9 @@ contract MockMegapot {
 
     // ─── IMegapot view surface ────────────────────────────────────────
 
-    function getDrawingState(uint256 _drawingId)
-        external
-        view
-        returns (IMegapot.DrawingState memory)
-    {
+    function getDrawingState(
+        uint256 _drawingId
+    ) external view returns (IMegapot.DrawingState memory) {
         return _drawings[_drawingId];
     }
 
@@ -161,9 +169,7 @@ contract MockMegapot {
         uint256[] memory mintedIds = new uint256[](quantity);
         for (uint256 i = 0; i < quantity; i++) {
             lastTickets.push(_tickets[i]);
-            mintedIds[i] = _useSafeMint
-                ? nft.safeMintNext(_recipient)
-                : nft.mintNext(_recipient);
+            mintedIds[i] = _useSafeMint ? nft.safeMintNext(_recipient) : nft.mintNext(_recipient);
         }
 
         // Default: one ID per ticket. Tests use returnLengthOverride to
@@ -174,7 +180,9 @@ contract MockMegapot {
             // For the override path, pad past the actually-minted set with
             // the next sequential ID — values don't matter for the
             // integrator's length check.
-            ticketIds[i] = i < quantity ? mintedIds[i] : (mintedIds[quantity - 1] + (i - quantity + 1));
+            ticketIds[i] = i < quantity
+                ? mintedIds[i]
+                : (mintedIds[quantity - 1] + (i - quantity + 1));
         }
 
         lastCaller = msg.sender;

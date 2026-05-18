@@ -36,11 +36,7 @@ contract MockBatchPurchaseFacilitator {
         uint256 staticTicketCount
     );
     /// @dev Mirrors the mainnet event, fired immediately because we're sync.
-    event BatchOrderExecuted(
-        address indexed user,
-        uint256[] ticketIds,
-        uint256 ticketsExecuted
-    );
+    event BatchOrderExecuted(address indexed user, uint256[] ticketIds, uint256 ticketsExecuted);
 
     IERC20 public immutable usdc;
     MockJackpotNFT public immutable nft;

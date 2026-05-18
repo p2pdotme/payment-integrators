@@ -93,10 +93,10 @@ contract ExampleIntegrator is IP2PIntegrator {
     }
 
     struct CheckoutSession {
-        address user;          // 20 bytes
-        bool fulfilled;        //  1 byte  — packs with user
-        bool cancelled;        //  1 byte  — packs with user (PLACED → fulfilled XOR cancelled)
-        uint32 placementDay;   //  4 bytes — pinned for onOrderCancel decrement keying
+        address user; // 20 bytes
+        bool fulfilled; //  1 byte  — packs with user
+        bool cancelled; //  1 byte  — packs with user (PLACED → fulfilled XOR cancelled)
+        uint32 placementDay; //  4 bytes — pinned for onOrderCancel decrement keying
         address client;
         uint256 productId;
         uint256 quantity;
@@ -121,12 +121,7 @@ contract ExampleIntegrator is IP2PIntegrator {
 
     // ─── Constructor ──────────────────────────────────────────────────
 
-    constructor(
-        address _diamond,
-        address _usdc,
-        uint256 _baseTxLimit,
-        uint256 _dailyTxCountLimit
-    ) {
+    constructor(address _diamond, address _usdc, uint256 _baseTxLimit, uint256 _dailyTxCountLimit) {
         if (_diamond == address(0) || _usdc == address(0)) revert InvalidAddress();
         diamond = _diamond;
         usdc = IERC20(_usdc);
@@ -165,10 +160,7 @@ contract ExampleIntegrator is IP2PIntegrator {
         emit UserRPUpdated(user, rp);
     }
 
-    function batchSetUserRP(
-        address[] calldata users,
-        uint256[] calldata rps
-    ) external onlyOwner {
+    function batchSetUserRP(address[] calldata users, uint256[] calldata rps) external onlyOwner {
         if (users.length != rps.length) revert ArrayLengthMismatch();
         for (uint256 i = 0; i < users.length; i++) {
             userRP[users[i]] = rps[i];
@@ -290,7 +282,13 @@ contract ExampleIntegrator is IP2PIntegrator {
             session.quantity
         );
 
-        emit CheckoutFulfilled(orderId, session.user, session.client, session.productId, session.quantity);
+        emit CheckoutFulfilled(
+            orderId,
+            session.user,
+            session.client,
+            session.productId,
+            session.quantity
+        );
     }
 
     /// @notice Cancellation hook — releases the userDailyCount slot reserved
@@ -313,10 +311,7 @@ contract ExampleIntegrator is IP2PIntegrator {
 
     // ─── View Functions ───────────────────────────────────────────────
 
-    function getUserTxLimit(
-        address user,
-        bytes32 currency
-    ) public view returns (uint256) {
+    function getUserTxLimit(address user, bytes32 currency) public view returns (uint256) {
         uint256 rp = userRP[user];
         if (rp == 0) return baseTxLimit;
 
@@ -347,12 +342,13 @@ contract ExampleIntegrator is IP2PIntegrator {
     /// @notice Predicts the deterministic UserProxy address for `user`. The
     ///         clone may not be deployed yet — check `code.length` if needed.
     function proxyAddress(address user) public view returns (address) {
-        return Clones.predictDeterministicAddressWithImmutableArgs(
-            proxyImpl,
-            _proxyArgs(user),
-            _salt(user),
-            address(this)
-        );
+        return
+            Clones.predictDeterministicAddressWithImmutableArgs(
+                proxyImpl,
+                _proxyArgs(user),
+                _salt(user),
+                address(this)
+            );
     }
 
     // ─── Internal: proxy helpers ──────────────────────────────────────

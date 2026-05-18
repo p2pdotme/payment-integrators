@@ -162,7 +162,6 @@ contract UserProxy is IERC721Receiver, IERC1155Receiver {
         emit SweptERC721(token, msg.sender, tokenId);
     }
 
-
     function sweepERC1155(address token, uint256 id) external onlyOwner {
         uint256 bal = IERC1155(token).balanceOf(address(this), id);
         if (bal == 0) return;

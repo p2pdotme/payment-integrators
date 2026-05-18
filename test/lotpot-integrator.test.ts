@@ -67,7 +67,10 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
       SOURCE
     );
 
-    await mockDiamond.registerIntegrator(await integrator.getAddress(), await integrator.proxyImpl());
+    await mockDiamond.registerIntegrator(
+      await integrator.getAddress(),
+      await integrator.proxyImpl()
+    );
     await mockUsdc.mint(await mockDiamond.getAddress(), USDC(10000));
 
     // Allowlist the integrator on the batch facilitator — mirrors what
@@ -159,14 +162,15 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
       // baseTxLimit=50 USDC and ticketPrice=1 USDC, a 0-RP user maxes at
       // 50 tickets. 51 reverts via the gateway's
       // B2BIntegratorRejectedOrder, not a hardcoded check.
-      await expect(integrator.connect(user).userPlaceOrder(51, INR, 1, "", 0, 0, [], [])).to.be.reverted;
+      await expect(integrator.connect(user).userPlaceOrder(51, INR, 1, "", 0, 0, [], [])).to.be
+        .reverted;
     });
 
     it("type-level safety net: quantity > uint64 max reverts with TooManyTickets", async function () {
       // The batch path narrows quantity to uint64 for createBatchOrder.
       // Without this guard a uint256 quantity above uint64 max would
       // silently truncate to garbage.
-      const overUint64 = (1n << 64n);
+      const overUint64 = 1n << 64n;
       await expect(
         integrator.connect(user).userPlaceOrder(overUint64, INR, 1, "", 0, 0, [], [])
       ).to.be.revertedWithCustomError(integrator, "TooManyTickets");
@@ -369,35 +373,31 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
   describe("Limits", function () {
     it("per-tx limit blocks oversized orders", async function () {
       await mockMegapot.setTicketPrice(USDC(20));
-      await expect(
-        integrator.connect(user).userPlaceOrder(3, INR, 1, "", 0, 0, [], [])
-      ).to.be.reverted;
+      await expect(integrator.connect(user).userPlaceOrder(3, INR, 1, "", 0, 0, [], [])).to.be
+        .reverted;
     });
 
     it("daily count limit blocks the Nth+1 order", async function () {
       await integrator.setDailyTxCountLimit(2);
       await integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], []);
       await integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], []);
-      await expect(
-        integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])
-      ).to.be.reverted;
+      await expect(integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])).to.be
+        .reverted;
     });
 
     it("RP unlocks tx amounts above baseTxLimit", async function () {
       // Base limit is USDC(50); set a higher ticket price so a 5-ticket order
       // would overflow base. Granting enough RP × rate must lift the cap.
       await mockMegapot.setTicketPrice(USDC(20));
-      await expect(
-        integrator.connect(user).userPlaceOrder(5, INR, 1, "", 0, 0, [], [])
-      ).to.be.reverted;
+      await expect(integrator.connect(user).userPlaceOrder(5, INR, 1, "", 0, 0, [], [])).to.be
+        .reverted;
 
       await integrator.setRpToUsdc(INR, USDC(1));
       await integrator.setUserRP(user.address, 200); // → 200 USDC limit
       expect(await integrator.getUserTxLimit(user.address, INR)).to.equal(USDC(200));
 
-      await expect(
-        integrator.connect(user).userPlaceOrder(5, INR, 1, "", 0, 0, [], [])
-      ).to.not.be.reverted;
+      await expect(integrator.connect(user).userPlaceOrder(5, INR, 1, "", 0, 0, [], [])).to.not.be
+        .reverted;
     });
   });
 
@@ -414,9 +414,7 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
     it("onOrderComplete reverts when called by non-Diamond", async function () {
       const proxyAddr = await integrator.proxyAddress(user.address);
       await expect(
-        integrator
-          .connect(stranger)
-          .onOrderComplete(1, user.address, USDC(1), proxyAddr)
+        integrator.connect(stranger).onOrderComplete(1, user.address, USDC(1), proxyAddr)
       ).to.be.revertedWithCustomError(integrator, "OnlyDiamond");
     });
 
@@ -439,9 +437,7 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
 
       const proxyAddr = await integrator.proxyAddress(user.address);
       await expect(
-        integrator
-          .connect(diamondSigner)
-          .onOrderComplete(1, user.address, USDC(1), proxyAddr)
+        integrator.connect(diamondSigner).onOrderComplete(1, user.address, USDC(1), proxyAddr)
       ).to.be.revertedWithCustomError(integrator, "OrderAlreadyFulfilled");
     });
   });
@@ -533,9 +529,7 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
       expect(session.fulfilled).to.equal(true);
       expect(await mockUsdc.balanceOf(proxyAddr)).to.equal(USDC(15));
       expect(await mockUsdc.balanceOf(integratorAddr)).to.equal(0);
-      expect(
-        await mockUsdc.allowance(integratorAddr, await mockBatch.getAddress())
-      ).to.equal(0);
+      expect(await mockUsdc.allowance(integratorAddr, await mockBatch.getAddress())).to.equal(0);
     });
 
     it("scales up to whatever the per-tx USDC limit allows", async function () {
@@ -550,35 +544,29 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
 
     it("validateOrder is the actual cap — 1 ticket above tx-limit reverts at placement", async function () {
       // 60 USDC tx-limit (set in beforeEach), ticketPrice 1 USDC ⇒ 61 fails.
-      await expect(
-        integrator.connect(user).userPlaceOrder(61, INR, 1, "", 0, 0, [], [])
-      ).to.be.reverted;
+      await expect(integrator.connect(user).userPlaceOrder(61, INR, 1, "", 0, 0, [], [])).to.be
+        .reverted;
     });
 
     it("integrator never holds USDC after a batch fulfillment", async function () {
       await integrator.connect(user).userPlaceOrder(15, INR, 1, "", 0, 0, [], []);
       await mockDiamond.simulateOrderComplete(1);
       // Pulled in JIT then approved → spent → reset.
+      expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(0);
       expect(
-        await mockUsdc.balanceOf(await integrator.getAddress())
-      ).to.equal(0);
-      expect(
-        await mockUsdc.allowance(
-          await integrator.getAddress(),
-          await mockBatch.getAddress()
-        )
+        await mockUsdc.allowance(await integrator.getAddress(), await mockBatch.getAddress())
       ).to.equal(0);
     });
 
     it("user-picked batch order forwards picks as _userStaticTickets, not random", async function () {
       // Build 12 distinct picks so we can verify each one round-trips.
       const picks = Array.from({ length: 12 }, (_, i) => ({
-        normals: [1, 2, 3, 4, 5 + i].slice(0, 5).map((n, j) => j === 4 ? 5 + i : n),
-        bonusball: ((i % BONUSBALL_MAX) + 1),
+        normals: [1, 2, 3, 4, 5 + i].slice(0, 5).map((n, j) => (j === 4 ? 5 + i : n)),
+        bonusball: (i % BONUSBALL_MAX) + 1,
       })).map((_, i) => ({
         // Each ticket: [1, 2, 3, 4, 5+i] — sorted ascending, unique.
         normals: [1, 2, 3, 4, 5 + i],
-        bonusball: ((i % BONUSBALL_MAX) + 1),
+        bonusball: (i % BONUSBALL_MAX) + 1,
       }));
 
       await integrator.connect(user).userPlaceOrderWithPicks(picks, INR, 1, "", 0, 0, [], []);
@@ -858,9 +846,9 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
 
     it("credit-only path returns 0 orderId (sentinel — no Diamond involvement)", async function () {
       await seedCredit(2);
-      const tx = await integrator.connect(user).userPlaceOrder.staticCall(
-        1, INR, 1, "", 0, 0, [], []
-      );
+      const tx = await integrator
+        .connect(user)
+        .userPlaceOrder.staticCall(1, INR, 1, "", 0, 0, [], []);
       expect(tx).to.equal(0n);
     });
 
@@ -951,8 +939,8 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
     it("credit-only retry reverts (and credit is preserved) if Megapot reverts", async function () {
       const proxyAddr = await seedCredit(2);
       await mockMegapot.setRevertOnBuyTickets(true);
-      await expect(integrator.connect(user).userPlaceOrder(2, INR, 1, "", 0, 0, [], []))
-        .to.be.reverted;
+      await expect(integrator.connect(user).userPlaceOrder(2, INR, 1, "", 0, 0, [], [])).to.be
+        .reverted;
       // Credit untouched.
       expect(await integrator.availableCredit(user.address)).to.equal(USDC(2));
       expect(await mockNft.balanceOf(user.address)).to.equal(0);
@@ -987,9 +975,7 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
       const diamondSigner = await ethers.getImpersonatedSigner(diamondAddr);
       const proxyAddr = await integrator.proxyAddress(user.address);
       await expect(
-        integrator
-          .connect(diamondSigner)
-          .onOrderComplete(1, user.address, USDC(99), proxyAddr)
+        integrator.connect(diamondSigner).onOrderComplete(1, user.address, USDC(99), proxyAddr)
       ).to.be.revertedWithCustomError(integrator, "AmountMismatch");
     });
 
@@ -1041,17 +1027,17 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
     });
 
     it("split not totalling 1e18 → defaultReferrer", async function () {
-      await integrator.connect(user).userPlaceOrder(
-        2, INR, 1, "", 0, 0, [user2.address], [ethers.parseEther("0.9")]
-      );
+      await integrator
+        .connect(user)
+        .userPlaceOrder(2, INR, 1, "", 0, 0, [user2.address], [ethers.parseEther("0.9")]);
       await mockDiamond.simulateOrderComplete(1);
       await expectDefault();
     });
 
     it("zero address in set → defaultReferrer", async function () {
-      await integrator.connect(user).userPlaceOrder(
-        2, INR, 1, "", 0, 0, [ethers.ZeroAddress], [FULL]
-      );
+      await integrator
+        .connect(user)
+        .userPlaceOrder(2, INR, 1, "", 0, 0, [ethers.ZeroAddress], [FULL]);
       await mockDiamond.simulateOrderComplete(1);
       await expectDefault();
     });
@@ -1093,7 +1079,9 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
       await mockDiamond.simulateOrderComplete(1);
       // Order 2 (qty 10): credit 5 < total 10 → Diamond delta order, which also
       // skips → proxy now holds 10 USDC, snapshot overwritten [stranger].
-      await integrator.connect(user).userPlaceOrder(10, INR, 1, "", 0, 0, [stranger.address], [FULL]);
+      await integrator
+        .connect(user)
+        .userPlaceOrder(10, INR, 1, "", 0, 0, [stranger.address], [FULL]);
       await mockDiamond.simulateOrderComplete(2);
       // Order 3 (qty 10): credit 10 ≥ total 10 → credit-only redemption.
       await mockMegapot.setRevertOnBuyTickets(false);
@@ -1104,16 +1092,18 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
     });
 
     it("credit-only redemption clears the snapshot (next redemption → default)", async function () {
-      await integrator.connect(user).userPlaceOrder(5, INR, 1, "", 0, 0, [stranger.address], [FULL]);
+      await integrator
+        .connect(user)
+        .userPlaceOrder(5, INR, 1, "", 0, 0, [stranger.address], [FULL]);
       await mockMegapot.setRevertOnBuyTickets(true);
-      await mockDiamond.simulateOrderComplete(1);          // skip → 5 USDC credit, snapshot [stranger]
+      await mockDiamond.simulateOrderComplete(1); // skip → 5 USDC credit, snapshot [stranger]
       await mockMegapot.setRevertOnBuyTickets(false);
       await integrator.connect(user).userPlaceOrder(5, INR, 1, "", 0, 0, [], []); // redeems 5 USDC
       expect(await mockMegapot.getLastReferrers()).to.deep.equal([stranger.address]);
 
       await mockMegapot.setRevertOnBuyTickets(true);
       await integrator.connect(user).userPlaceOrder(5, INR, 1, "", 0, 0, [], []);
-      await mockDiamond.simulateOrderComplete(2);          // skip → snapshot = [] (empty)
+      await mockDiamond.simulateOrderComplete(2); // skip → snapshot = [] (empty)
       await mockMegapot.setRevertOnBuyTickets(false);
       await integrator.connect(user).userPlaceOrder(5, INR, 1, "", 0, 0, [], []); // redeem
       expect(await mockMegapot.getLastReferrers()).to.deep.equal([owner.address]); // empty → default
@@ -1122,10 +1112,12 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
     it("delta-netted order uses the NEW session referral, not the credit snapshot", async function () {
       await integrator.connect(user).userPlaceOrder(5, INR, 1, "", 0, 0, [user2.address], [FULL]);
       await mockMegapot.setRevertOnBuyTickets(true);
-      await mockDiamond.simulateOrderComplete(1);          // skip → 5 USDC credit, snapshot [user2]
+      await mockDiamond.simulateOrderComplete(1); // skip → 5 USDC credit, snapshot [user2]
       await mockMegapot.setRevertOnBuyTickets(false);
-      await integrator.connect(user).userPlaceOrder(10, INR, 1, "", 0, 0, [stranger.address], [FULL]);
-      await mockDiamond.simulateOrderComplete(2);          // credit(5)<total(10) → delta path
+      await integrator
+        .connect(user)
+        .userPlaceOrder(10, INR, 1, "", 0, 0, [stranger.address], [FULL]);
+      await mockDiamond.simulateOrderComplete(2); // credit(5)<total(10) → delta path
       expect(await mockMegapot.getLastReferrers()).to.deep.equal([stranger.address]);
     });
 
@@ -1145,17 +1137,15 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
       await integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], []);
       await integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], []);
       expect(await integrator.getTodayCount(user.address)).to.equal(2);
-      await expect(
-        integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])
-      ).to.be.reverted;
+      await expect(integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])).to.be
+        .reverted;
 
       await mockDiamond.simulateOrderCancelled(1);
       expect(await integrator.getTodayCount(user.address)).to.equal(1);
 
       // Quota is now available again — user can place another order.
-      await expect(
-        integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])
-      ).to.not.be.reverted;
+      await expect(integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])).to.not.be
+        .reverted;
     });
 
     it("decrements the placement-day bucket even after a UTC boundary crossing", async function () {
@@ -1173,16 +1163,15 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
       // Today's bucket is untouched.
       expect(await integrator.getTodayCount(user.address)).to.equal(0);
       // The placement-day bucket dropped from 1 to 0.
-      expect(
-        await integrator.userDailyCount(user.address, placementDay)
-      ).to.equal(0);
+      expect(await integrator.userDailyCount(user.address, placementDay)).to.equal(0);
     });
 
     it("onOrderCancel reverts when called by non-Diamond", async function () {
       await integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], []);
-      await expect(
-        integrator.connect(stranger).onOrderCancel(1)
-      ).to.be.revertedWithCustomError(integrator, "OnlyDiamond");
+      await expect(integrator.connect(stranger).onOrderCancel(1)).to.be.revertedWithCustomError(
+        integrator,
+        "OnlyDiamond"
+      );
     });
 
     it("onOrderCancel is idempotent (OrderAlreadyCancelled on re-entry)", async function () {
@@ -1233,9 +1222,7 @@ describe("LotPotCheckoutIntegrator + Megapot", function () {
       const diamondSigner = await ethers.getImpersonatedSigner(diamondAddr);
       const proxyAddr = await integrator.proxyAddress(user.address);
       await expect(
-        integrator
-          .connect(diamondSigner)
-          .onOrderComplete(1, user.address, USDC(1), proxyAddr)
+        integrator.connect(diamondSigner).onOrderComplete(1, user.address, USDC(1), proxyAddr)
       ).to.be.revertedWithCustomError(integrator, "OrderAlreadyCancelled");
     });
   });

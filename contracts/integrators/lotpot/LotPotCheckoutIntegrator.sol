@@ -138,9 +138,9 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
     event UserProxyDeployed(address indexed user, address proxy);
 
     enum SkipReason {
-        PriceExceedsCommitment,   // currentDrawing.ticketPrice * qty > committed
-        PicksOutOfRange,          // user picks invalid for the active drawing
-        UpstreamReverted          // Megapot buyTickets / facilitator createBatchOrder reverted
+        PriceExceedsCommitment, // currentDrawing.ticketPrice * qty > committed
+        PicksOutOfRange, // user picks invalid for the active drawing
+        UpstreamReverted // Megapot buyTickets / facilitator createBatchOrder reverted
     }
 
     event SourceUpdated(bytes32 source);
@@ -236,13 +236,13 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
     ///      a cancelled order's quota slot is returned to the user even when
     ///      the cancellation lands in a later UTC day.
     struct CheckoutSession {
-        address user;          // 20 bytes
-        uint8 ballMax;         //  1 byte  — packs with user
-        uint8 bonusballMax;    //  1 byte  — packs with user
-        bool autoRandom;       //  1 byte  — packs with user
-        bool fulfilled;        //  1 byte  — packs with user
-        bool cancelled;        //  1 byte  — packs with user
-        uint32 placementDay;   //  4 bytes — packs with user (slot 0 total: 29 bytes)
+        address user; // 20 bytes
+        uint8 ballMax; //  1 byte  — packs with user
+        uint8 bonusballMax; //  1 byte  — packs with user
+        bool autoRandom; //  1 byte  — packs with user
+        bool fulfilled; //  1 byte  — packs with user
+        bool cancelled; //  1 byte  — packs with user
+        uint32 placementDay; //  4 bytes — packs with user (slot 0 total: 29 bytes)
         uint256 quantity;
         uint256 usdcAmount;
         uint256 ticketPrice;
@@ -361,10 +361,7 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         emit UserRPUpdated(user, rp);
     }
 
-    function batchSetUserRP(
-        address[] calldata users,
-        uint256[] calldata rps
-    ) external onlyOwner {
+    function batchSetUserRP(address[] calldata users, uint256[] calldata rps) external onlyOwner {
         if (users.length != rps.length) revert ArrayLengthMismatch();
         for (uint256 i = 0; i < users.length; i++) {
             userRP[users[i]] = rps[i];
@@ -375,18 +372,16 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
     // ─── Views ────────────────────────────────────────────────────────
 
     function proxyAddress(address user) public view returns (address) {
-        return Clones.predictDeterministicAddressWithImmutableArgs(
-            proxyImpl,
-            _proxyArgs(user),
-            _salt(user),
-            address(this)
-        );
+        return
+            Clones.predictDeterministicAddressWithImmutableArgs(
+                proxyImpl,
+                _proxyArgs(user),
+                _salt(user),
+                address(this)
+            );
     }
 
-    function getUserTxLimit(
-        address user,
-        bytes32 currency
-    ) public view returns (uint256) {
+    function getUserTxLimit(address user, bytes32 currency) public view returns (uint256) {
         uint256 rp = userRP[user];
         if (rp == 0) return baseTxLimit;
 
@@ -434,21 +429,27 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         return usdc.balanceOf(proxyAddress(user));
     }
 
-    function getSession(uint256 orderId) external view returns (
-        address user,
-        uint256 quantity,
-        uint256 usdcAmount,
-        bool autoRandom,
-        bool fulfilled,
-        IMegapot.Ticket[] memory tickets,
-        uint8 ballMax_,
-        uint8 bonusballMax_,
-        uint256 ticketPrice_,
-        uint32 placementDay,
-        bool cancelled,
-        address[] memory referrers,
-        uint256[] memory referralSplit
-    ) {
+    function getSession(
+        uint256 orderId
+    )
+        external
+        view
+        returns (
+            address user,
+            uint256 quantity,
+            uint256 usdcAmount,
+            bool autoRandom,
+            bool fulfilled,
+            IMegapot.Ticket[] memory tickets,
+            uint8 ballMax_,
+            uint8 bonusballMax_,
+            uint256 ticketPrice_,
+            uint32 placementDay,
+            bool cancelled,
+            address[] memory referrers,
+            uint256[] memory referralSplit
+        )
+    {
         CheckoutSession storage s = _sessions[orderId];
         return (
             s.user,
@@ -498,8 +499,12 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         // before the routing call so the entrypoint stays under the EVM
         // stack-depth limit.
         PlaceReq memory r = PlaceReq(
-            currency, circleId, preferredPaymentChannelConfigId,
-            fiatAmountLimit, referrers, referralSplit
+            currency,
+            circleId,
+            preferredPaymentChannelConfigId,
+            fiatAmountLimit,
+            referrers,
+            referralSplit
         );
         return _route(quantity, true, r, pubKey, new IMegapot.Ticket[](0), d);
     }
@@ -526,9 +531,7 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         uint256 credit = usdc.balanceOf(proxy);
 
         if (credit >= totalPrice) {
-            _redeemFromCredit(
-                msg.sender, proxy, quantity, autoRandom, picks, totalPrice, d
-            );
+            _redeemFromCredit(msg.sender, proxy, quantity, autoRandom, picks, totalPrice, d);
             return 0;
         }
 
@@ -536,9 +539,16 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         orderId = _placeOrder(proxy, delta, r, pubKey);
 
         _writeSession(
-            orderId, msg.sender, quantity, delta,
-            d.ticketPrice, d.ballMax, d.bonusballMax, autoRandom,
-            r.referrers, r.referralSplit
+            orderId,
+            msg.sender,
+            quantity,
+            delta,
+            d.ticketPrice,
+            d.ballMax,
+            d.bonusballMax,
+            autoRandom,
+            r.referrers,
+            r.referralSplit
         );
 
         if (!autoRandom) {
@@ -585,8 +595,12 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         _validatePicks(tickets, d.ballMax, d.bonusballMax);
 
         PlaceReq memory r = PlaceReq(
-            currency, circleId, preferredPaymentChannelConfigId,
-            fiatAmountLimit, referrers, referralSplit
+            currency,
+            circleId,
+            preferredPaymentChannelConfigId,
+            fiatAmountLimit,
+            referrers,
+            referralSplit
         );
         return _route(quantity, false, r, pubKey, tickets, d);
     }
@@ -598,11 +612,7 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
     ///      sub-NORMALS_PER_TICKET ballMax would otherwise reach
     ///      `_pickUniqueNormals` and either loop forever or revert with a
     ///      less-actionable error.
-    function _loadCurrentDrawing()
-        internal
-        view
-        returns (IMegapot.DrawingState memory d)
-    {
+    function _loadCurrentDrawing() internal view returns (IMegapot.DrawingState memory d) {
         IMegapot _mp = IMegapot(megapot);
         d = _mp.getDrawingState(_mp.currentDrawingId());
         if (d.ticketPrice == 0) revert InvalidTicketPrice();
@@ -674,12 +684,12 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
             // Synthetic seed for ticket generation since there's no
             // Diamond orderId. The counter advance prevents collisions
             // between repeated credit redemptions in the same block.
-            unchecked { _creditRedemptionCounter += 1; }
-            uint256 entropy = uint256(keccak256(abi.encode(
-                blockhash(block.number - 1),
-                user,
-                _creditRedemptionCounter
-            )));
+            unchecked {
+                _creditRedemptionCounter += 1;
+            }
+            uint256 entropy = uint256(
+                keccak256(abi.encode(blockhash(block.number - 1), user, _creditRedemptionCounter))
+            );
             tickets = _generateRandomTickets(quantity, entropy, d.ballMax, d.bonusballMax);
         } else {
             tickets = userPicks;
@@ -690,22 +700,24 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         // through the same sanitizer, then the snapshot is cleared.
         StoredReferral storage cr = _creditReferral[user];
         (address[] memory rRefs, uint256[] memory rSplit) = _resolveReferrers(
-            cr.referrers, cr.split, user, proxy
+            cr.referrers,
+            cr.split,
+            user,
+            proxy
         );
         delete _creditReferral[user];
 
         if (quantity <= MAX_DIRECT_TICKETS) {
             bytes memory data = abi.encodeCall(
                 IMegapot.buyTickets,
-                (
-                    tickets,
-                    user,
-                    rRefs,
-                    rSplit,
-                    source
-                )
+                (tickets, user, rRefs, rSplit, source)
             );
-            bytes memory result = UserProxy(proxy).execute(megapot, data, address(usdc), totalPrice);
+            bytes memory result = UserProxy(proxy).execute(
+                megapot,
+                data,
+                address(usdc),
+                totalPrice
+            );
             uint256[] memory ticketIds = abi.decode(result, (uint256[]));
             if (ticketIds.length != quantity) revert MegapotReturnMismatch();
         } else {
@@ -857,13 +869,16 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         }
 
         (address[] memory rRefs, uint256[] memory rSplit) = _resolveReferrers(
-            session.referrers, session.referralSplit, session.user, proxy
+            session.referrers,
+            session.referralSplit,
+            session.user,
+            proxy
         );
         bytes memory data = abi.encodeCall(
             IMegapot.buyTickets,
             (
                 tickets,
-                session.user,             // mint straight to user EOA
+                session.user, // mint straight to user EOA
                 rRefs,
                 rSplit,
                 source
@@ -878,14 +893,24 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         // via the credit-redemption path on a subsequent order.
         bytes memory result;
         bool execOk;
-        try UserProxy(proxy).execute(megapot, data, address(usdc), expectedTotal) returns (bytes memory r) {
+        try UserProxy(proxy).execute(megapot, data, address(usdc), expectedTotal) returns (
+            bytes memory r
+        ) {
             result = r;
             execOk = true;
-        } catch { /* execOk stays false */ }
+        } catch {
+            /* execOk stays false */
+        }
 
         if (!execOk) {
             _snapshotCreditReferral(session.user, session);
-            emit LotPotFulfillmentSkipped(orderId, session.user, proxy, expectedTotal, SkipReason.UpstreamReverted);
+            emit LotPotFulfillmentSkipped(
+                orderId,
+                session.user,
+                proxy,
+                expectedTotal,
+                SkipReason.UpstreamReverted
+            );
             return;
         }
 
@@ -1001,15 +1026,20 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         // skip event and return USDC to the proxy so the user can redeem
         // it through a subsequent credit-aware order.
         (address[] memory rRefs, uint256[] memory rSplit) = _resolveReferrers(
-            session.referrers, session.referralSplit, session.user, proxy
+            session.referrers,
+            session.referralSplit,
+            session.user,
+            proxy
         );
-        try IBatchPurchaseFacilitator(batchFacilitator).createBatchOrder(
-            session.user,                       // mint straight to user EOA
-            dynamicQty,
-            staticTickets,
-            rRefs,
-            rSplit
-        ) {
+        try
+            IBatchPurchaseFacilitator(batchFacilitator).createBatchOrder(
+                session.user, // mint straight to user EOA
+                dynamicQty,
+                staticTickets,
+                rRefs,
+                rSplit
+            )
+        {
             usdc.forceApprove(batchFacilitator, 0);
             if (session.autoRandom) {
                 emit LotPotBatchFulfilled(orderId, session.user, proxy, session.quantity, 0);
@@ -1031,7 +1061,13 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
             usdc.forceApprove(batchFacilitator, 0);
             usdc.safeTransfer(proxy, expectedTotal);
             _snapshotCreditReferral(session.user, session);
-            emit LotPotFulfillmentSkipped(orderId, session.user, proxy, expectedTotal, SkipReason.UpstreamReverted);
+            emit LotPotFulfillmentSkipped(
+                orderId,
+                session.user,
+                proxy,
+                expectedTotal,
+                SkipReason.UpstreamReverted
+            );
         }
     }
 
@@ -1067,7 +1103,6 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         emit LotPotOrderCancelled(orderId, session.user);
     }
 
-
     // ─── Ticket generation / validation ───────────────────────────────
 
     function _generateRandomTickets(
@@ -1079,9 +1114,7 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         tickets = new IMegapot.Ticket[](quantity);
 
         for (uint256 i = 0; i < quantity; i++) {
-            bytes32 baseSeed = keccak256(
-                abi.encode(blockhash(block.number - 1), orderId, i)
-            );
+            bytes32 baseSeed = keccak256(abi.encode(blockhash(block.number - 1), orderId, i));
             tickets[i] = IMegapot.Ticket({
                 normals: _pickUniqueNormals(baseSeed, _ballMax),
                 bonusball: uint8(
@@ -1107,9 +1140,13 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
             if (!picked[candidate]) {
                 picked[candidate] = true;
                 normals[count] = uint8(candidate);
-                unchecked { count++; }
+                unchecked {
+                    count++;
+                }
             }
-            unchecked { nonce++; }
+            unchecked {
+                nonce++;
+            }
         }
 
         // Megapot requires normals sorted ascending. Selection sort on 5 items.
@@ -1200,8 +1237,7 @@ contract LotPotCheckoutIntegrator is IP2PIntegrator {
         address recipient,
         address proxy
     ) internal view returns (address[] memory outRefs, uint256[] memory outSplit) {
-        bool valid =
-            referrers.length > 0 &&
+        bool valid = referrers.length > 0 &&
             referrers.length == split.length &&
             referrers.length <= MAX_REFERRERS &&
             _sum(split) == REFERRAL_SPLIT_FULL;

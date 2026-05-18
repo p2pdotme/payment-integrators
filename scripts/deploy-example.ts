@@ -61,8 +61,12 @@ async function main() {
   console.log(`Daily TX Count:      ${(await integrator.dailyTxCountLimit()).toString()} per day`);
   console.log("");
   console.log("Next steps:");
-  console.log("  1. Verify on Etherscan / Sourcify so reviewers can diff source against the merged commit.");
-  console.log("  2. File a Whitelist request issue (see docs/WHITELISTING.md). The P2P team will call:");
+  console.log(
+    "  1. Verify on Etherscan / Sourcify so reviewers can diff source against the merged commit."
+  );
+  console.log(
+    "  2. File a Whitelist request issue (see docs/WHITELISTING.md). The P2P team will call:"
+  );
   console.log(`       registerIntegrator(integrator = ${address},`);
   console.log(`                          proxyImpl  = ${proxyImpl},`);
   console.log(`                          source     = bytes32("<your-source-tag>"))`);
@@ -71,7 +75,9 @@ async function main() {
   console.log("  4. Set per-currency RP rates: setRpToUsdc(currency, usdcPerRp).");
 }
 
-main().then(() => process.exit(0)).catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

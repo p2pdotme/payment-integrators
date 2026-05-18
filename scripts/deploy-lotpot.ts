@@ -122,20 +122,32 @@ async function main() {
   console.log(`Megapot:               ${await integrator.megapot()}`);
   console.log(`JackpotNFT:            ${await integrator.jackpotNft()}`);
   console.log(`Owner:                 ${await integrator.owner()}`);
-  console.log(`Base TX Limit:         ${ethers.formatUnits(await integrator.baseTxLimit(), 6)} USDC`);
-  console.log(`Daily TX Count:        ${(await integrator.dailyTxCountLimit()).toString()} per day`);
+  console.log(
+    `Base TX Limit:         ${ethers.formatUnits(await integrator.baseTxLimit(), 6)} USDC`
+  );
+  console.log(
+    `Daily TX Count:        ${(await integrator.dailyTxCountLimit()).toString()} per day`
+  );
   console.log("");
   console.log("Next steps:");
   console.log(`  1. Register on Diamond (super-admin):`);
   console.log(`       registerIntegrator(${address}, false, ${proxyImpl})`);
-  console.log(`     - usdcThroughIntegrator=false: Diamond routes USDC to recipientAddr (= proxy) on completion.`);
-  console.log(`     - proxyImpl is pinned at registration; gateway re-derives clone CREATE2 addresses against it.`);
+  console.log(
+    `     - usdcThroughIntegrator=false: Diamond routes USDC to recipientAddr (= proxy) on completion.`
+  );
+  console.log(
+    `     - proxyImpl is pinned at registration; gateway re-derives clone CREATE2 addresses against it.`
+  );
   console.log(`  2. Set currency rates:   setRpToUsdc(currency, rate)`);
-  console.log(`  3. Coordinate with Megapot's owner to allowlist this integrator on BatchPurchaseFacilitator.`);
+  console.log(
+    `  3. Coordinate with Megapot's owner to allowlist this integrator on BatchPurchaseFacilitator.`
+  );
   console.log(`     (Required before any >10-ticket order can fulfill.)`);
 }
 
-main().then(() => process.exit(0)).catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

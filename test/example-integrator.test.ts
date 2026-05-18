@@ -135,17 +135,25 @@ describe("ExampleIntegrator — RP TX Limit + Daily Count + Quantity", function 
   describe("Daily TX Count Limit", function () {
     it("tracks count correctly with quantity > 1", async function () {
       // Each order counts as 1 tx regardless of quantity
-      await integrator.connect(user).userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 3, INR, 1, "", 0, 0);
-      await integrator.connect(user).userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 2, INR, 1, "", 0, 0);
+      await integrator
+        .connect(user)
+        .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 3, INR, 1, "", 0, 0);
+      await integrator
+        .connect(user)
+        .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 2, INR, 1, "", 0, 0);
       expect(await integrator.getTodayCount(user.address)).to.equal(2);
     });
 
     it("enforces daily count limit", async function () {
       for (let i = 0; i < DAILY_COUNT_LIMIT; i++) {
-        await integrator.connect(user).userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0);
+        await integrator
+          .connect(user)
+          .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0);
       }
       await expect(
-        integrator.connect(user).userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0)
+        integrator
+          .connect(user)
+          .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0)
       ).to.be.reverted;
     });
   });
@@ -153,23 +161,28 @@ describe("ExampleIntegrator — RP TX Limit + Daily Count + Quantity", function 
   describe("Admin Functions", function () {
     it("setBaseTxLimit", async function () {
       await expect(integrator.setBaseTxLimit(USDC(100)))
-        .to.emit(integrator, "BaseTxLimitUpdated").withArgs(USDC(100));
+        .to.emit(integrator, "BaseTxLimitUpdated")
+        .withArgs(USDC(100));
     });
     it("setDailyTxCountLimit", async function () {
       await expect(integrator.setDailyTxCountLimit(20))
-        .to.emit(integrator, "DailyTxCountLimitUpdated").withArgs(20);
+        .to.emit(integrator, "DailyTxCountLimitUpdated")
+        .withArgs(20);
     });
     it("setRpToUsdc", async function () {
       await expect(integrator.setRpToUsdc(INR, USDC(2)))
-        .to.emit(integrator, "RpRateUpdated").withArgs(INR, USDC(2));
+        .to.emit(integrator, "RpRateUpdated")
+        .withArgs(INR, USDC(2));
     });
     it("setMaxTxLimit", async function () {
       await expect(integrator.setMaxTxLimit(INR, USDC(500)))
-        .to.emit(integrator, "MaxTxLimitUpdated").withArgs(INR, USDC(500));
+        .to.emit(integrator, "MaxTxLimitUpdated")
+        .withArgs(INR, USDC(500));
     });
     it("setUserRP", async function () {
       await expect(integrator.setUserRP(user.address, 100))
-        .to.emit(integrator, "UserRPUpdated").withArgs(user.address, 100);
+        .to.emit(integrator, "UserRPUpdated")
+        .withArgs(user.address, 100);
     });
     it("batchSetUserRP", async function () {
       await integrator.batchSetUserRP([user.address, user2.address], [50, 75]);
@@ -177,8 +190,9 @@ describe("ExampleIntegrator — RP TX Limit + Daily Count + Quantity", function 
       expect(await integrator.userRP(user2.address)).to.equal(75);
     });
     it("rejects non-owner", async function () {
-      await expect(integrator.connect(user).setBaseTxLimit(USDC(100)))
-        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      await expect(
+        integrator.connect(user).setBaseTxLimit(USDC(100))
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
     });
   });
 
@@ -190,7 +204,9 @@ describe("ExampleIntegrator — RP TX Limit + Daily Count + Quantity", function 
     });
     it("rejects non-existent product", async function () {
       await expect(
-        integrator.connect(user).userPlaceOrder(await erc721Client.getAddress(), 999, 1, INR, 1, "", 0, 0)
+        integrator
+          .connect(user)
+          .userPlaceOrder(await erc721Client.getAddress(), 999, 1, INR, 1, "", 0, 0)
       ).to.be.revertedWithCustomError(integrator, "ProductNotFound");
     });
   });
@@ -214,6 +230,150 @@ describe("ExampleIntegrator — RP TX Limit + Daily Count + Quantity", function 
       const session = await integrator.sessions(1);
       expect(session.fulfilled).to.equal(true);
       expect(session.quantity).to.equal(3);
+    });
+  });
+
+  describe("Branch coverage — constructor + admin reverts + lifecycle gates", function () {
+    describe("constructor", function () {
+      it("reverts InvalidAddress when diamond is zero", async function () {
+        const Integrator = await ethers.getContractFactory("ExampleIntegrator");
+        await expect(
+          Integrator.deploy(ethers.ZeroAddress, await mockUsdc.getAddress(), BASE_TX_LIMIT, 10)
+        ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      });
+
+      it("reverts InvalidAddress when usdc is zero", async function () {
+        const Integrator = await ethers.getContractFactory("ExampleIntegrator");
+        await expect(
+          Integrator.deploy(await mockDiamond.getAddress(), ethers.ZeroAddress, BASE_TX_LIMIT, 10)
+        ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      });
+    });
+
+    describe("admin onlyOwner reverts", function () {
+      it("setDailyTxCountLimit non-owner reverts", async function () {
+        await expect(
+          integrator.connect(user).setDailyTxCountLimit(99)
+        ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      });
+      it("setRpToUsdc non-owner reverts", async function () {
+        await expect(
+          integrator.connect(user).setRpToUsdc(INR, USDC(1))
+        ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      });
+      it("setMaxTxLimit non-owner reverts", async function () {
+        await expect(
+          integrator.connect(user).setMaxTxLimit(INR, USDC(1))
+        ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      });
+      it("setUserRP non-owner reverts", async function () {
+        await expect(
+          integrator.connect(user).setUserRP(user.address, 1)
+        ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      });
+      it("batchSetUserRP non-owner reverts", async function () {
+        await expect(
+          integrator.connect(user).batchSetUserRP([user.address], [1])
+        ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      });
+      it("registerClient non-owner reverts", async function () {
+        await expect(
+          integrator.connect(user).registerClient(user.address)
+        ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      });
+      it("removeClient non-owner reverts", async function () {
+        await expect(
+          integrator.connect(user).removeClient(user.address)
+        ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      });
+    });
+
+    describe("batchSetUserRP", function () {
+      it("reverts ArrayLengthMismatch on uneven inputs", async function () {
+        await expect(
+          integrator.batchSetUserRP([user.address, user2.address], [1])
+        ).to.be.revertedWithCustomError(integrator, "ArrayLengthMismatch");
+      });
+    });
+
+    describe("registerClient", function () {
+      it("reverts InvalidAddress on zero address", async function () {
+        await expect(integrator.registerClient(ethers.ZeroAddress)).to.be.revertedWithCustomError(
+          integrator,
+          "InvalidAddress"
+        );
+      });
+    });
+
+    describe("removeClient", function () {
+      it("emits ClientRemoved and de-registers", async function () {
+        const clientAddr = await erc721Client.getAddress();
+        await expect(integrator.removeClient(clientAddr))
+          .to.emit(integrator, "ClientRemoved")
+          .withArgs(clientAddr);
+        // subsequent order placement against the de-registered client reverts
+        await expect(
+          integrator.connect(user).userPlaceOrder(clientAddr, PRODUCT_ID, 1, INR, 1, "", 0, 0)
+        ).to.be.revertedWithCustomError(integrator, "ClientNotRegistered");
+      });
+    });
+
+    describe("getRemainingDailyCount", function () {
+      it("returns 0 once count reaches the daily limit", async function () {
+        for (let i = 0; i < DAILY_COUNT_LIMIT; i++) {
+          await integrator
+            .connect(user)
+            .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0);
+        }
+        expect(await integrator.getRemainingDailyCount(user.address)).to.equal(0);
+      });
+    });
+
+    describe("onOrderComplete gates", function () {
+      it("reverts OnlyDiamond when caller isn't the Diamond", async function () {
+        await integrator
+          .connect(user)
+          .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0);
+        await expect(
+          integrator.connect(user).onOrderComplete(1, user.address, UNIT_PRICE, user.address)
+        ).to.be.revertedWithCustomError(integrator, "OnlyDiamond");
+      });
+
+      it("reverts OrderAlreadyFulfilled on second completion", async function () {
+        await integrator
+          .connect(user)
+          .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0);
+        await mockDiamond.simulateOrderComplete(1);
+        await expect(mockDiamond.simulateOrderComplete(1)).to.be.reverted;
+      });
+    });
+
+    describe("onOrderCancel gates", function () {
+      it("reverts OnlyDiamond when caller isn't the Diamond", async function () {
+        await integrator
+          .connect(user)
+          .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0);
+        await expect(integrator.connect(user).onOrderCancel(1)).to.be.revertedWithCustomError(
+          integrator,
+          "OnlyDiamond"
+        );
+      });
+
+      it("reverts OrderAlreadyFulfilled when cancelling after completion", async function () {
+        await integrator
+          .connect(user)
+          .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0);
+        await mockDiamond.simulateOrderComplete(1);
+        await expect(mockDiamond.simulateOrderCancelled(1)).to.be.reverted;
+      });
+
+      it("reverts OrderAlreadyCancelled when cancelling twice", async function () {
+        await integrator
+          .connect(user)
+          .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "", 0, 0);
+        await mockDiamond.simulateOrderCancelled(1);
+        await expect(mockDiamond.simulateOrderCancelled(1)).to.be.reverted;
+      });
     });
   });
 });

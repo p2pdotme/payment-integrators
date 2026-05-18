@@ -12,8 +12,7 @@ async function main() {
   if (!integratorAddr) {
     throw new Error("LOTPOT_INTEGRATOR_ADDRESS env var required");
   }
-  const user =
-    process.env.USER_ADDRESS || (await (await ethers.getSigners())[0].getAddress());
+  const user = process.env.USER_ADDRESS || (await (await ethers.getSigners())[0].getAddress());
   const i = await ethers.getContractAt(
     [
       "function getTodayCount(address) view returns (uint256)",
@@ -23,7 +22,7 @@ async function main() {
       "function availableCredit(address) view returns (uint256)",
       "function proxyAddress(address) view returns (address)",
     ],
-    integratorAddr,
+    integratorAddr
   );
   const inr = ethers.encodeBytes32String("INR");
   console.log("integrator :", integratorAddr);
@@ -35,4 +34,9 @@ async function main() {
   console.log("availCred  :", ethers.formatUnits(await i.availableCredit(user), 6), "USDC");
   console.log("proxyAddr  :", await i.proxyAddress(user));
 }
-main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+main()
+  .then(() => process.exit(0))
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
