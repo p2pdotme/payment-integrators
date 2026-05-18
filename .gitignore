@@ -32,3 +32,6 @@ pnpm-debug.log*
 *.pem
 *.key
 secrets.json
+
+# Claude Code — commit shared config (settings.json, skills/), ignore local overrides
+.claude/settings.local.json
