@@ -554,10 +554,9 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
       // terminal state, locking the legitimate completion path. Post-fix:
       // reconcile reads Diamond's status and rejects non-terminal.
       const sellOrderId = await placeAndAcceptSell("0x" + "aa".repeat(32));
-      await expect(integrator.connect(stranger).reconcile(sellOrderId)).to.be.revertedWithCustomError(
-        integrator,
-        "StatusNotTerminal"
-      );
+      await expect(
+        integrator.connect(stranger).reconcile(sellOrderId)
+      ).to.be.revertedWithCustomError(integrator, "StatusNotTerminal");
     });
 
     it("reverts StatusNotTerminal when Diamond order is PAID (mid-flight)", async function () {

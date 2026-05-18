@@ -609,8 +609,7 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
         // status=PLACED, which fails the terminal check below).
         IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
         uint8 status = order.status;
-        if (status != STATUS_COMPLETED && status != STATUS_CANCELLED)
-            revert StatusNotTerminal();
+        if (status != STATUS_COMPLETED && status != STATUS_CANCELLED) revert StatusNotTerminal();
 
         uint256 returned = 0;
         if (status == STATUS_CANCELLED && address(yieldVault) != address(0)) {

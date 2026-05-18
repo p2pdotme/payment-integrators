@@ -328,9 +328,7 @@ describe("TradeStarsCheckoutIntegrator", function () {
       it("reverts OrderAlreadyCancelled when Diamond completes an already-cancelled order", async function () {
         // Race the impossible: gateway invariants prevent this in practice,
         // but the guard makes a future Diamond bug loud rather than silent.
-        await integrator
-          .connect(user)
-          .userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
+        await integrator.connect(user).userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
         await mockDiamond.simulateOrderCancelled(1);
         await expect(
           mockDiamond.adminCallOnOrderComplete(
@@ -347,9 +345,7 @@ describe("TradeStarsCheckoutIntegrator", function () {
         // Diamond's gateway sends the same amount it placed with, so this
         // is only reachable via a Diamond bug — the guard mirrors LotPot
         // and pins the invariant.
-        await integrator
-          .connect(user)
-          .userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
+        await integrator.connect(user).userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
         await expect(
           mockDiamond.adminCallOnOrderComplete(
             await integrator.getAddress(),
@@ -362,9 +358,7 @@ describe("TradeStarsCheckoutIntegrator", function () {
       });
 
       it("happy path still works with the new guards in place", async function () {
-        await integrator
-          .connect(user)
-          .userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
+        await integrator.connect(user).userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
         await mockDiamond.simulateOrderComplete(1);
         const session = await integrator.sessions(1);
         expect(session.fulfilled).to.equal(true);
