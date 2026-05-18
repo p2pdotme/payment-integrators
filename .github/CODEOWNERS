@@ -1,8 +1,15 @@
 # Code ownership for review routing.
 # Syntax: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
 #
-# Edit this file to add team handles once you've created a `core` team in the
-# p2pdotme org. Until then, individual handles work fine.
+# TODO (tracked in CONTRIBUTING.md "Review process"):
+#   Add a second maintainer handle below so the "two maintainer approvals" policy
+#   becomes enforceable. Until then, the policy is aspirational — branch
+#   protection in GitHub settings can require only as many approvals as there
+#   are distinct CODEOWNERS to satisfy them.
+#
+# Once a `core` team is created in the p2pdotme org, prefer @p2pdotme/core
+# over individual handles so onboarding new maintainers doesn't require
+# touching this file.
 
 # Default reviewer for everything
 *                                @Software-Artist-Aash

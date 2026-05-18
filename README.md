@@ -16,7 +16,7 @@ This repository is the canonical home for:
 
 | Name | Location | Network | Status | Whitelisted address |
 |---|---|---|---|---|
-| LotPot | `contracts/integrators/lotpot/LotPotCheckoutIntegrator.sol` | Base mainnet | Production | See [docs/INTEGRATORS.md](docs/INTEGRATORS.md) |
+| LotPot | `contracts/integrators/lotpot/LotPotCheckoutIntegrator.sol` | Base mainnet | Production | [`0xb901c3399ED225e4C6c7bfbd8DABA16BBF340132`](https://basescan.org/address/0xb901c3399ED225e4C6c7bfbd8DABA16BBF340132) |
 | Example | `contracts/integrators/ExampleIntegrator.sol` | — | Reference (not whitelisted) | n/a |
 
 > PR merge ≠ whitelisting. The Diamond holds an explicit allowlist that gates which integrator contracts can place B2B orders. See [docs/WHITELISTING.md](docs/WHITELISTING.md).
@@ -29,12 +29,12 @@ contracts/
 ├── base/UserProxy.sol The canonical per-user CREATE2 proxy
 ├── integrators/       New integrators go here, one subfolder per integrator
 ├── examples/          Reference business clients (SimpleERC721Client)
-└── test/              Mocks used by hardhat tests
+├── templates/         Starter contracts to copy from (MyIntegrator.sol)
+└── test/              Mocks used by hardhat tests (Diamond, USDC, Megapot, ...)
 
 test/                  Hardhat tests (one file per integrator)
 scripts/               Deploy + smoke + inspect helpers
 docs/                  Architecture, proxy pattern, limits, whitelisting
-templates/             Starter contracts to copy from
 ```
 
 ## Quick start
@@ -50,7 +50,7 @@ npx hardhat test
 ## Authoring a new integrator
 
 1. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/PROXY-PATTERN.md`](docs/PROXY-PATTERN.md).
-2. Copy [`templates/MyIntegrator.sol`](templates/MyIntegrator.sol) into `contracts/integrators/<your-name>/`.
+2. Copy [`contracts/templates/MyIntegrator.sol`](contracts/templates/MyIntegrator.sol) into `contracts/integrators/<your-name>/`.
 3. Implement `IP2PIntegrator`. Use the canonical `UserProxy` — do not fork it.
 4. Add hardhat tests using the provided mocks.
 5. Open a PR. Follow [`CONTRIBUTING.md`](CONTRIBUTING.md).

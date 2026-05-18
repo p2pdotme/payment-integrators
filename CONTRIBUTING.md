@@ -126,7 +126,7 @@ slither contracts/integrators/<your-name>
 
 1. CI must be green.
 2. CODEOWNERS approval required for any change to `contracts/interfaces/` or `contracts/base/`.
-3. Two maintainer approvals required to merge any new integrator.
+3. Two maintainer approvals are the **target policy** for new integrators. Until a second maintainer is added to [`CODEOWNERS`](.github/CODEOWNERS), one approval is sufficient in practice — the gap is tracked there as a TODO. Branch protection in GitHub settings is what actually enforces the count.
 4. Maintainers may request a security review for non-trivial integrators (anything touching custody, vaults, async fulfillment, or cross-protocol routing).
 
 ## After merge

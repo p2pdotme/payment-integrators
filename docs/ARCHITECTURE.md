@@ -22,8 +22,8 @@ An **integrator** is the contract that sits between a user-facing checkout flow 
 ## Lifecycle
 
 1. **User calls `userPlaceOrder`** on the integrator with: client, productId, quantity, currency, circleId, encrypted pubkey.
-2. The integrator deploys a **per-user `UserProxy`** via `Clones.cloneDeterministic` if one doesn't exist yet (CREATE2 ⇒ deterministic address derived from `(integrator, user)`).
-3. The proxy calls `IB2BGateway.placeB2BOrder` on the Diamond. **The proxy is `msg.sender` to the Diamond**, which is the address the Diamond authorizes via its CREATE2-auth path.
+2. The integrator deploys a **per-user `UserProxy`** via `Clones.cloneDeterministicWithImmutableArgs` if one doesn't exist yet. The clone's address is deterministic: CREATE2 with deployer = the integrator contract, salt = the user EOA, and 40 bytes of immutable args = `(user, integrator)` packed. Per-(integrator, user) separation comes from the deployer being the integrator — the salt itself is user-only.
+3. The proxy calls `IB2BGateway.placeB2BOrder` on the Diamond. **The proxy is `msg.sender` to the Diamond**, which is the address the Diamond authorizes via its CREATE2-auth path (re-derives the predicted address from the integrator's pinned `proxyImpl`, the user salt, and the packed args).
 4. Diamond assigns merchants for the order.
 5. User pays fiat off-chain → merchant marks ACCEPTED → user marks PAID → merchant marks COMPLETED.
 6. Diamond calls `integrator.onOrderComplete(orderId, user, amount, recipientAddr)`.
@@ -35,7 +35,7 @@ If the order is cancelled at any point (expiry, dispute, manual), Diamond calls 
 
 Two reasons:
 
-1. **CREATE2 authentication**: The Diamond authorizes integrators by verifying that `msg.sender` matches the CREATE2 address derived from the integrator + user salt + pinned proxy implementation bytecode. This means the Diamond can verify *which integrator deployed which proxy* without maintaining a separate per-proxy allowlist. This is why `UserProxy.sol` must not be forked — its bytecode must match the proxy implementation pinned when the integrator was registered.
+1. **CREATE2 authentication**: The Diamond authorizes integrators by verifying that `msg.sender` matches the CREATE2 address derived from the pinned `proxyImpl`, the immutable args `(user, integrator)`, and the user-only salt — with the integrator contract as the deployer. This lets the Diamond verify *which integrator deployed which proxy* without maintaining a separate per-proxy allowlist. This is why `UserProxy.sol` must not be forked — its bytecode and immutable-args layout must match what the Diamond expects when the integrator was registered.
 2. **Fraud-bypass closure**: USDC stranded on a proxy cannot be swept out by the user. It can only be consumed by the upstream protocol the integrator routes to. This closes a path where a scammer could use a B2B integration to convert fiat → USDC while evading consumer-side fraud checks. See [`PROXY-PATTERN.md`](PROXY-PATTERN.md) for the full reasoning.
 
 ## Where state lives

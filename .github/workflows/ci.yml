@@ -47,3 +47,41 @@ jobs:
 
       - name: prettier
         run: npm run format:check
+
+  coverage:
+    name: Coverage gate (line ≥90%, branch ≥80%)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Run coverage
+        run: npx hardhat coverage
+
+      - name: Enforce thresholds
+        run: |
+          node <<'JS'
+          const summary = require('./coverage/coverage-summary.json');
+          const total = summary.total;
+          const linePct = total.lines.pct;
+          const branchPct = total.branches.pct;
+          console.log(`lines: ${linePct}%, branches: ${branchPct}%`);
+          let bad = false;
+          if (linePct < 90) { console.error(`Line coverage ${linePct}% < 90%`); bad = true; }
+          if (branchPct < 80) { console.error(`Branch coverage ${branchPct}% < 80%`); bad = true; }
+          if (bad) process.exit(1);
+          JS
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14
