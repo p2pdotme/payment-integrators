@@ -7,12 +7,14 @@ This is the canonical list of integrators that are whitelisted on the P2P Diamon
 | Integrator | Address | Source commit | Whitelisted since | Status |
 |---|---|---|---|---|
 | LotPot | `0xb901c3399ED225e4C6c7bfbd8DABA16BBF340132` | <!-- TODO: backfill from p2p-checkout commit SHA --> | <!-- TODO: YYYY-MM-DD --> | Production |
+| polycule.bet | <!-- TODO: fill after deployment --> | <!-- TODO --> | <!-- TODO --> | Pending whitelisting |
 
 ## Base Sepolia (chainId 84532)
 
 | Integrator | Address | Source commit | Whitelisted since | Status |
 |---|---|---|---|---|
 | LotPot | <!-- TODO: fill from project_sepolia_addresses or skip if not whitelisted --> | <!-- TODO --> | <!-- TODO --> | Test |
+| polycule.bet | <!-- TODO: fill after deployment --> | <!-- TODO --> | <!-- TODO --> | Pending |
 
 ## How this table is maintained
 
