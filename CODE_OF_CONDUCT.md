@@ -8,11 +8,11 @@ The full text, including the standards we expect contributors to uphold and the 
 
 If you experience or witness a violation, report it to the maintainers at:
 
-**softwareartistaash@gmail.com**
+**dev@p2p.me**
 
 Reports will be reviewed and acted on promptly. Reporter identity is kept confidential.
 
-Until a dedicated conduct alias exists, this address routes to the same maintainer listed in [`SECURITY.md`](SECURITY.md). When a `@p2pdotme/core` team is established, enforcement will move to that group.
+This is the same shared alias used in [`SECURITY.md`](SECURITY.md) — it reaches the maintainer team. When a `@p2pdotme/core` group is formalised in GitHub, enforcement will move there.
 
 ## Enforcement
 

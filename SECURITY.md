@@ -4,9 +4,9 @@
 
 **Do not file public GitHub issues for security vulnerabilities.**
 
-Email: **softwareartistaash@gmail.com**
+Email: **dev@p2p.me**
 
-You may also use GitHub's [private security advisory](https://github.com/p2pdotme/payment-integrators/security/advisories/new) feature, which is preferred if you want an audit trail in the repo itself. Until a dedicated security team alias exists, the email above and the advisory form route to the same maintainer.
+You may also use GitHub's [private security advisory](https://github.com/p2pdotme/payment-integrators/security/advisories/new) feature, which is preferred if you want an audit trail in the repo itself. Both routes reach the maintainer team.
 
 Please include:
 
