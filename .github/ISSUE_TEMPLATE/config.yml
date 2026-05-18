@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/p2pdotme/payment-integrators/blob/main/SECURITY.md
+    about: Report a vulnerability privately via email — do not file a public issue.

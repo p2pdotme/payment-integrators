@@ -1,0 +1,18 @@
+# Code ownership for review routing.
+# Syntax: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Edit this file to add team handles once you've created a `core` team in the
+# p2pdotme org. Until then, individual handles work fine.
+
+# Default reviewer for everything
+*                                @Software-Artist-Aash
+
+# Protocol surface — changes require extra scrutiny
+/contracts/interfaces/           @Software-Artist-Aash
+/contracts/base/                 @Software-Artist-Aash
+
+# Governance + security docs
+/GOVERNANCE.md                   @Software-Artist-Aash
+/SECURITY.md                     @Software-Artist-Aash
+/docs/WHITELISTING.md            @Software-Artist-Aash
+/docs/INTEGRATORS.md             @Software-Artist-Aash

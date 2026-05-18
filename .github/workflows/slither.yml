@@ -1,0 +1,36 @@
+name: Slither
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "contracts/**"
+      - "hardhat.config.ts"
+      - "package.json"
+      - "package-lock.json"
+
+jobs:
+  slither:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Compile
+        run: npx hardhat compile
+
+      - name: Slither
+        uses: crytic/slither-action@v0.4.0
+        id: slither
+        with:
+          target: contracts/
+          fail-on: high
+          slither-args: --filter-paths "contracts/test/|node_modules/"
