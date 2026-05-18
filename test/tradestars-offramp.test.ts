@@ -190,7 +190,7 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
       expect(so.status).to.equal(STATUS.PAID);
 
       await mockDiamond.completeSellOrder(sellOrderId);
-      await integrator.reconcile(sellOrderId, STATUS.COMPLETED);
+      await integrator.reconcile(sellOrderId);
       const r = await integrator.offramps(sellOrderId);
       expect(r.lastStatus).to.equal(STATUS.COMPLETED);
     });
@@ -227,7 +227,7 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
       // Diamond cancels (timeout / dispute) and refunds USDC to integrator.
       await mockDiamond.cancelSellOrder(sellOrderId);
       // Reconcile pushes the refunded USDC back into the vault.
-      const reconcileTx = await integrator.reconcile(sellOrderId, STATUS.CANCELLED);
+      const reconcileTx = await integrator.reconcile(sellOrderId);
       const recEv = (await reconcileTx.wait()).logs
         .map((l: any) => {
           try {
@@ -448,9 +448,24 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
       expect(await vault.ownerQuota()).to.equal(USDC(30));
     });
 
-    it("transferOwnership rotates control to new owner", async function () {
+    it("transferOwnership is 2-step: propose then accept", async function () {
+      // Step 1: current owner nominates — owner unchanged, pending set
       await vault.connect(owner).transferOwnership(stranger.address);
+      expect(await vault.owner()).to.equal(owner.address);
+      expect(await vault.pendingOwner()).to.equal(stranger.address);
+
+      // Step 2: only the nominee can complete the transfer
+      await expect(vault.connect(owner).acceptOwnership()).to.be.revertedWithCustomError(
+        vault,
+        "OnlyPendingOwner"
+      );
+
+      // Step 3: nominee accepts → owner rotates, pending clears
+      await vault.connect(stranger).acceptOwnership();
       expect(await vault.owner()).to.equal(stranger.address);
+      expect(await vault.pendingOwner()).to.equal(ethers.ZeroAddress);
+
+      // Old owner has lost control
       await expect(
         vault.connect(owner).setOfframpOperator(owner.address)
       ).to.be.revertedWithCustomError(vault, "OnlyOwner");
@@ -459,7 +474,7 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
 
   describe("Branch coverage — TradeStars reconcile error paths", function () {
     it("reconcile reverts OfframpRecordNotFound for unknown orderId", async function () {
-      await expect(integrator.reconcile(999n, STATUS.COMPLETED)).to.be.revertedWithCustomError(
+      await expect(integrator.reconcile(999n)).to.be.revertedWithCustomError(
         integrator,
         "OfframpRecordNotFound"
       );
@@ -491,10 +506,180 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
       await mockDiamond.acceptSellOrder(sellOrderId, "merchantPubKey");
       await integrator.connect(relayer).deliverOfframpUpi(sellOrderId, "encUpi");
       await mockDiamond.completeSellOrder(sellOrderId);
-      await integrator.reconcile(sellOrderId, STATUS.COMPLETED);
+      await integrator.reconcile(sellOrderId);
+      await expect(integrator.reconcile(sellOrderId)).to.be.revertedWithCustomError(
+        integrator,
+        "OfframpAlreadyReconciled"
+      );
+    });
+  });
+
+  // ─── Post-audit hardening guards ────────────────────────────────────
+  //
+  // Each test below pins one of the security fixes from the prod-readiness
+  // audit so a future regression surfaces immediately rather than re-opening
+  // the original attack vector. The labels (B1..B4 / S1..S3) match the
+  // audit report headers.
+
+  describe("Audit fix B1 — reconcile reads authoritative status from Diamond", function () {
+    async function placeAndAcceptSell(burnTxHex: string) {
+      const tx = await integrator
+        .connect(relayer)
+        .placeSellOrderForBurn(
+          burnTxHex,
+          "0x" + "cd".repeat(32),
+          USDC(20),
+          INR,
+          USDC(1600),
+          1n,
+          0n,
+          "userPubKey"
+        );
+      const sellOrderId = (await tx.wait()).logs
+        .map((l: any) => {
+          try {
+            return integrator.interface.parseLog(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((p: any) => p?.name === "OfframpInitiated").args.orderId as bigint;
+      await mockDiamond.acceptSellOrder(sellOrderId, "mp");
+      return sellOrderId;
+    }
+
+    it("reverts StatusNotTerminal when Diamond order is still ACCEPTED (griefer attack)", async function () {
+      // Pre-fix: a stranger could call reconcile(id, CANCELLED) right after
+      // placement and force the vault accounting + offramp record into a
+      // terminal state, locking the legitimate completion path. Post-fix:
+      // reconcile reads Diamond's status and rejects non-terminal.
+      const sellOrderId = await placeAndAcceptSell("0x" + "aa".repeat(32));
+      await expect(integrator.connect(stranger).reconcile(sellOrderId)).to.be.revertedWithCustomError(
+        integrator,
+        "StatusNotTerminal"
+      );
+    });
+
+    it("reverts StatusNotTerminal when Diamond order is PAID (mid-flight)", async function () {
+      const sellOrderId = await placeAndAcceptSell("0x" + "bb".repeat(32));
+      await integrator.connect(relayer).deliverOfframpUpi(sellOrderId, "encUpi");
+      // Mock now in PAID, integrator hasn't been notified of completion yet
+      await expect(integrator.reconcile(sellOrderId)).to.be.revertedWithCustomError(
+        integrator,
+        "StatusNotTerminal"
+      );
+    });
+
+    it("anyone can poke once Diamond is terminal — recorded status comes from Diamond, not caller", async function () {
+      // Permissionless reconcile is preserved post-fix; security comes from
+      // reading Diamond instead of trusting an argument. Stranger pokes
+      // after legitimate cancellation — succeeds and records CANCELLED.
+      const sellOrderId = await placeAndAcceptSell("0x" + "cc".repeat(32));
+      await integrator.connect(relayer).deliverOfframpUpi(sellOrderId, "encUpi");
+      await mockDiamond.cancelSellOrder(sellOrderId);
+      await integrator.connect(stranger).reconcile(sellOrderId);
+      const r = await integrator.offramps(sellOrderId);
+      expect(r.lastStatus).to.equal(STATUS.CANCELLED);
+    });
+  });
+
+  describe("Audit fix B2 — deliverOfframpUpi rejects unready fee", function () {
+    it("reverts OfframpFeeNotReady when Diamond returns 0 for actualUsdtAmount", async function () {
+      // Pre-fix: silent fallback to principal-only funded the proxy short
+      // of fee → Diamond's transferFrom underflowed → Diamond auto-cancelled
+      // (the 2026-05-07 fee bug). Post-fix: explicit revert forces the
+      // relayer to retry once Diamond has computed actualUsdtAmount.
+      const tx = await integrator
+        .connect(relayer)
+        .placeSellOrderForBurn(
+          "0x" + "ff".repeat(32),
+          "0x" + "cd".repeat(32),
+          USDC(20),
+          INR,
+          USDC(1600),
+          1n,
+          0n,
+          "userPubKey"
+        );
+      const sellOrderId = (await tx.wait()).logs
+        .map((l: any) => {
+          try {
+            return integrator.interface.parseLog(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((p: any) => p?.name === "OfframpInitiated").args.orderId as bigint;
+      await mockDiamond.acceptSellOrder(sellOrderId, "mp");
+
+      // Toggle the mock so getAdditionalOrderDetails returns 0
+      await mockDiamond.setAdditionalOrderDetailsFeeUnready(true);
       await expect(
-        integrator.reconcile(sellOrderId, STATUS.COMPLETED)
-      ).to.be.revertedWithCustomError(integrator, "OfframpAlreadyReconciled");
+        integrator.connect(relayer).deliverOfframpUpi(sellOrderId, "encUpi")
+      ).to.be.revertedWithCustomError(integrator, "OfframpFeeNotReady");
+
+      // Replay guard didn't trip (we reverted before the success path)
+      const r = await integrator.offramps(sellOrderId);
+      expect(r.delivered).to.equal(false);
+
+      // Once Diamond is ready, the legitimate retry succeeds
+      await mockDiamond.setAdditionalOrderDetailsFeeUnready(false);
+      await integrator.connect(relayer).deliverOfframpUpi(sellOrderId, "encUpi");
+      const r2 = await integrator.offramps(sellOrderId);
+      expect(r2.delivered).to.equal(true);
+    });
+  });
+
+  describe("Audit fix B4 — deliverOfframpUpi replay guard", function () {
+    it("reverts OfframpAlreadyDelivered on a second call for the same orderId", async function () {
+      const tx = await integrator
+        .connect(relayer)
+        .placeSellOrderForBurn(
+          "0x" + "d1".repeat(32),
+          "0x" + "cd".repeat(32),
+          USDC(20),
+          INR,
+          USDC(1600),
+          1n,
+          0n,
+          "userPubKey"
+        );
+      const sellOrderId = (await tx.wait()).logs
+        .map((l: any) => {
+          try {
+            return integrator.interface.parseLog(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((p: any) => p?.name === "OfframpInitiated").args.orderId as bigint;
+      await mockDiamond.acceptSellOrder(sellOrderId, "mp");
+      await integrator.connect(relayer).deliverOfframpUpi(sellOrderId, "encUpi");
+      await expect(
+        integrator.connect(relayer).deliverOfframpUpi(sellOrderId, "encUpi")
+      ).to.be.revertedWithCustomError(integrator, "OfframpAlreadyDelivered");
+    });
+  });
+
+  describe("Audit fix S3 — vault allowance reset after deposit", function () {
+    it("integrator's allowance to the vault is 0 after a buy completion", async function () {
+      // Defense-in-depth: even though deposit pulls the exact approved
+      // amount via safeTransferFrom (landing the allowance at 0 anyway),
+      // pin the invariant so a future vault that doesn't can't leave a
+      // dangling allowance the next placement could abuse.
+      const solanaPubkey = "0x" + "11".repeat(32);
+      await integrator
+        .connect(user)
+        .userPlaceOrder(solanaPubkey, USDC(10), INR, 1n, "pubkey", 0n, 0n);
+      const orderId = 1n; // first order
+      await usdc.mint(await mockDiamond.getAddress(), USDC(10));
+      await mockDiamond.simulateOrderComplete(orderId);
+
+      const allowance = await usdc.allowance(
+        await integrator.getAddress(),
+        await vault.getAddress()
+      );
+      expect(allowance).to.equal(0n);
     });
   });
 });

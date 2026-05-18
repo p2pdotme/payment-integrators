@@ -354,8 +354,90 @@ contract MockDiamond {
                 acceptedTimestamp: 0,
                 paidTimestamp: 0,
                 reserved2: 0,
-                actualUsdtAmount: sellOrders[orderId].amount,
+                actualUsdtAmount: additionalOrderDetailsFeeUnready ? 0 : sellOrders[orderId].amount,
                 actualFiatAmount: 0
             });
+    }
+
+    /// @notice When set, `getAdditionalOrderDetails` returns 0 for
+    ///         actualUsdtAmount instead of the order amount. Used by tests
+    ///         to exercise the `OfframpFeeNotReady` revert path in
+    ///         deliverOfframpUpi without having to mutate sellOrders.amount.
+    bool public additionalOrderDetailsFeeUnready;
+
+    function setAdditionalOrderDetailsFeeUnready(bool v) external {
+        additionalOrderDetailsFeeUnready = v;
+    }
+
+    /// @notice Mock of GetterFacet.getOrdersById. Only the `status`,
+    ///         `orderType`, and `amount` fields are meaningful for the
+    ///         tests that consume this — the integrator's reconcile reads
+    ///         only `status`. All other fields are zero-filled.
+    ///
+    ///         Tests drive a sell order through the mock state machine
+    ///         (acceptSellOrder / setSellOrderUpi / completeSellOrder /
+    ///         cancelSellOrder) and this getter exposes the resulting
+    ///         status so the integrator's reconcile sees the authoritative
+    ///         terminal state.
+    struct OrderView {
+        uint256 amount;
+        uint256 fiatAmount;
+        uint256 placedTimestamp;
+        uint256 completedTimestamp;
+        uint256 userCompletedTimestamp;
+        address acceptedMerchant;
+        address user;
+        address recipientAddr;
+        string pubkey;
+        string encUpi;
+        bool userCompleted;
+        uint8 status;
+        uint8 orderType;
+        Dispute disputeInfo;
+        uint256 id;
+        string userPubKey;
+        string encMerchantUpi;
+        uint256 acceptedAccountNo;
+        uint256[] assignedAccountNos;
+        bytes32 currency;
+        uint256 preferredPaymentChannelConfigId;
+        uint256 circleId;
+    }
+
+    struct Dispute {
+        uint8 raisedBy;
+        uint8 status;
+        uint256 redactTransId;
+        uint256 accountNumber;
+    }
+
+    /// @notice Test-only helper: directly invokes
+    ///         `IP2PIntegrator.onOrderComplete` on `integrator_` with the
+    ///         supplied arguments. Lets tests exercise the integrator's
+    ///         defense-in-depth guards (AmountMismatch / UnknownOrder /
+    ///         OrderAlreadyCancelled) without having to manipulate the
+    ///         mock's internal `orders` mapping.
+    function adminCallOnOrderComplete(
+        address integrator_,
+        uint256 orderId,
+        address user_,
+        uint256 amount,
+        address recipientAddr
+    ) external {
+        IP2PIntegrator(integrator_).onOrderComplete(orderId, user_, amount, recipientAddr);
+    }
+
+    function getOrdersById(uint256 orderId) external view returns (OrderView memory o) {
+        SellOrder storage s = sellOrders[orderId];
+        // SellStatus enum mirrors Diamond's OrderStatus (0..4) so the cast
+        // is a no-op semantically.
+        o.status = uint8(s.status);
+        o.orderType = 1; // SELL
+        o.amount = s.amount;
+        o.user = s.user;
+        o.currency = s.currency;
+        o.id = orderId;
+        // Strings / arrays / dispute default-init to empty — fine for the
+        // status-only consumer.
     }
 }

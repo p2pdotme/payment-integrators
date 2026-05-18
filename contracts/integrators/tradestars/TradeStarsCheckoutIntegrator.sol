@@ -44,6 +44,12 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
     error InvalidAmount();
     error InvalidSolanaRecipient();
     error ArrayLengthMismatch();
+    /// @notice Diamond's onOrderComplete callback passed an `amount` that
+    ///         doesn't match the session's recorded usdcAmount. Defense-in-
+    ///         depth: under correct gateway bookkeeping this is impossible,
+    ///         but reverting makes any future divergence loud rather than
+    ///         silently depositing the wrong amount to the vault.
+    error AmountMismatch();
 
     // Offramp
     error OfframpDisabled();
@@ -54,6 +60,24 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
     error OfframpRecordNotFound();
     error OfframpAlreadyReconciled();
     error OfframpInsufficientPool();
+    /// @notice deliverOfframpUpi tried to fund the system proxy but Diamond
+    ///         hasn't computed actualUsdtAmount yet (returned 0). Without
+    ///         the fee component, transferFrom inside setSellOrderUpi would
+    ///         underflow and Diamond would auto-cancel the order. Surface
+    ///         this explicitly so the relayer retries instead of shipping a
+    ///         doomed transaction.
+    error OfframpFeeNotReady();
+    /// @notice deliverOfframpUpi was already called for this order. Replay
+    ///         guard — without it a duplicate relayer call would re-fund
+    ///         the system proxy before Diamond reverted the duplicate
+    ///         setSellOrderUpi. The outer revert rolls everything back
+    ///         today, but the guard removes the cross-contract trust
+    ///         coupling.
+    error OfframpAlreadyDelivered();
+    /// @notice reconcile was called but Diamond's order isn't yet in a
+    ///         terminal state (COMPLETED or CANCELLED). Caller should wait
+    ///         for the merchant to complete or Diamond to expire/cancel.
+    error StatusNotTerminal();
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -90,6 +114,20 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
     );
     event OfframpUpiDelivered(uint256 indexed orderId);
     event OfframpReconciled(uint256 indexed orderId, uint8 newStatus, uint256 usdcReturnedToVault);
+
+    /// @notice Emitted when the Diamond cancels a BUY order before fulfillment
+    ///         and invokes the integrator's onOrderCancel hook. Mirrors LotPot's
+    ///         `LotPotOrderCancelled` so off-chain consumers have a single
+    ///         place to observe checkout lifecycle exits.
+    event OrderCancelled(uint256 indexed orderId, address indexed user);
+
+    // ─── Constants ────────────────────────────────────────────────────
+
+    /// @notice Mirrors OrderProcessorStorage.OrderStatus on the P2P Diamond.
+    ///         Hardcoded here so reconcile + offramp record bookkeeping can
+    ///         reference the terminal values without an interface roundtrip.
+    uint8 internal constant STATUS_COMPLETED = 3;
+    uint8 internal constant STATUS_CANCELLED = 4;
 
     // ─── Immutables ───────────────────────────────────────────────────
 
@@ -137,6 +175,11 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
         uint256 usdcAmount;
         uint8 lastStatus;
         bool initialized;
+        /// @notice deliverOfframpUpi replay guard. Set true on first
+        ///         successful invocation; remains true across subsequent
+        ///         lifecycle transitions (terminal status is tracked
+        ///         separately via lastStatus).
+        bool delivered;
     }
 
     mapping(uint256 => OfframpRecord) public offramps;
@@ -282,24 +325,38 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
     function onOrderComplete(
         uint256 orderId,
         address /* user */,
-        uint256 /* amount */,
+        uint256 amount,
         address /* recipientAddr */
     ) external onlyDiamond {
         CheckoutSession storage session = sessions[orderId];
+        // Defense-in-depth — these should never fire under correct gateway
+        // bookkeeping (BUY-only callback per B2BGatewayFacet line 257, single
+        // call per orderId, amount fixed at placement). Reverting on
+        // divergence makes any future drift loud rather than silently
+        // operating on a zero-init session or depositing the wrong amount
+        // to the vault. Mirrors LotPot's defense set.
+        if (session.user == address(0)) revert UnknownOrder();
+        if (session.cancelled) revert OrderAlreadyCancelled();
         if (session.fulfilled) revert OrderAlreadyFulfilled();
+        if (amount != session.usdcAmount) revert AmountMismatch();
 
         session.fulfilled = true;
 
         // Diamond just pushed USDC to this contract (usdcThroughIntegrator =
         // true on this integrator). If a vault is wired up, forward the USDC
-        // there so it starts earning Aave yield.
+        // there so it starts earning Aave yield. Reset the allowance to 0
+        // after deposit — RestrictedYieldVault.deposit pulls the exact
+        // approved amount via safeTransferFrom (allowance lands at 0 anyway),
+        // but the explicit reset is belt-and-suspenders against any future
+        // vault that doesn't.
         if (address(yieldVault) != address(0)) {
-            IERC20(usdc).forceApprove(address(yieldVault), session.usdcAmount);
-            yieldVault.deposit(session.usdcAmount);
-            emit UsdcDepositedToVault(orderId, session.usdcAmount);
+            IERC20(usdc).forceApprove(address(yieldVault), amount);
+            yieldVault.deposit(amount);
+            IERC20(usdc).forceApprove(address(yieldVault), 0);
+            emit UsdcDepositedToVault(orderId, amount);
         }
 
-        emit CheckoutFulfilled(orderId, session.solanaRecipient, session.usdcAmount);
+        emit CheckoutFulfilled(orderId, session.solanaRecipient, amount);
     }
 
     /// @notice Cancellation hook — releases the userDailyCount slot reserved
@@ -321,6 +378,8 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
         if (count > 0) {
             userDailyCount[session.user][day] = count - 1;
         }
+
+        emit OrderCancelled(orderId, session.user);
     }
 
     // ─── View Functions ───────────────────────────────────────────────
@@ -438,7 +497,8 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
             solanaUserPubkey: solanaUserPubkey,
             usdcAmount: usdcAmount,
             lastStatus: 0,
-            initialized: true
+            initialized: true,
+            delivered: false
         });
         solanaBurnToOrderId[solanaBurnTx] = orderId;
 
@@ -487,8 +547,16 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
         uint256 orderId,
         string calldata encUpi
     ) external onlyOfframpRelayer {
-        OfframpRecord memory r = offramps[orderId];
+        // storage because we set the replay guard before external calls
+        OfframpRecord storage r = offramps[orderId];
         if (!r.initialized) revert OfframpRecordNotFound();
+        if (r.delivered) revert OfframpAlreadyDelivered();
+
+        // CEI: flip the replay flag before any external call. If the
+        // downstream call reverts, the whole transaction reverts and the
+        // flag rolls back too — so a legitimate retry after a true revert
+        // still works.
+        r.delivered = true;
 
         // For SELL the Diamond pulls actualUsdtAmount (= principal + fee) from
         // order.user via transferFrom inside setSellOrderUpi. Funding the proxy
@@ -499,7 +567,11 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
         IOrderFlow.AdditionalOrderDetailsView memory aod = IOrderFlow(diamond)
             .getAdditionalOrderDetails(orderId);
         uint256 needed = aod.actualUsdtAmount;
-        if (needed == 0) needed = r.usdcAmount;
+        // No silent principal-only fallback — that path re-introduces the
+        // 2026-05-07 fee bug (Diamond auto-cancels because transferFrom
+        // underflows on principal + fee). Force the relayer to retry once
+        // Diamond has populated actualUsdtAmount.
+        if (needed == 0) revert OfframpFeeNotReady();
 
         if (IERC20(usdc).balanceOf(address(this)) < needed) revert OfframpInsufficientPool();
 
@@ -513,21 +585,35 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
     }
 
     /**
-     * @notice Read-and-record the Diamond status. On CANCELLED, the Diamond
-     *         refunded USDC to order.user = system proxy; we sweep it back to
-     *         this integrator and forward to the vault so the offramp pool's
-     *         accounting balances.
+     * @notice Read-and-record the Diamond's terminal status for an offramp
+     *         order. On CANCELLED, the Diamond refunded USDC to order.user =
+     *         system proxy; we sweep it back to this integrator and forward
+     *         to the vault so the offramp pool's accounting balances.
      *
-     *         Anyone can poke. The relayer does so on completion; on dispute
-     *         settlement, ops can call this to close out the bookkeeping.
+     *         Permissionless on purpose — the relayer pokes on completion, and
+     *         ops can close out bookkeeping after a dispute resolution without
+     *         needing the relayer key. Security comes from reading the
+     *         authoritative status from the Diamond (not from a caller-
+     *         supplied argument) and rejecting non-terminal states: a griefer
+     *         can call this but can't influence the recorded status or
+     *         prematurely return offramp liquidity to the vault.
      */
-    function reconcile(uint256 orderId, uint8 currentStatus) external {
+    function reconcile(uint256 orderId) external {
         OfframpRecord storage r = offramps[orderId];
         if (!r.initialized) revert OfframpRecordNotFound();
-        if (r.lastStatus == 3 || r.lastStatus == 4) revert OfframpAlreadyReconciled();
+        if (r.lastStatus == STATUS_COMPLETED || r.lastStatus == STATUS_CANCELLED)
+            revert OfframpAlreadyReconciled();
+
+        // Authoritative status from Diamond. Reverts if Diamond is broken or
+        // the orderId doesn't exist (returns default-init Order with
+        // status=PLACED, which fails the terminal check below).
+        IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
+        uint8 status = order.status;
+        if (status != STATUS_COMPLETED && status != STATUS_CANCELLED)
+            revert StatusNotTerminal();
 
         uint256 returned = 0;
-        if (currentStatus == 4 /* CANCELLED */ && address(yieldVault) != address(0)) {
+        if (status == STATUS_CANCELLED && address(yieldVault) != address(0)) {
             // After cancel-while-PAID, USDC was refunded to the system proxy.
             // Pull it back to this integrator. UserProxy blocks the user-
             // initiated USDC sweep universally; the integrator-only
@@ -542,11 +628,12 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
             if (bal >= r.usdcAmount) {
                 IERC20(usdc).forceApprove(address(yieldVault), r.usdcAmount);
                 yieldVault.returnFromOfframp(r.usdcAmount);
+                IERC20(usdc).forceApprove(address(yieldVault), 0);
                 returned = r.usdcAmount;
             }
         }
-        r.lastStatus = currentStatus;
-        emit OfframpReconciled(orderId, currentStatus, returned);
+        r.lastStatus = status;
+        emit OfframpReconciled(orderId, status, returned);
     }
 
     // ─── Internal: proxy helpers ──────────────────────────────────────

@@ -40,6 +40,7 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
 
     error OnlyOwner();
     error OnlyOperator();
+    error OnlyPendingOwner();
     error InvalidAddress();
     error InvalidAmount();
     error ExceedsOwnerQuota();
@@ -54,6 +55,9 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     );
     event OfframpReleased(address indexed operator, uint256 amount);
     event OfframpReturned(address indexed operator, uint256 amount);
+    /// @notice Emitted when the current owner nominates a new owner. The
+    ///         nominee must call `acceptOwnership` to complete the transfer.
+    event OwnerProposed(address indexed proposed);
     event OwnerUpdated(address indexed newOwner);
     event OperatorUpdated(address indexed newOperator);
 
@@ -65,6 +69,11 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     uint256 public constant OWNER_PRINCIPAL_BPS = 4000; // 40%
 
     address public owner;
+    /// @notice 2-step ownership transfer: the proposed owner must call
+    ///         `acceptOwnership` to complete the rotation. Closes the typo
+    ///         risk that would otherwise brick the vault (custody-bearing
+    ///         contract).
+    address public pendingOwner;
     address public offrampOperator;
 
     uint256 public override totalPrincipal;
@@ -154,9 +163,24 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         emit OperatorUpdated(op);
     }
 
+    /// @notice Nominate a new owner. The nominee becomes owner only after
+    ///         they call `acceptOwnership` from the proposed address — a
+    ///         one-step transfer to a wrong address would brick the vault
+    ///         (it holds principal + accrues yield from Aave).
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert InvalidAddress();
+        pendingOwner = newOwner;
+        emit OwnerProposed(newOwner);
+    }
+
+    /// @notice Complete a pending ownership transfer. Caller must be the
+    ///         address nominated via `transferOwnership` — proves they
+    ///         control the destination key.
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert OnlyPendingOwner();
+        address newOwner = pendingOwner;
         owner = newOwner;
+        pendingOwner = address(0);
         emit OwnerUpdated(newOwner);
     }
 

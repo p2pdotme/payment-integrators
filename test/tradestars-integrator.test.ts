@@ -297,6 +297,78 @@ describe("TradeStarsCheckoutIntegrator", function () {
         await mockDiamond.simulateOrderCancelled(1);
         await expect(mockDiamond.simulateOrderCancelled(1)).to.be.reverted;
       });
+      it("emits OrderCancelled with orderId and user (audit fix S2)", async function () {
+        await integrator.connect(user).userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
+        await expect(mockDiamond.simulateOrderCancelled(1))
+          .to.emit(integrator, "OrderCancelled")
+          .withArgs(1, user.address);
+      });
+    });
+
+    describe("onOrderComplete defense-in-depth (audit fixes B3 + S1)", function () {
+      // Drive onOrderComplete directly via the MockDiamond test helper so
+      // we can supply arbitrary args — the BUY callback is `onlyDiamond`
+      // and these adversarial inputs aren't reachable through the normal
+      // gateway flow.
+
+      it("reverts UnknownOrder when Diamond delivers a completion for a never-placed order", async function () {
+        // No session exists for orderId=999 → integrator must refuse to
+        // operate on a zero-init session.
+        await expect(
+          mockDiamond.adminCallOnOrderComplete(
+            await integrator.getAddress(),
+            999,
+            user.address,
+            USDC(10),
+            user.address
+          )
+        ).to.be.revertedWithCustomError(integrator, "UnknownOrder");
+      });
+
+      it("reverts OrderAlreadyCancelled when Diamond completes an already-cancelled order", async function () {
+        // Race the impossible: gateway invariants prevent this in practice,
+        // but the guard makes a future Diamond bug loud rather than silent.
+        await integrator
+          .connect(user)
+          .userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
+        await mockDiamond.simulateOrderCancelled(1);
+        await expect(
+          mockDiamond.adminCallOnOrderComplete(
+            await integrator.getAddress(),
+            1,
+            user.address,
+            USDC(10),
+            user.address
+          )
+        ).to.be.revertedWithCustomError(integrator, "OrderAlreadyCancelled");
+      });
+
+      it("reverts AmountMismatch when Diamond passes an amount != session.usdcAmount", async function () {
+        // Diamond's gateway sends the same amount it placed with, so this
+        // is only reachable via a Diamond bug — the guard mirrors LotPot
+        // and pins the invariant.
+        await integrator
+          .connect(user)
+          .userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
+        await expect(
+          mockDiamond.adminCallOnOrderComplete(
+            await integrator.getAddress(),
+            1,
+            user.address,
+            USDC(999),
+            user.address
+          )
+        ).to.be.revertedWithCustomError(integrator, "AmountMismatch");
+      });
+
+      it("happy path still works with the new guards in place", async function () {
+        await integrator
+          .connect(user)
+          .userPlaceOrder(SOLANA_RECIPIENT, USDC(10), INR, 1, "", 0, 0);
+        await mockDiamond.simulateOrderComplete(1);
+        const session = await integrator.sessions(1);
+        expect(session.fulfilled).to.equal(true);
+      });
     });
   });
 });
