@@ -321,7 +321,10 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         address _proxyImpl,
         address _megapot,
         address _batchFacilitator,
-        address _jackpotNft
+        address _jackpotNft,
+        uint256 _baseTxLimit,
+        uint256 _dailyTxCountLimit,
+        bytes32 _source
     ) {
         if (
             _diamond == address(0) ||
@@ -341,6 +344,9 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         batchFacilitator = _batchFacilitator;
         jackpotNft = _jackpotNft;
         defaultReferrer = _owner;
+        baseTxLimit = _baseTxLimit;
+        dailyTxCountLimit = _dailyTxCountLimit;
+        source = _source;
     }
 
     // ─── V2: Deprecation ──────────────────────────────────────────────

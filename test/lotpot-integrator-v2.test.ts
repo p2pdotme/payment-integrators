@@ -16,6 +16,9 @@ describe("LotPotCheckoutIntegratorV2", function () {
 
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
   const TICKET_PRICE = USDC(1);
+  const BASE_TX_LIMIT = USDC(50);
+  const DAILY_COUNT_LIMIT = 10n;
+  const SOURCE = ethers.encodeBytes32String("lotpot");
   const BALL_MAX = 30;
   const BONUSBALL_MAX = 15;
 
@@ -50,6 +53,9 @@ describe("LotPotCheckoutIntegratorV2", function () {
       await mockMegapot.getAddress(),
       await mockBatchFacilitator.getAddress(),
       await mockNft.getAddress(),
+      BASE_TX_LIMIT,
+      DAILY_COUNT_LIMIT,
+      SOURCE,
     ]);
 
     await mockDiamond.registerIntegrator(
@@ -98,7 +104,7 @@ describe("LotPotCheckoutIntegratorV2", function () {
     const predicted = await integratorV2.proxyAddress(user.address);
     expect(await ethers.provider.getCode(predicted)).to.equal("0x");
 
-    // Configure limits so validateOrder passes (baseTxLimit must be > 0).
+    // Limits are already set via constructor; confirm setters still work post-deploy.
     await integratorV2.connect(owner).setBaseTxLimit(USDC(50));
     await integratorV2.connect(owner).setDailyTxCountLimit(10);
 
