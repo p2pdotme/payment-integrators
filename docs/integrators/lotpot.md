@@ -61,3 +61,27 @@ npx hardhat run scripts/deploy-lotpot.ts --network base
 ```
 
 Then verify on Basescan and open a whitelist request per [`../WHITELISTING.md`](../WHITELISTING.md).
+
+## V2 — Buyer USDC Cashback (2026)
+
+`LotPotCheckoutIntegratorV2` extends V1 with three additions to support a
+protocol-side growth campaign: 2% USDC cashback for non-B2B P2P BUY orders,
+deposited directly to the buyer's V2 `UserProxy` for use on future LotPot
+ticket purchases.
+
+**New in V2:**
+- `deprecate()` — owner-callable sunset flag; unlocks `sweepStale` on all
+  V2 proxies immediately.
+- `adminEnsureProxy(user)` — owner-callable; materializes a never-engaged
+  user's proxy to start the 90-day sweep clock.
+- `UserProxyV2.notifyCashbackCredit()` — Diamond/integrator-callable; bumps
+  the proxy's activity clock after a cashback inbound.
+- `UserProxyV2.sweepStale(to)` — integrator-callable; recovers proxy USDC
+  after 90 days of inactivity OR when the integrator is deprecated.
+
+**Migration from V1:** V1 stays operational. V2 is a fresh deployment with
+new proxy addresses (different CREATE2 deployer → different addresses).
+Existing V1-stranded credits remain redeemable via V1's `_route`. No
+on-contract migration.
+
+See the design spec at `docs/superpowers/specs/2026-05-20-lotpot-buyer-usdc-cashback-design.md`.
