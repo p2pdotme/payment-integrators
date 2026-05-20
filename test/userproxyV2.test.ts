@@ -71,3 +71,77 @@ describe("UserProxyV2", function () {
     expect(await proxy.lastActivityTimestamp()).to.be.greaterThan(before);
   });
 });
+
+describe("UserProxyV2 — notifyCashbackCredit", function () {
+  let deployer: SignerWithAddress;
+  let user: SignerWithAddress;
+  let stranger: SignerWithAddress;
+  let proxy: any;
+  let shim: any;
+  let mockUsdc: any;
+
+  beforeEach(async function () {
+    [deployer, user, stranger] = await ethers.getSigners();
+    const diamondAddr = ethers.Wallet.createRandom().address;
+
+    const MockUSDC = await ethers.getContractFactory("MockUSDC");
+    mockUsdc = await MockUSDC.deploy();
+
+    const Shim = await ethers.getContractFactory("MockV2IntegratorShim");
+    shim = await Shim.deploy(await mockUsdc.getAddress(), diamondAddr);
+
+    const Impl = await ethers.getContractFactory("UserProxyV2");
+    const impl = await Impl.deploy();
+
+    const Cloner = await ethers.getContractFactory("MockV2Cloner");
+    const cloner = await Cloner.deploy();
+    const tx = await cloner.clone(
+      await impl.getAddress(),
+      user.address,
+      await shim.getAddress(),
+      ethers.id("salt2")
+    );
+    const receipt = await tx.wait();
+    const cloneAddr = "0x" + receipt!.logs[0].topics[1].slice(26);
+    proxy = await ethers.getContractAt("UserProxyV2", cloneAddr);
+
+    await shim.callInitialize(cloneAddr);
+  });
+
+  it("bumps timestamp when called by integrator", async function () {
+    const before = await proxy.lastActivityTimestamp();
+    await time.increase(60);
+    await shim.callNotifyCashbackCredit(await proxy.getAddress());
+    expect(await proxy.lastActivityTimestamp()).to.be.greaterThan(before);
+  });
+
+  it("bumps timestamp when called by configured Diamond address", async function () {
+    const before = await proxy.lastActivityTimestamp();
+    await time.increase(60);
+
+    const diamondAddr = await shim.diamond();
+    await ethers.provider.send("hardhat_impersonateAccount", [diamondAddr]);
+    await ethers.provider.send("hardhat_setBalance", [diamondAddr, "0x100000000000000000"]);
+    const diamondSigner = await ethers.getSigner(diamondAddr);
+
+    await proxy.connect(diamondSigner).notifyCashbackCredit();
+
+    await ethers.provider.send("hardhat_stopImpersonatingAccount", [diamondAddr]);
+
+    expect(await proxy.lastActivityTimestamp()).to.be.greaterThan(before);
+  });
+
+  it("reverts OnlyIntegrator when called by a stranger", async function () {
+    await expect(proxy.connect(stranger).notifyCashbackCredit()).to.be.revertedWithCustomError(
+      proxy,
+      "OnlyIntegrator"
+    );
+  });
+
+  it("emits CashbackCredited event", async function () {
+    await expect(shim.callNotifyCashbackCredit(await proxy.getAddress())).to.emit(
+      proxy,
+      "CashbackCredited"
+    );
+  });
+});
