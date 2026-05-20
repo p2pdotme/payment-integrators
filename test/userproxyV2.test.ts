@@ -145,3 +145,95 @@ describe("UserProxyV2 — notifyCashbackCredit", function () {
     );
   });
 });
+
+describe("UserProxyV2 — sweepStale", function () {
+  let deployer: SignerWithAddress;
+  let user: SignerWithAddress;
+  let stranger: SignerWithAddress;
+  let proxy: any;
+  let shim: any;
+  let mockUsdc: any;
+
+  const TEN_USDC = ethers.parseUnits("10", 6);
+  const NINETY_DAYS = 90 * 24 * 60 * 60;
+
+  beforeEach(async function () {
+    [deployer, user, stranger] = await ethers.getSigners();
+    const diamondAddr = ethers.Wallet.createRandom().address;
+
+    const MockUSDC = await ethers.getContractFactory("MockUSDC");
+    mockUsdc = await MockUSDC.deploy();
+
+    const Shim = await ethers.getContractFactory("MockV2IntegratorShim");
+    shim = await Shim.deploy(await mockUsdc.getAddress(), diamondAddr);
+
+    const Impl = await ethers.getContractFactory("UserProxyV2");
+    const impl = await Impl.deploy();
+
+    const Cloner = await ethers.getContractFactory("MockV2Cloner");
+    const cloner = await Cloner.deploy();
+    const tx = await cloner.clone(
+      await impl.getAddress(),
+      user.address,
+      await shim.getAddress(),
+      ethers.id("salt3")
+    );
+    const receipt = await tx.wait();
+    const cloneAddr = "0x" + receipt!.logs[0].topics[1].slice(26);
+    proxy = await ethers.getContractAt("UserProxyV2", cloneAddr);
+
+    await shim.callInitialize(cloneAddr);
+
+    // Mint 10 USDC to the proxy so sweepStale has something to recover
+    await mockUsdc.mint(cloneAddr, TEN_USDC);
+  });
+
+  it("reverts SweepLocked before 90 days", async function () {
+    await expect(
+      shim.callSweepStale(await proxy.getAddress(), user.address)
+    ).to.be.revertedWithCustomError(proxy, "SweepLocked");
+  });
+
+  it("succeeds after 90 days of inactivity", async function () {
+    await time.increase(NINETY_DAYS + 1);
+    const balanceBefore = await mockUsdc.balanceOf(user.address);
+    await shim.callSweepStale(await proxy.getAddress(), user.address);
+    const balanceAfter = await mockUsdc.balanceOf(user.address);
+    expect(balanceAfter - balanceBefore).to.equal(TEN_USDC);
+  });
+
+  it("succeeds immediately when deprecate flag is set", async function () {
+    await shim.setDeprecated(true);
+    await expect(shim.callSweepStale(await proxy.getAddress(), user.address)).to.emit(
+      proxy,
+      "SweepStale"
+    );
+  });
+
+  it("reverts when called by non-integrator", async function () {
+    await time.increase(NINETY_DAYS + 1);
+    await expect(proxy.connect(stranger).sweepStale(user.address)).to.be.revertedWithCustomError(
+      proxy,
+      "OnlyIntegrator"
+    );
+  });
+
+  it("reverts InvalidAddress when to is zero", async function () {
+    await time.increase(NINETY_DAYS + 1);
+    await expect(
+      shim.callSweepStale(await proxy.getAddress(), ethers.ZeroAddress)
+    ).to.be.revertedWithCustomError(proxy, "InvalidAddress");
+  });
+
+  it("reverts NothingToSweep on empty proxy", async function () {
+    await time.increase(NINETY_DAYS + 1);
+    // First sweep drains the 10 USDC
+    await shim.callSweepStale(await proxy.getAddress(), user.address);
+    // Second sweep on now-empty proxy should revert
+    // Need to advance time again since sweepStale resets the activity clock
+    await time.increase(NINETY_DAYS + 1);
+    await expect(
+      shim.callSweepStale(await proxy.getAddress(), user.address)
+    ).to.be.revertedWithCustomError(proxy, "NothingToSweep");
+  });
+});
