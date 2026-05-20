@@ -233,14 +233,20 @@ contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
         emit RegistrarUpdated(registrar_);
     }
 
-    /// @notice Escape hatch for USDC stranded on this contract. The two
-    ///         realistic paths are: (a) `onOrderComplete`'s `safeTransfer`
-    ///         reverted (recipient is blacklisted by USDC or otherwise
-    ///         rejects), and the Diamond's try/catch swallowed it so the
-    ///         protocol moved on; (b) the recipient mapping was cleared
-    ///         between placement and settlement and the callback reverted on
-    ///         the `NoBridgeRecipient` guard. In both cases the Diamond does
-    ///         not retry — owner pulls the funds and routes them manually.
+    /// @notice Escape hatch for USDC stranded on this contract. The realistic
+    ///         path is `onOrderComplete`'s `safeTransfer` reverting (recipient
+    ///         is blacklisted by USDC or otherwise rejects) and the Diamond's
+    ///         try/catch swallowing it so the protocol moves on. The Diamond
+    ///         does not retry — owner pulls the funds and routes them
+    ///         manually.
+    ///
+    ///         The `NoBridgeRecipient` guard in `onOrderComplete` is
+    ///         defense-in-depth only: `setBridgeRecipient` rejects the zero
+    ///         address and there is no clearing path, so once a user is
+    ///         mapped the entry cannot revert to zero. The guard exists to
+    ///         fail loudly if `onOrderComplete` is ever invoked for a user
+    ///         that was never mapped (which `userPlaceOrder` prevents on the
+    ///         happy path).
     function rescueStrandedUsdc(address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert InvalidAddress();
         usdc.safeTransfer(to, amount);

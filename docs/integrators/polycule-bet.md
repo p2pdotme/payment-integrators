@@ -42,9 +42,11 @@ The `UserProxy` is used only at placement time, to satisfy the Diamond's CREATE2
 
 ## Stranded-USDC recovery
 
-If `safeTransfer` in `onOrderComplete` reverts (e.g. the recipient is on USDC's blacklist, or the registrar cleared the mapping between placement and settlement), the Diamond's try/catch swallows the revert and finalises protocol state. USDC remains on the integrator contract.
+If `safeTransfer` in `onOrderComplete` reverts (e.g. the recipient is on USDC's blacklist or otherwise rejects the transfer), the Diamond's try/catch swallows the revert and finalises protocol state. USDC remains on the integrator contract.
 
-The owner pulls those funds via `rescueStrandedUsdc(to, amount)` and re-routes manually. There is no per-order claimable mapping — the assumption is that mapping clears / USDC blacklist hits are rare enough to handle out-of-band rather than warranting on-chain bookkeeping.
+The owner pulls those funds via `rescueStrandedUsdc(to, amount)` and re-routes manually. There is no per-order claimable mapping — the assumption is that USDC blacklist hits are rare enough to handle out-of-band rather than warranting on-chain bookkeeping.
+
+The `NoBridgeRecipient` guard in `onOrderComplete` is defense-in-depth only: `setBridgeRecipient` rejects the zero address and the contract exposes no clearing path, so a mapped user's entry cannot revert to zero. The guard exists to fail loudly if the callback is ever invoked for a user that was never mapped (which `userPlaceOrder` prevents on the happy path).
 
 ## Limits
 
@@ -70,7 +72,6 @@ DIAMOND_ADDRESS=0x... \
 USDC_ADDRESS=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 \
 OWNER_ADDRESS=0x... \
 REGISTRAR_ADDRESS=0x... \
-SOURCE_TAG=polycule-bet \
 npx hardhat run scripts/deploy-polycule-bet.ts --network base
 ```
 
