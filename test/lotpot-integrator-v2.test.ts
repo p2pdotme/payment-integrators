@@ -172,12 +172,10 @@ describe("LotPotCheckoutIntegratorV2 — credit ledger + vault pull", function (
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
 
-    it("silently no-ops on zero amount", async function () {
-      await expect(integrator.connect(issuerEoa).issueCredit(user.address, 0)).to.not.emit(
-        integrator,
-        "CreditIssued"
-      );
-      expect(await integrator.issuedCredit(user.address)).to.equal(0);
+    it("reverts InvalidAmount on zero amount", async function () {
+      await expect(
+        integrator.connect(issuerEoa).issueCredit(user.address, 0)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
     });
   });
 

@@ -74,6 +74,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
     error ArrayLengthMismatch();
     // V2-only:
     error OnlyCreditIssuer();
+    error InvalidAmount();
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -397,6 +398,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
     ///         P2P fallback). The vaults must independently whitelist
     ///         this integrator via `vault.setApprovedSpender`.
     function setVaults(address grant, address fallback_) external onlyOwner {
+        if (grant == grantVault && fallback_ == fallbackVault) return;
         grantVault = grant;
         fallbackVault = fallback_;
         emit VaultsUpdated(grant, fallback_);
@@ -410,7 +412,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
     ///         user's next ticket purchase.
     function issueCredit(address user, uint256 amount) external onlyCreditIssuer {
         if (user == address(0)) revert InvalidAddress();
-        if (amount == 0) return;
+        if (amount == 0) revert InvalidAmount();
         issuedCredit[user] += amount;
         emit CreditIssued(msg.sender, user, amount);
     }
@@ -646,16 +648,18 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         //      both vaults are dry).
         address proxy = _ensureProxy(msg.sender);
         uint256 proxyBal = usdc.balanceOf(proxy);
-        uint256 issued = issuedCredit[msg.sender];
 
         uint256 pulled = 0;
-        if (proxyBal < totalPrice && issued > 0) {
-            uint256 need = totalPrice - proxyBal;
-            uint256 toPull = need < issued ? need : issued;
-            pulled = _pullFromVaults(toPull, proxy);
-            if (pulled > 0) {
-                issuedCredit[msg.sender] = issued - pulled;
-                emit CreditConsumed(msg.sender, pulled, issued - pulled);
+        if (proxyBal < totalPrice) {
+            uint256 issued = issuedCredit[msg.sender];
+            if (issued > 0) {
+                uint256 need = totalPrice - proxyBal;
+                uint256 toPull = need < issued ? need : issued;
+                pulled = _pullFromVaults(toPull, proxy);
+                if (pulled > 0) {
+                    issuedCredit[msg.sender] = issued - pulled;
+                    emit CreditConsumed(msg.sender, pulled, issued - pulled);
+                }
             }
         }
 
