@@ -65,7 +65,7 @@ Then verify on Basescan and open a whitelist request per [`../WHITELISTING.md`](
 ## V2 — Buyer USDC Cashback (2026)
 
 `LotPotCheckoutIntegratorV2` extends V1 with on-chain credit accounting
-to support a protocol-side growth campaign: 2% USDC cashback on every
+to support a protocol-side growth campaign: USDC cashback (super-admin tunable, capped at 10%) on every
 completed non-B2B P2P BUY order is registered as **credit on the
 integrator's ledger** and redeemed for Megapot tickets later. USDC
 itself is held in two vaults (Megapot-funded primary, P2P-funded

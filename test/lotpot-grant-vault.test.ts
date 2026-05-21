@@ -29,7 +29,7 @@ describe("LotpotGrantVault", function () {
 
   describe("construction", function () {
     it("stores usdc + owner and emits OwnershipTransferred(0, owner)", async function () {
-      expect(await vault.usdc()).to.equal(await usdc.getAddress());
+      expect(await vault.USDC()).to.equal(await usdc.getAddress());
       expect(await vault.owner()).to.equal(owner.address);
     });
 

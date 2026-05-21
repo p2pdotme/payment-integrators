@@ -45,7 +45,7 @@ contract LotpotGrantVault {
     // ─── Storage ──────────────────────────────────────────────────────
 
     /// @notice The USDC token this vault holds.
-    IERC20 public immutable usdc;
+    IERC20 public immutable USDC;
 
     /// @notice Current owner. Can withdraw, set spenders, and transfer ownership.
     address public owner;
@@ -57,7 +57,7 @@ contract LotpotGrantVault {
 
     constructor(IERC20 _usdc, address _owner) {
         if (address(_usdc) == address(0) || _owner == address(0)) revert InvalidAddress();
-        usdc = _usdc;
+        USDC = _usdc;
         owner = _owner;
         emit OwnershipTransferred(address(0), _owner);
     }
@@ -90,7 +90,7 @@ contract LotpotGrantVault {
     function withdraw(address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert InvalidAddress();
         if (amount == 0) revert InvalidAmount();
-        usdc.safeTransfer(to, amount);
+        USDC.safeTransfer(to, amount);
         emit Withdrawn(to, amount);
     }
 
@@ -113,7 +113,7 @@ contract LotpotGrantVault {
     function release(address to, uint256 amount) external onlyApprovedSpender {
         if (to == address(0)) revert InvalidAddress();
         if (amount == 0) revert InvalidAmount();
-        usdc.safeTransfer(to, amount);
+        USDC.safeTransfer(to, amount);
         emit Released(msg.sender, to, amount);
     }
 }

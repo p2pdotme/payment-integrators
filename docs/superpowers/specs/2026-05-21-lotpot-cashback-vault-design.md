@@ -5,7 +5,7 @@
 
 ## Goal
 
-Run a growth campaign that nudges non-B2B P2P users into LotPot by issuing a **2% USDC cashback** on every completed non-B2B P2P BUY order. The cashback is delivered as **on-chain credit** that can only be redeemed for Megapot lottery tickets via the LotPot V2 integrator. Megapot funds the campaign; P2P provides backstop liquidity.
+Run a growth campaign that nudges non-B2B P2P users into LotPot by issuing a **USDC cashback** (initial rate 2%, super-admin tunable up to 10%) on every completed non-B2B P2P BUY order. The cashback is delivered as **on-chain credit** that can only be redeemed for Megapot lottery tickets via the LotPot V2 integrator. Megapot funds the campaign; P2P provides backstop liquidity.
 
 ## Architecture
 
