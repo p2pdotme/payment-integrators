@@ -75,6 +75,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
     // V2-only:
     error OnlyCreditIssuer();
     error InvalidAmount();
+    error Reentrancy();
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -348,6 +349,23 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         _;
     }
 
+    /// @notice Transient reentrancy lock for user-facing placement
+    ///         entrypoints. The `_route` flow makes external calls into
+    ///         the configured vaults (via `_pullFromVaults`) BEFORE
+    ///         decrementing `issuedCredit`, so a malicious vault — if
+    ///         one ever gets wired in via `setVaults` — could otherwise
+    ///         re-enter `userPlaceOrder` and double-spend the pre-decrement
+    ///         credit. Uses EIP-1153 transient storage (Cancun) to keep the
+    ///         per-call overhead at ~100 gas.
+    bool private transient _entered;
+
+    modifier nonReentrant() {
+        if (_entered) revert Reentrancy();
+        _entered = true;
+        _;
+        _entered = false;
+    }
+
     // ─── Constructor ──────────────────────────────────────────────────
 
     constructor(
@@ -598,7 +616,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         uint256 fiatAmountLimit,
         address[] calldata referrers,
         uint256[] calldata referralSplit
-    ) external returns (uint256 orderId) {
+    ) external nonReentrant returns (uint256 orderId) {
         if (quantity == 0) revert InvalidQuantity();
         // Type-level safety net: the batch path casts quantity to uint64
         // when calling createBatchOrder, so anything above uint64 max would
@@ -718,7 +736,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         uint256 fiatAmountLimit,
         address[] calldata referrers,
         uint256[] calldata referralSplit
-    ) external returns (uint256 orderId) {
+    ) external nonReentrant returns (uint256 orderId) {
         uint256 quantity = tickets.length;
         if (quantity == 0) revert InvalidQuantity();
         // Same uint64 safety net as userPlaceOrder — batch path narrows
