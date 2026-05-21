@@ -108,4 +108,6 @@ SOURCE_TAG=lotpot-v2 \
 npx hardhat run scripts/deploy-lotpot-v2.ts --network base
 ```
 
-Full design spec at [`../superpowers/specs/2026-05-21-lotpot-cashback-vault-design.md`](../superpowers/specs/2026-05-21-lotpot-cashback-vault-design.md).
+Source of truth lives in the contracts themselves
+(`contracts/base/LotpotGrantVault.sol` and
+`contracts/integrators/lotpot/LotPotCheckoutIntegratorV2.sol`).
