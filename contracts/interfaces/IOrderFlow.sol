@@ -51,4 +51,53 @@ interface IOrderFlow {
     function getAdditionalOrderDetails(
         uint256 orderId
     ) external view returns (AdditionalOrderDetailsView memory);
+
+    /// @notice Dispute sub-struct embedded in the Diamond's Order record.
+    ///         Both fields are uint8 enums on Diamond; mirror as uint8 so
+    ///         ABI decoding works without importing Diamond's enum types.
+    struct Dispute {
+        uint8 raisedBy;
+        uint8 status;
+        uint256 redactTransId;
+        uint256 accountNumber;
+    }
+
+    /// @notice Mirror of OrderProcessorStorage.Order. Field order must match
+    ///         Diamond exactly — decoder reads positional ABI tuples. The
+    ///         only field consumers (reconcile) actually read is `status`,
+    ///         but the full shape has to be declared so the ABI return-type
+    ///         resolves. Status values: 0=PLACED 1=ACCEPTED 2=PAID
+    ///         3=COMPLETED 4=CANCELLED. Type values: 0=BUY 1=SELL 2=PAY.
+    struct OrderView {
+        uint256 amount;
+        uint256 fiatAmount;
+        uint256 placedTimestamp;
+        uint256 completedTimestamp;
+        uint256 userCompletedTimestamp;
+        address acceptedMerchant;
+        address user;
+        address recipientAddr;
+        string pubkey;
+        string encUpi;
+        bool userCompleted;
+        uint8 status;
+        uint8 orderType;
+        Dispute disputeInfo;
+        uint256 id;
+        string userPubKey;
+        string encMerchantUpi;
+        uint256 acceptedAccountNo;
+        uint256[] assignedAccountNos;
+        bytes32 currency;
+        uint256 preferredPaymentChannelConfigId;
+        uint256 circleId;
+    }
+
+    /// @notice Mock of GetterFacet.getOrdersById. The integrator uses this
+    ///         in `reconcile` to read the authoritative order status from
+    ///         the Diamond rather than trusting a caller-supplied value —
+    ///         closing a griefing surface where any address could lock the
+    ///         offramp record into a wrong terminal state by passing the
+    ///         wrong status.
+    function getOrdersById(uint256 orderId) external view returns (OrderView memory);
 }
