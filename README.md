@@ -56,6 +56,15 @@ npx hardhat test
 5. Open a PR. Follow [`CONTRIBUTING.md`](CONTRIBUTING.md).
 6. Once merged, request whitelisting per [`docs/WHITELISTING.md`](docs/WHITELISTING.md).
 
+### Claude Code skills (optional, accelerator)
+
+If you use [Claude Code](https://docs.claude.com/en/docs/claude-code), this repo ships two bundled skills that automate the scaffolding + whitelist flow. They auto-load when you start `claude` inside the repo — no install step.
+
+- **`/new-integrator <name>`** — scaffolds the contract, test file, deploy script, and docs page from the canonical template, following CONTRIBUTING.md conventions. Defaults to convention, soft-warns on deviation, never auto-commits or auto-pushes.
+- **`/whitelist-request <address> <chain>`** — after you've deployed + verified on Basescan, verifies on-chain bytecode parity against the merged commit, renders the [whitelist-request issue template](.github/ISSUE_TEMPLATE/whitelist-request.md), and opens the issue via `gh`.
+
+Source: [`.claude/skills/new-integrator/SKILL.md`](.claude/skills/new-integrator/SKILL.md), [`.claude/skills/whitelist-request/SKILL.md`](.claude/skills/whitelist-request/SKILL.md). Both are intentionally manual-invocation only (`disable-model-invocation: true`) so Claude never triggers them without you typing the slash command.
+
 ## Governance
 
 Today: maintainers from the P2P team review PRs; the Diamond owner submits whitelist transactions. Tomorrow: community reviewers + multisig + on-chain governance. See [`GOVERNANCE.md`](GOVERNANCE.md) for the roadmap.
