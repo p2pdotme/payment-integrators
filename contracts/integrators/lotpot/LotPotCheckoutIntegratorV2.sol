@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.28;
 
 import { IP2PIntegrator } from "../../interfaces/IP2PIntegrator.sol";
 import { IB2BGateway } from "../../interfaces/IB2BGateway.sol";
@@ -75,7 +75,6 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
     // V2-only:
     error OnlyCreditIssuer();
     error InvalidAmount();
-    error Reentrancy();
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -349,23 +348,6 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         _;
     }
 
-    /// @notice Transient reentrancy lock for user-facing placement
-    ///         entrypoints. The `_route` flow makes external calls into
-    ///         the configured vaults (via `_pullFromVaults`) BEFORE
-    ///         decrementing `issuedCredit`, so a malicious vault — if
-    ///         one ever gets wired in via `setVaults` — could otherwise
-    ///         re-enter `userPlaceOrder` and double-spend the pre-decrement
-    ///         credit. Uses EIP-1153 transient storage (Cancun) to keep the
-    ///         per-call overhead at ~100 gas.
-    bool private transient _entered;
-
-    modifier nonReentrant() {
-        if (_entered) revert Reentrancy();
-        _entered = true;
-        _;
-        _entered = false;
-    }
-
     // ─── Constructor ──────────────────────────────────────────────────
 
     constructor(
@@ -616,7 +598,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         uint256 fiatAmountLimit,
         address[] calldata referrers,
         uint256[] calldata referralSplit
-    ) external nonReentrant returns (uint256 orderId) {
+    ) external returns (uint256 orderId) {
         if (quantity == 0) revert InvalidQuantity();
         // Type-level safety net: the batch path casts quantity to uint64
         // when calling createBatchOrder, so anything above uint64 max would
@@ -667,16 +649,39 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         address proxy = _ensureProxy(msg.sender);
         uint256 proxyBal = usdc.balanceOf(proxy);
 
+        // Checks-effects-interactions: decrement the ledger by the intended
+        // pull amount BEFORE calling the vault, then restore any shortfall
+        // afterwards if the vault released less than asked. This way a
+        // malicious vault that re-enters userPlaceOrder during release()
+        // observes the post-decrement balance and cannot double-spend the
+        // same credit. The pessimistic over-decrement is safe because:
+        //   - if the vault delivers in full, the restore is a no-op
+        //   - if the vault partially fails, we only restore the diff
+        //   - if a reentrant call drained more credit, the restore lands
+        //     on top of the (already-further-decremented) value and
+        //     underflow-checks would catch any attempt to over-restore
         uint256 pulled = 0;
         if (proxyBal < totalPrice) {
             uint256 issued = issuedCredit[msg.sender];
             if (issued > 0) {
                 uint256 need = totalPrice - proxyBal;
                 uint256 toPull = need < issued ? need : issued;
+
+                // Effect first
+                issuedCredit[msg.sender] = issued - toPull;
+
+                // Interaction
                 pulled = _pullFromVaults(toPull, proxy);
+
+                // Effect after: restore any unpulled amount. Safe under
+                // reentrancy — by this point all external calls in the
+                // pull path have returned.
+                if (pulled < toPull) {
+                    issuedCredit[msg.sender] += toPull - pulled;
+                }
+
                 if (pulled > 0) {
-                    issuedCredit[msg.sender] = issued - pulled;
-                    emit CreditConsumed(msg.sender, pulled, issued - pulled);
+                    emit CreditConsumed(msg.sender, pulled, issuedCredit[msg.sender]);
                 }
             }
         }
@@ -736,7 +741,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         uint256 fiatAmountLimit,
         address[] calldata referrers,
         uint256[] calldata referralSplit
-    ) external nonReentrant returns (uint256 orderId) {
+    ) external returns (uint256 orderId) {
         uint256 quantity = tickets.length;
         if (quantity == 0) revert InvalidQuantity();
         // Same uint64 safety net as userPlaceOrder — batch path narrows
