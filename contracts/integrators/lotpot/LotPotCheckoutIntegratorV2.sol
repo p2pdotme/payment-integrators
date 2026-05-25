@@ -8,7 +8,7 @@ import { UserProxy } from "../../base/UserProxy.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
-import { LotpotGrantVault } from "../../base/LotpotGrantVault.sol";
+import { GrantVault } from "../../base/GrantVault.sol";
 
 /**
  * @title LotPotCheckoutIntegrator
@@ -1448,7 +1448,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
             uint256 grantBal = usdc.balanceOf(gv);
             uint256 fromGrant = needed < grantBal ? needed : grantBal;
             if (fromGrant > 0) {
-                try LotpotGrantVault(gv).release(to, fromGrant) {
+                try GrantVault(gv).release(to, fromGrant) {
                     pulled += fromGrant;
                     needed -= fromGrant;
                 } catch {
@@ -1462,7 +1462,7 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
             uint256 fallbackBal = usdc.balanceOf(fv);
             uint256 fromFallback = needed < fallbackBal ? needed : fallbackBal;
             if (fromFallback > 0) {
-                try LotpotGrantVault(fv).release(to, fromFallback) {
+                try GrantVault(fv).release(to, fromFallback) {
                     pulled += fromFallback;
                 } catch {
                     // Fallback also failed → partial fulfillment by

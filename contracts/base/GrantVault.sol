@@ -5,18 +5,20 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
- * @title LotpotGrantVault
- * @notice Holds USDC earmarked for LotPot cashback redemptions. Designed
- *         to be deployed twice for the buyer-cashback growth campaign:
- *         once owned by the Megapot team (primary grant) and once owned
- *         by the P2P team (fallback liquidity). The deployed integrator
- *         is added as an approved spender; on each ticket purchase that
- *         consumes issued credit, the integrator calls `release(proxy,
- *         amount)` and the vault transfers USDC to the user's proxy so
- *         it can be spent on tickets in the same tx.
+ * @title GrantVault
+ * @notice Generic USDC holding contract: passive balance + a release
+ *         authority gated to whitelisted spenders. First consumer is the
+ *         LotPot buyer-cashback growth campaign, where two instances are
+ *         deployed — a primary "grant" vault (funded by the grant-giving
+ *         party, e.g. Megapot) and a fallback vault (funded by P2P
+ *         treasury). The configured integrator is added as an approved
+ *         spender; on each ticket purchase that consumes issued credit,
+ *         the integrator calls `release(proxy, amount)` and the vault
+ *         transfers USDC to the user's proxy so it can be spent on
+ *         tickets in the same tx.
  *
  *         Vault owners can `withdraw` their USDC at any time — there is
- *         no timelock. The integrator's purchase flow degrades to partial
+ *         no timelock. The consuming integrator should degrade to partial
  *         fulfillment if a vault is empty or has revoked the spender.
  *         Funds in the vault are NOT user property; they are protocol /
  *         grant-team property until redeemed.
@@ -25,7 +27,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  *         no special deposit method — the vault is a passive balance plus
  *         a release authority.
  */
-contract LotpotGrantVault {
+contract GrantVault {
     using SafeERC20 for IERC20;
 
     // ─── Errors ───────────────────────────────────────────────────────

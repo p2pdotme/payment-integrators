@@ -6,10 +6,12 @@ import { ethers } from "hardhat";
  * V2 differences vs V1:
  *  - On-chain `issuedCredit` ledger written by whitelisted issuers (the
  *    P2P Diamond on day one) — see `setCreditIssuer`.
- *  - `setVaults(grant, fallback_)` points the integrator at the
- *    Megapot-funded grant vault (primary) and the P2P-funded fallback
- *    vault. Both vaults must independently call
- *    `vault.setApprovedSpender(thisIntegrator, true)`.
+ *  - `setVaults(grant, fallback_)` points the integrator at two GrantVault
+ *    instances. Both are P2P-deployed and P2P-owned; Megapot funds the
+ *    primary "grant" vault via plain `usdc.transfer`, P2P treasury funds
+ *    the fallback. Each vault must call
+ *    `vault.setApprovedSpender(thisIntegrator, true)` (one call per vault,
+ *    by its owner).
  *  - `_route` pulls USDC from the vaults at ticket-purchase time when a
  *    user has issued credit; partial fulfillment if vaults are dry.
  *
@@ -29,15 +31,17 @@ import { ethers } from "hardhat";
  *   SOURCE_TAG=lotpot-v2          (free-form telemetry, encoded as bytes32)
  *
  * After deployment, complete the wiring out of band:
- *   1. Deploy LotpotGrantVault for P2P (P2P treasury owner, funded by P2P).
- *   2. Share LotpotGrantVault source with Megapot; they deploy + fund +
- *      own the primary grant vault.
- *   3. On this integrator: setCreditIssuer(diamondAddr, true) and
- *      setVaults(megapotVaultAddr, p2pFallbackVaultAddr).
- *   4. On each vault (by its owner): setApprovedSpender(thisIntegrator, true).
- *   5. On the Diamond: setLotpotBuyerCashback(200, thisIntegrator).
- *   6. Add this integrator to Megapot's batch facilitator allowlist (same
+ *   1. Deploy GrantVault x 2 (P2P treasury owner each). One = grant
+ *      (Megapot funds via plain usdc.transfer), one = fallback
+ *      (pre-seeded from P2P treasury).
+ *   2. On this integrator: setCreditIssuer(diamondAddr, true) and
+ *      setVaults(grantVaultAddr, fallbackVaultAddr).
+ *   3. On each vault (by its P2P owner): setApprovedSpender(thisIntegrator, true).
+ *   4. On the Diamond: setLotpotBuyerCashback(200, thisIntegrator) —
+ *      use scripts/setLotpotBuyerCashback.ts in contracts-v4.
+ *   5. Add this integrator to Megapot's batch facilitator allowlist (same
  *      as V1) before any >10-ticket order can fulfill.
+ *   6. Share the grant vault address with Megapot so they can fund it.
  */
 
 const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
@@ -100,19 +104,19 @@ async function main() {
   console.log("─────────────────────────────────────────────────────────");
   console.log("");
   console.log("Next steps:");
-  console.log("  1. Deploy LotpotGrantVault for P2P (P2P treasury = owner).");
-  console.log("  2. Share LotpotGrantVault.sol with Megapot — they deploy + own + fund the");
-  console.log("     primary grant vault. Capture both vault addresses.");
-  console.log("  3. integrator.setCreditIssuer(<diamondAddr>, true)");
-  console.log("  4. integrator.setVaults(<megapotVaultAddr>, <p2pFallbackVaultAddr>)");
+  console.log("  1. Deploy GrantVault x 2 (P2P treasury = owner) — grant + fallback.");
+  console.log("  2. integrator.setCreditIssuer(<diamondAddr>, true)");
+  console.log("  3. integrator.setVaults(<grantVaultAddr>, <fallbackVaultAddr>)");
   console.log(
-    "  5. On each vault (its owner): vault.setApprovedSpender(",
+    "  4. On each vault (its P2P owner): vault.setApprovedSpender(",
     integratorAddr,
     ", true)"
   );
-  console.log("  6. Diamond super-admin: setLotpotBuyerCashback(200,", integratorAddr, ")");
-  console.log("  7. Coordinate with Megapot to add this integrator to BatchPurchaseFacilitator");
-  console.log("     allowlist (required for >10-ticket orders).");
+  console.log("  5. Diamond super-admin: setLotpotBuyerCashback(200,", integratorAddr, ")");
+  console.log("     (use contracts-v4 scripts/setLotpotBuyerCashback.ts)");
+  console.log("  6. Coordinate with Megapot to add this integrator to BatchPurchaseFacilitator");
+  console.log("     allowlist (required for >10-ticket orders), and share the grant vault");
+  console.log("     address so they can fund it.");
 }
 
 main().catch((err) => {

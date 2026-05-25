@@ -2,7 +2,7 @@ import { expect } from "chai";
 import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
-describe("LotpotGrantVault", function () {
+describe("GrantVault", function () {
   let owner: SignerWithAddress;
   let newOwner: SignerWithAddress;
   let spender: SignerWithAddress;
@@ -20,7 +20,7 @@ describe("LotpotGrantVault", function () {
     const MockUSDC = await ethers.getContractFactory("MockUSDC");
     usdc = await MockUSDC.deploy();
 
-    const Vault = await ethers.getContractFactory("LotpotGrantVault");
+    const Vault = await ethers.getContractFactory("GrantVault");
     vault = await Vault.deploy(await usdc.getAddress(), owner.address);
 
     // Fund the vault by plain transfer.
@@ -34,7 +34,7 @@ describe("LotpotGrantVault", function () {
     });
 
     it("reverts InvalidAddress on zero usdc", async function () {
-      const Vault = await ethers.getContractFactory("LotpotGrantVault");
+      const Vault = await ethers.getContractFactory("GrantVault");
       await expect(Vault.deploy(ethers.ZeroAddress, owner.address)).to.be.revertedWithCustomError(
         vault,
         "InvalidAddress"
@@ -42,7 +42,7 @@ describe("LotpotGrantVault", function () {
     });
 
     it("reverts InvalidAddress on zero owner", async function () {
-      const Vault = await ethers.getContractFactory("LotpotGrantVault");
+      const Vault = await ethers.getContractFactory("GrantVault");
       await expect(
         Vault.deploy(await usdc.getAddress(), ethers.ZeroAddress)
       ).to.be.revertedWithCustomError(vault, "InvalidAddress");

@@ -79,11 +79,12 @@ fallback) and pulled to the user's proxy at ticket-purchase time.
   owner-managed configuration.
 - `previewAvailableCredit(user) -> (onProxy, issued, grantAvail, fallbackAvail)`
   — frontend helper.
-- `LotpotGrantVault` (`contracts/base/LotpotGrantVault.sol`) — minimal
-  USDC holding contract. Owner can `withdraw` anytime; whitelisted
-  spenders (the integrator) can call `release(to, amount)`. Same source
-  is deployed twice for the campaign — one Megapot-owned (primary
-  grant), one P2P-owned (fallback liquidity).
+- `GrantVault` (`contracts/base/GrantVault.sol`) — minimal USDC holding
+  contract. Owner can `withdraw` anytime; whitelisted spenders (the
+  integrator) can call `release(to, amount)`. Same source is deployed
+  twice for the campaign — both P2P-owned. The primary "grant" vault is
+  funded by Megapot via plain `usdc.transfer`; the fallback is funded by
+  P2P treasury.
 
 **Behavior at ticket purchase:** the V2 `_route` first reads the user's
 `issuedCredit` ledger, then pulls up to that amount from the grant
@@ -109,5 +110,5 @@ npx hardhat run scripts/deploy-lotpot-v2.ts --network base
 ```
 
 Source of truth lives in the contracts themselves
-(`contracts/base/LotpotGrantVault.sol` and
+(`contracts/base/GrantVault.sol` and
 `contracts/integrators/lotpot/LotPotCheckoutIntegratorV2.sol`).

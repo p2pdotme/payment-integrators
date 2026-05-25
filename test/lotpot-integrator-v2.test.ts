@@ -89,7 +89,7 @@ describe("LotPotCheckoutIntegratorV2 — credit ledger + vault pull", function (
     await mockUsdc.mint(await mockDiamond.getAddress(), USDC(10000));
     await mockBatch.addAllowed(await integrator.getAddress());
 
-    const Vault = await ethers.getContractFactory("LotpotGrantVault");
+    const Vault = await ethers.getContractFactory("GrantVault");
     grantVault = await Vault.deploy(await mockUsdc.getAddress(), grantOwner.address);
     fallbackVault = await Vault.deploy(await mockUsdc.getAddress(), fallbackOwner.address);
   });
