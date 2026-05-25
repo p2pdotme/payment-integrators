@@ -1,6 +1,15 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
+import { runLotpotIntegratorSharedTests } from "./_lotpot-integrator-shared";
+
+// V1-behavior parity: V2 inherits the entire V1 surface when vaults and
+// credit issuers are unconfigured. Re-run the V1 suite against the V2
+// factory to lock that in.
+runLotpotIntegratorSharedTests(
+  "LotPotCheckoutIntegratorV2 (V1-behavior parity) + Megapot",
+  "LotPotCheckoutIntegratorV2"
+);
 
 describe("LotPotCheckoutIntegratorV2 — credit ledger + vault pull", function () {
   let owner: SignerWithAddress;
