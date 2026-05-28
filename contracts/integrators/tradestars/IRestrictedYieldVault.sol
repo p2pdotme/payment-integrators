@@ -4,12 +4,15 @@ pragma solidity ^0.8.20;
 /**
  * @title IRestrictedYieldVault
  * @notice Custodies USDC for an integrator (e.g. TradeStars) and earns
- *         yield via Aave. Two withdrawer roles:
+ *         yield via Aave. Three withdrawer roles:
  *
  *           - Owner: can pull up to 40% of principal + 100% of accrued
  *             yield, bounded by the actual aUSDC balance.
  *           - Operator: the offramp integrator. Can draw up to 100% of
  *             principal to fund SELL orders, returns USDC on cancellation.
+ *           - P2P beneficiary: can claim 2.5% of cumulative onramp +
+ *             offramp volume (net of cancelled offramps), drawn from
+ *             inside the owner's 40% bucket.
  *
  *         The owner's 40% is a cap on cumulative withdrawals rather than
  *         a reservation — the operator may legitimately drain the pool,
@@ -36,12 +39,18 @@ interface IRestrictedYieldVault {
     ///         order cancels and the integrator is refunded).
     function returnFromOfframp(uint256 amount) external;
 
+    /// @notice P2P-beneficiary-only. Claim accrued share of cumulative volume.
+    function p2pWithdraw(uint256 amount) external;
+
     // ── Views ────────────────────────────────────────────────────────────
 
     function totalPrincipal() external view returns (uint256);
     function ownerWithdrawnPrincipal() external view returns (uint256);
     function offrampWithdrawn() external view returns (uint256);
     function offrampOperator() external view returns (address);
+    function p2pBeneficiary() external view returns (address);
+    function p2pEntitled() external view returns (uint256);
+    function p2pWithdrawn() external view returns (uint256);
 
     /// @notice Current yield (aUSDC balance − totalPrincipal). Returns 0 if
     ///         the vault is in deficit (shouldn't happen with Aave).
@@ -52,4 +61,7 @@ interface IRestrictedYieldVault {
 
     /// @notice Remaining USDC the operator can pull for offramps.
     function offrampQuota() external view returns (uint256);
+
+    /// @notice Remaining USDC the P2P beneficiary can claim right now.
+    function p2pAvailable() external view returns (uint256);
 }

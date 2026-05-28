@@ -31,6 +31,16 @@ interface IAavePool {
  *           - Operator (the offramp integrator) can draw up to 100% of
  *             principal to fund SELL orders. Refunds (cancelled offramps)
  *             are returned via `returnFromOfframp`.
+ *
+ *         P2P entitlement share:
+ *           - 2.5% of cumulative onramp + offramp volume accrues to a
+ *             P2P-controlled beneficiary, withdrawable via `p2pWithdraw`.
+ *           - The P2P share is *part of* the owner's 40% bucket, not
+ *             additional to it: combined `ownerWithdrawnPrincipal +
+ *             p2pWithdrawn` cannot exceed 40% × principal.
+ *           - `p2pEntitled` ticks up on `deposit` and `releaseForOfframp`,
+ *             and ticks down on `returnFromOfframp` (cancelled offramp
+ *             refund) so the accumulator reflects net completed volume.
  */
 contract RestrictedYieldVault is IRestrictedYieldVault {
     using SafeERC20 for IERC20;
@@ -51,6 +61,15 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     ///         the on-chain balance — distinct from `ExceedsOwnerQuota`,
     ///         which means the owner asked above 40% in the first place.
     error InsufficientFunds();
+    /// @notice `p2pWithdraw` caller is not the configured beneficiary.
+    error OnlyP2PBeneficiary();
+    /// @notice `p2pWithdraw` requested more than the accrued net share.
+    error ExceedsP2PEntitlement();
+    /// @notice `setP2PBeneficiary` called when one is already configured.
+    ///         The setter is one-shot to preserve the trust assumption
+    ///         that the recipient cannot be redirected after the vault
+    ///         starts accruing entitlement.
+    error P2PBeneficiaryAlreadySet();
 
     event Deposited(address indexed from, uint256 amount, uint256 newPrincipal);
     event OwnerWithdrew(
@@ -66,6 +85,12 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     event OwnerProposed(address indexed proposed);
     event OwnerUpdated(address indexed newOwner);
     event OperatorUpdated(address indexed newOperator);
+    /// @notice Emitted when P2P entitlement accrues on deposit/release, or
+    ///         is reversed on returnFromOfframp. `delta` is signed via
+    ///         `isCredit`: true = ticked up, false = ticked down.
+    event P2PEntitlementUpdated(uint256 volume, uint256 share, bool isCredit);
+    event P2PWithdrew(address indexed to, uint256 amount);
+    event P2PBeneficiarySet(address indexed beneficiary);
 
     IERC20 public immutable usdc;
     IERC20 public immutable aUsdc;
@@ -73,6 +98,10 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     /// @notice Bps (out of 10_000) of `totalPrincipal` reserved for the
     ///         owner's withdrawal quota. The rest backs the offramp pool.
     uint256 public constant OWNER_PRINCIPAL_BPS = 4000; // 40%
+    /// @notice Bps (out of 10_000) of cumulative onramp + offramp volume
+    ///         that accrues to P2P. Lives inside the owner's 40% bucket
+    ///         (i.e., counts against `OWNER_PRINCIPAL_BPS`, doesn't add to it).
+    uint256 public constant P2P_BPS = 250; // 2.5%
 
     address public owner;
     /// @notice 2-step ownership transfer: the proposed owner must call
@@ -81,10 +110,21 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     ///         contract).
     address public pendingOwner;
     address public offrampOperator;
+    /// @notice Recipient of accrued P2P share. May be address(0) at deploy
+    ///         (entitlement still accrues correctly); set once via
+    ///         `setP2PBeneficiary` once the P2P address is known.
+    address public p2pBeneficiary;
 
     uint256 public override totalPrincipal;
     uint256 public override ownerWithdrawnPrincipal;
     uint256 public override offrampWithdrawn;
+    /// @notice Cumulative 2.5% accrual against deposit + release volume,
+    ///         net of returned-on-cancel volume. Monotonic intent — clamped
+    ///         to zero on the (degenerate) case where returns exceed prior
+    ///         credits.
+    uint256 public p2pEntitled;
+    /// @notice Cumulative USDC withdrawn to the beneficiary via `p2pWithdraw`.
+    uint256 public p2pWithdrawn;
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
@@ -96,13 +136,20 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         _;
     }
 
-    constructor(address _usdc, address _aUsdc, address _aave) {
+    constructor(address _usdc, address _aUsdc, address _aave, address _p2pBeneficiary) {
         if (_usdc == address(0) || _aUsdc == address(0) || _aave == address(0))
             revert InvalidAddress();
         usdc = IERC20(_usdc);
         aUsdc = IERC20(_aUsdc);
         aave = IAavePool(_aave);
         owner = msg.sender;
+        // p2pBeneficiary may be address(0) at construction — entitlement
+        // still accrues, but `p2pWithdraw` reverts until set. Allows the
+        // vault to be deployed before the P2P treasury address is known.
+        if (_p2pBeneficiary != address(0)) {
+            p2pBeneficiary = _p2pBeneficiary;
+            emit P2PBeneficiarySet(_p2pBeneficiary);
+        }
     }
 
     // ─── Deposits ────────────────────────────────────────────────────
@@ -113,6 +160,7 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         totalPrincipal += amount;
         usdc.forceApprove(address(aave), amount);
         aave.supply(address(usdc), amount, address(this), 0);
+        _creditP2P(amount);
         emit Deposited(msg.sender, amount, totalPrincipal);
     }
 
@@ -123,8 +171,11 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
 
         uint256 yield = getYield();
         uint256 principalQuota = (totalPrincipal * OWNER_PRINCIPAL_BPS) / 10_000;
-        uint256 remainingPrincipalQuota = principalQuota > ownerWithdrawnPrincipal
-            ? principalQuota - ownerWithdrawnPrincipal
+        // Owner and P2P share the 40% principal bucket. Combined cumulative
+        // principal draws cannot exceed the bucket.
+        uint256 combinedDrawn = ownerWithdrawnPrincipal + p2pWithdrawn;
+        uint256 remainingPrincipalQuota = principalQuota > combinedDrawn
+            ? principalQuota - combinedDrawn
             : 0;
         uint256 maxWithdraw = remainingPrincipalQuota + yield;
         if (amount > maxWithdraw) revert ExceedsOwnerQuota();
@@ -158,6 +209,7 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         if (amount > aUsdc.balanceOf(address(this))) revert InsufficientFunds();
         offrampWithdrawn += amount;
         aave.withdraw(address(usdc), amount, msg.sender);
+        _creditP2P(amount);
         emit OfframpReleased(msg.sender, amount);
     }
 
@@ -170,6 +222,11 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         offrampWithdrawn = amount > offrampWithdrawn ? 0 : offrampWithdrawn - amount;
         usdc.forceApprove(address(aave), amount);
         aave.supply(address(usdc), amount, address(this), 0);
+        // Reverse the P2P credit for the cancelled portion. If P2P already
+        // withdrew against this volume, `p2pEntitled` ticks down below
+        // `p2pWithdrawn`; `p2pAvailable()` clamps to zero and P2P has to
+        // earn the balance back from future net volume.
+        _debitP2P(amount);
         emit OfframpReturned(msg.sender, amount);
     }
 
@@ -202,6 +259,78 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         emit OwnerUpdated(newOwner);
     }
 
+    // ─── P2P entitlement ─────────────────────────────────────────────
+
+    function _creditP2P(uint256 volume) internal {
+        uint256 share = (volume * P2P_BPS) / 10_000;
+        if (share == 0) return;
+        p2pEntitled += share;
+        emit P2PEntitlementUpdated(volume, share, true);
+    }
+
+    function _debitP2P(uint256 volume) internal {
+        uint256 share = (volume * P2P_BPS) / 10_000;
+        if (share == 0) return;
+        p2pEntitled = share > p2pEntitled ? 0 : p2pEntitled - share;
+        emit P2PEntitlementUpdated(volume, share, false);
+    }
+
+    /// @notice One-shot setter for the P2P beneficiary, used when the
+    ///         vault was deployed before the address was known. Callable
+    ///         by owner only, and only while `p2pBeneficiary` is unset —
+    ///         once set, the recipient cannot be redirected, preserving
+    ///         the "no rug-pull of accrued P2P share" invariant.
+    function setP2PBeneficiary(address b) external onlyOwner {
+        if (p2pBeneficiary != address(0)) revert P2PBeneficiaryAlreadySet();
+        if (b == address(0)) revert InvalidAddress();
+        p2pBeneficiary = b;
+        emit P2PBeneficiarySet(b);
+    }
+
+    /// @notice Withdraw accrued P2P share. Bounded by the unclaimed
+    ///         entitlement, the available aUSDC balance, and the
+    ///         owner-side 40% bucket (which P2P shares).
+    function p2pWithdraw(uint256 amount) external {
+        if (msg.sender != p2pBeneficiary) revert OnlyP2PBeneficiary();
+        if (amount == 0) revert InvalidAmount();
+
+        uint256 available = p2pEntitled > p2pWithdrawn ? p2pEntitled - p2pWithdrawn : 0;
+        if (amount > available) revert ExceedsP2PEntitlement();
+
+        // Sharing the 40% bucket with the owner — neither side can push
+        // combined principal draws above the cap. If owner has already
+        // taken their share, P2P waits for more onramps to grow the cap.
+        uint256 principalQuota = (totalPrincipal * OWNER_PRINCIPAL_BPS) / 10_000;
+        uint256 combinedDrawn = ownerWithdrawnPrincipal + p2pWithdrawn;
+        uint256 remainingBucket = principalQuota > combinedDrawn
+            ? principalQuota - combinedDrawn
+            : 0;
+        if (amount > remainingBucket) revert ExceedsOwnerQuota();
+
+        if (amount > aUsdc.balanceOf(address(this))) revert InsufficientFunds();
+
+        p2pWithdrawn += amount;
+        aave.withdraw(address(usdc), amount, msg.sender);
+        emit P2PWithdrew(msg.sender, amount);
+    }
+
+    /// @notice Effective USDC the P2P beneficiary can withdraw right now —
+    ///         the accrued net entitlement, bounded by the owner's
+    ///         shared bucket and the actual aUSDC balance.
+    function p2pAvailable() external view returns (uint256) {
+        uint256 entitled = p2pEntitled > p2pWithdrawn ? p2pEntitled - p2pWithdrawn : 0;
+
+        uint256 principalQuota = (totalPrincipal * OWNER_PRINCIPAL_BPS) / 10_000;
+        uint256 combinedDrawn = ownerWithdrawnPrincipal + p2pWithdrawn;
+        uint256 remainingBucket = principalQuota > combinedDrawn
+            ? principalQuota - combinedDrawn
+            : 0;
+
+        uint256 bound = entitled < remainingBucket ? entitled : remainingBucket;
+        uint256 bal = aUsdc.balanceOf(address(this));
+        return bound < bal ? bound : bal;
+    }
+
     // ─── Views ───────────────────────────────────────────────────────
 
     function getYield() public view returns (uint256) {
@@ -217,9 +346,8 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     ///         `InsufficientFunds`.
     function ownerQuota() external view returns (uint256) {
         uint256 principalQuota = (totalPrincipal * OWNER_PRINCIPAL_BPS) / 10_000;
-        uint256 remaining = principalQuota > ownerWithdrawnPrincipal
-            ? principalQuota - ownerWithdrawnPrincipal
-            : 0;
+        uint256 combinedDrawn = ownerWithdrawnPrincipal + p2pWithdrawn;
+        uint256 remaining = principalQuota > combinedDrawn ? principalQuota - combinedDrawn : 0;
         uint256 theoretical = remaining + getYield();
         uint256 bal = aUsdc.balanceOf(address(this));
         return theoretical < bal ? theoretical : bal;

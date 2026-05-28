@@ -19,6 +19,8 @@ import { ethers } from "hardhat";
  *   DAILY_TX_COUNT_LIMIT=10
  *   MAX_USDC_PER_OFFRAMP=50000000    (default 50 USDC per call)
  *   OFFRAMP_RELAYER=0x...            (default: deployer)
+ *   P2P_BENEFICIARY=0x...            (P2P share recipient; omit to set later
+ *                                     via vault.setP2PBeneficiary)
  */
 
 const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
@@ -29,6 +31,7 @@ const BASE_TX_LIMIT = process.env.BASE_TX_LIMIT || "50000000";
 const DAILY_TX_COUNT_LIMIT = process.env.DAILY_TX_COUNT_LIMIT || "10";
 const MAX_USDC_PER_OFFRAMP = process.env.MAX_USDC_PER_OFFRAMP || "50000000";
 const OFFRAMP_RELAYER = process.env.OFFRAMP_RELAYER || "";
+const P2P_BENEFICIARY = process.env.P2P_BENEFICIARY || ""; // optional; leave empty to set later via setP2PBeneficiary
 
 async function main() {
   if (!DIAMOND_ADDRESS || !USDC_ADDRESS) {
@@ -76,10 +79,17 @@ async function main() {
   // 3. Vault
   console.log("Deploying RestrictedYieldVault…");
   const Vault = await ethers.getContractFactory("RestrictedYieldVault");
-  const vault = await Vault.deploy(USDC_ADDRESS, aUsdcAddress, aavePoolAddress);
+  const p2pBeneficiary = P2P_BENEFICIARY || ethers.ZeroAddress;
+  const vault = await Vault.deploy(USDC_ADDRESS, aUsdcAddress, aavePoolAddress, p2pBeneficiary);
   await vault.deploymentTransaction()?.wait(3);
   const vaultAddress = await vault.getAddress();
   console.log("  Vault:           ", vaultAddress);
+  console.log(
+    "  p2pBeneficiary:  ",
+    p2pBeneficiary === ethers.ZeroAddress
+      ? "(unset — call vault.setP2PBeneficiary later)"
+      : p2pBeneficiary
+  );
 
   // 4. Integrator
   console.log("Deploying TradeStarsCheckoutIntegrator…");
