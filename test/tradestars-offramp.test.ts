@@ -405,14 +405,14 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
       await ethers.provider.send("hardhat_stopImpersonatingAccount", [integratorAddr]);
     });
 
-    it("releaseForOfframp reverts ExceedsOfframpQuota when above 60% of principal", async function () {
+    it("releaseForOfframp reverts ExceedsOfframpQuota when above 100% of principal", async function () {
       const integratorAddr = await integrator.getAddress();
       await ethers.provider.send("hardhat_impersonateAccount", [integratorAddr]);
       await ethers.provider.send("hardhat_setBalance", [integratorAddr, "0x1000000000000000000"]);
       const integratorSigner = await ethers.getSigner(integratorAddr);
-      // 60% of 100 USDC = 60; 61 USDC exceeds.
+      // 100% of 100 USDC = 100; 101 USDC exceeds.
       await expect(
-        vault.connect(integratorSigner).releaseForOfframp(USDC(61))
+        vault.connect(integratorSigner).releaseForOfframp(USDC(101))
       ).to.be.revertedWithCustomError(vault, "ExceedsOfframpQuota");
       await ethers.provider.send("hardhat_stopImpersonatingAccount", [integratorAddr]);
     });
