@@ -63,8 +63,7 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
     await integrator.setOfframpRelayer(relayer.address);
     await integrator.setMaxUsdcPerOfframp(USDC(50));
 
-    // Seed the vault: 100 USDC of principal so 60% (= 60 USDC) is reserved
-    // for offramp.
+    // Seed the vault: 100 USDC of principal (100% available for offramp).
     await usdc.mint(owner.address, USDC(100));
     await usdc.connect(owner).approve(await vault.getAddress(), USDC(100));
     await vault.connect(owner).deposit(USDC(100));
@@ -245,9 +244,9 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
   });
 
   describe("Vault quotas", function () {
-    it("releaseForOfframp respects 60% cap", async function () {
-      // total principal = 100 → offramp quota = 60
-      // Try to pull 70 — should revert.
+    it("releaseForOfframp allows up to 100% of principal", async function () {
+      // total principal = 100 → offramp quota = 100
+      // Try to pull 70 with 50 max per tx — should revert on per-tx cap.
       await expect(
         integrator
           .connect(relayer)
@@ -263,17 +262,33 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
           )
       ).to.be.revertedWithCustomError(integrator, "OfframpAmountTooLarge");
 
-      // Bump per-tx cap so we can hit the vault's quota.
+      // Bump per-tx cap so we can test the vault's quota.
       await integrator.setMaxUsdcPerOfframp(USDC(1000));
+
+      // 70 USDC should now succeed (within 100% quota).
+      await integrator
+        .connect(relayer)
+        .placeSellOrderForBurn(
+          "0x" + "11".repeat(32),
+          "0x" + "22".repeat(32),
+          USDC(70),
+          INR,
+          USDC(5600),
+          1n,
+          0n,
+          ""
+        );
+
+      // Remaining quota = 100 - 70 = 30. Pulling 40 should exceed it.
       await expect(
         integrator
           .connect(relayer)
           .placeSellOrderForBurn(
-            "0x" + "11".repeat(32),
-            "0x" + "22".repeat(32),
-            USDC(70),
+            "0x" + "33".repeat(32),
+            "0x" + "44".repeat(32),
+            USDC(40),
             INR,
-            USDC(5600),
+            USDC(3200),
             1n,
             0n,
             ""
