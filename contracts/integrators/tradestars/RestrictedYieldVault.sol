@@ -26,14 +26,11 @@ interface IAavePool {
  *         USDC to Aave (via aUSDC) so the principal earns yield while
  *         held. Withdrawals draw down from Aave automatically.
  *
- *         The 40/60 split:
+ *         Principal access:
  *           - Owner withdraws up to 40% of principal + 100% of yield.
- *           - Operator (the offramp integrator) draws from the remaining
- *             60% to fund SELL orders. Refunds (cancelled offramps) are
- *             returned via `returnFromOfframp`.
- *
- *         The two pools are tracked separately so neither role can
- *         encroach on the other's quota.
+ *           - Operator (the offramp integrator) can draw up to 100% of
+ *             principal to fund SELL orders. Refunds (cancelled offramps)
+ *             are returned via `returnFromOfframp`.
  */
 contract RestrictedYieldVault is IRestrictedYieldVault {
     using SafeERC20 for IERC20;
@@ -200,7 +197,6 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     }
 
     function offrampQuota() public view returns (uint256) {
-        uint256 quota = (totalPrincipal * (10_000 - OWNER_PRINCIPAL_BPS)) / 10_000;
-        return quota > offrampWithdrawn ? quota - offrampWithdrawn : 0;
+        return totalPrincipal > offrampWithdrawn ? totalPrincipal - offrampWithdrawn : 0;
     }
 }
