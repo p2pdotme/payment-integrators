@@ -354,6 +354,44 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
         "ExceedsOwnerQuota"
       );
     });
+
+    it("releaseForOfframp reverts InsufficientFunds when owner has drained their share", async function () {
+      // Owner pulls their full 40%. Vault balance now = 60, but the
+      // operator's principal headroom (totalPrincipal - offrampWithdrawn)
+      // still claims 100 of headroom.
+      await vault.connect(owner).ownerWithdraw(USDC(40));
+      expect(await aUsdc.balanceOf(await vault.getAddress())).to.equal(USDC(60));
+
+      // Impersonate the integrator (operator) and ask for 80. Quota check
+      // sees 100 of headroom and passes, but balance is 60 — should revert
+      // with InsufficientFunds, not fall through to an Aave low-level error.
+      const integratorAddr = await integrator.getAddress();
+      await ethers.provider.send("hardhat_impersonateAccount", [integratorAddr]);
+      await ethers.provider.send("hardhat_setBalance", [integratorAddr, "0x1000000000000000000"]);
+      const integratorSigner = await ethers.getSigner(integratorAddr);
+      await expect(
+        vault.connect(integratorSigner).releaseForOfframp(USDC(80))
+      ).to.be.revertedWithCustomError(vault, "InsufficientFunds");
+
+      // Asking exactly at the balance still works — proves the new bound
+      // is min(quota, balance), not strictly < balance.
+      await vault.connect(integratorSigner).releaseForOfframp(USDC(60));
+      expect(await aUsdc.balanceOf(await vault.getAddress())).to.equal(0n);
+      await ethers.provider.send("hardhat_stopImpersonatingAccount", [integratorAddr]);
+    });
+
+    it("offrampQuota and ownerQuota views reflect actual balance, not just bookkeeping", async function () {
+      // Pre-drain sanity.
+      expect(await vault.offrampQuota()).to.equal(USDC(100));
+      expect(await vault.ownerQuota()).to.equal(USDC(40));
+
+      // Owner pulls 40. Operator's view should drop to balance (60), not
+      // stay at totalPrincipal - offrampWithdrawn = 100. Owner's view
+      // should drop to 0 (cap consumed).
+      await vault.connect(owner).ownerWithdraw(USDC(40));
+      expect(await vault.offrampQuota()).to.equal(USDC(60));
+      expect(await vault.ownerQuota()).to.equal(0n);
+    });
   });
 
   describe("Access control", function () {

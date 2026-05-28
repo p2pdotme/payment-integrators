@@ -148,8 +148,14 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
 
     function releaseForOfframp(uint256 amount) external onlyOperator {
         if (amount == 0) revert InvalidAmount();
-        uint256 q = offrampQuota();
+        // Quota check uses the raw principal headroom rather than
+        // `offrampQuota()` so the two failure modes stay distinguishable:
+        // ExceedsOfframpQuota means the operator asked above cumulative
+        // principal drawn, InsufficientFunds means the owner has pulled
+        // their 40% and there isn't enough liquid balance to service this.
+        uint256 q = totalPrincipal > offrampWithdrawn ? totalPrincipal - offrampWithdrawn : 0;
         if (amount > q) revert ExceedsOfframpQuota();
+        if (amount > aUsdc.balanceOf(address(this))) revert InsufficientFunds();
         offrampWithdrawn += amount;
         aave.withdraw(address(usdc), amount, msg.sender);
         emit OfframpReleased(msg.sender, amount);
@@ -203,15 +209,28 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         return bal > totalPrincipal ? bal - totalPrincipal : 0;
     }
 
+    /// @notice Effective USDC the owner can withdraw right now — the
+    ///         theoretical (40% + yield) headroom bounded by the actual
+    ///         aUSDC balance. Off-chain callers should treat this as a
+    ///         hard ceiling; the on-chain function distinguishes the
+    ///         two failure modes via `ExceedsOwnerQuota` vs
+    ///         `InsufficientFunds`.
     function ownerQuota() external view returns (uint256) {
         uint256 principalQuota = (totalPrincipal * OWNER_PRINCIPAL_BPS) / 10_000;
         uint256 remaining = principalQuota > ownerWithdrawnPrincipal
             ? principalQuota - ownerWithdrawnPrincipal
             : 0;
-        return remaining + getYield();
+        uint256 theoretical = remaining + getYield();
+        uint256 bal = aUsdc.balanceOf(address(this));
+        return theoretical < bal ? theoretical : bal;
     }
 
+    /// @notice Effective USDC the operator can release right now — the
+    ///         remaining principal headroom (totalPrincipal − offrampWithdrawn)
+    ///         bounded by the actual aUSDC balance.
     function offrampQuota() public view returns (uint256) {
-        return totalPrincipal > offrampWithdrawn ? totalPrincipal - offrampWithdrawn : 0;
+        uint256 q = totalPrincipal > offrampWithdrawn ? totalPrincipal - offrampWithdrawn : 0;
+        uint256 bal = aUsdc.balanceOf(address(this));
+        return q < bal ? q : bal;
     }
 }
