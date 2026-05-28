@@ -318,6 +318,42 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
         "ExceedsOwnerQuota"
       );
     });
+
+    it("ownerWithdraw reverts InsufficientFunds when the operator has drained the pool", async function () {
+      // Drain the vault via offramp. Bump per-tx cap so two relayer calls
+      // can pull the full 100 USDC of principal.
+      await integrator.setMaxUsdcPerOfframp(USDC(1000));
+      await integrator
+        .connect(relayer)
+        .placeSellOrderForBurn(
+          "0x" + "aa".repeat(32),
+          "0x" + "bb".repeat(32),
+          USDC(100),
+          INR,
+          USDC(8000),
+          1n,
+          0n,
+          ""
+        );
+
+      // Sanity: pool drained.
+      expect(await aUsdc.balanceOf(await vault.getAddress())).to.equal(0n);
+
+      // Owner's theoretical quota is still 40% of totalPrincipal=100 = 40,
+      // but the actual balance is 0. Pre-fix this hit Aave with an opaque
+      // low-level revert; post-fix it surfaces InsufficientFunds.
+      await expect(vault.connect(owner).ownerWithdraw(USDC(1))).to.be.revertedWithCustomError(
+        vault,
+        "InsufficientFunds"
+      );
+
+      // Above-quota amounts still revert ExceedsOwnerQuota first — the
+      // quota check runs before the balance check.
+      await expect(vault.connect(owner).ownerWithdraw(USDC(41))).to.be.revertedWithCustomError(
+        vault,
+        "ExceedsOwnerQuota"
+      );
+    });
   });
 
   describe("Access control", function () {

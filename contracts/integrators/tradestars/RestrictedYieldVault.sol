@@ -42,6 +42,15 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     error InvalidAmount();
     error ExceedsOwnerQuota();
     error ExceedsOfframpQuota();
+    /// @notice Owner's 40% quota is theoretical and computed against
+    ///         `totalPrincipal`. The pool is shared with the offramp
+    ///         operator (which can draw up to 100% of principal), so the
+    ///         actual aUSDC balance may be below the owner's quota when
+    ///         offramp activity has drained the vault. This error is
+    ///         raised when the request is inside the quota but exceeds
+    ///         the on-chain balance — distinct from `ExceedsOwnerQuota`,
+    ///         which means the owner asked above 40% in the first place.
+    error InsufficientFunds();
 
     event Deposited(address indexed from, uint256 amount, uint256 newPrincipal);
     event OwnerWithdrew(
@@ -119,6 +128,12 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
             : 0;
         uint256 maxWithdraw = remainingPrincipalQuota + yield;
         if (amount > maxWithdraw) revert ExceedsOwnerQuota();
+
+        // Since the offramp operator can drain up to 100% of principal,
+        // the theoretical quota may exceed the actual aUSDC balance.
+        // Surface that as a clean revert instead of letting the call
+        // reach Aave and fail with an opaque low-level error.
+        if (amount > aUsdc.balanceOf(address(this))) revert InsufficientFunds();
 
         // Yield first, then principal.
         uint256 fromYield = amount > yield ? yield : amount;

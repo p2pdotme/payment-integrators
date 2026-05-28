@@ -30,12 +30,12 @@ fiat →  │  P2P Diamond (Base)  │  ←─ USDC settlement
 
 Custodies USDC for the integrator. Two withdrawer roles:
 
-- **Owner** can pull up to **40% of principal** plus **100% of accrued yield**.
-- **Operator** (the offramp integrator) can pull from the remaining **60%** for offramp orders.
+- **Owner** can pull up to **40% of principal** plus **100% of accrued yield**, bounded by the actual aUSDC balance.
+- **Operator** (the offramp integrator) can pull up to **100% of principal** for offramp orders.
 
 Deposited USDC is supplied to Aave V3 to earn yield. The vault tracks `totalPrincipal` (deposit accounting) and reads `aUsdc.balanceOf` for the current yield-bearing balance.
 
-This split is the safety mechanism: the offramp can't drain owner reserves, the owner can't grief the offramp pool below 60%. Both roles share the same Aave-backed pool but consume from independent quotas.
+The owner's 40% is a *cap on cumulative withdrawals*, not a reservation: the operator may legitimately drain the pool, in which case `ownerWithdraw` reverts with `InsufficientFunds` until new principal is deposited via onramp. This is deliberate — the offramp side needs the full pool to service SELL orders, and the owner's 40% governs total exposure rather than instantaneous availability.
 
 ## Custody flow
 
@@ -53,7 +53,7 @@ This split is the safety mechanism: the offramp can't drain owner reserves, the 
 - **Solana-side identity**: `userPlaceOrder` takes `bytes32 solanaRecipient` instead of using `msg.sender` as the delivery target. Diamond's `placeB2BOrder` still uses `msg.sender` (the proxy) for accounting, but the integrator's `CheckoutFulfilled` event carries the Solana pubkey for the off-chain delivery service.
 - **System proxy** for sell orders: Solana users have no Base identity, so the integrator uses a single per-integrator "system proxy" as the on-chain `user` field of SELL orders. See `systemProxy()`.
 - **Idempotent burn handling**: `placeSellOrderForBurn` rejects a repeated `solanaBurnTx` with `BurnAlreadyProcessed`. The relayer can safely retry.
-- **Per-call offramp cap**: `maxUsdcPerOfframp` limits one sell order's size independently of the vault's 60% quota. Defaults to 50 USDC; configurable by owner.
+- **Per-call offramp cap**: `maxUsdcPerOfframp` limits one sell order's size independently of the vault's principal balance. Defaults to 50 USDC; configurable by owner.
 
 ## External dependencies
 
@@ -73,7 +73,7 @@ Required wiring after deploy:
 
 ```solidity
 integrator.setYieldVault(vault);          // BUY-completion deposits route here
-vault.setOfframpOperator(integrator);     // grants the 60% quota to the integrator
+vault.setOfframpOperator(integrator);     // grants 100% principal access to the integrator
 integrator.setOfframpEnabled(true);
 integrator.setOfframpRelayer(relayerEoa); // off-chain service address
 integrator.setMaxUsdcPerOfframp(USDC(50));
