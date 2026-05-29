@@ -481,9 +481,9 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
             revert OfframpAmountTooLarge();
 
         // Pull USDC from the vault into this integrator. The vault bounds
-        // the draw by remaining principal headroom and the actual aUSDC
-        // balance; it reverts InsufficientFunds if the owner has already
-        // drawn their 40% and there isn't enough liquid balance.
+        // the draw only by its live aUSDC balance (no cumulative cap); it
+        // reverts InsufficientFunds if there isn't enough liquid balance to
+        // service this release.
         yieldVault.releaseForOfframp(usdcAmount);
 
         orderId = _placeSellOrder(
