@@ -961,4 +961,107 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
       expect(allowance).to.equal(0n);
     });
   });
+
+  describe("Vault migration sequence (P2P carry-over)", function () {
+    // Mirrors the on-chain steps in scripts/migrate-tradestars-vault.ts and
+    // asserts funds + P2P fee state migrate correctly under the accrual model.
+    const PCT = (n: bigint, bps: bigint) => (n * bps) / 10000n;
+
+    it("migrates funds, carries over custom rates, resets + re-accrues ledgers", async function () {
+      // Old vault: seeded with 100 USDC at default 2.5% in beforeEach, so the
+      // onramp fee already accrued at 2.5%. Now switch to custom rates.
+      await vault.connect(owner).setP2PFeeBps(100, 500); // 1% onramp, 5% offramp
+      const oldOnrampBps = await vault.p2pOnrampBps();
+      const oldOfframpBps = await vault.p2pOfframpBps();
+      expect(await vault.p2pOnrampAccrued()).to.equal(PCT(USDC(100), 250n)); // 2.5 (seeded @2.5%)
+      expect(await vault.p2pOfframpAccrued()).to.equal(0n);
+
+      // ── Drain old vault to the owner (mirrors phases 3-4) ──
+      await integrator.setOfframpEnabled(false);
+      const ownerUsdcStart = await usdc.balanceOf(owner.address);
+      await vault.connect(owner).ownerWithdraw(await vault.ownerQuota()); // 40
+      await vault.connect(owner).setOfframpOperator(owner.address); // operator handoff
+      const remaining = await aUsdc.balanceOf(await vault.getAddress()); // 60
+      await vault.connect(owner).releaseForOfframp(remaining);
+
+      expect(await aUsdc.balanceOf(await vault.getAddress())).to.equal(0n);
+      // The drain INFLATED the old offramp ledger (documented caveat — the
+      // biller must snapshot accrued BEFORE the drain): +5% of 60 = 3.0.
+      expect(await vault.p2pOfframpAccrued()).to.equal(PCT(remaining, 500n));
+
+      const drained = (await usdc.balanceOf(owner.address)) - ownerUsdcStart;
+      expect(drained).to.equal(USDC(100)); // 40 (owner) + 60 (operator)
+
+      // ── Deploy new vault + carry rates over (mirrors phase 2) ──
+      const Vault = await ethers.getContractFactory("RestrictedYieldVault");
+      const newVault = await Vault.connect(owner).deploy(
+        await usdc.getAddress(),
+        await aUsdc.getAddress(),
+        await aave.getAddress()
+      );
+      expect(await newVault.p2pOnrampBps()).to.equal(250n); // fresh defaults
+      await newVault.connect(owner).setP2PFeeBps(oldOnrampBps, oldOfframpBps);
+
+      // ── Deposit drained USDC into the new vault (mirrors phase 5) ──
+      await usdc.connect(owner).approve(await newVault.getAddress(), drained);
+      await newVault.connect(owner).deposit(drained);
+
+      // ── Rewire integrator (mirrors phase 6) ──
+      await newVault.connect(owner).setOfframpOperator(await integrator.getAddress());
+      await integrator.setYieldVault(await newVault.getAddress());
+      await integrator.setOfframpEnabled(true);
+
+      // ── Correct migration ──
+      // Funds conserved: the full 100 is now in the new vault, none in the old.
+      expect(await newVault.totalPrincipal()).to.equal(USDC(100));
+      expect(await aUsdc.balanceOf(await newVault.getAddress())).to.equal(USDC(100));
+      // Custom rates carried over.
+      expect(await newVault.p2pOnrampBps()).to.equal(100n);
+      expect(await newVault.p2pOfframpBps()).to.equal(500n);
+      // Ledgers reset, then re-accrued on the migrated deposit at the carried
+      // onramp rate (1% of 100 = 1.0); the offramp ledger starts clean.
+      expect(await newVault.p2pOnrampAccrued()).to.equal(PCT(USDC(100), 100n));
+      expect(await newVault.p2pOfframpAccrued()).to.equal(0n);
+      // Wiring complete.
+      expect(await integrator.yieldVault()).to.equal(await newVault.getAddress());
+      expect(await newVault.offrampOperator()).to.equal(await integrator.getAddress());
+    });
+
+    it("offramp works end-to-end on the migrated vault", async function () {
+      await integrator.setOfframpEnabled(false);
+      await vault.connect(owner).ownerWithdraw(await vault.ownerQuota());
+      await vault.connect(owner).setOfframpOperator(owner.address);
+      const remaining = await aUsdc.balanceOf(await vault.getAddress());
+      if (remaining > 0n) await vault.connect(owner).releaseForOfframp(remaining);
+      const drained = await usdc.balanceOf(owner.address);
+
+      const Vault = await ethers.getContractFactory("RestrictedYieldVault");
+      const newVault = await Vault.connect(owner).deploy(
+        await usdc.getAddress(),
+        await aUsdc.getAddress(),
+        await aave.getAddress()
+      );
+      await usdc.connect(owner).approve(await newVault.getAddress(), drained);
+      await newVault.connect(owner).deposit(drained);
+      await newVault.connect(owner).setOfframpOperator(await integrator.getAddress());
+      await integrator.setYieldVault(await newVault.getAddress());
+      await integrator.setOfframpEnabled(true);
+
+      // A sell order now pulls from the NEW vault and accrues its offramp fee.
+      await integrator
+        .connect(relayer)
+        .placeSellOrderForBurn(
+          "0x" + "a1".repeat(32),
+          "0x" + "b2".repeat(32),
+          USDC(20),
+          INR,
+          USDC(1600),
+          1n,
+          0n,
+          ""
+        );
+      expect(await newVault.offrampWithdrawn()).to.equal(USDC(20));
+      expect(await newVault.p2pOfframpAccrued()).to.equal(PCT(USDC(20), 250n)); // default 2.5%
+    });
+  });
 });

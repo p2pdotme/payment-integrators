@@ -45,10 +45,18 @@ import { ethers } from "hardhat";
  *     across migrations, track it off-chain.
  *   - offrampWithdrawn resets to 0 (matters less under the 100% offramp
  *     model since the cap is liquid balance, not bookkeeping).
- *   - p2pAccrued resets to 0. Re-depositing the migrated principal on the
- *     new vault re-accrues the 2.5% P2P fee on that amount, so the
- *     off-chain biller MUST treat per-vault accrual as cumulative-from-zero
- *     and not double-bill principal that already accrued on the old vault.
+ *   - P2P fee ledgers (p2pOnrampAccrued / p2pOfframpAccrued) reset to 0.
+ *     Pre-flight logs the old vault's ledgers as the final P2P liability:
+ *     SNAPSHOT and bill those BEFORE the drain. Phase 4 drains via
+ *     releaseForOfframp, which itself credits the old vault's offramp
+ *     ledger (offramp rate × drained amount), so the post-drain value is
+ *     inflated by the migration and is NOT the true liability. Re-depositing
+ *     the migrated principal on the new vault re-accrues the onramp fee on
+ *     that amount, so the off-chain biller MUST treat each vault's ledgers
+ *     as cumulative-from-zero and not double-bill carried-over principal.
+ *   - P2P fee RATES (p2pOnrampBps / p2pOfframpBps) reset to the 2.5%
+ *     defaults on a fresh vault; this script carries the old vault's rates
+ *     over automatically when they differ from the defaults.
  *
  * Usage:
  *   INTEGRATOR_ADDRESS=0x...       # the deployed TradeStarsCheckoutIntegrator
@@ -93,6 +101,13 @@ const VAULT_ABI = [
   "function returnFromOfframp(uint256)",
   "function setOfframpOperator(address)",
   "function deposit(uint256)",
+  // P2P fee ledger (accrual-only vault version). Read defensively via
+  // tryRead — a vault deployed before the P2P fee won't expose these.
+  "function p2pOnrampBps() view returns (uint256)",
+  "function p2pOfframpBps() view returns (uint256)",
+  "function p2pOnrampAccrued() view returns (uint256)",
+  "function p2pOfframpAccrued() view returns (uint256)",
+  "function setP2PFeeBps(uint256,uint256)",
 ];
 
 const INTEGRATOR_ABI = [
@@ -115,6 +130,17 @@ const AUSDC_ABI = ["function balanceOf(address) view returns (uint256)"];
 
 function need(name: string, value: string) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
+}
+
+// Read a uint256 view that may not exist on the on-chain vault version
+// (e.g. a vault deployed before the P2P fee ledger). Returns null instead
+// of throwing so pre-flight degrades gracefully across vault versions.
+async function tryRead(contract: any, method: string): Promise<bigint | null> {
+  try {
+    return (await contract[method]()) as bigint;
+  } catch {
+    return null;
+  }
 }
 
 async function sendOrLog(description: string, contract: any, method: string, args: any[]) {
@@ -202,6 +228,32 @@ async function main() {
   console.log(`    ownerQuota:               ${fmt(ownerQuota)}`);
   console.log(`    offrampQuota:             ${fmt(offrampQuota)}`);
 
+  // P2P fee ledger snapshot — read defensively (older vaults won't have it).
+  const oldOnrampBps = await tryRead(oldVault, "p2pOnrampBps");
+  const oldOfframpBps = await tryRead(oldVault, "p2pOfframpBps");
+  const oldOnrampAccrued = await tryRead(oldVault, "p2pOnrampAccrued");
+  const oldOfframpAccrued = await tryRead(oldVault, "p2pOfframpAccrued");
+  const hasP2PLedger =
+    oldOnrampBps !== null &&
+    oldOfframpBps !== null &&
+    oldOnrampAccrued !== null &&
+    oldOfframpAccrued !== null;
+
+  console.log("    ── P2P fee ledger (old vault) ──");
+  if (hasP2PLedger) {
+    console.log(`    p2pOnrampBps:             ${oldOnrampBps} (${Number(oldOnrampBps) / 100}%)`);
+    console.log(`    p2pOfframpBps:            ${oldOfframpBps} (${Number(oldOfframpBps) / 100}%)`);
+    console.log(`    p2pOnrampAccrued:         ${fmt(oldOnrampAccrued!)}`);
+    console.log(`    p2pOfframpAccrued:        ${fmt(oldOfframpAccrued!)}`);
+    console.log(`    P2P total owed (pre-drain): ${fmt(oldOnrampAccrued! + oldOfframpAccrued!)}`);
+    console.log("    ⚠  Snapshot the values above NOW and bill the off-chain P2P invoice");
+    console.log("       against them. Phase 4 drains via releaseForOfframp on the OLD vault,");
+    console.log("       inflating its p2pOfframpAccrued by (offramp rate × drained amount) —");
+    console.log("       the post-migration value is NOT the true liability.");
+  } else {
+    console.log("    (old vault predates the P2P fee ledger — nothing to snapshot)");
+  }
+
   if (oldVaultBalance === 0n) {
     console.log("\nOld vault is already empty — only need to rewire the integrator.");
   }
@@ -221,6 +273,40 @@ async function main() {
   }
 
   const newVault = EXECUTE ? new ethers.Contract(newVaultAddress, VAULT_ABI, signer) : null;
+
+  // Carry over non-default P2P fee rates. A fresh vault deploys at
+  // 2.5%/2.5%; replicate the old vault's rates so migration is rate-
+  // preserving. Skipped if the old vault predates the fee ledger or
+  // already used the defaults.
+  const DEFAULT_BPS = 250n;
+  const carryRates =
+    oldOnrampBps !== null &&
+    oldOfframpBps !== null &&
+    (oldOnrampBps !== DEFAULT_BPS || oldOfframpBps !== DEFAULT_BPS);
+  if (carryRates) {
+    if (EXECUTE && newVault) {
+      await sendOrLog(
+        `newVault.setP2PFeeBps(${oldOnrampBps}, ${oldOfframpBps})  — carry over old rates`,
+        newVault,
+        "setP2PFeeBps",
+        [oldOnrampBps, oldOfframpBps]
+      );
+    } else {
+      console.log(
+        `\n→ newVault.setP2PFeeBps(${oldOnrampBps}, ${oldOfframpBps})  — carry over old rates`
+      );
+      console.log(`    target:   ${newVaultAddress}`);
+      console.log("    [dry-run] skipped");
+    }
+  } else {
+    console.log(
+      "    P2P fee rates: new vault keeps the 2.5%/2.5% defaults (old vault used defaults or predates the ledger)."
+    );
+  }
+
+  // Baseline the signer's USDC so phase 5 deposits only what the drain
+  // actually pulled from the vault — not any unrelated USDC the signer held.
+  const signerUsdcBefore: bigint = EXECUTE ? await usdc.balanceOf(me) : 0n;
 
   // ─── Phase 3: Drain owner's portion ──────────────────────────────
   console.log("\n[3/7] Drain owner's portion of old vault");
@@ -260,7 +346,9 @@ async function main() {
 
   // ─── Phase 5: Deposit into new vault ─────────────────────────────
   console.log("\n[5/7] Move USDC into new vault");
-  const signerUsdc: bigint = EXECUTE ? await usdc.balanceOf(me) : oldVaultBalance; // dry-run estimate
+  const signerUsdc: bigint = EXECUTE
+    ? (await usdc.balanceOf(me)) - signerUsdcBefore // only what the drain pulled in
+    : oldVaultBalance; // dry-run estimate
   console.log(`    signer USDC balance: ${fmt(signerUsdc)}`);
 
   if (signerUsdc > 0n) {
@@ -315,10 +403,12 @@ async function main() {
   console.log(`       newVault.offrampOperator() == ${INTEGRATOR_ADDRESS}`);
   console.log(`       integrator.yieldVault()    == ${newVaultAddress}`);
   console.log(`       integrator.offrampEnabled() == true`);
+  console.log(`       newVault.p2pOnrampBps()/p2pOfframpBps() == intended rates`);
   console.log("  2. Verify new vault on Basescan / Sourcify.");
-  console.log("  3. Point the off-chain P2P biller at the new vault: p2pAccrued restarts at 0");
-  console.log("     and re-accrues on the migrated deposit — don't double-bill principal that");
-  console.log("     already accrued on the old vault.");
+  console.log("  3. Off-chain P2P biller: bill the OLD vault's PRE-DRAIN accrued snapshot");
+  console.log("     (logged in pre-flight), then point the biller at the new vault — its");
+  console.log("     ledgers restart at 0 and re-accrue on the migrated deposit. Treat each");
+  console.log("     vault's ledgers as cumulative-from-zero; don't double-bill carried principal.");
   console.log("  4. Optionally update the off-chain relayer's vault-address config if it");
   console.log("     pins one explicitly (it should read it from integrator.yieldVault()).");
   console.log("  5. Old vault still has no on-chain authority over integrator funds, but the");
