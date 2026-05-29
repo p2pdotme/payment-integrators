@@ -308,7 +308,8 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
     ) external onlyDiamond returns (bool allowed) {
         // Offramp SELL self-call: order.user is the system proxy (owned by this
         // integrator). The relayer entry point already enforced maxUsdcPerOfframp
-        // and the vault's 60% quota; per-user buy limits do not apply here.
+        // and the vault's principal/balance bounds; per-user buy limits do not
+        // apply here.
         if (user == _systemProxy()) return true;
 
         uint256 txLimit = getUserTxLimit(user, currency);
@@ -479,8 +480,10 @@ contract TradeStarsCheckoutIntegrator is IP2PIntegrator {
         if (maxUsdcPerOfframp != 0 && usdcAmount > maxUsdcPerOfframp)
             revert OfframpAmountTooLarge();
 
-        // Pull USDC from the vault into this integrator. The vault enforces
-        // the 60% offramp quota.
+        // Pull USDC from the vault into this integrator. The vault bounds
+        // the draw only by its live aUSDC balance (no cumulative cap); it
+        // reverts InsufficientFunds if there isn't enough liquid balance to
+        // service this release.
         yieldVault.releaseForOfframp(usdcAmount);
 
         orderId = _placeSellOrder(
