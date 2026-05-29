@@ -45,6 +45,10 @@ import { ethers } from "hardhat";
  *     across migrations, track it off-chain.
  *   - offrampWithdrawn resets to 0 (matters less under the 100% offramp
  *     model since the cap is liquid balance, not bookkeeping).
+ *   - p2pAccrued resets to 0. Re-depositing the migrated principal on the
+ *     new vault re-accrues the 2.5% P2P fee on that amount, so the
+ *     off-chain biller MUST treat per-vault accrual as cumulative-from-zero
+ *     and not double-bill principal that already accrued on the old vault.
  *
  * Usage:
  *   INTEGRATOR_ADDRESS=0x...       # the deployed TradeStarsCheckoutIntegrator
@@ -52,10 +56,6 @@ import { ethers } from "hardhat";
  *   USDC_ADDRESS=0x...
  *   AAVE_POOL_ADDRESS=0x...
  *   AUSDC_ADDRESS=0x...
- *   [P2P_BENEFICIARY=0x...]        # P2P share recipient on the new vault.
- *                                  # Optional — leave empty to deploy with
- *                                  # address(0) and set later via
- *                                  # newVault.setP2PBeneficiary (one-shot).
  *   [EXECUTE=1]                    # actually send txs; default is dry-run
  *   [PRINT_CALLDATA=1]             # also log multisig-ready calldata for each tx
  *   npx hardhat run scripts/migrate-tradestars-vault.ts --network base
@@ -70,7 +70,6 @@ const OLD_VAULT_ADDRESS = process.env.OLD_VAULT_ADDRESS || "";
 const USDC_ADDRESS = process.env.USDC_ADDRESS || "";
 const AAVE_POOL_ADDRESS = process.env.AAVE_POOL_ADDRESS || "";
 const AUSDC_ADDRESS = process.env.AUSDC_ADDRESS || "";
-const P2P_BENEFICIARY = process.env.P2P_BENEFICIARY || ""; // optional; falls back to address(0)
 
 const EXECUTE = process.env.EXECUTE === "1";
 const PRINT_CALLDATA = process.env.PRINT_CALLDATA === "1";
@@ -157,9 +156,6 @@ async function main() {
   console.log(`USDC:        ${USDC_ADDRESS}`);
   console.log(`Aave pool:   ${AAVE_POOL_ADDRESS}`);
   console.log(`aUSDC:       ${AUSDC_ADDRESS}`);
-  console.log(
-    `P2P beneficiary: ${P2P_BENEFICIARY || "(unset — set later via newVault.setP2PBeneficiary)"}`
-  );
 
   const integrator = new ethers.Contract(INTEGRATOR_ADDRESS, INTEGRATOR_ABI, signer);
   const oldVault = new ethers.Contract(OLD_VAULT_ADDRESS, VAULT_ABI, signer);
@@ -212,22 +208,16 @@ async function main() {
 
   // ─── Phase 2: Deploy new vault ───────────────────────────────────
   console.log("\n[2/7] Deploy new vault");
-  const p2pArg = P2P_BENEFICIARY || ethers.ZeroAddress;
   let newVaultAddress: string;
   if (EXECUTE) {
     const Vault = await ethers.getContractFactory("RestrictedYieldVault");
-    const newVault = await Vault.deploy(USDC_ADDRESS, AUSDC_ADDRESS, AAVE_POOL_ADDRESS, p2pArg);
+    const newVault = await Vault.deploy(USDC_ADDRESS, AUSDC_ADDRESS, AAVE_POOL_ADDRESS);
     await newVault.deploymentTransaction()?.wait(3);
     newVaultAddress = await newVault.getAddress();
     console.log(`    deployed:                 ${newVaultAddress}`);
-    console.log(
-      `    p2pBeneficiary:           ${p2pArg === ethers.ZeroAddress ? "address(0) — set later via setP2PBeneficiary" : p2pArg}`
-    );
   } else {
     newVaultAddress = "0x<NEW_VAULT_ADDRESS_TBD>";
-    console.log(
-      `    [dry-run] would deploy RestrictedYieldVault(usdc, aUsdc, aave, p2pBeneficiary=${p2pArg})`
-    );
+    console.log(`    [dry-run] would deploy RestrictedYieldVault(usdc, aUsdc, aave)`);
   }
 
   const newVault = EXECUTE ? new ethers.Contract(newVaultAddress, VAULT_ABI, signer) : null;
@@ -325,26 +315,15 @@ async function main() {
   console.log(`       newVault.offrampOperator() == ${INTEGRATOR_ADDRESS}`);
   console.log(`       integrator.yieldVault()    == ${newVaultAddress}`);
   console.log(`       integrator.offrampEnabled() == true`);
-  console.log(`       newVault.p2pBeneficiary()  == ${p2pArg}`);
-  if (p2pArg === ethers.ZeroAddress) {
-    console.log(
-      "  2. When P2P address is known, owner calls newVault.setP2PBeneficiary(addr) — one-shot."
-    );
-    console.log("     Entitlement accrues correctly in the meantime; only withdrawals are gated.");
-    console.log("  3. Verify new vault on Basescan / Sourcify.");
-    console.log("  4. Optionally update the off-chain relayer's vault-address config if it");
-    console.log("     pins one explicitly (it should read it from integrator.yieldVault()).");
-    console.log("  5. Old vault still has no on-chain authority over integrator funds, but the");
-    console.log("     signer is now its operator. Optionally restore the operator to the old");
-    console.log("     integrator address or zero it out to remove ambient authority.");
-  } else {
-    console.log("  2. Verify new vault on Basescan / Sourcify.");
-    console.log("  3. Optionally update the off-chain relayer's vault-address config if it");
-    console.log("     pins one explicitly (it should read it from integrator.yieldVault()).");
-    console.log("  4. Old vault still has no on-chain authority over integrator funds, but the");
-    console.log("     signer is now its operator. Optionally restore the operator to the old");
-    console.log("     integrator address or zero it out to remove ambient authority.");
-  }
+  console.log("  2. Verify new vault on Basescan / Sourcify.");
+  console.log("  3. Point the off-chain P2P biller at the new vault: p2pAccrued restarts at 0");
+  console.log("     and re-accrues on the migrated deposit — don't double-bill principal that");
+  console.log("     already accrued on the old vault.");
+  console.log("  4. Optionally update the off-chain relayer's vault-address config if it");
+  console.log("     pins one explicitly (it should read it from integrator.yieldVault()).");
+  console.log("  5. Old vault still has no on-chain authority over integrator funds, but the");
+  console.log("     signer is now its operator. Optionally restore the operator to the old");
+  console.log("     integrator address or zero it out to remove ambient authority.");
   if (!EXECUTE) {
     console.log("\nDry-run complete. Re-run with EXECUTE=1 to send the transactions.");
   }

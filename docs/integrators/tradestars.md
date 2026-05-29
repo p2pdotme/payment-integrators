@@ -37,6 +37,18 @@ Deposited USDC is supplied to Aave V3 to earn yield. The vault tracks `totalPrin
 
 The owner's 40% is a *cap on cumulative withdrawals*, not a reservation: the operator may legitimately drain the pool, in which case `ownerWithdraw` reverts with `InsufficientFunds` until new principal is deposited via onramp. This is deliberate — the offramp side needs the full pool to service SELL orders, and the owner's 40% governs total exposure rather than instantaneous availability.
 
+### P2P fee accounting (on-chain ledger, off-chain settlement)
+
+The vault accrues a **P2P fee** on onramp and offramp volume into two separate ledgers, at **independently owner-configurable rates** (`p2pOnrampBps` / `p2pOfframpBps`, both default **2.5%**):
+
+- `deposit` (BUY completion) credits `p2pOnrampAccrued` by `p2pOnrampBps` of the amount.
+- `releaseForOfframp` (SELL funding) credits `p2pOfframpAccrued` by `p2pOfframpBps`.
+- `returnFromOfframp` (cancelled offramp refund) debits `p2pOfframpAccrued`, so the offramp ledger reflects **net completed volume**.
+
+Each move emits `P2PFeeAccrued(volume, fee, isCredit, isOfframp)`. The owner adjusts rates via `setP2PFeeBps(onrampBps, offrampBps)` (each ≤ `MAX_P2P_BPS` = 100%), which emits `P2PFeeBpsUpdated`. Rate changes apply to volume accrued after the call; an in-flight offramp reverses at the rate in force at refund time, so prefer changing rates during quiet windows (the event stream still records the exact per-move fee).
+
+This is **accounting only**. There is no beneficiary, no `p2pWithdraw`, and no on-chain payout — the vault never moves the fee. The ledgers do **not** reduce the owner's 40% bucket or any other quota; they are independent liability counters. `p2pAccrued()` returns the running total (onramp + offramp). An off-chain billing UI reads the ledgers (and the `P2PFeeAccrued` event stream) to produce a monthly invoice, and the TradeStars owner settles that bill **off-chain**. Note the ledgers are per-vault and reset to 0 on a vault migration (the migrated principal re-accrues on re-deposit), so the biller must treat each vault's counters as cumulative-from-zero.
+
 ## Custody flow
 
 | Step | Custody location |

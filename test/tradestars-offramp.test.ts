@@ -9,7 +9,6 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
   let user: SignerWithAddress;
   let relayer: SignerWithAddress;
   let stranger: SignerWithAddress;
-  let p2p: SignerWithAddress;
 
   let usdc: any;
   let aUsdc: any;
@@ -24,7 +23,7 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
   const INR = ethers.encodeBytes32String("INR");
 
   beforeEach(async function () {
-    [owner, user, relayer, stranger, p2p] = await ethers.getSigners();
+    [owner, user, relayer, stranger] = await ethers.getSigners();
 
     const MockUSDC = await ethers.getContractFactory("MockUSDC");
     usdc = await MockUSDC.deploy();
@@ -35,13 +34,10 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
     await aave.configure(await usdc.getAddress(), await aUsdc.getAddress());
 
     const Vault = await ethers.getContractFactory("RestrictedYieldVault");
-    // p2pBeneficiary deliberately set in tests so we can exercise the
-    // withdraw path. Branch-coverage tests for the unset case live below.
     vault = await Vault.deploy(
       await usdc.getAddress(),
       await aUsdc.getAddress(),
-      await aave.getAddress(),
-      p2p.address
+      await aave.getAddress()
     );
 
     const MockDiamond = await ethers.getContractFactory("MockDiamond");
@@ -398,22 +394,35 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
     });
   });
 
-  describe("P2P entitlement (2.5% share within the 40% bucket)", function () {
-    // 2.5% of 100 USDC = 2.5 USDC; 2.5% of 20 = 0.5 USDC
-    const PCT = (n: bigint) => (n * 250n) / 10000n;
+  describe("P2P fee accrual (configurable per-leg rates, accounting only)", function () {
+    // default 2.5% on each leg. 2.5% of 100 = 2.5; of 20 = 0.5
+    const PCT = (n: bigint, bps: bigint = 250n) => (n * bps) / 10000n;
 
-    it("deposit credits p2pEntitled by 2.5% of the amount", async function () {
-      // Seeding in beforeEach already deposited 100 USDC; verify the credit landed.
-      expect(await vault.p2pEntitled()).to.equal(PCT(USDC(100)));
-      // Another 20 USDC deposit (simulate onramp completion).
+    it("default rates are 2.5% on each leg", async function () {
+      expect(await vault.p2pOnrampBps()).to.equal(250n);
+      expect(await vault.p2pOfframpBps()).to.equal(250n);
+    });
+
+    it("deposit credits the onramp ledger by p2pOnrampBps of the amount", async function () {
+      // beforeEach already deposited 100 USDC → 2.5 onramp fee.
+      expect(await vault.p2pOnrampAccrued()).to.equal(PCT(USDC(100)));
+      expect(await vault.p2pOfframpAccrued()).to.equal(0n);
       await usdc.mint(owner.address, USDC(20));
       await usdc.connect(owner).approve(await vault.getAddress(), USDC(20));
       await vault.connect(owner).deposit(USDC(20));
-      expect(await vault.p2pEntitled()).to.equal(PCT(USDC(100)) + PCT(USDC(20)));
+      expect(await vault.p2pOnrampAccrued()).to.equal(PCT(USDC(100)) + PCT(USDC(20)));
     });
 
-    it("releaseForOfframp credits p2pEntitled by 2.5% of release", async function () {
-      const before = await vault.p2pEntitled();
+    it("deposit emits P2PFeeAccrued(volume, fee, isCredit=true, isOfframp=false)", async function () {
+      await usdc.mint(owner.address, USDC(20));
+      await usdc.connect(owner).approve(await vault.getAddress(), USDC(20));
+      await expect(vault.connect(owner).deposit(USDC(20)))
+        .to.emit(vault, "P2PFeeAccrued")
+        .withArgs(USDC(20), PCT(USDC(20)), true, false);
+    });
+
+    it("releaseForOfframp credits the offramp ledger by p2pOfframpBps of release", async function () {
+      const before = await vault.p2pOfframpAccrued();
       await integrator
         .connect(relayer)
         .placeSellOrderForBurn(
@@ -426,12 +435,33 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
           0n,
           ""
         );
-      expect(await vault.p2pEntitled()).to.equal(before + PCT(USDC(20)));
+      expect(await vault.p2pOfframpAccrued()).to.equal(before + PCT(USDC(20)));
+      // onramp ledger untouched by an offramp.
+      expect(await vault.p2pOnrampAccrued()).to.equal(PCT(USDC(100)));
     });
 
-    it("returnFromOfframp on cancel reverses the credit", async function () {
-      // Place + cancel a 20-USDC offramp; entitlement should net out.
-      const before = await vault.p2pEntitled();
+    it("p2pAccrued() returns the sum of both ledgers", async function () {
+      await integrator
+        .connect(relayer)
+        .placeSellOrderForBurn(
+          "0x" + "ab".repeat(32),
+          "0x" + "cd".repeat(32),
+          USDC(20),
+          INR,
+          USDC(1600),
+          1n,
+          0n,
+          ""
+        );
+      expect(await vault.p2pAccrued()).to.equal(
+        (await vault.p2pOnrampAccrued()) + (await vault.p2pOfframpAccrued())
+      );
+      expect(await vault.p2pAccrued()).to.equal(PCT(USDC(100)) + PCT(USDC(20)));
+    });
+
+    it("returnFromOfframp on cancel reverses only the offramp ledger (net of cancels)", async function () {
+      const onrampBefore = await vault.p2pOnrampAccrued();
+      const offrampBefore = await vault.p2pOfframpAccrued();
       const burnTx = "0x" + "ab".repeat(32);
       const txPlace = await integrator
         .connect(relayer)
@@ -456,189 +486,102 @@ describe("TradeStarsCheckoutIntegrator — offramp via RestrictedYieldVault", fu
         .find((p: any) => p?.name === "OfframpInitiated").args.orderId as bigint;
       await mockDiamond.acceptSellOrder(sellOrderId, "merchantPubKey");
       await integrator.connect(relayer).deliverOfframpUpi(sellOrderId, "enc");
-      // After release: entitlement = before + 0.5
-      expect(await vault.p2pEntitled()).to.equal(before + PCT(USDC(20)));
-      // Cancel via Diamond, reconcile — refund path returns 20 USDC.
+      expect(await vault.p2pOfframpAccrued()).to.equal(offrampBefore + PCT(USDC(20)));
+      // Cancel + reconcile → 20 USDC returns, offramp fee reversed.
       await mockDiamond.cancelSellOrder(sellOrderId);
-      await integrator.reconcile(sellOrderId);
-      // After return: entitlement back to `before` (net for cancelled offramp = 0)
-      expect(await vault.p2pEntitled()).to.equal(before);
+      await expect(integrator.reconcile(sellOrderId))
+        .to.emit(vault, "P2PFeeAccrued")
+        .withArgs(USDC(20), PCT(USDC(20)), false, true);
+      expect(await vault.p2pOfframpAccrued()).to.equal(offrampBefore);
+      // onramp ledger never moved.
+      expect(await vault.p2pOnrampAccrued()).to.equal(onrampBefore);
     });
 
-    it("p2pWithdraw transfers USDC and updates accounting", async function () {
-      const entitled = await vault.p2pEntitled(); // PCT(USDC(100)) = 2.5
-      const bal0 = await usdc.balanceOf(p2p.address);
-      await vault.connect(p2p).p2pWithdraw(entitled);
-      expect(await usdc.balanceOf(p2p.address)).to.equal(bal0 + entitled);
-      expect(await vault.p2pWithdrawn()).to.equal(entitled);
-      expect(await vault.p2pAvailable()).to.equal(0n);
-    });
+    it("owner can set independent onramp/offramp rates", async function () {
+      await expect(vault.connect(owner).setP2PFeeBps(100, 500)) // 1% onramp, 5% offramp
+        .to.emit(vault, "P2PFeeBpsUpdated")
+        .withArgs(100n, 500n);
+      expect(await vault.p2pOnrampBps()).to.equal(100n);
+      expect(await vault.p2pOfframpBps()).to.equal(500n);
 
-    it("p2pWithdraw reverts OnlyP2PBeneficiary for non-beneficiary callers", async function () {
-      await expect(vault.connect(stranger).p2pWithdraw(USDC(1))).to.be.revertedWithCustomError(
-        vault,
-        "OnlyP2PBeneficiary"
-      );
-      await expect(vault.connect(owner).p2pWithdraw(USDC(1))).to.be.revertedWithCustomError(
-        vault,
-        "OnlyP2PBeneficiary"
-      );
-    });
+      // New deposit accrues at 1%.
+      await usdc.mint(owner.address, USDC(100));
+      await usdc.connect(owner).approve(await vault.getAddress(), USDC(100));
+      const onrampBefore = await vault.p2pOnrampAccrued();
+      await vault.connect(owner).deposit(USDC(100));
+      expect(await vault.p2pOnrampAccrued()).to.equal(onrampBefore + PCT(USDC(100), 100n));
 
-    it("p2pWithdraw reverts ExceedsP2PEntitlement when above accrued share", async function () {
-      const entitled = await vault.p2pEntitled();
-      await expect(vault.connect(p2p).p2pWithdraw(entitled + 1n)).to.be.revertedWithCustomError(
-        vault,
-        "ExceedsP2PEntitlement"
-      );
-    });
-
-    it("p2pWithdraw reverts InvalidAmount on zero", async function () {
-      await expect(vault.connect(p2p).p2pWithdraw(0)).to.be.revertedWithCustomError(
-        vault,
-        "InvalidAmount"
-      );
-    });
-
-    it("p2pWithdraw shares the 40% bucket with the owner", async function () {
-      // Owner takes their full 40% first. Then P2P entitlement (2.5) is fully
-      // accrued but the bucket has no room left — withdrawal reverts.
-      await vault.connect(owner).ownerWithdraw(USDC(40));
-      const entitled = await vault.p2pEntitled();
-      expect(entitled).to.be.gt(0n);
-      await expect(vault.connect(p2p).p2pWithdraw(entitled)).to.be.revertedWithCustomError(
-        vault,
-        "ExceedsOwnerQuota"
-      );
-    });
-
-    it("p2pWithdraw consumes from the same bucket — owner's max shrinks", async function () {
-      // Pre: ownerQuota = 40 (40% of 100). P2P has 2.5 entitled.
-      expect(await vault.ownerQuota()).to.equal(USDC(40));
-      await vault.connect(p2p).p2pWithdraw(USDC(2)); // partial draw within entitlement
-      // Owner can now only pull 40 - 2 = 38 from principal (plus yield, which is 0).
-      expect(await vault.ownerQuota()).to.equal(USDC(38));
-      await expect(vault.connect(owner).ownerWithdraw(USDC(39))).to.be.revertedWithCustomError(
-        vault,
-        "ExceedsOwnerQuota"
-      );
-      await vault.connect(owner).ownerWithdraw(USDC(38));
-    });
-
-    it("the leading-indicator tradeoff: P2P withdraws after a release that later cancels", async function () {
-      // Trade-off scenario described in the design discussion:
-      //   1. Onramp + offramp release credit P2P generously
-      //   2. P2P withdraws against the optimistic entitlement
-      //   3. Offramp cancels — entitlement is reversed, but the withdrawal already happened
-      //   4. P2P sees `available = 0` until new volume catches up to `p2pWithdrawn`
-      const burnTx = "0x" + "11".repeat(32);
-      const txPlace = await integrator
+      // New release accrues at 5%.
+      const offrampBefore = await vault.p2pOfframpAccrued();
+      await integrator
         .connect(relayer)
         .placeSellOrderForBurn(
-          burnTx,
-          "0x" + "22".repeat(32),
-          USDC(20),
+          "0x" + "ef".repeat(32),
+          "0x" + "cd".repeat(32),
+          USDC(40),
           INR,
-          USDC(1600),
+          USDC(3200),
           1n,
           0n,
           ""
         );
-      const orderId = (await txPlace.wait()).logs
-        .map((l: any) => {
-          try {
-            return integrator.interface.parseLog(l);
-          } catch {
-            return null;
-          }
-        })
-        .find((p: any) => p?.name === "OfframpInitiated").args.orderId as bigint;
-
-      // P2P entitled = 2.5 (from deposit) + 0.5 (from release) = 3.0
-      const entitledBefore = await vault.p2pEntitled();
-      expect(entitledBefore).to.equal(PCT(USDC(100)) + PCT(USDC(20)));
-
-      // P2P pulls all 3.0
-      await vault.connect(p2p).p2pWithdraw(entitledBefore);
-      expect(await vault.p2pAvailable()).to.equal(0n);
-
-      // Cancel that offramp → entitled drops by 0.5, but p2pWithdrawn stays at 3.0.
-      await mockDiamond.acceptSellOrder(orderId, "merchantPubKey");
-      await integrator.connect(relayer).deliverOfframpUpi(orderId, "enc");
-      await mockDiamond.cancelSellOrder(orderId);
-      await integrator.reconcile(orderId);
-
-      expect(await vault.p2pEntitled()).to.equal(entitledBefore - PCT(USDC(20)));
-      expect(await vault.p2pWithdrawn()).to.equal(entitledBefore);
-      // p2pAvailable clamps to 0 — P2P took 0.5 it now "owes back."
-      expect(await vault.p2pAvailable()).to.equal(0n);
-
-      // A fresh onramp of 20 USDC credits 0.5 — exactly enough to clear the
-      // implicit debt; available is still 0, anything beyond requires more
-      // volume.
-      await usdc.mint(owner.address, USDC(20));
-      await usdc.connect(owner).approve(await vault.getAddress(), USDC(20));
-      await vault.connect(owner).deposit(USDC(20));
-      expect(await vault.p2pAvailable()).to.equal(0n);
-
-      // Another onramp of 20 puts P2P legitimately ahead by 0.5.
-      await usdc.mint(owner.address, USDC(20));
-      await usdc.connect(owner).approve(await vault.getAddress(), USDC(20));
-      await vault.connect(owner).deposit(USDC(20));
-      expect(await vault.p2pAvailable()).to.equal(PCT(USDC(20)));
+      expect(await vault.p2pOfframpAccrued()).to.equal(offrampBefore + PCT(USDC(40), 500n));
     });
 
-    it("setP2PBeneficiary one-shot setter — works when unset, reverts when already set", async function () {
-      // Deploy a fresh vault with no beneficiary to exercise the setter.
-      const Vault = await ethers.getContractFactory("RestrictedYieldVault");
-      const v2 = await Vault.deploy(
-        await usdc.getAddress(),
-        await aUsdc.getAddress(),
-        await aave.getAddress(),
-        ethers.ZeroAddress
+    it("setP2PFeeBps is owner-only", async function () {
+      await expect(vault.connect(stranger).setP2PFeeBps(100, 100)).to.be.revertedWithCustomError(
+        vault,
+        "OnlyOwner"
       );
-      expect(await v2.p2pBeneficiary()).to.equal(ethers.ZeroAddress);
-
-      // Non-owner can't set
-      await expect(
-        v2.connect(stranger).setP2PBeneficiary(stranger.address)
-      ).to.be.revertedWithCustomError(v2, "OnlyOwner");
-
-      // Owner can't set to address(0)
-      await expect(
-        v2.connect(owner).setP2PBeneficiary(ethers.ZeroAddress)
-      ).to.be.revertedWithCustomError(v2, "InvalidAddress");
-
-      // Owner sets once — succeeds
-      await expect(v2.connect(owner).setP2PBeneficiary(p2p.address))
-        .to.emit(v2, "P2PBeneficiarySet")
-        .withArgs(p2p.address);
-      expect(await v2.p2pBeneficiary()).to.equal(p2p.address);
-
-      // Second attempt — reverts
-      await expect(
-        v2.connect(owner).setP2PBeneficiary(stranger.address)
-      ).to.be.revertedWithCustomError(v2, "P2PBeneficiaryAlreadySet");
     });
 
-    it("vault deployed with address(0) accrues entitlement but blocks p2pWithdraw", async function () {
-      const Vault = await ethers.getContractFactory("RestrictedYieldVault");
-      const v2 = await Vault.deploy(
-        await usdc.getAddress(),
-        await aUsdc.getAddress(),
-        await aave.getAddress(),
-        ethers.ZeroAddress
+    it("setP2PFeeBps reverts InvalidFeeBps above MAX_P2P_BPS", async function () {
+      const max = await vault.MAX_P2P_BPS();
+      await expect(vault.connect(owner).setP2PFeeBps(max + 1n, 0)).to.be.revertedWithCustomError(
+        vault,
+        "InvalidFeeBps"
       );
-      await usdc.mint(owner.address, USDC(100));
-      await usdc.connect(owner).approve(await v2.getAddress(), USDC(100));
-      await v2.connect(owner).deposit(USDC(100));
-      // Accrued correctly
-      expect(await v2.p2pEntitled()).to.equal(PCT(USDC(100)));
-      // Nobody can withdraw — beneficiary is unset, msg.sender can't be address(0).
-      await expect(v2.connect(p2p).p2pWithdraw(USDC(1))).to.be.revertedWithCustomError(
-        v2,
-        "OnlyP2PBeneficiary"
+      await expect(vault.connect(owner).setP2PFeeBps(0, max + 1n)).to.be.revertedWithCustomError(
+        vault,
+        "InvalidFeeBps"
       );
+      // Exactly at the cap is allowed.
+      await vault.connect(owner).setP2PFeeBps(max, max);
+      expect(await vault.p2pOfframpBps()).to.equal(max);
+    });
+
+    it("rate of 0 accrues nothing (ledger unchanged)", async function () {
+      await vault.connect(owner).setP2PFeeBps(0, 0);
+      const onrampBefore = await vault.p2pOnrampAccrued();
+      await usdc.mint(owner.address, USDC(50));
+      await usdc.connect(owner).approve(await vault.getAddress(), USDC(50));
+      await vault.connect(owner).deposit(USDC(50));
+      expect(await vault.p2pOnrampAccrued()).to.equal(onrampBefore);
+    });
+
+    it("the fee ledgers do NOT reduce the owner's 40% bucket", async function () {
+      // 100 USDC principal → owner quota = 40, independent of the accrued fee.
+      expect(await vault.p2pAccrued()).to.equal(PCT(USDC(100)));
+      expect(await vault.ownerQuota()).to.equal(USDC(40));
+      await vault.connect(owner).ownerWithdraw(USDC(40));
+      expect(await vault.ownerQuota()).to.equal(0n);
+      // Owner withdrawal left the fee ledgers untouched.
+      expect(await vault.p2pAccrued()).to.equal(PCT(USDC(100)));
+    });
+
+    it("exposes no on-chain payout path for the P2P fee (accounting only)", async function () {
+      const hasFn = (name: string) =>
+        vault.interface.fragments.some((f: any) => f.type === "function" && f.name === name);
+      expect(hasFn("p2pWithdraw")).to.equal(false);
+      expect(hasFn("p2pAvailable")).to.equal(false);
+      expect(hasFn("p2pBeneficiary")).to.equal(false);
+      expect(hasFn("setP2PBeneficiary")).to.equal(false);
+      expect(hasFn("p2pWithdrawn")).to.equal(false);
+      // Ledger getters + rate setter present.
+      expect(hasFn("p2pAccrued")).to.equal(true);
+      expect(hasFn("p2pOnrampAccrued")).to.equal(true);
+      expect(hasFn("p2pOfframpAccrued")).to.equal(true);
+      expect(hasFn("setP2PFeeBps")).to.equal(true);
     });
   });
 
