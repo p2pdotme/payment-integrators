@@ -98,8 +98,10 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     IERC20 public immutable usdc;
     IERC20 public immutable aUsdc;
     IAavePool public immutable aave;
-    /// @notice Bps (out of 10_000) of `totalPrincipal` reserved for the
-    ///         owner's withdrawal quota. The rest backs the offramp pool.
+    /// @notice Bps (out of 10_000) cap on the owner's *cumulative* principal
+    ///         withdrawals. Not a reservation — the operator may draw up to
+    ///         100% of principal for offramps, so this bounds the owner's
+    ///         total exposure, not their instantaneous availability.
     uint256 public constant OWNER_PRINCIPAL_BPS = 4000; // 40%
     /// @notice Hard ceiling on the configurable P2P fee rates (100%).
     uint256 public constant MAX_P2P_BPS = 10_000;
