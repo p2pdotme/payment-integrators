@@ -28,9 +28,11 @@ interface IAavePool {
  *
  *         Principal access:
  *           - Owner withdraws up to 40% of principal + 100% of yield.
- *           - Operator (the offramp integrator) can draw up to 100% of
- *             principal to fund SELL orders. Refunds (cancelled offramps)
- *             are returned via `returnFromOfframp`.
+ *           - Operator (the offramp integrator) can draw up to the vault's
+ *             full aUSDC balance to fund SELL orders — there is no cumulative
+ *             cap, so offramp volume may exceed onramp (totalPrincipal) when
+ *             backed by Aave yield or owner-supplied liquidity (`fund`).
+ *             Refunds (cancelled offramps) are returned via `returnFromOfframp`.
  *
  *         P2P fee accrual (accounting only — settled off-chain):
  *           - Onramp volume (deposits) and offramp volume (releases) accrue
@@ -58,15 +60,14 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     error InvalidAddress();
     error InvalidAmount();
     error ExceedsOwnerQuota();
-    error ExceedsOfframpQuota();
     /// @notice Owner's 40% quota is theoretical and computed against
     ///         `totalPrincipal`. The pool is shared with the offramp
-    ///         operator (which can draw up to 100% of principal), so the
-    ///         actual aUSDC balance may be below the owner's quota when
-    ///         offramp activity has drained the vault. This error is
-    ///         raised when the request is inside the quota but exceeds
-    ///         the on-chain balance — distinct from `ExceedsOwnerQuota`,
-    ///         which means the owner asked above 40% in the first place.
+    ///         operator (which can draw the full balance), so the actual
+    ///         aUSDC balance may be below the owner's quota when offramp
+    ///         activity has drained the vault. This error is raised when
+    ///         the request is inside the quota but exceeds the on-chain
+    ///         balance — distinct from `ExceedsOwnerQuota`, which means the
+    ///         owner asked above 40% in the first place.
     error InsufficientFunds();
     /// @notice `setP2PFeeBps` given a rate above `MAX_P2P_BPS`.
     error InvalidFeeBps();
@@ -80,6 +81,9 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     );
     event OfframpReleased(address indexed operator, uint256 amount);
     event OfframpReturned(address indexed operator, uint256 amount);
+    /// @notice Emitted when the owner injects extra offramp liquidity via
+    ///         `fund` — not counted as onramp volume, so no P2P fee accrues.
+    event Funded(address indexed from, uint256 amount);
     /// @notice Emitted when the current owner nominates a new owner. The
     ///         nominee must call `acceptOwnership` to complete the transfer.
     event OwnerProposed(address indexed proposed);
@@ -99,8 +103,8 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
     IERC20 public immutable aUsdc;
     IAavePool public immutable aave;
     /// @notice Bps (out of 10_000) cap on the owner's *cumulative* principal
-    ///         withdrawals. Not a reservation — the operator may draw up to
-    ///         100% of principal for offramps, so this bounds the owner's
+    ///         withdrawals. Not a reservation — the operator may draw the
+    ///         vault's full balance for offramps, so this bounds the owner's
     ///         total exposure, not their instantaneous availability.
     uint256 public constant OWNER_PRINCIPAL_BPS = 4000; // 40%
     /// @notice Hard ceiling on the configurable P2P fee rates (100%).
@@ -161,6 +165,23 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         emit Deposited(msg.sender, amount, totalPrincipal);
     }
 
+    /// @notice Owner-only. Supply USDC as extra offramp liquidity WITHOUT
+    ///         counting it as onramp volume — no P2P fee accrues and
+    ///         `totalPrincipal` is unchanged. The funded amount surfaces as
+    ///         `getYield` (balance above principal), so the owner can reclaim
+    ///         any unused portion via `ownerWithdraw` (yield is paid out
+    ///         before principal), while it stays fully available to the
+    ///         operator for offramp settlement. Use this to back offramps
+    ///         that exceed onramp volume (e.g. users won more than they
+    ///         onramped).
+    function fund(uint256 amount) external onlyOwner {
+        if (amount == 0) revert InvalidAmount();
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+        usdc.forceApprove(address(aave), amount);
+        aave.supply(address(usdc), amount, address(this), 0);
+        emit Funded(msg.sender, amount);
+    }
+
     // ─── Owner withdraw ──────────────────────────────────────────────
 
     function ownerWithdraw(uint256 amount) external onlyOwner {
@@ -174,8 +195,8 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         uint256 maxWithdraw = remainingPrincipalQuota + yield;
         if (amount > maxWithdraw) revert ExceedsOwnerQuota();
 
-        // Since the offramp operator can drain up to 100% of principal,
-        // the theoretical quota may exceed the actual aUSDC balance.
+        // Since the offramp operator can drain the full balance, the
+        // theoretical quota may exceed the actual aUSDC balance.
         // Surface that as a clean revert instead of letting the call
         // reach Aave and fail with an opaque low-level error.
         if (amount > aUsdc.balanceOf(address(this))) revert InsufficientFunds();
@@ -193,13 +214,10 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
 
     function releaseForOfframp(uint256 amount) external onlyOperator {
         if (amount == 0) revert InvalidAmount();
-        // Quota check uses the raw principal headroom rather than
-        // `offrampQuota()` so the two failure modes stay distinguishable:
-        // ExceedsOfframpQuota means the operator asked above cumulative
-        // principal drawn, InsufficientFunds means the owner has pulled
-        // their 40% and there isn't enough liquid balance to service this.
-        uint256 q = totalPrincipal > offrampWithdrawn ? totalPrincipal - offrampWithdrawn : 0;
-        if (amount > q) revert ExceedsOfframpQuota();
+        // No cumulative cap: offramp is bounded only by the vault's live
+        // aUSDC balance. Net offramp volume MAY exceed cumulative onramp
+        // (totalPrincipal) when funded by Aave yield or owner-supplied
+        // liquidity (`fund`) — e.g. when users won more than they onramped.
         if (amount > aUsdc.balanceOf(address(this))) revert InsufficientFunds();
         offrampWithdrawn += amount;
         aave.withdraw(address(usdc), amount, msg.sender);
@@ -317,12 +335,10 @@ contract RestrictedYieldVault is IRestrictedYieldVault {
         return theoretical < bal ? theoretical : bal;
     }
 
-    /// @notice Effective USDC the operator can release right now — the
-    ///         remaining principal headroom (totalPrincipal − offrampWithdrawn)
-    ///         bounded by the actual aUSDC balance.
+    /// @notice USDC the operator can release right now — simply the vault's
+    ///         live aUSDC balance. Offramp has no cumulative cap, so it may
+    ///         draw yield and owner-funded liquidity, not just principal.
     function offrampQuota() public view returns (uint256) {
-        uint256 q = totalPrincipal > offrampWithdrawn ? totalPrincipal - offrampWithdrawn : 0;
-        uint256 bal = aUsdc.balanceOf(address(this));
-        return q < bal ? q : bal;
+        return aUsdc.balanceOf(address(this));
     }
 }

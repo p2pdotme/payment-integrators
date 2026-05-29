@@ -29,7 +29,10 @@ import { ethers } from "hardhat";
  *
  *   5. Move drained USDC into the new vault
  *      - signer approves USDC to new vault
- *      - vault.deposit(amount) supplies it to Aave
+ *      - deposit() re-establishes principal up to the old totalPrincipal;
+ *        any excess recovered (Aave yield + owner-funded liquidity) goes in
+ *        via fund() so it stays fee-free and owner-recoverable rather than
+ *        being re-billed as onramp volume
  *
  *   6. Rewire integrator
  *      - newVault.setOfframpOperator(integrator)
@@ -39,7 +42,10 @@ import { ethers } from "hardhat";
  *      - integrator.setOfframpEnabled(true)
  *
  * State that does NOT carry over:
- *   - totalPrincipal resets to whatever you deposit fresh.
+ *   - totalPrincipal is re-established via deposit() up to the old value,
+ *     capped at what was actually recovered; recovered excess beyond
+ *     principal (yield + owner-funded liquidity) goes in fee-free via fund()
+ *     and surfaces as yield, not principal.
  *   - ownerWithdrawnPrincipal resets to 0 — the owner's lifetime 40% cap
  *     restarts against the new vault. If the cumulative cap must persist
  *     across migrations, track it off-chain.
@@ -52,8 +58,9 @@ import { ethers } from "hardhat";
  *     ledger (offramp rate × drained amount), so the post-drain value is
  *     inflated by the migration and is NOT the true liability. Re-depositing
  *     the migrated principal on the new vault re-accrues the onramp fee on
- *     that amount, so the off-chain biller MUST treat each vault's ledgers
- *     as cumulative-from-zero and not double-bill carried-over principal.
+ *     the principal portion only (the fund() excess is fee-free), so the
+ *     off-chain biller MUST treat each vault's ledgers as cumulative-from-
+ *     zero and not double-bill carried-over principal.
  *   - P2P fee RATES (p2pOnrampBps / p2pOfframpBps) reset to the 2.5%
  *     defaults on a fresh vault; this script carries the old vault's rates
  *     over automatically when they differ from the defaults.
@@ -101,6 +108,7 @@ const VAULT_ABI = [
   "function returnFromOfframp(uint256)",
   "function setOfframpOperator(address)",
   "function deposit(uint256)",
+  "function fund(uint256)",
   // P2P fee ledger (accrual-only vault version). Read defensively via
   // tryRead — a vault deployed before the P2P fee won't expose these.
   "function p2pOnrampBps() view returns (uint256)",
@@ -344,27 +352,52 @@ async function main() {
     console.log("    skip: nothing remaining to drain");
   }
 
-  // ─── Phase 5: Deposit into new vault ─────────────────────────────
+  // ─── Phase 5: Move USDC into new vault ───────────────────────────
+  // Re-establish principal up to the old vault's onramp total via deposit()
+  // (so the P2P onramp fee re-accrues only on actual onramp principal), and
+  // route any recovered excess — Aave yield + owner-funded liquidity that
+  // exceeded principal — through fund() so it stays fee-free and surfaces as
+  // yield (owner-recoverable) rather than being re-billed as onramp volume.
   console.log("\n[5/7] Move USDC into new vault");
   const signerUsdc: bigint = EXECUTE
     ? (await usdc.balanceOf(me)) - signerUsdcBefore // only what the drain pulled in
     : oldVaultBalance; // dry-run estimate
-  console.log(`    signer USDC balance: ${fmt(signerUsdc)}`);
+  const principalPortion = signerUsdc < totalPrincipal ? signerUsdc : totalPrincipal;
+  const excessPortion = signerUsdc - principalPortion;
+  console.log(`    recovered:              ${fmt(signerUsdc)}`);
+  console.log(`      → principal (deposit): ${fmt(principalPortion)}`);
+  console.log(
+    `      → excess (fund):       ${fmt(excessPortion)}  [yield + owner-funded liquidity]`
+  );
 
   if (signerUsdc > 0n) {
+    // One approval covers both pulls (deposit + fund consume it in turn).
     await sendOrLog(`usdc.approve(newVault, ${fmt(signerUsdc)})`, usdc, "approve", [
       newVaultAddress,
       signerUsdc,
     ]);
-    if (EXECUTE && newVault) {
-      await sendOrLog(`newVault.deposit(${fmt(signerUsdc)})`, newVault, "deposit", [signerUsdc]);
-    } else {
-      console.log(`\n→ newVault.deposit(${fmt(signerUsdc)})`);
-      console.log(`    target:   ${newVaultAddress}`);
-      console.log(`    [dry-run] skipped`);
+    if (principalPortion > 0n) {
+      if (EXECUTE && newVault) {
+        await sendOrLog(`newVault.deposit(${fmt(principalPortion)})`, newVault, "deposit", [
+          principalPortion,
+        ]);
+      } else {
+        console.log(`\n→ newVault.deposit(${fmt(principalPortion)})`);
+        console.log(`    target:   ${newVaultAddress}`);
+        console.log("    [dry-run] skipped");
+      }
+    }
+    if (excessPortion > 0n) {
+      if (EXECUTE && newVault) {
+        await sendOrLog(`newVault.fund(${fmt(excessPortion)})`, newVault, "fund", [excessPortion]);
+      } else {
+        console.log(`\n→ newVault.fund(${fmt(excessPortion)})`);
+        console.log(`    target:   ${newVaultAddress}`);
+        console.log("    [dry-run] skipped");
+      }
     }
   } else {
-    console.log("    skip: nothing to deposit");
+    console.log("    skip: nothing to move");
   }
 
   // ─── Phase 6: Rewire integrator ──────────────────────────────────

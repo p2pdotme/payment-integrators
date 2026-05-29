@@ -31,11 +31,13 @@ fiat →  │  P2P Diamond (Base)  │  ←─ USDC settlement
 Custodies USDC for the integrator. Two withdrawer roles:
 
 - **Owner** can pull up to **40% of principal** plus **100% of accrued yield**, bounded by the actual aUSDC balance.
-- **Operator** (the offramp integrator) can pull up to **100% of principal** for offramp orders.
+- **Operator** (the offramp integrator) can pull up to the **vault's full balance** for offramp orders — there is **no cumulative cap**, so offramp volume may exceed onramp when backed by Aave yield or owner-supplied liquidity.
 
 Deposited USDC is supplied to Aave V3 to earn yield. The vault tracks `totalPrincipal` (deposit accounting) and reads `aUsdc.balanceOf` for the current yield-bearing balance.
 
 The owner's 40% is a *cap on cumulative withdrawals*, not a reservation: the operator may legitimately drain the pool, in which case `ownerWithdraw` reverts with `InsufficientFunds` until new principal is deposited via onramp. This is deliberate — the offramp side needs the full pool to service SELL orders, and the owner's 40% governs total exposure rather than instantaneous availability.
+
+Offramp itself has **no cumulative cap** — it is bounded only by the live aUSDC balance, so it can draw Aave yield and any owner-supplied liquidity. This lets **offramp volume exceed onramp** (e.g. when users won more than they onramped). To back that, the owner can inject liquidity via **`fund(amount)`**: it supplies USDC to Aave *without* accruing the P2P onramp fee and *without* increasing `totalPrincipal`, so it surfaces as yield — fully available to the operator for offramps, and any unused portion is recoverable by the owner via `ownerWithdraw` (yield is paid out before principal).
 
 ### P2P fee accounting (on-chain ledger, off-chain settlement)
 
@@ -65,7 +67,7 @@ This is **accounting only**. There is no beneficiary, no `p2pWithdraw`, and no o
 - **Solana-side identity**: `userPlaceOrder` takes `bytes32 solanaRecipient` instead of using `msg.sender` as the delivery target. Diamond's `placeB2BOrder` still uses `msg.sender` (the proxy) for accounting, but the integrator's `CheckoutFulfilled` event carries the Solana pubkey for the off-chain delivery service.
 - **System proxy** for sell orders: Solana users have no Base identity, so the integrator uses a single per-integrator "system proxy" as the on-chain `user` field of SELL orders. See `systemProxy()`.
 - **Idempotent burn handling**: `placeSellOrderForBurn` rejects a repeated `solanaBurnTx` with `BurnAlreadyProcessed`. The relayer can safely retry.
-- **Per-call offramp cap**: `maxUsdcPerOfframp` limits one sell order's size independently of the vault's principal balance. Defaults to 50 USDC; configurable by owner.
+- **Per-call offramp cap**: `maxUsdcPerOfframp` limits one sell order's size independently of the vault's available balance. Defaults to 50 USDC; configurable by owner.
 
 ## External dependencies
 
@@ -85,7 +87,7 @@ Required wiring after deploy:
 
 ```solidity
 integrator.setYieldVault(vault);          // BUY-completion deposits route here
-vault.setOfframpOperator(integrator);     // grants 100% principal access to the integrator
+vault.setOfframpOperator(integrator);     // grants full-balance offramp access to the integrator
 integrator.setOfframpEnabled(true);
 integrator.setOfframpRelayer(relayerEoa); // off-chain service address
 integrator.setMaxUsdcPerOfframp(USDC(50));
