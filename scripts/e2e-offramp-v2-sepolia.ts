@@ -146,9 +146,18 @@ async function main() {
   console.log("  offrampRelayer:   ", await integrator.offrampRelayer());
   console.log("  maxUsdcPerOfframp:", fmt(await integrator.maxUsdcPerOfframp()));
   console.log("  vault offrampQuota:", fmt(await vault.offrampQuota()));
-  const threshold = await diamond.getSmallOrderThreshold(currencyHex);
-  const fixedFee = await diamond.getSmallOrderFixedFee(currencyHex);
-  console.log(`  smallOrderThreshold(${CURRENCY}):`, fmt(threshold), " fixedFee:", fmt(fixedFee));
+  try {
+    const threshold = await diamond.getSmallOrderThreshold(currencyHex);
+    const fixedFee = await diamond.getSmallOrderFixedFee(currencyHex);
+    console.log(`  smallOrderThreshold(${CURRENCY}):`, fmt(threshold), " fixedFee:", fmt(fixedFee));
+  } catch {
+    // This Diamond version may not expose the unified fee getters — the
+    // authoritative actualUsdtAmount is read from getAdditionalOrderDetails
+    // after placement, so this preflight line is best-effort only.
+    console.log(
+      `  small-order fee getters unavailable here — using getAdditionalOrderDetails post-placement`
+    );
+  }
   if ((await vault.offrampQuota()) < amount) {
     throw new Error(
       `Vault offrampQuota ${fmt(await vault.offrampQuota())} < amount ${fmt(amount)}. Seed the vault (deposit USDC) first.`
