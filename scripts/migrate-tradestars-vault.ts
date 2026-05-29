@@ -8,11 +8,12 @@ import { ethers } from "hardhat";
  *
  * The migration runs in 7 phases:
  *
- *   1. Pre-flight checks
+ *   1. Pre-flight checks + disable offramp
  *      - signer owns the integrator
  *      - signer owns the old vault
- *      - offramp is already disabled (caller must do this manually and wait
- *        for in-flight orders to settle before running this script)
+ *      - disables offramp on the integrator (blocks NEW SELL orders); re-
+ *        enabled in phase 7. The caller must still ensure in-flight orders
+ *        have settled first, since the drain + rewire follow immediately.
  *
  *   2. Deploy new vault (same Aave + aUSDC + USDC addresses as old)
  *
@@ -197,7 +198,7 @@ async function main() {
   const aUsdc = new ethers.Contract(AUSDC_ADDRESS, AUSDC_ABI, signer);
 
   // ─── Phase 1: Pre-flight ─────────────────────────────────────────
-  console.log("\n[1/7] Pre-flight checks");
+  console.log("\n[1/7] Pre-flight checks + disable offramp");
 
   const integratorOwner = await integrator.owner();
   const oldVaultOwner = await oldVault.owner();
@@ -217,11 +218,6 @@ async function main() {
     throw new Error(`Signer is not old vault owner (expected ${oldVaultOwner})`);
   if (wiredVault.toLowerCase() !== OLD_VAULT_ADDRESS.toLowerCase())
     throw new Error(`Integrator is wired to ${wiredVault}, not OLD_VAULT_ADDRESS`);
-  if (offrampEnabled)
-    throw new Error(
-      "Offramp is still enabled on the integrator. Run `integrator.setOfframpEnabled(false)`, " +
-        "wait for in-flight orders to settle (reconcile each), then re-run this script."
-    );
   if (oldOperator.toLowerCase() !== INTEGRATOR_ADDRESS.toLowerCase())
     throw new Error(
       `Old vault operator (${oldOperator}) is not the integrator — unexpected wiring`
@@ -264,6 +260,21 @@ async function main() {
 
   if (oldVaultBalance === 0n) {
     console.log("\nOld vault is already empty — only need to rewire the integrator.");
+  }
+
+  // ─── Disable offramp (stop new SELL orders before the drain) ─────
+  if (offrampEnabled) {
+    console.log("\nDisabling offramp on the integrator (blocks NEW SELL orders)…");
+    console.log(
+      "    ⚠  This does NOT settle in-flight offramps. Ensure any released-but-\n" +
+        "       unreconciled SELL orders have settled before the drain — the migration\n" +
+        "       moves the vault's liquidity and rewires the integrator to the new vault."
+    );
+    await sendOrLog("integrator.setOfframpEnabled(false)", integrator, "setOfframpEnabled", [
+      false,
+    ]);
+  } else {
+    console.log("\nOfframp already disabled on the integrator — skipping disable step.");
   }
 
   // ─── Phase 2: Deploy new vault ───────────────────────────────────
