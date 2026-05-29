@@ -35,3 +35,6 @@ secrets.json
 
 # Claude Code — commit shared config (settings.json, skills/), ignore local overrides
 .claude/settings.local.json
+
+# Local-only test/debug scripts (kept out of the published repo)
+scripts/local/
