@@ -294,7 +294,7 @@ contract MockDiamond {
         require(msg.sender == o.user, "Only order.user");
         o.encUpi = encUpi;
         o.status = SellStatus.PAID;
-        usdc.safeTransferFrom(o.user, address(this), o.amount);
+        usdc.safeTransferFrom(o.user, address(this), _sellNeeded(orderId));
         emit MockSellOrderPaid(orderId);
     }
 
@@ -316,7 +316,7 @@ contract MockDiamond {
         o.status = SellStatus.CANCELLED;
         uint256 refund = 0;
         if (wasPaid) {
-            refund = o.amount;
+            refund = _sellNeeded(orderId);
             usdc.safeTransfer(o.user, refund);
         }
         emit MockSellOrderCancelled(orderId, refund);
@@ -354,7 +354,7 @@ contract MockDiamond {
                 acceptedTimestamp: 0,
                 paidTimestamp: 0,
                 reserved2: 0,
-                actualUsdtAmount: additionalOrderDetailsFeeUnready ? 0 : sellOrders[orderId].amount,
+                actualUsdtAmount: additionalOrderDetailsFeeUnready ? 0 : _sellNeeded(orderId),
                 actualFiatAmount: 0
             });
     }
@@ -367,6 +367,46 @@ contract MockDiamond {
 
     function setAdditionalOrderDetailsFeeUnready(bool v) external {
         additionalOrderDetailsFeeUnready = v;
+    }
+
+    // ─── Small-order fee config (mirrors libOrderProcessorFacet) ─────────
+    // SELL actualUsdtAmount = amount + (amount <= threshold ? fixedFee : 0).
+    // Defaults are 0 (no fee), so fee-agnostic tests are unaffected.
+    mapping(bytes32 => uint256) public smallOrderThreshold;
+    mapping(bytes32 => uint256) public smallOrderFixedFee;
+
+    function setSmallOrderConfig(bytes32 currency, uint256 threshold, uint256 fixedFee) external {
+        smallOrderThreshold[currency] = threshold;
+        smallOrderFixedFee[currency] = fixedFee;
+    }
+
+    function getSmallOrderThreshold(bytes32 currency) external view returns (uint256) {
+        return smallOrderThreshold[currency];
+    }
+    /// @notice When set, the per-type SELL getter reverts (mimics a pre-V22
+    ///         Diamond) so the integrator's `_sellFee` exercises its fallback
+    ///         to the unified `getSmallOrderFixedFee`.
+    bool public sellFeeGetterReverts;
+    function setSellFeeGetterReverts(bool v) external {
+        sellFeeGetterReverts = v;
+    }
+
+    function getSmallOrderFixedFeeSell(bytes32 currency) external view returns (uint256) {
+        require(!sellFeeGetterReverts, "no per-type sell getter");
+        return smallOrderFixedFee[currency];
+    }
+    function getSmallOrderFixedFee(bytes32 currency) external view returns (uint256) {
+        return smallOrderFixedFee[currency];
+    }
+
+    /// @notice principal + small-order fee charged for a SELL — what the Diamond
+    ///         pulls at setSellOrderUpi and refunds on a PAID cancel.
+    function _sellNeeded(uint256 orderId) internal view returns (uint256) {
+        SellOrder storage o = sellOrders[orderId];
+        uint256 fee = o.amount <= smallOrderThreshold[o.currency]
+            ? smallOrderFixedFee[o.currency]
+            : 0;
+        return o.amount + fee;
     }
 
     /// @notice Mock of GetterFacet.getOrdersById. Only the `status`,

@@ -10,6 +10,15 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
+/// @notice Minimal view surface for the Diamond's small-order fee config, used
+///         to compute the SELL fee up front so the proxy can be checked for
+///         `principal + fee` before placing a draw.
+interface IDiamondSmallOrderFees {
+    function getSmallOrderThreshold(bytes32 currency) external view returns (uint256);
+    function getSmallOrderFixedFeeSell(bytes32 currency) external view returns (uint256);
+    function getSmallOrderFixedFee(bytes32 currency) external view returns (uint256);
+}
+
 /**
  * @title TradeStarsCheckoutIntegratorV2
  * @notice User-driven offramp ("offramp v2"). Supersedes the relayer-driven
@@ -22,23 +31,28 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *            `allocateOfframp(userEOA, amount, burnTx, solPubkey)` — the ONLY
  *            relayer write. It pulls `amount` from the vault and forwards it to
  *            the user's *own* per-user proxy (the same proxy keyed on the user
- *            EOA that BUY uses). The relayer's job ends here.
+ *            EOA that BUY uses), pooling it with any prior allocation. The
+ *            relayer's job ends here.
  *         2. The USER (their Base wallet, gasless via paymaster) calls
- *            `userStartOfframp(allocationId, ...)`. The integrator places a
- *            SELL on the Diamond *through the user's proxy*, so
- *            `order.user == that proxy` — the Diamond pulls/refunds USDC there
- *            and the order is attributable to the user (not a shared system
- *            proxy), so it shows in the user's P2P history.
+ *            `userStartOfframp(principal, ...)` — drawing ANY principal up to
+ *            their pooled proxy balance, in as many parts as they like (one
+ *            in-flight at a time). The integrator places a SELL on the Diamond
+ *            *through the user's proxy*, so `order.user == that proxy` — the
+ *            Diamond pulls/refunds USDC there and the order is attributable to
+ *            the user (not a shared system proxy), so it shows in their P2P
+ *            history. The small-order fee is funded from the proxy balance too
+ *            (never subsidised), so a draw needing more than is available is
+ *            rejected up front.
  *         3. The USER calls `userDeliverOfframpUpi(orderId, encUpi)` once a
  *            merchant accepts. The Diamond pulls `actualUsdtAmount` from the
  *            proxy → PAID → merchant pays fiat → COMPLETED.
  *         4. If the order is cancelled (merchant no-show / dispute / timeout),
  *            the Diamond refunds USDC to the proxy. The user simply calls
- *            `userStartOfframp` again — self-serve retry, no relayer/owner.
+ *            `userStartOfframp` again — self-serve retry/redraw, no relayer/owner.
  *         5. `syncOfframp(orderId)` (permissionless) records the terminal
- *            status; on COMPLETED the allocation is settled. Abandoned
- *            allocations can be returned to the vault by the owner via
- *            `reclaimAbandonedOfframp` after a timeout.
+ *            status and frees the in-flight slot. Abandoned proxy balances can
+ *            be returned to the vault by the owner via `reclaimAbandonedOfframp`
+ *            after a timeout.
  *
  *         USDC remains trapped in the proxy throughout — it can leave only via
  *         the Diamond pulling it for the SELL (→ fiat to the user off-chain) or
@@ -68,21 +82,24 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     error BurnAlreadyProcessed();
     error OfframpAmountTooLarge();
     error OfframpRecordNotFound();
-    error OfframpAlreadySettled();
-    error OfframpInsufficientPool();
     /// @notice setSellOrderUpi funding tried to read `actualUsdtAmount` from the
     ///         Diamond before it was computed (returned 0). Funding the proxy
     ///         short of principal+fee would make the Diamond's transferFrom
     ///         underflow and auto-cancel. Surface explicitly so the user retries
     ///         once the Diamond has populated it.
     error OfframpFeeNotReady();
-    /// @notice Caller is not the EOA that owns this allocation.
-    error OnlyAllocationOwner();
-    /// @notice The allocation already has a non-cancelled order in flight; finish
-    ///         or let it cancel before placing/reclaiming.
+    /// @notice Caller is not the proxy owner who placed this order.
+    error OnlyOrderOwner();
+    /// @notice The user already has a non-terminal SELL in flight; finish or let
+    ///         it cancel before placing another (one at a time) / reclaiming.
     error OfframpInFlight();
     /// @notice reclaimAbandonedOfframp called before the abandon timeout.
     error NotYetAbandoned();
+    /// @notice Proxy balance can't cover the requested principal + small-order
+    ///         fee. The fee is funded from the user's own balance — never
+    ///         subsidised — so a draw that needs more than is available is
+    ///         rejected up front (no late setSellOrderUpi failure).
+    error OfframpInsufficientBalance();
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -119,20 +136,15 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
         bytes32 indexed solanaBurnTx,
         bytes32 solanaUserPubkey
     );
-    /// @notice User placed (or re-placed, on retry) a SELL order from the proxy.
-    event OfframpOrderPlaced(
-        uint256 indexed allocationId,
-        uint256 indexed orderId,
-        address indexed user,
-        uint256 amount
-    );
+    /// @notice User drew `principal` from their pooled proxy balance as a SELL.
+    event OfframpOrderPlaced(uint256 indexed orderId, address indexed user, uint256 principal);
     event OfframpUpiDelivered(uint256 indexed orderId);
-    /// @notice Order COMPLETED — fiat sent; allocation closed.
-    event OfframpSettled(uint256 indexed allocationId, uint256 indexed orderId);
-    /// @notice Order CANCELLED — USDC refunded to the proxy; user may retry.
-    event OfframpCancelled(uint256 indexed allocationId, uint256 indexed orderId);
-    /// @notice Owner returned an abandoned allocation's USDC to the vault.
-    event OfframpReclaimed(uint256 indexed allocationId, uint256 amount);
+    /// @notice Order COMPLETED — fiat sent for this draw.
+    event OfframpSettled(uint256 indexed orderId, address indexed user);
+    /// @notice Order CANCELLED — USDC refunded to the proxy; user may retry/redraw.
+    event OfframpCancelled(uint256 indexed orderId, address indexed user);
+    /// @notice Owner returned a user's abandoned proxy balance to the vault.
+    event OfframpReclaimed(address indexed user, uint256 amount);
 
     // ─── Constants ────────────────────────────────────────────────────
 
@@ -182,7 +194,13 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     ///         abandoned (never-completed) allocation's USDC to the vault.
     uint64 public offrampAbandonTimeout = 7 days;
 
-    // ─── Offramp v2 allocation state ──────────────────────────────────
+    // ─── Offramp v2 allocation state (pooled-proxy model) ─────────────
+    //
+    // An allocation is a *funding* record: the relayer moves `amount` into the
+    // user's proxy and logs it (for burn-dedup + audit). Withdrawals are NOT
+    // tied to a single allocation — the user draws any principal from the
+    // pooled proxy balance, in as many parts as they like, until it's drained.
+    // The proxy USDC balance is the single source of truth for what's cashable.
 
     struct OfframpAllocation {
         address user; // Base EOA = proxy owner
@@ -190,16 +208,18 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
         bytes32 solanaBurnTx;
         bytes32 solanaUserPubkey;
         uint64 allocatedAt;
-        uint256 activeOrderId; // current in-flight SELL (0 = none)
-        uint8 lastStatus; // last status seen by syncOfframp (informational)
-        bool settled; // COMPLETED (fiat sent) or reclaimed to vault
     }
 
     mapping(uint256 => OfframpAllocation) public allocations;
     /// @notice solanaBurnTx → allocationId. Non-zero ⇒ already processed.
     mapping(bytes32 => uint256) public burnToAllocation;
-    /// @notice Diamond orderId → allocationId.
-    mapping(uint256 => uint256) public orderToAllocation;
+    /// @notice Diamond orderId → the user (proxy owner) who placed the draw.
+    mapping(uint256 => address) public orderToUser;
+    /// @notice User's current SELL draw (0 = none). One in-flight at a time;
+    ///         a new draw is allowed once the prior order is terminal.
+    mapping(address => uint256) public userActiveOrder;
+    /// @notice Most recent allocation time per user — drives the reclaim timeout.
+    mapping(address => uint64) public lastAllocatedAt;
     mapping(address => uint256[]) internal _userAllocations;
     uint256 public nextAllocationId;
 
@@ -495,13 +515,11 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
             amount: amount,
             solanaBurnTx: solanaBurnTx,
             solanaUserPubkey: solanaUserPubkey,
-            allocatedAt: uint64(block.timestamp),
-            activeOrderId: 0,
-            lastStatus: 0,
-            settled: false
+            allocatedAt: uint64(block.timestamp)
         });
         burnToAllocation[solanaBurnTx] = allocationId;
         _userAllocations[user].push(allocationId);
+        lastAllocatedAt[user] = uint64(block.timestamp);
 
         emit OfframpAllocated(allocationId, user, proxy, amount, solanaBurnTx, solanaUserPubkey);
     }
@@ -509,35 +527,47 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     // ─── Offramp v2: user-driven lifecycle ────────────────────────────
 
     /**
-     * @notice User-only. Place (or re-place, on retry) a SELL order from the
-     *         user's own proxy, funded by the allocation already sitting there.
+     * @notice User-only. Draw `principal` from the pooled USDC sitting in the
+     *         caller's own proxy and place a SELL for it on the Diamond.
+     *         Callable repeatedly — any principal up to the available balance,
+     *         in as many parts as the user likes, one in-flight order at a time.
      *         `order.user` is the proxy, so the Diamond pulls/refunds USDC there
-     *         and the order is attributed to the user in P2P history.
+     *         and the order shows in the user's P2P history.
+     *
+     *         The small-order fee (when `principal` is at or below the Diamond's
+     *         threshold) is paid from the proxy balance too — never subsidised.
+     *         The draw is rejected up front unless the proxy holds
+     *         `principal + fee`, so a user can't withdraw an amount that would
+     *         leave the fee uncovered (→ `OfframpInsufficientBalance`).
      */
     function userStartOfframp(
-        uint256 allocationId,
+        uint256 principal,
         bytes32 currency,
         uint256 fiatAmount,
         uint256 circleId,
         uint256 preferredPaymentChannelConfigId,
         string calldata userPubKey
     ) external returns (uint256 orderId) {
-        OfframpAllocation storage a = allocations[allocationId];
-        if (a.user == address(0)) revert OfframpRecordNotFound();
-        if (msg.sender != a.user) revert OnlyAllocationOwner();
-        if (a.settled) revert OfframpAlreadySettled();
-        // One in-flight order per allocation: a prior order must be terminally
-        // CANCELLED (USDC refunded to the proxy) before re-placing.
-        if (a.activeOrderId != 0 && _diamondStatus(a.activeOrderId) != STATUS_CANCELLED) {
-            revert OfframpInFlight();
+        if (!offrampEnabled) revert OfframpDisabled();
+        if (principal == 0) revert InvalidAmount();
+
+        // One in-flight draw per user: the prior order must be terminal
+        // (COMPLETED or CANCELLED) before the next part.
+        uint256 active = userActiveOrder[msg.sender];
+        if (active != 0) {
+            uint8 st = _diamondStatus(active);
+            if (st != STATUS_COMPLETED && st != STATUS_CANCELLED) revert OfframpInFlight();
         }
 
-        address proxy = _ensureProxy(a.user);
+        address proxy = _ensureProxy(msg.sender);
+        uint256 needed = principal + _sellFee(currency, principal);
+        if (IERC20(usdc).balanceOf(proxy) < needed) revert OfframpInsufficientBalance();
+
         bytes memory data = abi.encodeCall(
             IB2BGateway.placeB2BSellOrder,
             (
                 proxy,
-                a.amount,
+                principal,
                 currency,
                 userPubKey,
                 circleId,
@@ -551,39 +581,31 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
         _offrampPlacing = false;
 
         orderId = abi.decode(result, (uint256));
-        a.activeOrderId = orderId;
-        a.lastStatus = STATUS_PLACED;
-        orderToAllocation[orderId] = allocationId;
+        userActiveOrder[msg.sender] = orderId;
+        orderToUser[orderId] = msg.sender;
 
-        emit OfframpOrderPlaced(allocationId, orderId, a.user, a.amount);
+        emit OfframpOrderPlaced(orderId, msg.sender, principal);
     }
 
     /**
      * @notice User-only. Forward the encrypted payout address to the Diamond,
      *         triggering the PAID transition (the Diamond pulls actualUsdtAmount
-     *         from the proxy). The proxy already holds the allocation; any
-     *         small-order fee shortfall is fronted from the integrator's USDC
-     *         float (recovered into the proxy on a later cancel-refund).
+     *         = principal + fee from the proxy). `userStartOfframp` already
+     *         guaranteed the proxy holds it — there is NO integrator-float
+     *         subsidy; if the proxy is somehow short the call reverts.
      */
     function userDeliverOfframpUpi(uint256 orderId, string calldata encUpi) external {
-        uint256 allocationId = orderToAllocation[orderId];
-        OfframpAllocation storage a = allocations[allocationId];
-        if (a.user == address(0)) revert OfframpRecordNotFound();
-        if (msg.sender != a.user) revert OnlyAllocationOwner();
-        if (a.activeOrderId != orderId) revert UnknownOrder();
+        address user = orderToUser[orderId];
+        if (user == address(0)) revert OfframpRecordNotFound();
+        if (msg.sender != user) revert OnlyOrderOwner();
 
         IOrderFlow.AdditionalOrderDetailsView memory aod = IOrderFlow(diamond)
             .getAdditionalOrderDetails(orderId);
         uint256 needed = aod.actualUsdtAmount; // principal + fee
         if (needed == 0) revert OfframpFeeNotReady();
 
-        address proxy = _ensureProxy(a.user);
-        uint256 proxyBal = IERC20(usdc).balanceOf(proxy);
-        if (proxyBal < needed) {
-            uint256 gap = needed - proxyBal;
-            if (IERC20(usdc).balanceOf(address(this)) < gap) revert OfframpInsufficientPool();
-            IERC20(usdc).safeTransfer(proxy, gap);
-        }
+        address proxy = _ensureProxy(user);
+        if (IERC20(usdc).balanceOf(proxy) < needed) revert OfframpInsufficientBalance();
 
         bytes memory data = abi.encodeCall(IOrderFlow.setSellOrderUpi, (orderId, encUpi, 0));
         UserProxy(proxy).execute(diamond, data, usdc, needed);
@@ -593,91 +615,93 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
 
     /**
      * @notice Permissionless. Read the Diamond's authoritative terminal status
-     *         and record it. On COMPLETED the allocation is settled (fiat sent).
-     *         On CANCELLED the USDC is back in the proxy — the user may retry
-     *         via `userStartOfframp`; nothing is returned to the vault here.
+     *         and clear the user's in-flight slot so they can start the next
+     *         draw. On CANCELLED the USDC is back in the proxy (redraw/retry);
+     *         nothing is returned to the vault here. Optional bookkeeping —
+     *         `userStartOfframp` also tolerates a terminal prior order directly.
      */
     function syncOfframp(uint256 orderId) external {
-        uint256 allocationId = orderToAllocation[orderId];
-        OfframpAllocation storage a = allocations[allocationId];
-        if (a.user == address(0)) revert OfframpRecordNotFound();
+        address user = orderToUser[orderId];
+        if (user == address(0)) revert OfframpRecordNotFound();
 
         uint8 status = _diamondStatus(orderId);
         if (status != STATUS_COMPLETED && status != STATUS_CANCELLED) revert StatusNotTerminal();
-        a.lastStatus = status;
+
+        if (userActiveOrder[user] == orderId) userActiveOrder[user] = 0;
 
         if (status == STATUS_COMPLETED) {
-            a.settled = true;
-            emit OfframpSettled(allocationId, orderId);
+            emit OfframpSettled(orderId, user);
         } else {
-            emit OfframpCancelled(allocationId, orderId);
+            emit OfframpCancelled(orderId, user);
         }
     }
 
     error StatusNotTerminal();
 
     /**
-     * @notice Owner break-glass. After `offrampAbandonTimeout` from allocation,
-     *         pull the proxy's remaining USDC back to the integrator and return
-     *         it to the vault. Refuses while an order is in flight (not yet
-     *         cancelled) so it can never yank funds the Diamond might pull.
+     * @notice Owner break-glass. After `offrampAbandonTimeout` from the user's
+     *         most recent allocation, pull the proxy's remaining USDC back to
+     *         the vault. Refuses while a draw is in flight (not yet terminal) so
+     *         it can never yank funds the Diamond might pull.
      */
-    function reclaimAbandonedOfframp(uint256 allocationId) external onlyOwner {
-        OfframpAllocation storage a = allocations[allocationId];
-        if (a.user == address(0)) revert OfframpRecordNotFound();
-        if (a.settled) revert OfframpAlreadySettled();
-        if (block.timestamp < uint256(a.allocatedAt) + uint256(offrampAbandonTimeout)) {
+    function reclaimAbandonedOfframp(address user) external onlyOwner {
+        if (user == address(0)) revert InvalidAddress();
+        if (lastAllocatedAt[user] == 0) revert OfframpRecordNotFound();
+        if (block.timestamp < uint256(lastAllocatedAt[user]) + uint256(offrampAbandonTimeout)) {
             revert NotYetAbandoned();
         }
-        if (a.activeOrderId != 0 && _diamondStatus(a.activeOrderId) != STATUS_CANCELLED) {
-            revert OfframpInFlight();
+        uint256 active = userActiveOrder[user];
+        if (active != 0) {
+            uint8 st = _diamondStatus(active);
+            if (st != STATUS_COMPLETED && st != STATUS_CANCELLED) revert OfframpInFlight();
         }
 
-        a.settled = true;
-
-        address proxy = _ensureProxy(a.user);
+        address proxy = _ensureProxy(user);
         uint256 bal = IERC20(usdc).balanceOf(proxy);
-        uint256 ret = bal < a.amount ? bal : a.amount;
-        if (ret > 0) {
-            UserProxy(proxy).transferERC20ToIntegrator(usdc, ret);
-            IERC20(usdc).forceApprove(address(yieldVault), ret);
-            yieldVault.returnFromOfframp(ret);
+        if (bal > 0) {
+            UserProxy(proxy).transferERC20ToIntegrator(usdc, bal);
+            IERC20(usdc).forceApprove(address(yieldVault), bal);
+            yieldVault.returnFromOfframp(bal);
             IERC20(usdc).forceApprove(address(yieldVault), 0);
         }
-        emit OfframpReclaimed(allocationId, ret);
+        emit OfframpReclaimed(user, bal);
     }
 
     // ─── Offramp v2: views ────────────────────────────────────────────
 
-    /// @notice Total unsettled allocation principal for `user` — what the widget
-    ///         shows as the offramp-able balance.
-    function availableOfframp(address user) external view returns (uint256 total) {
-        uint256[] storage ids = _userAllocations[user];
-        for (uint256 i = 0; i < ids.length; i++) {
-            OfframpAllocation storage a = allocations[ids[i]];
-            if (!a.settled) total += a.amount;
-        }
+    /// @notice Cashable balance for `user` — simply the USDC pooled in their
+    ///         proxy. The widget shows this; the user draws any principal
+    ///         (+ fee) up to it, in as many parts as they like.
+    function availableOfframp(address user) external view returns (uint256) {
+        return IERC20(usdc).balanceOf(proxyAddress(user));
     }
 
-    /// @notice Unsettled allocation ids for `user` (newest-inclusive). The widget
-    ///         picks one to drive the Cashout flow.
-    function pendingAllocations(address user) external view returns (uint256[] memory ids) {
-        uint256[] storage all = _userAllocations[user];
-        uint256 n;
-        for (uint256 i = 0; i < all.length; i++) {
-            if (!allocations[all[i]].settled) n++;
-        }
-        ids = new uint256[](n);
-        uint256 j;
-        for (uint256 i = 0; i < all.length; i++) {
-            if (!allocations[all[i]].settled) {
-                ids[j++] = all[i];
-            }
-        }
+    /// @notice All allocation ids that funded `user`'s proxy (audit/history).
+    function getUserAllocations(address user) external view returns (uint256[] memory) {
+        return _userAllocations[user];
     }
 
     function getAllocation(uint256 allocationId) external view returns (OfframpAllocation memory) {
         return allocations[allocationId];
+    }
+
+    /// @notice Principal + small-order fee the Diamond will charge for a SELL of
+    ///         `principal` in `currency`. Mirrors `libOrderProcessorFacet`: the
+    ///         fixed fee applies when `principal <= smallOrderThreshold`. Prefers
+    ///         the per-type SELL getter (V22+) and falls back to the unified
+    ///         getter (pre-V22) — both read the `smallOrderFixedFee` the Diamond
+    ///         actually charges for SELL.
+    function _sellFee(bytes32 currency, uint256 principal) internal view returns (uint256) {
+        if (principal > IDiamondSmallOrderFees(diamond).getSmallOrderThreshold(currency)) {
+            return 0;
+        }
+        try IDiamondSmallOrderFees(diamond).getSmallOrderFixedFeeSell(currency) returns (
+            uint256 fee
+        ) {
+            return fee;
+        } catch {
+            return IDiamondSmallOrderFees(diamond).getSmallOrderFixedFee(currency);
+        }
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────
