@@ -91,9 +91,6 @@ function userDeliverOfframpUpi(uint256 orderId, string calldata encUpi) external
 // ── permissionless: record terminal status + free the user's in-flight slot ──
 function syncOfframp(uint256 orderId) external;
 
-// ── owner break-glass: return a user's abandoned proxy balance to the vault ──
-function reclaimAbandonedOfframp(address user) external;   // onlyOwner, after timeout, no in-flight
-
 // ── views (widget reads these) ──
 function availableOfframp(address user) external view returns (uint256);  // = proxy USDC balance (the pool)
 function getUserAllocations(address user) external view returns (uint256[] memory); // audit/history
@@ -103,7 +100,6 @@ function allocations(uint256) external view returns (/* OfframpAllocation */);
 function burnToAllocation(bytes32) external view returns (uint256);
 function orderToUser(uint256) external view returns (address);             // orderId → proxy owner
 function userActiveOrder(address) external view returns (uint256);         // current in-flight draw (0 = none)
-function lastAllocatedAt(address) external view returns (uint64);          // drives the reclaim timeout
 
 // ── events ──
 event OfframpAllocated(uint256 indexed allocationId, address indexed user, address proxy, uint256 amount, bytes32 indexed solanaBurnTx, bytes32 solanaUserPubkey);
@@ -111,7 +107,6 @@ event OfframpOrderPlaced(uint256 indexed orderId, address indexed user, uint256 
 event OfframpUpiDelivered(uint256 indexed orderId);
 event OfframpSettled(uint256 indexed orderId, address indexed user);       // COMPLETED — fiat sent
 event OfframpCancelled(uint256 indexed orderId, address indexed user);     // USDC back in proxy; retry/redraw
-event OfframpReclaimed(address indexed user, uint256 amount);
 ```
 
 ```solidity
@@ -138,10 +133,9 @@ in v2; the v1 integrator stays deployed for any in-flight legacy offramps.
 ## Invariants & nuances
 
 - **USDC trap intact.** Pooled USDC sits in the user's proxy and can leave only
-  via (a) the Diamond pulling it for a SELL (→ merchant → fiat to the user
-  off-chain) or (b) `transferERC20ToIntegrator` → vault on reclaim. It can never
-  reach the user's EOA. `UserProxy.sol` is **not modified** (its bytecode is
-  pinned into the Diamond's CREATE2 auth).
+  via the Diamond pulling it for a SELL (→ merchant → fiat to the user
+  off-chain). It can never reach the user's EOA. `UserProxy.sol` is **not
+  modified** (its bytecode is pinned into the Diamond's CREATE2 auth).
 - **Pooled balance / partial draws.** `availableOfframp(user)` = the proxy's USDC
   balance. The user draws any `principal` ≤ that balance, in as many parts as
   they like; each completed draw debits `principal + fee` from the proxy and the
@@ -159,9 +153,12 @@ in v2; the v1 integrator stays deployed for any in-flight legacy offramps.
 - **Retry / redraw.** Cancel refunds (`principal + fee`) to the proxy;
   `userStartOfframp` is callable again once the prior order is terminal
   (COMPLETED or CANCELLED) — `syncOfframp` also frees the slot but isn't required.
-- **Abandonment.** `reclaimAbandonedOfframp(user)` (owner-only, after
-  `offrampAbandonTimeout` from the user's last allocation, and only when no draw
-  is in-flight) returns the proxy's remaining USDC to the vault.
+- **No reclaim.** Allocated USDC stays in the user's proxy until they draw it
+  down — there is no owner sweep/reclaim. (A reclaim-to-vault path was
+  considered but dropped: it would strand the user, since the original burn is
+  deduped and the proxy would be emptied, leaving recovery to an off-chain
+  re-allocation. Re-add behind such an SOP only if vault-liquidity recovery from
+  dormant allocations becomes necessary.)
 - **Fee-not-ready guard** (the 2026-05-07 bug) is preserved (`userDeliverOfframpUpi`
   reverts `OfframpFeeNotReady` if `actualUsdtAmount` reads 0).
 - **Burn-backed note.** Because the pool is the raw proxy balance, USDC sent
@@ -222,7 +219,6 @@ E2E: deploy v2 (vault+integrator+mocks) → `registerIntegrator(v2, true, proxyI
 `userStartOfframp(principal)` (user) → demo-merchant-bot accepts →
 `userDeliverOfframpUpi` (dummy ciphertext; the bot doesn't decrypt) → bot
 completes → `syncOfframp` → assert COMPLETED. Covered by the test suite
-(`test/tradestars-v2-offramp.test.ts`, 44 cases): multi-part draws (e.g.
+(`test/tradestars-v2-offramp.test.ts`, 40 cases): multi-part draws (e.g.
 30/40/30), fee-from-balance, `OfframpInsufficientBalance`, cancel→redraw,
-per-user reclaim, plus admin/BUY/guard branch coverage (contract 100% line /
-91% branch).
+plus admin/BUY/guard branch coverage (contract 100% line / 91% branch).

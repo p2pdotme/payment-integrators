@@ -50,14 +50,12 @@ interface IDiamondSmallOrderFees {
  *            the Diamond refunds USDC to the proxy. The user simply calls
  *            `userStartOfframp` again — self-serve retry/redraw, no relayer/owner.
  *         5. `syncOfframp(orderId)` (permissionless) records the terminal
- *            status and frees the in-flight slot. Abandoned proxy balances can
- *            be returned to the vault by the owner via `reclaimAbandonedOfframp`
- *            after a timeout.
+ *            status and frees the in-flight slot. Allocated USDC stays in the
+ *            user's proxy until they draw it down — there is no owner reclaim.
  *
  *         USDC remains trapped in the proxy throughout — it can leave only via
- *         the Diamond pulling it for the SELL (→ fiat to the user off-chain) or
- *         via `transferERC20ToIntegrator` → vault on reclaim. It can never
- *         reach the user EOA. See docs/OFFRAMP-V2.md.
+ *         the Diamond pulling it for the SELL (→ fiat to the user off-chain). It
+ *         can never reach the user EOA. See docs/OFFRAMP-V2.md.
  */
 contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     using SafeERC20 for IERC20;
@@ -93,8 +91,6 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     /// @notice The user already has a non-terminal SELL in flight; finish or let
     ///         it cancel before placing another (one at a time) / reclaiming.
     error OfframpInFlight();
-    /// @notice reclaimAbandonedOfframp called before the abandon timeout.
-    error NotYetAbandoned();
     /// @notice Proxy balance can't cover the requested principal + small-order
     ///         fee. The fee is funded from the user's own balance — never
     ///         subsidised — so a draw that needs more than is available is
@@ -123,7 +119,6 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     event OfframpRelayerUpdated(address indexed relayer);
     event OfframpEnabledUpdated(bool enabled);
     event MaxUsdcPerOfframpUpdated(uint256 cap);
-    event OfframpAbandonTimeoutUpdated(uint64 timeout);
     event UsdcDepositedToVault(uint256 indexed orderId, uint256 amount);
 
     // Offramp v2 lifecycle
@@ -143,8 +138,6 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     event OfframpSettled(uint256 indexed orderId, address indexed user);
     /// @notice Order CANCELLED — USDC refunded to the proxy; user may retry/redraw.
     event OfframpCancelled(uint256 indexed orderId, address indexed user);
-    /// @notice Owner returned a user's abandoned proxy balance to the vault.
-    event OfframpReclaimed(address indexed user, uint256 amount);
 
     // ─── Constants ────────────────────────────────────────────────────
 
@@ -190,9 +183,6 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     bool public offrampEnabled;
     address public offrampRelayer;
     uint256 public maxUsdcPerOfframp;
-    /// @notice How long after allocation before the owner may reclaim an
-    ///         abandoned (never-completed) allocation's USDC to the vault.
-    uint64 public offrampAbandonTimeout = 7 days;
 
     // ─── Offramp v2 allocation state (pooled-proxy model) ─────────────
     //
@@ -218,8 +208,6 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     /// @notice User's current SELL draw (0 = none). One in-flight at a time;
     ///         a new draw is allowed once the prior order is terminal.
     mapping(address => uint256) public userActiveOrder;
-    /// @notice Most recent allocation time per user — drives the reclaim timeout.
-    mapping(address => uint64) public lastAllocatedAt;
     mapping(address => uint256[]) internal _userAllocations;
     uint256 public nextAllocationId;
 
@@ -476,11 +464,6 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
         emit MaxUsdcPerOfframpUpdated(cap);
     }
 
-    function setOfframpAbandonTimeout(uint64 timeout) external onlyOwner {
-        offrampAbandonTimeout = timeout;
-        emit OfframpAbandonTimeoutUpdated(timeout);
-    }
-
     // ─── Offramp v2: relayer allocation ───────────────────────────────
 
     /**
@@ -519,7 +502,6 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
         });
         burnToAllocation[solanaBurnTx] = allocationId;
         _userAllocations[user].push(allocationId);
-        lastAllocatedAt[user] = uint64(block.timestamp);
 
         emit OfframpAllocated(allocationId, user, proxy, amount, solanaBurnTx, solanaUserPubkey);
     }
@@ -637,35 +619,6 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     }
 
     error StatusNotTerminal();
-
-    /**
-     * @notice Owner break-glass. After `offrampAbandonTimeout` from the user's
-     *         most recent allocation, pull the proxy's remaining USDC back to
-     *         the vault. Refuses while a draw is in flight (not yet terminal) so
-     *         it can never yank funds the Diamond might pull.
-     */
-    function reclaimAbandonedOfframp(address user) external onlyOwner {
-        if (user == address(0)) revert InvalidAddress();
-        if (lastAllocatedAt[user] == 0) revert OfframpRecordNotFound();
-        if (block.timestamp < uint256(lastAllocatedAt[user]) + uint256(offrampAbandonTimeout)) {
-            revert NotYetAbandoned();
-        }
-        uint256 active = userActiveOrder[user];
-        if (active != 0) {
-            uint8 st = _diamondStatus(active);
-            if (st != STATUS_COMPLETED && st != STATUS_CANCELLED) revert OfframpInFlight();
-        }
-
-        address proxy = _ensureProxy(user);
-        uint256 bal = IERC20(usdc).balanceOf(proxy);
-        if (bal > 0) {
-            UserProxy(proxy).transferERC20ToIntegrator(usdc, bal);
-            IERC20(usdc).forceApprove(address(yieldVault), bal);
-            yieldVault.returnFromOfframp(bal);
-            IERC20(usdc).forceApprove(address(yieldVault), 0);
-        }
-        emit OfframpReclaimed(user, bal);
-    }
 
     // ─── Offramp v2: views ────────────────────────────────────────────
 

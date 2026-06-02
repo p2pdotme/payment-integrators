@@ -417,55 +417,6 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
   });
 
-  // ─── reclaim abandoned ────────────────────────────────────────────────
-
-  describe("reclaimAbandonedOfframp (owner break-glass, per user)", function () {
-    it("returns the proxy's USDC to the vault after the timeout", async function () {
-      await allocate(USDC(20));
-      const proxy = await proxyOf();
-      const offrampAfterAlloc = await vault.offrampWithdrawn();
-
-      await expect(
-        integrator.connect(owner).reclaimAbandonedOfframp(user.address)
-      ).to.be.revertedWithCustomError(integrator, "NotYetAbandoned");
-
-      await ethers.provider.send("evm_increaseTime", [7 * 24 * 60 * 60 + 1]);
-      await ethers.provider.send("evm_mine", []);
-
-      await expect(integrator.connect(owner).reclaimAbandonedOfframp(user.address))
-        .to.emit(integrator, "OfframpReclaimed")
-        .withArgs(user.address, USDC(20));
-      expect(await usdc.balanceOf(proxy)).to.equal(0n);
-      expect(await vault.offrampWithdrawn()).to.equal(offrampAfterAlloc - USDC(20));
-      expect(await integrator.availableOfframp(user.address)).to.equal(0n);
-    });
-
-    it("reverts for a user that was never allocated", async function () {
-      await expect(
-        integrator.connect(owner).reclaimAbandonedOfframp(stranger.address)
-      ).to.be.revertedWithCustomError(integrator, "OfframpRecordNotFound");
-    });
-
-    it("only the owner can reclaim", async function () {
-      await allocate(USDC(20));
-      await ethers.provider.send("evm_increaseTime", [7 * 24 * 60 * 60 + 1]);
-      await ethers.provider.send("evm_mine", []);
-      await expect(
-        integrator.connect(stranger).reclaimAbandonedOfframp(user.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
-    });
-
-    it("refuses to reclaim while a draw is in flight", async function () {
-      await allocate(USDC(20));
-      await startOfframp(USDC(20)); // PLACED, not terminal
-      await ethers.provider.send("evm_increaseTime", [7 * 24 * 60 * 60 + 1]);
-      await ethers.provider.send("evm_mine", []);
-      await expect(
-        integrator.connect(owner).reclaimAbandonedOfframp(user.address)
-      ).to.be.revertedWithCustomError(integrator, "OfframpInFlight");
-    });
-  });
-
   // ─── admin / BUY limits / guards (branch coverage) ────────────────────
 
   describe("admin, BUY limits, and guards", function () {
@@ -519,10 +470,6 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
         integrator,
         "OnlyOwner"
       );
-      await expect(s.setOfframpAbandonTimeout(1n)).to.be.revertedWithCustomError(
-        integrator,
-        "OnlyOwner"
-      );
     });
 
     it("admin setters update state + emit", async function () {
@@ -544,9 +491,6 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
         .withArgs(user.address, 5n);
       await integrator.batchSetUserRP([user.address, stranger.address], [3n, 4n]);
       expect(await integrator.userRP(stranger.address)).to.equal(4n);
-      await expect(integrator.setOfframpAbandonTimeout(123n))
-        .to.emit(integrator, "OfframpAbandonTimeoutUpdated")
-        .withArgs(123n);
     });
 
     it("batchSetUserRP rejects a length mismatch", async function () {
@@ -636,7 +580,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
       ).to.be.revertedWithCustomError(integrator, "OfframpDisabled");
     });
 
-    it("deliver/sync reject unknown orders; reclaim rejects the zero address", async function () {
+    it("deliver/sync reject unknown orders", async function () {
       await expect(
         integrator.connect(user).userDeliverOfframpUpi(99999n, "x")
       ).to.be.revertedWithCustomError(integrator, "OfframpRecordNotFound");
@@ -644,9 +588,6 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
         integrator,
         "OfframpRecordNotFound"
       );
-      await expect(
-        integrator.connect(owner).reclaimAbandonedOfframp(ethers.ZeroAddress)
-      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
 
     it("_sellFee falls back to the unified getter when the per-type SELL getter reverts", async function () {
