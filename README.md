@@ -9,7 +9,7 @@ This repository is the canonical home for:
 - The protocol-side interfaces every integrator must satisfy
 - The reference `UserProxy` (CREATE2 per-user proxy) every integrator must use
 - A worked `ExampleIntegrator` to fork from
-- Production integrators (currently: `LotPotCheckoutIntegrator`)
+- Production + in-review integrators (`LotPotCheckoutIntegrator`; `TradeStarsCheckoutIntegratorV2` — fiat↔Solana on/offramp)
 - The CONTRIBUTING + WHITELISTING process for getting a new integrator approved on the Diamond
 
 ## Accepted integrators
@@ -17,6 +17,7 @@ This repository is the canonical home for:
 | Name | Location | Network | Status | Whitelisted address |
 |---|---|---|---|---|
 | LotPot | `contracts/integrators/lotpot/LotPotCheckoutIntegrator.sol` | Base mainnet | Production | [`0xb901c3399ED225e4C6c7bfbd8DABA16BBF340132`](https://basescan.org/address/0xb901c3399ED225e4C6c7bfbd8DABA16BBF340132) |
+| TradeStars | `contracts/integrators/tradestars/TradeStarsCheckoutIntegratorV2.sol` | Base Sepolia | In review (PR #14) — fiat↔Solana on/offramp, user-driven offramp v2 | n/a (testnet) |
 | Example | `contracts/integrators/ExampleIntegrator.sol` | — | Reference (not whitelisted) | n/a |
 
 > PR merge ≠ whitelisting. The Diamond holds an explicit allowlist that gates which integrator contracts can place B2B orders. See [docs/WHITELISTING.md](docs/WHITELISTING.md).
