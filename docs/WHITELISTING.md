@@ -40,6 +40,8 @@ Use the **"Whitelist request"** issue template. Required fields:
 
 - **Network**: `base` or `baseSepolia`
 - **Integrator address**: `0x...`
+- **Pinned `proxyImpl`**: `0x...` — output of `cast call <integrator> "proxyImpl()(address)" --rpc-url <rpc>`
+- **`usdcThroughIntegrator`**: `true` or `false` — pinned at registration. `true` routes BUY proceeds to the integrator on completion (e.g. LotPot, TradeStars); `false` routes direct to the order's `recipientAddr`. Must match what the integrator's `onOrderComplete` was coded to expect.
 - **Deployer address**: `0x...`
 - **Merged commit hash**: short SHA, e.g. `8f89206`
 - **Bytecode hash**: `keccak256(<runtime bytecode>)` — paste output of `cast code <addr> | cast keccak`
@@ -53,11 +55,11 @@ Reviewers:
 
 1. Pull the merged commit, compile, compare bytecode hash against the deployed contract.
 2. Confirm verified source on Etherscan matches the merged commit.
-3. Confirm the integrator's pinned `proxyImpl` matches the canonical `UserProxy` bytecode (this is what the Diamond's CREATE2 auth path checks).
-4. Confirm constructor parameters (Diamond address, USDC address, source tag, etc.) are correct.
-5. Submit the `registerIntegrator(integrator, proxyImpl, source)` call on the Diamond.
+3. Confirm the integrator's pinned `proxyImpl` matches the canonical `UserProxy` bytecode. This is an **off-chain review check** — the Diamond does not re-verify proxy bytecode on `registerIntegrator`; it only stores the address. If a non-canonical `proxyImpl` is registered, the CREATE2 auth path still works (clones of the non-canonical impl will pass `msg.sender` derivation) but the proxy's USDC-trapping behavior would be whatever the non-canonical impl implements. The off-chain bytecode-match is therefore the actual security gate.
+4. Confirm constructor parameters (Diamond address, USDC address, per-tx and daily limits, etc.) are correct.
+5. Submit `registerIntegrator(integrator, usdcThroughIntegrator, proxyImpl)` on the Diamond (gated by `onlySuperAdmin`).
 
-The Diamond will reject the registration if the `proxyImpl` bytecode does not match the canonical `UserProxy`. This is by design — it's the protocol-side guarantee that whitelisted integrators have not subtly modified the proxy's USDC-trapping behavior.
+**`proxyImpl` is set-once per integrator.** Re-registering the same integrator address with a different `proxyImpl` reverts with `B2BProxyImplLocked` — this is the on-chain enforcement that prevents a registered integrator from later rotating its proxy implementation under existing clones. The other fields (`isActive`, `usdcThroughIntegrator`) can be re-asserted by calling `registerIntegrator` again with the same `proxyImpl`. To take an integrator offline, use `deactivateIntegrator(integrator)`; in-flight orders continue to complete, only new placements fail.
 
 ### 5. Smoke-test on Sepolia first
 

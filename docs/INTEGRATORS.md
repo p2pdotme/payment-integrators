@@ -14,6 +14,7 @@ This is the canonical list of integrators that are whitelisted on the P2P Diamon
 | Integrator | Address | Source commit | Whitelisted since | Status |
 |---|---|---|---|---|
 | LotPot | <!-- TODO: fill from project_sepolia_addresses or skip if not whitelisted --> | <!-- TODO --> | <!-- TODO --> | Test |
+| TradeStars | <!-- TODO: backfill `0x64400FDa…` from p2p-checkout --> | <!-- TODO --> | <!-- TODO --> | Partner testing |
 | polycule.bet | <!-- TODO: fill after deployment --> | <!-- TODO --> | <!-- TODO --> | Pending |
 
 ## How this table is maintained
