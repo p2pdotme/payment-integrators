@@ -294,7 +294,10 @@ contract MockDiamond {
         require(msg.sender == o.user, "Only order.user");
         o.encUpi = encUpi;
         o.status = SellStatus.PAID;
-        usdc.safeTransferFrom(o.user, address(this), o.amount);
+        // Real Diamond pulls actualUsdtAmount = principal + fee. `sellFee`
+        // defaults to 0 (fee-less), so existing integrator tests are
+        // unaffected; offramp tests can opt into a fee via setSellFee.
+        usdc.safeTransferFrom(o.user, address(this), o.amount + sellFee);
         emit MockSellOrderPaid(orderId);
     }
 
@@ -316,7 +319,9 @@ contract MockDiamond {
         o.status = SellStatus.CANCELLED;
         uint256 refund = 0;
         if (wasPaid) {
-            refund = o.amount;
+            // Mirror the PAID pull: principal + fee was taken, so the cancel
+            // refunds the same total back to order.user.
+            refund = o.amount + sellFee;
             usdc.safeTransfer(o.user, refund);
         }
         emit MockSellOrderCancelled(orderId, refund);
@@ -354,7 +359,9 @@ contract MockDiamond {
                 acceptedTimestamp: 0,
                 paidTimestamp: 0,
                 reserved2: 0,
-                actualUsdtAmount: additionalOrderDetailsFeeUnready ? 0 : sellOrders[orderId].amount,
+                actualUsdtAmount: additionalOrderDetailsFeeUnready
+                    ? 0
+                    : sellOrders[orderId].amount + sellFee,
                 actualFiatAmount: 0
             });
     }
@@ -367,6 +374,17 @@ contract MockDiamond {
 
     function setAdditionalOrderDetailsFeeUnready(bool v) external {
         additionalOrderDetailsFeeUnready = v;
+    }
+
+    /// @notice Small-order SELL fee (6-decimal USDC) added on top of the
+    ///         principal. Defaults to 0 so fee-less integrator tests are
+    ///         unchanged; offramp tests set it to exercise the principal+fee
+    ///         funding/refund paths. Mirrors the real Diamond, which pulls
+    ///         `actualUsdtAmount = principal + fee` at setSellOrderUpi.
+    uint256 public sellFee;
+
+    function setSellFee(uint256 f) external {
+        sellFee = f;
     }
 
     /// @notice Mock of GetterFacet.getOrdersById. Only the `status`,
