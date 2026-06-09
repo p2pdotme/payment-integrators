@@ -327,4 +327,103 @@ describe("PikerOfframpIntegrator", function () {
       );
     });
   });
+
+  describe("on-ramp (BUY: INR→USDC)", function () {
+    const AMOUNT = USDC(100);
+
+    async function initiateOnramp(amount = AMOUNT) {
+      const tx = await integrator
+        .connect(user)
+        .userInitiateOnramp(amount, INR, 0, CIRCLE_ID, 0, PUBKEY);
+      await tx.wait();
+      return 1n;
+    }
+
+    it("places a BUY via the proxy with recipientAddr = user; pulls no USDC", async function () {
+      const balBefore = await usdc.balanceOf(user.address);
+      const orderId = await initiateOnramp();
+
+      // A BUY pulls nothing at placement (buyer pays fiat off-chain).
+      expect(await usdc.balanceOf(user.address)).to.equal(balBefore);
+      expect(await usdc.balanceOf(await integrator.getAddress())).to.equal(0);
+
+      const proxy = await integrator.proxyAddress(user.address);
+      expect((await ethers.provider.getCode(proxy)).length).to.be.greaterThan(2);
+
+      const rec = await integrator.getOnramp(orderId);
+      expect(rec.user).to.equal(user.address);
+      expect(rec.fulfilled).to.equal(false);
+      expect(rec.cancelled).to.equal(false);
+      expect(rec.initialized).to.equal(true);
+
+      // Diamond recorded order.user + recipientAddr = the buyer's EOA.
+      const order = await diamond.orders(orderId);
+      expect(order.user).to.equal(user.address);
+      expect(order.recipientAddr).to.equal(user.address);
+      expect(order.amount).to.equal(AMOUNT);
+    });
+
+    it("emits OnrampInitiated", async function () {
+      await expect(
+        integrator.connect(user).userInitiateOnramp(AMOUNT, INR, 0, CIRCLE_ID, 0, PUBKEY)
+      )
+        .to.emit(integrator, "OnrampInitiated")
+        .withArgs(1n, user.address, AMOUNT);
+    });
+
+    it("delivers USDC to the buyer's wallet on completion + marks fulfilled", async function () {
+      const orderId = await initiateOnramp();
+      // Merchant USDC escrowed by the Diamond; on completion it routes to recipient.
+      await usdc.mint(await diamond.getAddress(), AMOUNT);
+
+      const balBefore = await usdc.balanceOf(user.address);
+      await expect(diamond.simulateOrderComplete(orderId))
+        .to.emit(integrator, "OnrampFulfilled")
+        .withArgs(orderId, user.address, AMOUNT);
+
+      expect(await usdc.balanceOf(user.address)).to.equal(balBefore + AMOUNT);
+      expect((await integrator.getOnramp(orderId)).fulfilled).to.equal(true);
+    });
+
+    it("releases the daily-count slot when an onramp is cancelled", async function () {
+      await integrator.setDailyTxCountLimit(1);
+      const orderId = await initiateOnramp();
+      expect(await integrator.getTodayCount(user.address)).to.equal(1);
+
+      await expect(diamond.simulateOrderCancelled(orderId))
+        .to.emit(integrator, "OnrampCancelled")
+        .withArgs(orderId, user.address);
+
+      expect(await integrator.getTodayCount(user.address)).to.equal(0);
+      await expect(initiateOnramp()).to.not.be.reverted; // slot freed
+    });
+
+    it("enforces the per-tx limit", async function () {
+      await expect(
+        integrator
+          .connect(user)
+          .userInitiateOnramp(BASE_TX_LIMIT + 1n, INR, 0, CIRCLE_ID, 0, PUBKEY)
+      ).to.be.revertedWithCustomError(integrator, "TxLimitExceeded");
+    });
+
+    it("enforces the daily count", async function () {
+      await integrator.setDailyTxCountLimit(1);
+      await initiateOnramp();
+      await expect(
+        integrator.connect(user).userInitiateOnramp(AMOUNT, INR, 0, CIRCLE_ID, 0, PUBKEY)
+      ).to.be.revertedWithCustomError(integrator, "DailyCountExceeded");
+    });
+
+    it("onOrderComplete reverts on an unknown order", async function () {
+      await expect(
+        diamond.adminCallOnOrderComplete(
+          await integrator.getAddress(),
+          999,
+          user.address,
+          AMOUNT,
+          user.address
+        )
+      ).to.be.revertedWithCustomError(integrator, "UnknownOrder");
+    });
+  });
 });

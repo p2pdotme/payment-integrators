@@ -11,31 +11,40 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
 /**
  * @title PikerOfframpIntegrator
- * @notice Off-ramp-only integrator for Piker: lets a user convert USDC they
- *         already hold on Base into local fiat (INR via UPI) through the P2P
- *         protocol. Unlike TradeStars (Solana burn → relayer-driven, vault-
- *         backed) the Piker user is a first-class Base EOA cashing out their
- *         OWN funds, so the model is simpler:
+ * @notice Piker's P2P integrator — handles BOTH on-ramp and off-ramp. (Name is
+ *         historical from the offramp-first build; the contract now covers both
+ *         flows.) The Piker user is a first-class Base EOA transacting their OWN
+ *         funds, so the model is simpler than TradeStars (Solana burn →
+ *         relayer-driven, vault-backed):
  *
  *           - One UserProxy per user EOA (salt = user). `order.user` = that
  *             proxy, so the Diamond pulls funds from — and refunds to — a
  *             per-user address. No shared system proxy, no vault.
- *           - The user pays the protocol's small-order SELL fee themselves;
- *             the integrator fronts no capital and holds no withdrawable
- *             pool. It only ever custodies a single order's funds in-flight,
- *             which always resolve to the merchant (on completion) or back to
- *             the user (on cancellation). The owner cannot move user funds —
- *             there is deliberately no owner USDC-withdrawal path.
+ *           - Off-ramp (SELL, USDC→INR): the user pays the protocol's small-order
+ *             SELL fee themselves; the integrator fronts no capital and holds no
+ *             withdrawable pool. It only ever custodies a single order's funds
+ *             in-flight, which always resolve to the merchant (on completion) or
+ *             back to the user (on cancellation). No owner USDC-withdrawal path.
+ *           - On-ramp (BUY, fiat→USDC): placed with `recipientAddr = user` and
+ *             `usdcThroughIntegrator = false`, so the Diamond delivers USDC
+ *             straight to the buyer's wallet. The integrator never custodies
+ *             onramp USDC; the buyer pays fiat off-chain to the merchant.
  *
- *         Flow (driven by the p2pdotme/widgets Cashout host callbacks):
- *           1. userInitiateOfframp — pull `principal` USDC from the user, place
- *              the SELL on the Diamond via the user's proxy (order.user=proxy).
+ *         Off-ramp flow (p2pdotme/widgets Cashout host callbacks):
+ *           1. userInitiateOfframp — pull `principal` USDC, place the SELL via
+ *              the user's proxy (order.user=proxy).
  *           2. deliverOfframpUpi — once ACCEPTED, read the Diamond's authoritative
- *              `actualUsdtAmount` (= principal + fee), pull the `fee` remainder
- *              from the user, fund the proxy with the total, and have the proxy
- *              call setSellOrderUpi (Diamond pulls it, merchant pays fiat).
+ *              `actualUsdtAmount` (= principal + fee), pull the `fee` remainder,
+ *              fund the proxy, call setSellOrderUpi (Diamond pulls it, merchant
+ *              pays fiat).
  *           3. reconcile — at a terminal status, sweep the proxy and (on
  *              CANCELLED) refund everything the user deposited.
+ *
+ *         On-ramp flow (Checkout host callback):
+ *           1. userInitiateOnramp — place the BUY via the user's proxy with
+ *              recipientAddr=user. USDC lands in the user's wallet on completion;
+ *              onOrderComplete just marks it fulfilled, onOrderCancel releases
+ *              the daily-count slot.
  *
  *         Compiles against the canonical UserProxy (do NOT fork it) on
  *         solc 0.8.28 / cancun, matching the registered proxyImpl bytecode.
@@ -56,6 +65,10 @@ contract PikerOfframpIntegrator is IP2PIntegrator {
     error OfframpAlreadyReconciled();
     error OfframpFeeNotReady();
     error StatusNotTerminal();
+    // Onramp (BUY)
+    error OrderAlreadyFulfilled();
+    error OrderAlreadyCancelled();
+    error UnknownOrder();
 
     // ─── Events ───────────────────────────────────────────────────────
     event OfframpInitiated(uint256 indexed orderId, address indexed user, uint256 principal);
@@ -64,6 +77,9 @@ contract PikerOfframpIntegrator is IP2PIntegrator {
     event UserProxyDeployed(address indexed user, address proxy);
     event BaseTxLimitUpdated(uint256 limit);
     event DailyTxCountLimitUpdated(uint256 count);
+    event OnrampInitiated(uint256 indexed orderId, address indexed user, uint256 amount);
+    event OnrampFulfilled(uint256 indexed orderId, address indexed user, uint256 amount);
+    event OnrampCancelled(uint256 indexed orderId, address indexed user);
 
     // ─── Constants ────────────────────────────────────────────────────
     /// @notice Mirrors OrderProcessorStorage.OrderStatus on the P2P Diamond.
@@ -101,6 +117,17 @@ contract PikerOfframpIntegrator is IP2PIntegrator {
     }
 
     mapping(uint256 => OfframpRecord) public offramps;
+
+    // ─── Onramp records (BUY: INR→USDC) ───────────────────────────────
+    struct OnrampRecord {
+        address user; // the buyer (== recipient of the USDC)
+        uint64 placementDay; // block.timestamp/1 days at placement — so a cancel releases the right daily-count bucket
+        bool fulfilled;
+        bool cancelled;
+        bool initialized;
+    }
+
+    mapping(uint256 => OnrampRecord) public onramps;
 
     // ─── Modifiers ────────────────────────────────────────────────────
     modifier onlyOwner() {
@@ -148,23 +175,103 @@ contract PikerOfframpIntegrator is IP2PIntegrator {
         return true;
     }
 
-    /// @notice Off-ramp SELL orders never use the BUY completion callback; the
-    ///         SELL lifecycle is driven by setSellOrderUpi + reconcile. Present
-    ///         only to satisfy IP2PIntegrator. No-op beyond access control.
+    /// @notice Diamond's BUY-completion callback (fires when an onramp's fiat
+    ///         settles). With usdcThroughIntegrator=false and recipientAddr=user,
+    ///         the Diamond delivers USDC straight to the user's wallet — this
+    ///         integrator never custodies it. We only mark the onramp fulfilled
+    ///         (defense-in-depth guards make any gateway divergence loud). SELL
+    ///         offramp orders never reach this BUY-only callback.
     function onOrderComplete(
-        uint256 /* orderId */,
+        uint256 orderId,
         address /* user */,
-        uint256 /* amount */,
+        uint256 amount,
         address /* recipientAddr */
-    ) external view {
+    ) external {
         if (msg.sender != diamond) revert OnlyDiamond();
+        OnrampRecord storage o = onramps[orderId];
+        if (!o.initialized) revert UnknownOrder();
+        if (o.cancelled) revert OrderAlreadyCancelled();
+        if (o.fulfilled) revert OrderAlreadyFulfilled();
+        o.fulfilled = true;
+        emit OnrampFulfilled(orderId, o.user, amount);
     }
 
-    /// @notice SELL cancellations are settled in `reconcile` (which refunds the
-    ///         user from the swept proxy balance). This hook consumes no per-
-    ///         user accounting, so it is a no-op beyond access control.
-    function onOrderCancel(uint256 /* orderId */) external view {
+    /// @notice Order-cancellation hook. For an onramp (BUY) we release the
+    ///         daily-count slot reserved at placement (keyed on the pinned
+    ///         placementDay so it lands in the right bucket across a UTC
+    ///         boundary). SELL/offramp cancels carry no onramp record → no-op
+    ///         (offramp refunds run via `reconcile`). Best-effort: tolerate an
+    ///         unknown orderId or a repeat call.
+    function onOrderCancel(uint256 orderId) external {
         if (msg.sender != diamond) revert OnlyDiamond();
+        OnrampRecord storage o = onramps[orderId];
+        if (!o.initialized) return; // SELL/offramp or unknown — nothing to release
+        if (o.fulfilled || o.cancelled) return; // already terminal — idempotent
+        o.cancelled = true;
+        uint256 c = userDailyCount[o.user][o.placementDay];
+        if (c != 0) userDailyCount[o.user][o.placementDay] = c - 1;
+        emit OnrampCancelled(orderId, o.user);
+    }
+
+    // ─── On-ramp lifecycle (BUY: INR→USDC, driven by the <Checkout> widget) ──
+
+    /**
+     * @notice Place a BUY on the Diamond for the caller buying USDC with fiat.
+     *         Routes placeB2BOrder through the caller's per-user proxy with
+     *         `recipientAddr = caller`, so on completion the Diamond delivers
+     *         USDC straight to the buyer's wallet (the integrator is registered
+     *         `usdcThroughIntegrator = false`). The buyer pays fiat off-chain to
+     *         the assigned merchant; this integrator never pulls or custodies
+     *         USDC for an onramp. Same per-tx + daily-count limits as the
+     *         offramp, keyed on the caller.
+     *
+     * @dev    `usdcAllowance = 0` on the proxy execute: a BUY pulls no USDC at
+     *         placement (the merchant's USDC is escrowed protocol-side).
+     */
+    function userInitiateOnramp(
+        uint256 amount,
+        bytes32 currency,
+        uint256 fiatAmountLimit,
+        uint256 circleId,
+        uint256 preferredPaymentChannelConfigId,
+        string calldata userPubKey
+    ) external returns (uint256 orderId) {
+        if (amount == 0) revert InvalidAmount();
+        if (baseTxLimit != 0 && amount > baseTxLimit) revert TxLimitExceeded();
+
+        uint256 dayIndex = block.timestamp / 1 days;
+        if (dailyTxCountLimit != 0) {
+            uint256 count = userDailyCount[msg.sender][dayIndex];
+            if (count + 1 > dailyTxCountLimit) revert DailyCountExceeded();
+            userDailyCount[msg.sender][dayIndex] = count + 1;
+        }
+
+        address proxy = _ensureProxy(msg.sender);
+        bytes memory data = abi.encodeCall(
+            IB2BGateway.placeB2BOrder,
+            (
+                msg.sender, // order.user (proxy owner)
+                amount,
+                currency,
+                msg.sender, // recipientAddr — USDC delivered to the buyer's wallet
+                userPubKey,
+                circleId,
+                preferredPaymentChannelConfigId,
+                fiatAmountLimit
+            )
+        );
+        bytes memory result = UserProxy(proxy).execute(diamond, data, address(usdc), 0);
+        orderId = abi.decode(result, (uint256));
+
+        onramps[orderId] = OnrampRecord({
+            user: msg.sender,
+            placementDay: uint64(dayIndex),
+            fulfilled: false,
+            cancelled: false,
+            initialized: true
+        });
+
+        emit OnrampInitiated(orderId, msg.sender, amount);
     }
 
     // ─── Off-ramp lifecycle (driven by the <Cashout> widget) ──────────
@@ -323,6 +430,10 @@ contract PikerOfframpIntegrator is IP2PIntegrator {
 
     function getOfframp(uint256 orderId) external view returns (OfframpRecord memory) {
         return offramps[orderId];
+    }
+
+    function getOnramp(uint256 orderId) external view returns (OnrampRecord memory) {
+        return onramps[orderId];
     }
 
     // ─── Proxy helpers (mirror ExampleIntegrator / the template exactly) ─

@@ -1,8 +1,14 @@
 # PikerOfframpIntegrator
 
-Off-ramp integrator for [Piker](https://piker.io) — a fantasy-sports app on Base.
-Lets a user convert USDC they already hold into local fiat (**INR via UPI**)
-through the P2P protocol. SELL-only; no BUY/checkout flow.
+P2P integrator for [Piker](https://piker.io) — a fantasy-sports app on Base.
+Handles **both on-ramp and off-ramp** for the Piker user (a first-class Base
+EOA transacting their own funds):
+
+- **Off-ramp (SELL):** convert held USDC → local fiat (**INR via UPI**).
+- **On-ramp (BUY):** buy USDC with fiat, delivered straight to the user's wallet
+  (`recipientAddr = user`, `usdcThroughIntegrator = false`).
+
+(The contract name is historical from the offramp-first build.)
 
 Maintainer: Piker team. Network: Base mainnet (`usdcThroughIntegrator = false`).
 
@@ -38,6 +44,23 @@ Driven by the `@p2pdotme/widgets` `<Cashout>` host callbacks:
    status from the Diamond (never a caller argument). On `CANCELLED`, sweeps the
    proxy via `transferERC20ToIntegrator` and refunds everything the user
    deposited; on `COMPLETED`, records the status.
+
+## On-ramp flow
+
+Driven by the `@p2pdotme/widgets` `<Checkout>` host callback:
+
+1. **`userInitiateOnramp(amount, currency, fiatAmountLimit, circleId, ppccId, userPubKey)`**
+   — places `placeB2BOrder` through the caller's proxy with `recipientAddr =
+   caller`. The buyer pays fiat off-chain to the assigned merchant; the
+   integrator pulls/custodies **no** USDC (a BUY moves no USDC at placement).
+   Same per-tx + daily-count limits as the off-ramp.
+2. **`onOrderComplete`** (Diamond → integrator, BUY-only) — with
+   `usdcThroughIntegrator = false` + `recipientAddr = user`, the Diamond already
+   delivered USDC to the buyer's wallet; the hook just marks the onramp
+   fulfilled (defense-in-depth guards on double/cancelled).
+3. **`onOrderCancel`** — releases the daily-count slot reserved at placement
+   (keyed on the pinned `placementDay`). Off-ramp SELL cancels carry no onramp
+   record, so this is a no-op for them (their refunds run via `reconcile`).
 
 ## When to fork this
 
