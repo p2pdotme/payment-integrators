@@ -1,25 +1,25 @@
 import { ethers } from "hardhat";
 
 /**
- * Deploy PikerOfframpIntegrator.
+ * Deploy PikerOnrampIntegrator.
  *
- *   - baseTxLimit: max USDC principal per cash-out (6 decimals). 0 = unlimited.
- *   - dailyTxCountLimit: max cash-outs per user per UTC day. 0 = unlimited.
+ *   - baseTxLimit: max USDC per onramp (6 decimals). 0 = unlimited.
+ *   - dailyTxCountLimit: max onramps per user per UTC day. 0 = unlimited.
  *
  * Usage:
  *   DIAMOND_ADDRESS=0x... USDC_ADDRESS=0x... npx hardhat run scripts/deploy-piker.ts --network base
  *
  * Optional:
- *   BASE_TX_LIMIT=2000000000     (6 decimals, default 2000 USDC per cash-out)
+ *   BASE_TX_LIMIT=2000000000     (6 decimals, default 2000 USDC per onramp)
  *   DAILY_TX_COUNT_LIMIT=10      (default 10)
  *
  * After deploy:
  *   1. Verify on Basescan so the source matches the merged commit.
  *   2. Open a "Whitelist request" issue with the integrator address, the
  *      pinned `proxyImpl`, the bytecode hash, and the deployer address.
- *   3. The Piker off-ramp uses the user's own USDC and pulls the small-order
- *      SELL fee from the user at deliver time, so the integrator needs NO
- *      pre-funded USDC pool.
+ *   3. Register with usdcThroughIntegrator = false: onramp BUYs use
+ *      recipientAddr = the buyer, so USDC is delivered straight to their
+ *      wallet on completion. The integrator custodies no USDC.
  */
 
 const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
@@ -36,12 +36,12 @@ async function main() {
   console.log("Deployer:", await deployer.getAddress());
   console.log("Diamond:", DIAMOND_ADDRESS);
   console.log("USDC:", USDC_ADDRESS);
-  console.log("Base TX Limit:", ethers.formatUnits(BASE_TX_LIMIT, 6), "USDC per cash-out");
-  console.log("Daily TX Count Limit:", DAILY_TX_COUNT_LIMIT, "cash-outs per day");
+  console.log("Base TX Limit:", ethers.formatUnits(BASE_TX_LIMIT, 6), "USDC per onramp");
+  console.log("Daily TX Count Limit:", DAILY_TX_COUNT_LIMIT, "onramps per day");
   console.log("");
 
-  console.log("Deploying PikerOfframpIntegrator...");
-  const Integrator = await ethers.getContractFactory("PikerOfframpIntegrator");
+  console.log("Deploying PikerOnrampIntegrator...");
+  const Integrator = await ethers.getContractFactory("PikerOnrampIntegrator");
   const integrator = await Integrator.deploy(
     DIAMOND_ADDRESS,
     USDC_ADDRESS,
@@ -52,7 +52,7 @@ async function main() {
   await deployTx?.wait(5);
 
   const address = await integrator.getAddress();
-  console.log(`PikerOfframpIntegrator deployed to: ${address}`);
+  console.log(`PikerOnrampIntegrator deployed to: ${address}`);
 
   const code = await ethers.provider.getCode(address);
   if (code === "0x" || code.length <= 2) throw new Error(`Contract has no code at ${address}`);

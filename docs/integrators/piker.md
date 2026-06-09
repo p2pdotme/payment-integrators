@@ -1,79 +1,47 @@
-# PikerOfframpIntegrator
+# PikerOnrampIntegrator
 
-P2P integrator for [Piker](https://piker.io) — a fantasy-sports app on Base.
-Handles **both on-ramp and off-ramp** for the Piker user (a first-class Base
-EOA transacting their own funds):
-
-- **Off-ramp (SELL):** convert held USDC → local fiat (**INR via UPI**).
-- **On-ramp (BUY):** buy USDC with fiat, delivered straight to the user's wallet
-  (`recipientAddr = user`, `usdcThroughIntegrator = false`).
-
-(The contract name is historical from the offramp-first build.)
+On-ramp integrator for [Piker](https://piker.io) — a fantasy-sports app on Base.
+Lets a user buy USDC with local fiat (**INR via UPI**) through the P2P protocol,
+delivered straight to their own wallet to fund contest play. BUY-only.
 
 Maintainer: Piker team. Network: Base mainnet (`usdcThroughIntegrator = false`).
 
 ## What it shows
 
-A minimal, **self-funded** off-ramp where the end user is a first-class Base
-EOA cashing out their own funds:
+A minimal on-ramp where the end user is a first-class Base EOA and the purchased
+USDC lands directly in their wallet:
 
-- One `UserProxy` per user EOA (`salt = user`). `order.user` is that proxy, so
-  the Diamond pulls from — and refunds to — a per-user address.
-- The user pays the protocol's small-order SELL fee themselves. The integrator
-  fronts **no capital** and exposes **no owner USDC-withdrawal path**; it only
-  ever custodies a single order's funds in-flight, which always resolve to the
-  merchant (completion) or back to the user (cancellation).
-- Per-tx principal cap + per-user daily cash-out count, enforced at the entry
-  point and re-asserted Diamond-side in `validateOrder`.
+- One `UserProxy` per user EOA (`salt = user`) is the on-chain actor that places
+  the order; the Diamond resolves the integrator from it via CREATE2-auth.
+- The BUY is placed with **`recipientAddr = user`** and the integrator is
+  registered **`usdcThroughIntegrator = false`**, so on completion the Diamond
+  delivers USDC straight to the buyer's wallet. The integrator **never pulls or
+  custodies USDC** — the buyer pays fiat off-chain to the assigned merchant.
+- Per-tx cap + per-user daily onramp count, enforced at the entry point and
+  re-asserted Diamond-side in `validateOrder`.
 
 ## Flow
-
-Driven by the `@p2pdotme/widgets` `<Cashout>` host callbacks:
-
-1. **`userInitiateOfframp(principal, currency, fiatAmountLimit, circleId, ppccId, userPubKey)`**
-   — pulls `principal` USDC from the caller, then routes
-   `placeB2BSellOrder` through the caller's proxy (`order.user = proxy`).
-   Returns the `orderId`.
-2. **`deliverOfframpUpi(orderId, encUpi)`** — once the order is `ACCEPTED`,
-   reads the Diamond's authoritative `actualUsdtAmount` (`= principal + fee`),
-   pulls the `fee` remainder from the user (allowance from the up-front
-   approval), funds the proxy with the exact total, and has the proxy call
-   `setSellOrderUpi`. Exact funding ⇒ no residue on the proxy. Order-owner-only;
-   replay-guarded.
-3. **`reconcile(orderId)`** — permissionless. Reads the authoritative terminal
-   status from the Diamond (never a caller argument). On `CANCELLED`, sweeps the
-   proxy via `transferERC20ToIntegrator` and refunds everything the user
-   deposited; on `COMPLETED`, records the status.
-
-## On-ramp flow
 
 Driven by the `@p2pdotme/widgets` `<Checkout>` host callback:
 
 1. **`userInitiateOnramp(amount, currency, fiatAmountLimit, circleId, ppccId, userPubKey)`**
-   — places `placeB2BOrder` through the caller's proxy with `recipientAddr =
-   caller`. The buyer pays fiat off-chain to the assigned merchant; the
-   integrator pulls/custodies **no** USDC (a BUY moves no USDC at placement).
-   Same per-tx + daily-count limits as the off-ramp.
-2. **`onOrderComplete`** (Diamond → integrator, BUY-only) — with
-   `usdcThroughIntegrator = false` + `recipientAddr = user`, the Diamond already
-   delivered USDC to the buyer's wallet; the hook just marks the onramp
-   fulfilled (defense-in-depth guards on double/cancelled).
+   — places `placeB2BOrder` through the caller's proxy with
+   `recipientAddr = caller`. A BUY pulls no USDC at placement. Returns the
+   `orderId`.
+2. **`onOrderComplete`** (Diamond → integrator, BUY-only) — the Diamond has
+   already delivered USDC to the buyer's wallet; the hook just marks the onramp
+   fulfilled (defense-in-depth guards against double/cancelled).
 3. **`onOrderCancel`** — releases the daily-count slot reserved at placement
-   (keyed on the pinned `placementDay`). Off-ramp SELL cancels carry no onramp
-   record, so this is a no-op for them (their refunds run via `reconcile`).
+   (keyed on the pinned `placementDay`). Best-effort.
 
 ## When to fork this
 
-If your integrator is a **SELL/off-ramp** where the user holds USDC on Base and
-cashes out their own funds, and you don't need a yield vault or a relayer-driven
-(no-Base-identity) flow — fork this instead of `TradeStarsCheckoutIntegrator`
-(vault-backed, Solana-burn-driven).
-
-## When not to fork this
-
-- BUY/checkout flows → `ExampleIntegrator` / `LotPotCheckoutIntegrator`.
-- Off-ramp for users with no Base address, or yield-bearing pooled liquidity →
-  `TradeStarsCheckoutIntegrator`.
+If your integrator is a **BUY/on-ramp** where the user buys USDC with fiat and
+wants it delivered straight to their own Base wallet (no upstream product to
+consume the proceeds into), fork this. If instead the proceeds must be consumed
+into a deliverable (NFT, ticket, credit), look at `ExampleIntegrator` /
+`LotPotCheckoutIntegrator` (which set `recipientAddr = proxy` +
+`usdcThroughIntegrator = true`).
 
 ## Deploy
 
@@ -83,5 +51,5 @@ DIAMOND_ADDRESS=0x... USDC_ADDRESS=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 \
   npx hardhat run scripts/deploy-piker.ts --network base
 ```
 
-Then verify on Basescan and file a whitelist request with the integrator
-address + pinned `proxyImpl`. No USDC pool top-up is required.
+Then verify on Basescan and file a whitelist request with the integrator address
++ pinned `proxyImpl`, registered `usdcThroughIntegrator = false`.
