@@ -1,31 +1,36 @@
-# Offramp v2 — user-driven, per-user-proxy, pooled partial cash-outs
+# Offramp v2 — user-driven, voucher-attested, ONE Base tx
 
 > Status: implemented on `feat/offramp-v2` (PR #14), deployed + E2E-verified on
 > Base Sepolia. This doc is the authoritative spec for the v2 integrator ABI
-> that the relayer (`tradestars-relayer`) and widget (`p2pdotme-checkout-widget`)
-> build against.
+> that the attester service (`tradestars-relayer`) and widget
+> (`p2pdotme-checkout-widget`) build against.
 
 ## The core idea
 
-Today the TradeStars offramp places every SELL through a **shared system proxy**
-driven end-to-end by the relayer. v2 flips it: the relayer's **only** on-chain
-job is **allocation** — it moves vault USDC into the **user's own per-user
-proxy** (the same proxy keyed on their Base EOA that onramp uses), **pooling** it
-with any prior allocation. The **user** then draws **any principal up to their
-pooled proxy balance, in as many parts as they like** (one in-flight at a time),
-driving place-SELL → deliver-UPI → retry from the widget (gaslessly, via their
-paymaster). The proxy's USDC balance **is** the cashable balance.
+The legacy TradeStars offramp places every SELL through a **shared system
+proxy** driven end-to-end by the relayer. v2 flips it: the relayer has **no
+on-chain write path at all**. When it observes a Solana tUSDC burn it only
+**signs an EIP-712 `OfframpVoucher`** off-chain. The **user** then sends **one
+Base tx** — `userRedeemAndStartOfframp` — that atomically verifies the voucher,
+releases the burned amount from the vault into the **user's own per-user
+proxy** (the same proxy keyed on their Base EOA that onramp uses, **pooling**
+with any prior balance), and places the SELL through that proxy. Subsequent /
+partial / retry draws come from the pooled balance via `userStartOfframp` — no
+new voucher. The user drives deliver-UPI → retry from the widget (gaslessly,
+via their paymaster). The proxy's USDC balance **is** the cashable balance.
 
 ```
-            OLD (relayer-driven, system proxy)            v2 (user-driven, per-user proxy, pooled)
- burn ─▶ relayer: placeSellOrderForBurn ┐            relayer: allocateOfframp(userEOA, amt, burnTx)
-         poll / encrypt / deliverUpi    │ system       └ vault.releaseForOfframp → USDC ▶ USER proxy (pooled)
-         poll / reconcile               │ proxy       ───────────────────────────────────────────
-         (manual replay on failure)     ┘             USER (gasless), repeatable per part:
-                                                       userStartOfframp(principal ≤ balance)
-                                                       ↳ poll ACCEPTED → encrypt UPI client-side
-                                                       ↳ userDeliverOfframpUpi(orderId, encUpi)
-                                                       ↳ PAID → COMPLETED ✓ / CANCELLED → retry/redraw
+            OLD (relayer-driven, system proxy)            v2 (voucher-attested, ONE user tx)
+ burn ─▶ relayer: placeSellOrderForBurn ┐            relayer/attester: SIGNS OfframpVoucher (off-chain, no tx)
+         poll / encrypt / deliverUpi    │ system     USER (gasless) — ONE Base tx:
+         poll / reconcile               │ proxy        userRedeemAndStartOfframp(voucher, sig, principal ≤ balance)
+         (manual replay on failure)     ┘              ├ verify sig + deadline + burn-dedupe
+                                                       ├ vault.releaseForOfframp → USDC ▶ USER proxy (pooled)
+                                                       └ SELL placed through the proxy — same tx
+                                                      ↳ poll ACCEPTED → encrypt UPI client-side
+                                                      ↳ userDeliverOfframpUpi(orderId, encUpi)
+                                                      ↳ PAID → COMPLETED ✓ / CANCELLED → retry:
+                                                        userStartOfframp(principal) — NO new voucher
 ```
 
 ## Why this fixes all three problems (one root cause)
@@ -34,7 +39,7 @@ paymaster). The proxy's USDC balance **is** the cashable balance.
 |---|---|---|
 | History shows only onramp | SELL `order.user` = one shared system proxy; history is keyed on the user's address | SELL `order.user` = the user's **per-user proxy** (deterministic from their EOA); widget merges EOA + derived-proxy `getOrders` |
 | Owner manually retriggers failed offramps | relayer workflow owns the whole lifecycle; failures need `replay:p2p-withdrawal` | cancel refunds land in the **user's proxy**; the user re-places/redraws from the widget — no owner/relayer |
-| One relayer driving everything | relayer is the sequential driver and holds payout-encryption keys | relayer only calls `allocateOfframp`; the user signs place/deliver/retry; payout is encrypted **client-side** |
+| One relayer driving everything | relayer is the sequential driver and holds payout-encryption keys | relayer only **signs the voucher off-chain** (zero relayer txs, zero event-pickup wait); the user signs the single redeem+place tx, deliver, retry; payout is encrypted **client-side** |
 
 ## How it stays legal on the live Base Sepolia Diamond
 
@@ -58,29 +63,49 @@ interface IDiamondSmallOrderFees {
     function getSmallOrderFixedFee(bytes32 currency) external view returns (uint256); // fallback
 }
 
-// ── relayer-only: the ONLY relayer write in the offramp path ──
-// Pulls `amount` from the vault (releaseForOfframp) and transfers it to the
-// user's per-user proxy, POOLING with any prior allocation. Dedupes on
-// solanaBurnTx. Bounded by maxUsdcPerOfframp (per-allocation cap).
-function allocateOfframp(
-    address user,            // Base EOA (= proxy owner); allocation target
-    uint256 amount,          // burned principal (USDC, 6dp)
-    bytes32 solanaBurnTx,    // dedupe key
-    bytes32 solanaUserPubkey
-) external returns (uint256 allocationId);                 // onlyOfframpRelayer
+// ── the burn attestation the attester (offrampRelayer key) signs OFF-CHAIN ──
+// EIP-712 domain: name "TradeStarsOfframp", version "1", chainId, verifyingContract
+// = the integrator. Single-use (deduped on solanaBurnTx), deadline-bounded,
+// redeemable only by `user`. The attester NEVER sends a transaction.
+struct OfframpVoucher {
+    bytes32 solanaBurnTx;    // dedupe key
+    bytes32 solanaUserPubkey;
+    address user;            // Base EOA that may redeem; their proxy is funded
+    uint256 amount;          // burned principal released from the vault (USDC, 6dp)
+    uint256 deadline;        // unix seconds; attester re-signs if it lapses
+}
 
-// ── user-driven (msg.sender owns the proxy the draw is placed through) ──
-// Draws `principal` from the caller's pooled proxy balance and places a SELL.
-// Callable repeatedly (partial / multi-part), ONE in-flight order at a time —
-// the prior order must be terminal (COMPLETED or CANCELLED) before the next.
-// Reverts OfframpInsufficientBalance unless proxyBalance >= principal + fee.
-function userStartOfframp(
-    uint256 principal,                        // any amount ≤ pooled proxy balance
+// ── user-only, ONE Base tx: verify voucher → vault release → place SELL ──
+// Atomic: any revert (e.g. the placement guard) rolls the whole tx back and the
+// voucher stays unredeemed. `principal` may be ≤ voucher.amount (remainder stays
+// pooled) or > it (if a prior pooled balance covers the difference) — placement
+// is bounded only by the proxy balance, exactly like userStartOfframp.
+// Voucher checks: sig recovers to offrampRelayer, deadline not passed, burn not
+// already redeemed, amount ≤ maxUsdcPerOfframp, msg.sender == voucher.user.
+function userRedeemAndStartOfframp(
+    OfframpVoucher calldata voucher,
+    bytes calldata signature,                 // attester's EIP-712 signature
+    uint256 principal,
     bytes32 currency,
     uint256 fiatAmount,                       // SELL slippage floor; 0 = none
     uint256 circleId,                         // merchant circle (Base Sepolia: 1)
     uint256 preferredPaymentChannelConfigId,
     string calldata userPubKey                // user's relay pubkey (widget SDK identity)
+) external returns (uint256 orderId);
+
+// ── user-driven retry / subsequent partial draws (NO voucher) ──
+// Draws `principal` from the caller's pooled proxy balance and places a SELL.
+// Callable repeatedly (partial / multi-part / retry-after-cancel), ONE in-flight
+// order at a time — the prior order must be terminal (COMPLETED or CANCELLED)
+// before the next. Reverts OfframpInsufficientBalance unless
+// proxyBalance >= principal + fee.
+function userStartOfframp(
+    uint256 principal,                        // any amount ≤ pooled proxy balance
+    bytes32 currency,
+    uint256 fiatAmount,
+    uint256 circleId,
+    uint256 preferredPaymentChannelConfigId,
+    string calldata userPubKey
 ) external returns (uint256 orderId);
 
 // Encrypted-UPI delivery (drives ACCEPTED → PAID). Diamond pulls actualUsdtAmount
@@ -97,9 +122,10 @@ function getUserAllocations(address user) external view returns (uint256[] memor
 function getAllocation(uint256 allocationId) external view returns (OfframpAllocation memory);
 function proxyAddress(address user) external view returns (address);       // deterministic per-user proxy
 function allocations(uint256) external view returns (/* OfframpAllocation */);
-function burnToAllocation(bytes32) external view returns (uint256);
+function burnToAllocation(bytes32) external view returns (uint256);        // non-zero ⇒ voucher redeemed
 function orderToUser(uint256) external view returns (address);             // orderId → proxy owner
 function userActiveOrder(address) external view returns (uint256);         // current in-flight draw (0 = none)
+function hashOfframpVoucher(OfframpVoucher calldata) external view returns (bytes32); // EIP-712 digest cross-check for off-chain signers
 
 // ── events ──
 event OfframpAllocated(uint256 indexed allocationId, address indexed user, address proxy, uint256 amount, bytes32 indexed solanaBurnTx, bytes32 solanaUserPubkey);
@@ -110,8 +136,9 @@ event OfframpCancelled(uint256 indexed orderId, address indexed user);     // US
 ```
 
 ```solidity
-// An allocation is a FUNDING record (dedup + audit) — withdrawals are NOT tied
-// to a single allocation; they draw from the pooled proxy balance.
+// An allocation is a FUNDING record (dedup + audit), written when a voucher is
+// redeemed — withdrawals are NOT tied to a single allocation; they draw from
+// the pooled proxy balance.
 struct OfframpAllocation {
     address user;            // Base EOA = proxy owner
     uint256 amount;          // USDC moved into the proxy (burned principal)
@@ -123,15 +150,27 @@ struct OfframpAllocation {
 
 The v2 integrator keeps the v1 BUY surface unchanged (`userPlaceOrder`,
 `onOrderComplete`, `onOrderCancel`, limits/RP, proxy helpers). `validateOrder`
-gains a bypass: while the integrator is mid-`userStartOfframp` (a transient
-`_offrampPlacing` flag), it returns `true` — the relayer already bounded the
-pooled balance via `maxUsdcPerOfframp` + the vault quota, so per-user *buy*
-limits don't apply to an offramp SELL. The v1 relayer-driven offramp
-(`placeSellOrderForBurn`/relayer `deliverOfframpUpi`/`reconcile`) is **removed**
-in v2; the v1 integrator stays deployed for any in-flight legacy offramps.
+gains a bypass: while the integrator is mid-placement (a transient
+`_offrampPlacing` flag), it returns `true` — the draw is already bounded by the
+attested voucher amount (≤ `maxUsdcPerOfframp`) + the proxy balance, so
+per-user *buy* limits don't apply to an offramp SELL. The v1 relayer-driven
+offramp (`placeSellOrderForBurn`/relayer `deliverOfframpUpi`/`reconcile`) and
+the earlier relayer-funded `allocateOfframp` are both **removed**; the v1
+integrator stays deployed for any in-flight legacy offramps. `offrampRelayer`
+(+ `setOfframpRelayer`) is retained as the **attester key** — it authorises
+voucher signatures and nothing else.
 
 ## Invariants & nuances
 
+- **Voucher = the burn attestation.** Vault USDC moves only against a voucher
+  signed by the attester key: single-use (`BurnAlreadyProcessed` on replay),
+  deadline-bounded (`VoucherExpired` — ask the attester to re-sign),
+  user-bound (`OnlyVoucherUser` — the SELL is placed as `msg.sender`), amount
+  ≤ `maxUsdcPerOfframp`. A forged/tampered voucher fails `ECDSA.recover` →
+  `InvalidVoucherSignature`. The redeem+place tx is **atomic**: if the
+  placement leg reverts (zero principal, in-flight order, insufficient
+  balance for principal+fee), the vault release rolls back too and the
+  voucher stays unredeemed/reusable.
 - **USDC trap intact.** Pooled USDC sits in the user's proxy and can leave only
   via the Diamond pulling it for a SELL (→ merchant → fiat to the user
   off-chain). It can never reach the user's EOA. `UserProxy.sol` is **not
@@ -150,9 +189,11 @@ in v2; the v1 integrator stays deployed for any in-flight legacy offramps.
   cash out the *full* balance when it is at/below the threshold — withdraw
   `balance − fee` (the widget's "insufficient balance" guard mirrors the
   contract). Above-threshold draws have fee 0.
-- **Retry / redraw.** Cancel refunds (`principal + fee`) to the proxy;
-  `userStartOfframp` is callable again once the prior order is terminal
-  (COMPLETED or CANCELLED) — `syncOfframp` also frees the slot but isn't required.
+- **Retry / redraw — never needs a new voucher.** Cancel refunds
+  (`principal + fee`) to the proxy; the burn stays deduped and the funds sit in
+  the proxy, so the retry is just `userStartOfframp` once the prior order is
+  terminal (COMPLETED or CANCELLED) — `syncOfframp` also frees the slot but
+  isn't required.
 - **No reclaim.** Allocated USDC stays in the user's proxy until they draw it
   down — there is no owner sweep/reclaim. (A reclaim-to-vault path was
   considered but dropped: it would strand the user, since the original burn is
@@ -161,19 +202,27 @@ in v2; the v1 integrator stays deployed for any in-flight legacy offramps.
   dormant allocations becomes necessary.)
 - **Fee-not-ready guard** (the 2026-05-07 bug) is preserved (`userDeliverOfframpUpi`
   reverts `OfframpFeeNotReady` if `actualUsdtAmount` reads 0).
-- **Burn-backed note.** Because the pool is the raw proxy balance, USDC sent
-  *directly* to a proxy would also be cashable (i.e. not strictly tied to a
-  Solana burn). Fine for the relayer-funded testnet flow; for stricter
-  production accounting add a thin per-user "allocated" ledger gating draws.
+- **Burn-backed note.** *Vault* USDC is strictly burn-backed (it moves only
+  against a signed voucher). But because the pool is the raw proxy balance,
+  USDC sent *directly* to a proxy would also be cashable through
+  `userStartOfframp`. Fine for testnet; for stricter production accounting add
+  a thin per-user "allocated" ledger gating draws.
 
 ## Widget changes (`p2pdotme-checkout-widget`)
 
-The `<Cashout>` machine is callback-shaped (SDK unchanged):
-1. Balance affordance = the pool (`availableOfframp(user)` via a host
-   `fetchAvailableOfframp` callback/prop), not `balanceOf`. No USDC approve in
-   the TradeStars `placeCashout`.
-2. `placeCashout` → `userStartOfframp(principal = entered amount, …)` (any amount
-   ≤ balance); `deliverUpi` → `userDeliverOfframpUpi`; `reconcile` → `syncOfframp`.
+The `<Cashout>` machine is callback-shaped (SDK unchanged) — **the widget needs
+NO code change for the voucher flow**; the voucher lives entirely inside the
+host app's callback implementations:
+1. Balance affordance via the host `fetchAvailableOfframp` callback. For the
+   voucher flow the host returns `unredeemedVoucherAmount + proxyBalance` —
+   before the first draw that's the voucher amount; after a cancel the
+   refunded proxy balance carries it. No USDC approve in the TradeStars
+   `placeCashout`.
+2. `placeCashout` → host fetches the signed voucher from its backend and calls
+   `userRedeemAndStartOfframp(voucher, sig, principal, …)`; on retry (voucher
+   already redeemed — funds in the proxy) the host calls
+   `userStartOfframp(principal, …)` instead. `deliverUpi` →
+   `userDeliverOfframpUpi`; `reconcile` → `syncOfframp`.
 3. Fee-aware amount: the widget reads the threshold + `getSmallOrderFixedFeeSell`
    and enforces `principal + fee <= balance` (shows "insufficient balance"
    otherwise) — matching the contract guard. The order id is parsed from the
@@ -183,18 +232,22 @@ The `<Cashout>` machine is callback-shaped (SDK unchanged):
 5. `PaymentHistory`: query a second `getOrders({ userAddress: proxyAddress })`
    and merge/dedupe with the EOA's orders.
 
-## Relayer changes (`tradestars-relayer`)
+## Relayer changes (`tradestars-relayer`) — attester (signer-only)
 
-`processP2PWithdrawal` collapses to one step: `allocateOfframp(baseAddress,
-amount, burnTx, solPubkey)` — unchanged by the pooled model (allocation is
-still a single funding write). Drop merchant/terminal polling, payout
-decrypt/encrypt, `deliverOfframpUpi`, `reconcile`. Shrink `WithdrawalRecord`
-(add `baseAddress` + `baseAllocationId/Tx`; drop the place/deliver/reconcile tx
-fields + `payoutAddressEncrypted`); status → `{ allocating, allocated, failed }`.
-Drop the `P2P_OFFRAMP_RELAY_*` + `P2P_WITHDRAWAL_ENCRYPTION_KEY` secrets from the
-withdrawal path. Deposit/onramp flow untouched. **Gap to close in the product
-app:** the withdrawal record must carry the user's **Base address**
-(`baseAddress`) so the relayer can allocate to the right proxy.
+`processP2PWithdrawal` collapses to a **pure off-chain signing step**: validate
+the withdrawal record (wallet/amount/nonce/`baseAddress`), EIP-712-sign
+`OfframpVoucher(burnTx, solPubkey, baseAddress, amount, deadline)` with the
+attester key, and persist `{voucher, signature}` on the withdrawal record so
+the product app can hand it to the widget/host. The relayer sends **no Base
+transaction** — it needs no Base gas, no nonce management, no tx retry logic.
+Drop merchant/terminal polling, payout decrypt/encrypt, `deliverOfframpUpi`,
+`reconcile`, and the allocation tx path. Status →
+`{ signing, signed, redeemed?, failed }` (`redeemed` optional — observable
+on-chain via `burnToAllocation`). If a voucher's deadline lapses before the
+user redeems, the relayer simply re-signs the same record. Deposit/onramp flow
+untouched. **Gap to close in the product app:** the withdrawal record must
+carry the user's **Base address** (`baseAddress`) — it becomes `voucher.user`,
+the only wallet that can redeem.
 
 ## Base Sepolia coordinates (E2E)
 
@@ -207,18 +260,25 @@ subgraph   = https://api.studio.thegraph.com/query/1745491/event-indexer/version
 sell circle = 1 (INR/BRL/IDR)   merchant: p2p-checkout/demo-merchant-bot (auto-accept + auto-complete)
 Aave       = none on Sepolia → deploy MockAavePool + mock aUSDC with the vault
 
-current pooled-partial deployment:
-  integrator = 0xF1d04b7a0Ae0030BcCF8859238f921862e2eB6e3
-  proxyImpl  = 0x1C3386457b6a15ee273160ed772B14DE0285d4A1
-  vault      = 0x59B90CCda791aCd14d2cc1C3B5644d8e9B0A5Af1
+current voucher-flow deployment (2026-06-10):
+  integrator = 0xadD13C5DB8aD6913E213fAa6572f9C79F1659D19
+  proxyImpl  = 0x2F64Eea6f46fdbeA7C45196E180f01594D88B1D5
+  vault      = 0x437D0d767DEC6741fB59b291Cb787BF933b349ac
   INR pricing: sellPrice 89, smallOrderThreshold 10 USDC, sell fee 0.125 USDC
+
+superseded pooled-partial deployment (pre-voucher, allocateOfframp era):
+  integrator = 0xF1d04b7a0Ae0030BcCF8859238f921862e2eB6e3
 ```
 
-E2E: deploy v2 (vault+integrator+mocks) → `registerIntegrator(v2, true, proxyImpl)`
-→ fund vault (`deposit`/owner `fund`) → `allocateOfframp` (relayer) →
-`userStartOfframp(principal)` (user) → demo-merchant-bot accepts →
+E2E (verified live 2026-06-10, order 240): deploy v2 (vault+integrator+mocks) →
+`registerIntegrator(v2, true, proxyImpl)` → fund vault (`deposit`/owner `fund`)
+→ attester **signs** `OfframpVoucher` off-chain → user sends **one tx**
+`userRedeemAndStartOfframp(voucher, sig, principal)` (fee-aware: principal =
+voucher − fee at/below threshold) → demo-merchant-bot accepts →
 `userDeliverOfframpUpi` (dummy ciphertext; the bot doesn't decrypt) → bot
 completes → `syncOfframp` → assert COMPLETED. Covered by the test suite
-(`test/tradestars-v2-offramp.test.ts`, 40 cases): multi-part draws (e.g.
-30/40/30), fee-from-balance, `OfframpInsufficientBalance`, cancel→redraw,
-plus admin/BUY/guard branch coverage (contract 100% line / 91% branch).
+(`test/tradestars-v2-offramp.test.ts`, 48 cases): voucher
+forge/tamper/expiry/replay/wrong-redeemer, atomic-rollback, multi-part draws
+(e.g. 30/40/30), fee-from-balance, `OfframpInsufficientBalance`,
+cancel→redraw, plus admin/BUY/guard branch coverage (contract 100% line / 91%
+branch).
