@@ -9,6 +9,8 @@ import { UserProxy } from "../../base/UserProxy.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
+import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @notice Minimal view surface for the Diamond's small-order fee config, used
 ///         to compute the SELL fee up front so the proxy can be checked for
@@ -25,30 +27,33 @@ interface IDiamondSmallOrderFees {
  *         offramp on {TradeStarsCheckoutIntegrator}. The BUY (onramp) surface
  *         is unchanged from v1.
  *
- *         OFFRAMP MODEL
- *         -------------
- *         1. The relayer observes a Solana tUSDC burn and calls
- *            `allocateOfframp(userEOA, amount, burnTx, solPubkey)` — the ONLY
- *            relayer write. It pulls `amount` from the vault and forwards it to
- *            the user's *own* per-user proxy (the same proxy keyed on the user
- *            EOA that BUY uses), pooling it with any prior allocation. The
- *            relayer's job ends here.
+ *         OFFRAMP MODEL (single-tx, voucher-attested)
+ *         -------------------------------------------
+ *         1. The attester (`offrampRelayer` key) observes a Solana tUSDC burn
+ *            and SIGNS an EIP-712 `OfframpVoucher(burnTx, solPubkey, user,
+ *            amount, deadline)` OFF-CHAIN. It never sends a transaction — the
+ *            offramp has NO relayer write path at all.
  *         2. The USER (their Base wallet, gasless via paymaster) calls
- *            `userStartOfframp(principal, ...)` — drawing ANY principal up to
- *            their pooled proxy balance, in as many parts as they like (one
- *            in-flight at a time). The integrator places a SELL on the Diamond
- *            *through the user's proxy*, so `order.user == that proxy` — the
- *            Diamond pulls/refunds USDC there and the order is attributable to
- *            the user (not a shared system proxy), so it shows in their P2P
- *            history. The small-order fee is funded from the proxy balance too
- *            (never subsidised), so a draw needing more than is available is
- *            rejected up front.
+ *            `userRedeemAndStartOfframp(voucher, sig, principal, ...)` — ONE
+ *            Base tx that atomically (a) verifies the voucher + burn dedupe,
+ *            (b) releases `voucher.amount` from the vault into the user's
+ *            *own* per-user proxy (the same proxy keyed on the user EOA that
+ *            BUY uses), pooling it with any prior balance, and (c) places the
+ *            SELL on the Diamond *through that proxy*, so `order.user == the
+ *            proxy` — the Diamond pulls/refunds USDC there and the order is
+ *            attributable to the user (not a shared system proxy), so it shows
+ *            in their P2P history. The small-order fee is funded from the
+ *            proxy balance too (never subsidised), so a draw needing more than
+ *            is available is rejected up front.
+ *            Partial/subsequent draws of an already-redeemed balance use
+ *            `userStartOfframp(principal, ...)` — same placement, no voucher.
  *         3. The USER calls `userDeliverOfframpUpi(orderId, encUpi)` once a
  *            merchant accepts. The Diamond pulls `actualUsdtAmount` from the
  *            proxy → PAID → merchant pays fiat → COMPLETED.
  *         4. If the order is cancelled (merchant no-show / dispute / timeout),
  *            the Diamond refunds USDC to the proxy. The user simply calls
- *            `userStartOfframp` again — self-serve retry/redraw, no relayer/owner.
+ *            `userStartOfframp` again — the voucher is already redeemed, the
+ *            funds sit in their proxy. Self-serve retry/redraw, no relayer/owner.
  *         5. `syncOfframp(orderId)` (permissionless) records the terminal
  *            status and frees the in-flight slot. Allocated USDC stays in the
  *            user's proxy until they draw it down — there is no owner reclaim.
@@ -57,7 +62,7 @@ interface IDiamondSmallOrderFees {
  *         the Diamond pulling it for the SELL (→ fiat to the user off-chain). It
  *         can never reach the user EOA. See docs/OFFRAMP-V2.md.
  */
-contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
+contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator, EIP712 {
     using SafeERC20 for IERC20;
 
     // ─── Errors ───────────────────────────────────────────────────────
@@ -75,11 +80,17 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
 
     // Offramp
     error OfframpDisabled();
-    error OnlyOfframpRelayer();
     error VaultNotSet();
     error BurnAlreadyProcessed();
     error OfframpAmountTooLarge();
     error OfframpRecordNotFound();
+    /// @notice Voucher signature does not recover to the offramp attester key.
+    error InvalidVoucherSignature();
+    /// @notice Voucher deadline has passed — ask the attester to re-sign.
+    error VoucherExpired();
+    /// @notice Only the user named in the voucher may redeem it (the SELL is
+    ///         placed as `msg.sender`, so redemption is bound to that wallet).
+    error OnlyVoucherUser();
     /// @notice setSellOrderUpi funding tried to read `actualUsdtAmount` from the
     ///         Diamond before it was computed (returned 0). Funding the proxy
     ///         short of principal+fee would make the Diamond's transferFrom
@@ -122,7 +133,8 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     event UsdcDepositedToVault(uint256 indexed orderId, uint256 amount);
 
     // Offramp v2 lifecycle
-    /// @notice Relayer moved `amount` from the vault into the user's proxy.
+    /// @notice A signed voucher was redeemed — `amount` moved from the vault
+    ///         into the user's proxy (inside the user's own redeem+place tx).
     event OfframpAllocated(
         uint256 indexed allocationId,
         address indexed user,
@@ -147,6 +159,13 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
     uint8 internal constant STATUS_PAID = 2;
     uint8 internal constant STATUS_COMPLETED = 3;
     uint8 internal constant STATUS_CANCELLED = 4;
+
+    /// @notice EIP-712 typehash for the burn attestation the offramp attester
+    ///         signs off-chain. Field order must match `OfframpVoucher`.
+    bytes32 internal constant OFFRAMP_VOUCHER_TYPEHASH =
+        keccak256(
+            "OfframpVoucher(bytes32 solanaBurnTx,bytes32 solanaUserPubkey,address user,uint256 amount,uint256 deadline)"
+        );
 
     // ─── Immutables ───────────────────────────────────────────────────
 
@@ -181,6 +200,9 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
 
     IRestrictedYieldVault public yieldVault;
     bool public offrampEnabled;
+    /// @notice The offramp ATTESTER key. It only signs `OfframpVoucher`s
+    ///         off-chain — it has no on-chain write path in the offramp.
+    ///         (Name kept from v2 so ops/tooling references stay valid.)
     address public offrampRelayer;
     uint256 public maxUsdcPerOfframp;
 
@@ -229,14 +251,14 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
         _;
     }
 
-    modifier onlyOfframpRelayer() {
-        if (msg.sender != offrampRelayer) revert OnlyOfframpRelayer();
-        _;
-    }
-
     // ─── Constructor ──────────────────────────────────────────────────
 
-    constructor(address _diamond, address _usdc, uint256 _baseTxLimit, uint256 _dailyTxCountLimit) {
+    constructor(
+        address _diamond,
+        address _usdc,
+        uint256 _baseTxLimit,
+        uint256 _dailyTxCountLimit
+    ) EIP712("TradeStarsOfframp", "1") {
         if (_diamond == address(0) || _usdc == address(0)) revert InvalidAddress();
         diamond = _diamond;
         usdc = _usdc;
@@ -338,9 +360,9 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
         uint256 amount,
         bytes32 currency
     ) external onlyDiamond returns (bool allowed) {
-        // Our own offramp SELL placement (userStartOfframp). The relayer already
-        // bounded the draw by maxUsdcPerOfframp + the vault balance at allocation
-        // time; per-user BUY limits do not apply.
+        // Our own offramp SELL placement (_startOfframp). The draw is already
+        // bounded by the attested voucher amount (≤ maxUsdcPerOfframp) and the
+        // proxy balance; per-user BUY limits do not apply.
         if (_offrampPlacing) return true;
 
         uint256 txLimit = getUserTxLimit(user, currency);
@@ -464,46 +486,105 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
         emit MaxUsdcPerOfframpUpdated(cap);
     }
 
-    // ─── Offramp v2: relayer allocation ───────────────────────────────
+    // ─── Offramp v3: voucher-attested single-tx redeem + draw ─────────
+
+    /// @notice Burn attestation signed off-chain by `offrampRelayer`. The
+    ///         signature authorises moving `amount` from the vault into
+    ///         `user`'s proxy exactly once (keyed on `solanaBurnTx`).
+    struct OfframpVoucher {
+        bytes32 solanaBurnTx;
+        bytes32 solanaUserPubkey;
+        address user; // Base EOA that may redeem (and whose proxy is funded)
+        uint256 amount; // USDC released from the vault, 6 decimals
+        uint256 deadline; // unix seconds; attester re-signs if it lapses
+    }
 
     /**
-     * @notice Relayer-only. After observing a Solana burn, move `amount` from
-     *         the vault into `user`'s per-user proxy and record an allocation.
-     *         This is the ONLY relayer write in the offramp path — the user
-     *         drives everything after this.
+     * @notice User-only, ONE Base tx for the whole offramp entry: verify the
+     *         attester-signed voucher, release `voucher.amount` from the vault
+     *         into the caller's own proxy (pooled with any prior balance), and
+     *         place a SELL for `principal` on the Diamond through that proxy.
+     *
+     *         `principal` may be less than `voucher.amount` (the remainder
+     *         stays pooled in the proxy) or more (if a prior balance covers
+     *         the difference) — placement is bounded only by the proxy
+     *         balance, exactly like `userStartOfframp`.
+     *
+     *         The voucher is single-use (burn-tx dedupe). Retries after a
+     *         cancel do NOT need a new voucher — the funds are already in the
+     *         proxy; call `userStartOfframp`.
      */
-    function allocateOfframp(
-        address user,
-        uint256 amount,
-        bytes32 solanaBurnTx,
-        bytes32 solanaUserPubkey
-    ) external onlyOfframpRelayer returns (uint256 allocationId) {
+    function userRedeemAndStartOfframp(
+        OfframpVoucher calldata voucher,
+        bytes calldata signature,
+        uint256 principal,
+        bytes32 currency,
+        uint256 fiatAmount,
+        uint256 circleId,
+        uint256 preferredPaymentChannelConfigId,
+        string calldata userPubKey
+    ) external returns (uint256 orderId) {
         if (!offrampEnabled) revert OfframpDisabled();
         if (address(yieldVault) == address(0)) revert VaultNotSet();
-        if (user == address(0)) revert InvalidAddress();
-        if (amount == 0) revert InvalidAmount();
-        if (solanaBurnTx == bytes32(0)) revert InvalidSolanaRecipient();
-        if (burnToAllocation[solanaBurnTx] != 0) revert BurnAlreadyProcessed();
-        if (maxUsdcPerOfframp != 0 && amount > maxUsdcPerOfframp) revert OfframpAmountTooLarge();
+        if (msg.sender != voucher.user) revert OnlyVoucherUser();
+        if (voucher.amount == 0) revert InvalidAmount();
+        if (voucher.solanaBurnTx == bytes32(0)) revert InvalidSolanaRecipient();
+        if (block.timestamp > voucher.deadline) revert VoucherExpired();
+        if (burnToAllocation[voucher.solanaBurnTx] != 0) revert BurnAlreadyProcessed();
+        if (maxUsdcPerOfframp != 0 && voucher.amount > maxUsdcPerOfframp) {
+            revert OfframpAmountTooLarge();
+        }
 
-        // Pull USDC from the vault into this integrator, then forward to the
-        // user's proxy. The vault reverts if its balance can't service this.
-        yieldVault.releaseForOfframp(amount);
-        address proxy = _ensureProxy(user);
-        IERC20(usdc).safeTransfer(proxy, amount);
+        bytes32 digest = _hashTypedDataV4(
+            keccak256(
+                abi.encode(
+                    OFFRAMP_VOUCHER_TYPEHASH,
+                    voucher.solanaBurnTx,
+                    voucher.solanaUserPubkey,
+                    voucher.user,
+                    voucher.amount,
+                    voucher.deadline
+                )
+            )
+        );
+        if (ECDSA.recover(digest, signature) != offrampRelayer) revert InvalidVoucherSignature();
 
-        allocationId = ++nextAllocationId;
+        // Reserve leg: vault → caller's proxy. The vault reverts if its
+        // balance can't service this.
+        yieldVault.releaseForOfframp(voucher.amount);
+        address proxy = _ensureProxy(voucher.user);
+        IERC20(usdc).safeTransfer(proxy, voucher.amount);
+
+        uint256 allocationId = ++nextAllocationId;
         allocations[allocationId] = OfframpAllocation({
-            user: user,
-            amount: amount,
-            solanaBurnTx: solanaBurnTx,
-            solanaUserPubkey: solanaUserPubkey,
+            user: voucher.user,
+            amount: voucher.amount,
+            solanaBurnTx: voucher.solanaBurnTx,
+            solanaUserPubkey: voucher.solanaUserPubkey,
             allocatedAt: uint64(block.timestamp)
         });
-        burnToAllocation[solanaBurnTx] = allocationId;
-        _userAllocations[user].push(allocationId);
+        burnToAllocation[voucher.solanaBurnTx] = allocationId;
+        _userAllocations[voucher.user].push(allocationId);
 
-        emit OfframpAllocated(allocationId, user, proxy, amount, solanaBurnTx, solanaUserPubkey);
+        emit OfframpAllocated(
+            allocationId,
+            voucher.user,
+            proxy,
+            voucher.amount,
+            voucher.solanaBurnTx,
+            voucher.solanaUserPubkey
+        );
+
+        // Withdraw leg: place the SELL in the same tx. Reverts here roll the
+        // reserve leg back too — the voucher stays unredeemed.
+        orderId = _startOfframp(
+            principal,
+            currency,
+            fiatAmount,
+            circleId,
+            preferredPaymentChannelConfigId,
+            userPubKey
+        );
     }
 
     // ─── Offramp v2: user-driven lifecycle ────────────────────────────
@@ -531,6 +612,27 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
         string calldata userPubKey
     ) external returns (uint256 orderId) {
         if (!offrampEnabled) revert OfframpDisabled();
+        orderId = _startOfframp(
+            principal,
+            currency,
+            fiatAmount,
+            circleId,
+            preferredPaymentChannelConfigId,
+            userPubKey
+        );
+    }
+
+    /// @dev Shared placement body for `userStartOfframp` (pooled-balance draw)
+    ///      and `userRedeemAndStartOfframp` (same draw right after the reserve
+    ///      leg funded the proxy). `msg.sender` is the drawing user in both.
+    function _startOfframp(
+        uint256 principal,
+        bytes32 currency,
+        uint256 fiatAmount,
+        uint256 circleId,
+        uint256 preferredPaymentChannelConfigId,
+        string calldata userPubKey
+    ) internal returns (uint256 orderId) {
         if (principal == 0) revert InvalidAmount();
 
         // One in-flight draw per user: the prior order must be terminal
@@ -636,6 +738,25 @@ contract TradeStarsCheckoutIntegratorV2 is IP2PIntegrator {
 
     function getAllocation(uint256 allocationId) external view returns (OfframpAllocation memory) {
         return allocations[allocationId];
+    }
+
+    /// @notice EIP-712 digest the attester must sign for `voucher`. Exposed so
+    ///         off-chain signers/tests can cross-check their typed-data hashing
+    ///         against the contract's domain (name/version/chainId/address).
+    function hashOfframpVoucher(OfframpVoucher calldata voucher) external view returns (bytes32) {
+        return
+            _hashTypedDataV4(
+                keccak256(
+                    abi.encode(
+                        OFFRAMP_VOUCHER_TYPEHASH,
+                        voucher.solanaBurnTx,
+                        voucher.solanaUserPubkey,
+                        voucher.user,
+                        voucher.amount,
+                        voucher.deadline
+                    )
+                )
+            );
     }
 
     /// @notice Principal + small-order fee the Diamond will charge for a SELL of

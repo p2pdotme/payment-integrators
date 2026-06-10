@@ -4,10 +4,10 @@ import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
 const STATUS = { PLACED: 0, ACCEPTED: 1, PAID: 2, COMPLETED: 3, CANCELLED: 4 };
 
-describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partial draws)", function () {
+describe("TradeStarsCheckoutIntegratorV2 — voucher-attested single-tx offramp", function () {
   let owner: SignerWithAddress;
   let user: SignerWithAddress;
-  let relayer: SignerWithAddress;
+  let relayer: SignerWithAddress; // the ATTESTER — only signs, never transacts
   let stranger: SignerWithAddress;
 
   let usdc: any;
@@ -75,12 +75,59 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
 
   // ─── helpers ────────────────────────────────────────────────────────
 
-  async function allocate(amount: bigint, burnHex = "ab") {
-    const tx = await integrator
-      .connect(relayer)
-      .allocateOfframp(user.address, amount, BURN(burnHex), PUBKEY);
-    const rcpt = await tx.wait();
-    const ev = rcpt.logs
+  async function now() {
+    return (await ethers.provider.getBlock("latest"))!.timestamp;
+  }
+
+  type Voucher = {
+    solanaBurnTx: string;
+    solanaUserPubkey: string;
+    user: string;
+    amount: bigint;
+    deadline: bigint;
+  };
+
+  async function makeVoucher(
+    amount: bigint,
+    burnHex = "ab",
+    overrides: Partial<Voucher> = {}
+  ): Promise<Voucher> {
+    return {
+      solanaBurnTx: BURN(burnHex),
+      solanaUserPubkey: PUBKEY,
+      user: user.address,
+      amount,
+      deadline: BigInt((await now()) + 3600),
+      ...overrides,
+    };
+  }
+
+  /** EIP-712 sign `voucher` against `ig`'s domain (default: the attester key). */
+  async function signVoucher(
+    voucher: Voucher,
+    signer: SignerWithAddress = relayer,
+    ig: any = integrator
+  ): Promise<string> {
+    const domain = {
+      name: "TradeStarsOfframp",
+      version: "1",
+      chainId: (await ethers.provider.getNetwork()).chainId,
+      verifyingContract: await ig.getAddress(),
+    };
+    const types = {
+      OfframpVoucher: [
+        { name: "solanaBurnTx", type: "bytes32" },
+        { name: "solanaUserPubkey", type: "bytes32" },
+        { name: "user", type: "address" },
+        { name: "amount", type: "uint256" },
+        { name: "deadline", type: "uint256" },
+      ],
+    };
+    return signer.signTypedData(domain, types, voucher);
+  }
+
+  function parseEvents(rcpt: any) {
+    return rcpt.logs
       .map((l: any) => {
         try {
           return integrator.interface.parseLog(l);
@@ -88,8 +135,34 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
           return null;
         }
       })
-      .find((p: any) => p?.name === "OfframpAllocated");
-    return ev.args.allocationId as bigint;
+      .filter(Boolean);
+  }
+
+  /** The single-tx entry: redeem `voucher` and place a SELL for `principal`. */
+  async function redeemAndStart(
+    voucher: Voucher,
+    principal: bigint,
+    who: SignerWithAddress = user
+  ) {
+    const sig = await signVoucher(voucher);
+    const tx = await integrator
+      .connect(who)
+      .userRedeemAndStartOfframp(voucher, sig, principal, INR, USDC(0), 1n, 0n, "userRelayPubKey");
+    const rcpt = await tx.wait();
+    const evs = parseEvents(rcpt);
+    return {
+      allocationId: evs.find((p: any) => p.name === "OfframpAllocated")!.args
+        .allocationId as bigint,
+      orderId: evs.find((p: any) => p.name === "OfframpOrderPlaced")!.args.orderId as bigint,
+    };
+  }
+
+  /** Pool USDC straight into the user's proxy. The contract's documented
+   *  source of truth for what's cashable IS the raw proxy balance, so this is
+   *  a valid setup shortcut for draw-side tests that don't exercise the
+   *  voucher/vault reserve leg. */
+  async function fundProxy(amount: bigint, who: SignerWithAddress = user) {
+    await usdc.mint(await integrator.proxyAddress(who.address), amount);
   }
 
   /** Draw `principal` from the user's pooled proxy balance (places a SELL). */
@@ -98,15 +171,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
       .connect(who)
       .userStartOfframp(principal, INR, USDC(0), 1n, 0n, "userRelayPubKey");
     const rcpt = await tx.wait();
-    const ev = rcpt.logs
-      .map((l: any) => {
-        try {
-          return integrator.interface.parseLog(l);
-        } catch {
-          return null;
-        }
-      })
-      .find((p: any) => p?.name === "OfframpOrderPlaced");
+    const ev = parseEvents(rcpt).find((p: any) => p.name === "OfframpOrderPlaced");
     return ev.args.orderId as bigint;
   }
 
@@ -135,14 +200,16 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
   });
 
-  // ─── allocateOfframp ──────────────────────────────────────────────────
+  // ─── userRedeemAndStartOfframp ────────────────────────────────────────
 
-  describe("allocateOfframp (relayer-only)", function () {
-    it("pulls from the vault and funds the user's OWN proxy", async function () {
+  describe("userRedeemAndStartOfframp (voucher-attested, one tx)", function () {
+    it("releases vault USDC to the user's OWN proxy AND places the SELL atomically", async function () {
       const offrampBefore = await vault.offrampWithdrawn();
-      const allocationId = await allocate(USDC(20));
+      const voucher = await makeVoucher(USDC(20));
+      const { allocationId, orderId } = await redeemAndStart(voucher, USDC(20));
 
       const proxy = await proxyOf();
+      // Reserve leg: vault → proxy (placement does NOT debit — only deliver does).
       expect(await usdc.balanceOf(proxy)).to.equal(USDC(20));
       expect(await vault.offrampWithdrawn()).to.equal(offrampBefore + USDC(20));
       expect(await integrator.availableOfframp(user.address)).to.equal(USDC(20));
@@ -155,48 +222,205 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
       const ids = await integrator.getUserAllocations(user.address);
       expect(ids.length).to.equal(1);
       expect(ids[0]).to.equal(allocationId);
+
+      // Withdraw leg: SELL placed in the same tx, order.user = the user's proxy.
+      const so = await mockDiamond.getSellOrder(orderId);
+      expect(so.user).to.equal(proxy);
+      expect(so.amount).to.equal(USDC(20));
+      expect(so.status).to.equal(STATUS.PLACED);
+      expect(await integrator.orderToUser(orderId)).to.equal(user.address);
+      expect(await integrator.userActiveOrder(user.address)).to.equal(orderId);
     });
 
-    it("pools multiple allocations into one proxy balance", async function () {
-      await allocate(USDC(20), "ab");
-      await allocate(USDC(30), "cd");
-      expect(await integrator.availableOfframp(user.address)).to.equal(USDC(50));
-      expect((await integrator.getUserAllocations(user.address)).length).to.equal(2);
+    it("partial first draw: remainder stays pooled in the proxy", async function () {
+      const { orderId } = await redeemAndStart(await makeVoucher(USDC(100)), USDC(30));
+      expect((await mockDiamond.getSellOrder(orderId)).amount).to.equal(USDC(30));
+      // Full 100 still in the proxy until deliver.
+      expect(await integrator.availableOfframp(user.address)).to.equal(USDC(100));
     });
 
-    it("dedupes the same burn tx", async function () {
-      await allocate(USDC(20), "ab");
+    it("can draw MORE than the voucher when a prior pooled balance covers it", async function () {
+      await fundProxy(USDC(10));
+      const { orderId } = await redeemAndStart(await makeVoucher(USDC(20), "cd"), USDC(30));
+      expect((await mockDiamond.getSellOrder(orderId)).amount).to.equal(USDC(30));
+    });
+
+    it("rejects a signature from anyone but the attester", async function () {
+      const voucher = await makeVoucher(USDC(20));
+      const sig = await signVoucher(voucher, stranger);
       await expect(
-        integrator.connect(relayer).allocateOfframp(user.address, USDC(20), BURN("ab"), PUBKEY)
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(voucher, sig, USDC(20), INR, 0n, 1n, 0n, "pk")
+      ).to.be.revertedWithCustomError(integrator, "InvalidVoucherSignature");
+    });
+
+    it("rejects a tampered voucher (amount inflated after signing)", async function () {
+      const voucher = await makeVoucher(USDC(20));
+      const sig = await signVoucher(voucher);
+      const tampered = { ...voucher, amount: USDC(90) };
+      await expect(
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(tampered, sig, USDC(20), INR, 0n, 1n, 0n, "pk")
+      ).to.be.revertedWithCustomError(integrator, "InvalidVoucherSignature");
+    });
+
+    it("rejects an expired voucher", async function () {
+      const voucher = await makeVoucher(USDC(20), "ab", {
+        deadline: BigInt((await now()) - 1),
+      });
+      const sig = await signVoucher(voucher);
+      await expect(
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(voucher, sig, USDC(20), INR, 0n, 1n, 0n, "pk")
+      ).to.be.revertedWithCustomError(integrator, "VoucherExpired");
+    });
+
+    it("dedupes the burn tx (voucher is single-use)", async function () {
+      const v1 = await makeVoucher(USDC(20), "ab");
+      const { orderId } = await redeemAndStart(v1, USDC(20));
+      // Terminate the draw so the in-flight guard isn't what trips.
+      await mockDiamond.cancelSellOrder(orderId);
+
+      const replay = await makeVoucher(USDC(20), "ab"); // same burn, fresh deadline
+      const sig = await signVoucher(replay);
+      await expect(
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(replay, sig, USDC(20), INR, 0n, 1n, 0n, "pk")
       ).to.be.revertedWithCustomError(integrator, "BurnAlreadyProcessed");
     });
 
-    it("enforces maxUsdcPerOfframp", async function () {
-      await integrator.setMaxUsdcPerOfframp(USDC(50));
+    it("only the user named in the voucher can redeem it", async function () {
+      const voucher = await makeVoucher(USDC(20));
+      const sig = await signVoucher(voucher);
       await expect(
-        integrator.connect(relayer).allocateOfframp(user.address, USDC(51), BURN("11"), PUBKEY)
+        integrator
+          .connect(stranger)
+          .userRedeemAndStartOfframp(voucher, sig, USDC(20), INR, 0n, 1n, 0n, "pk")
+      ).to.be.revertedWithCustomError(integrator, "OnlyVoucherUser");
+    });
+
+    it("enforces maxUsdcPerOfframp on the voucher amount", async function () {
+      await integrator.setMaxUsdcPerOfframp(USDC(50));
+      const voucher = await makeVoucher(USDC(51));
+      const sig = await signVoucher(voucher);
+      await expect(
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(voucher, sig, USDC(51), INR, 0n, 1n, 0n, "pk")
       ).to.be.revertedWithCustomError(integrator, "OfframpAmountTooLarge");
     });
 
-    it("only the relayer can allocate", async function () {
-      await expect(
-        integrator.connect(stranger).allocateOfframp(user.address, USDC(20), BURN("11"), PUBKEY)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOfframpRelayer");
-    });
+    it("guards: disabled / zero amount / zero burn / expired vault wiring", async function () {
+      const voucher = await makeVoucher(USDC(20));
+      const sig = await signVoucher(voucher);
 
-    it("blocked when offramp disabled", async function () {
       await integrator.setOfframpEnabled(false);
       await expect(
-        integrator.connect(relayer).allocateOfframp(user.address, USDC(20), BURN("11"), PUBKEY)
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(voucher, sig, USDC(20), INR, 0n, 1n, 0n, "pk")
       ).to.be.revertedWithCustomError(integrator, "OfframpDisabled");
+      await integrator.setOfframpEnabled(true);
+
+      const zeroAmount = await makeVoucher(0n, "a2");
+      await expect(
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(
+            zeroAmount,
+            await signVoucher(zeroAmount),
+            USDC(1),
+            INR,
+            0n,
+            1n,
+            0n,
+            "pk"
+          )
+      ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
+
+      const zeroBurn = await makeVoucher(USDC(5), "a3", { solanaBurnTx: ethers.ZeroHash });
+      await expect(
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(
+            zeroBurn,
+            await signVoucher(zeroBurn),
+            USDC(5),
+            INR,
+            0n,
+            1n,
+            0n,
+            "pk"
+          )
+      ).to.be.revertedWithCustomError(integrator, "InvalidSolanaRecipient");
+    });
+
+    it("a revert in the placement leg rolls back the reserve leg (voucher stays unredeemed)", async function () {
+      const voucher = await makeVoucher(USDC(20));
+      const sig = await signVoucher(voucher);
+      // principal 0 → placement leg reverts InvalidAmount → WHOLE tx reverts.
+      await expect(
+        integrator.connect(user).userRedeemAndStartOfframp(voucher, sig, 0n, INR, 0n, 1n, 0n, "pk")
+      ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
+      // Nothing was consumed: no allocation, no vault draw, voucher reusable.
+      expect(await integrator.burnToAllocation(voucher.solanaBurnTx)).to.equal(0n);
+      expect(await integrator.availableOfframp(user.address)).to.equal(0n);
+      const { orderId } = await redeemAndStart(voucher, USDC(20));
+      expect((await mockDiamond.getSellOrder(orderId)).amount).to.equal(USDC(20));
+    });
+
+    it("blocked while a prior draw is still in flight (second voucher untouched)", async function () {
+      await redeemAndStart(await makeVoucher(USDC(20), "ab"), USDC(20));
+      const v2 = await makeVoucher(USDC(10), "cd");
+      const sig2 = await signVoucher(v2);
+      await expect(
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(v2, sig2, USDC(10), INR, 0n, 1n, 0n, "pk")
+      ).to.be.revertedWithCustomError(integrator, "OfframpInFlight");
+      expect(await integrator.burnToAllocation(v2.solanaBurnTx)).to.equal(0n);
+    });
+
+    it("hashOfframpVoucher matches ethers' typed-data digest", async function () {
+      const voucher = await makeVoucher(USDC(20));
+      const domain = {
+        name: "TradeStarsOfframp",
+        version: "1",
+        chainId: (await ethers.provider.getNetwork()).chainId,
+        verifyingContract: await integrator.getAddress(),
+      };
+      const types = {
+        OfframpVoucher: [
+          { name: "solanaBurnTx", type: "bytes32" },
+          { name: "solanaUserPubkey", type: "bytes32" },
+          { name: "user", type: "address" },
+          { name: "amount", type: "uint256" },
+          { name: "deadline", type: "uint256" },
+        ],
+      };
+      expect(await integrator.hashOfframpVoucher(voucher)).to.equal(
+        ethers.TypedDataEncoder.hash(domain, types, voucher)
+      );
+    });
+
+    it("vouchers pool across burns into one proxy balance", async function () {
+      const { orderId } = await redeemAndStart(await makeVoucher(USDC(20), "ab"), USDC(5));
+      await mockDiamond.cancelSellOrder(orderId); // free the in-flight slot
+      await redeemAndStart(await makeVoucher(USDC(30), "cd"), USDC(10));
+      expect(await integrator.availableOfframp(user.address)).to.equal(USDC(50));
+      expect((await integrator.getUserAllocations(user.address)).length).to.equal(2);
     });
   });
 
   // ─── userStartOfframp ─────────────────────────────────────────────────
 
-  describe("userStartOfframp (user draws a SELL from the pool)", function () {
+  describe("userStartOfframp (retry / subsequent draws from the pool)", function () {
     it("places a SELL whose order.user is the user's OWN proxy (history attribution)", async function () {
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       const orderId = await startOfframp(USDC(20));
 
       const proxy = await proxyOf();
@@ -211,7 +435,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     it("bypasses BUY limits for the offramp SELL (validateOrder bypass)", async function () {
       // baseTxLimit = 50 USDC; a draw of 70 would FAIL the buy limit if
       // validateOrder didn't bypass for our own placement.
-      await allocate(USDC(70), "11");
+      await fundProxy(USDC(70));
       const proxy = await proxyOf();
       const orderId = await startOfframp(USDC(70));
       const so = await mockDiamond.getSellOrder(orderId);
@@ -220,28 +444,28 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
 
     it("rejects a zero principal", async function () {
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       await expect(
         integrator.connect(user).userStartOfframp(0n, INR, 0n, 1n, 0n, "pk")
       ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
     });
 
     it("rejects a draw with no proxy balance (insufficient)", async function () {
-      // stranger has never been allocated → empty proxy.
+      // stranger has never been funded → empty proxy.
       await expect(
         integrator.connect(stranger).userStartOfframp(USDC(5), INR, 0n, 1n, 0n, "pk")
       ).to.be.revertedWithCustomError(integrator, "OfframpInsufficientBalance");
     });
 
     it("rejects a draw larger than the pooled balance", async function () {
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       await expect(
         integrator.connect(user).userStartOfframp(USDC(21), INR, 0n, 1n, 0n, "pk")
       ).to.be.revertedWithCustomError(integrator, "OfframpInsufficientBalance");
     });
 
     it("rejects a second draw while one is still in flight", async function () {
-      await allocate(USDC(50));
+      await fundProxy(USDC(50));
       await startOfframp(USDC(20));
       await expect(
         integrator.connect(user).userStartOfframp(USDC(20), INR, 0n, 1n, 0n, "pk")
@@ -253,7 +477,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
 
   describe("partial draws (100 cashed out in parts)", function () {
     it("draws 30 + 40 + 30 sequentially, balance ticks down to 0", async function () {
-      await allocate(USDC(100));
+      await fundProxy(USDC(100));
       const proxy = await proxyOf();
 
       await completeDraw(USDC(30));
@@ -268,7 +492,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
 
     it("a draw only debits the proxy at deliver (PAID), not at placement", async function () {
-      await allocate(USDC(100));
+      await fundProxy(USDC(100));
       const proxy = await proxyOf();
       const orderId = await startOfframp(USDC(30));
       // Placed but not delivered — proxy still holds the full pool.
@@ -290,22 +514,36 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
 
     it("rejects withdrawing the full balance when a fee applies (needs principal+fee)", async function () {
-      await allocate(USDC(10)); // exactly the threshold → fee applies
+      await fundProxy(USDC(10)); // exactly the threshold → fee applies
       // principal 10 + fee 0.125 = 10.125 > 10 available.
       await expect(
         integrator.connect(user).userStartOfframp(USDC(10), INR, 0n, 1n, 0n, "pk")
       ).to.be.revertedWithCustomError(integrator, "OfframpInsufficientBalance");
     });
 
+    it("the redeem path enforces principal+fee too (one-tx flow, same guard)", async function () {
+      const voucher = await makeVoucher(USDC(10));
+      const sig = await signVoucher(voucher);
+      await expect(
+        integrator
+          .connect(user)
+          .userRedeemAndStartOfframp(voucher, sig, USDC(10), INR, 0n, 1n, 0n, "pk")
+      ).to.be.revertedWithCustomError(integrator, "OfframpInsufficientBalance");
+      // Rolled back whole: voucher unredeemed, drawable later at 9.875.
+      expect(await integrator.burnToAllocation(voucher.solanaBurnTx)).to.equal(0n);
+      const { orderId } = await redeemAndStart(voucher, USDC("9.875"));
+      expect((await mockDiamond.getSellOrder(orderId)).amount).to.equal(USDC("9.875"));
+    });
+
     it("allows the largest draw that leaves room for the fee", async function () {
-      await allocate(USDC(10));
+      await fundProxy(USDC(10));
       // 9.875 + 0.125 = 10 exactly.
       const orderId = await startOfframp(USDC("9.875"));
       expect((await mockDiamond.getSellOrder(orderId)).amount).to.equal(USDC("9.875"));
     });
 
     it("deliver debits principal + fee from the proxy", async function () {
-      await allocate(USDC(12));
+      await fundProxy(USDC(12));
       const proxy = await proxyOf();
       const orderId = await startOfframp(USDC(5)); // 5 <= 10 → fee 0.125
       await mockDiamond.acceptSellOrder(orderId, "mp");
@@ -315,7 +553,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
 
     it("no fee above the threshold", async function () {
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       const proxy = await proxyOf();
       await completeDraw(USDC(15)); // 15 > 10 → fee 0
       expect(await usdc.balanceOf(proxy)).to.equal(USDC(5));
@@ -329,9 +567,8 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
   // ─── full happy path ──────────────────────────────────────────────────
 
   describe("userDeliverOfframpUpi → COMPLETED", function () {
-    it("delivers UPI (Diamond pulls from the proxy) then completes", async function () {
-      await allocate(USDC(20));
-      const orderId = await startOfframp(USDC(20));
+    it("single-tx entry → deliver (Diamond pulls from the proxy) → complete", async function () {
+      const { orderId } = await redeemAndStart(await makeVoucher(USDC(20)), USDC(20));
       const proxy = await proxyOf();
 
       await mockDiamond.acceptSellOrder(orderId, "merchantPubKey");
@@ -349,7 +586,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
 
     it("reverts OfframpFeeNotReady when actualUsdtAmount is 0", async function () {
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       const orderId = await startOfframp(USDC(20));
       await mockDiamond.acceptSellOrder(orderId, "mp");
       await mockDiamond.setAdditionalOrderDetailsFeeUnready(true);
@@ -359,7 +596,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
 
     it("only the order owner can deliver", async function () {
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       const orderId = await startOfframp(USDC(20));
       await mockDiamond.acceptSellOrder(orderId, "mp");
       await expect(
@@ -370,10 +607,11 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
 
   // ─── cancel → retry from the proxy balance ────────────────────────────
 
-  describe("cancel → user retries from the proxy balance", function () {
+  describe("cancel → user retries from the proxy balance (NO new voucher)", function () {
     it("a cancelled order leaves USDC in the proxy; user re-draws and completes", async function () {
-      await allocate(USDC(20));
-      const orderId = await startOfframp(USDC(20));
+      // Full lifecycle from the real single-tx entry — the retry never
+      // touches the voucher again.
+      const { orderId } = await redeemAndStart(await makeVoucher(USDC(20)), USDC(20));
       const proxy = await proxyOf();
 
       await mockDiamond.acceptSellOrder(orderId, "mp");
@@ -399,7 +637,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
 
     it("allows a new draw after a cancel even without calling syncOfframp", async function () {
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       const orderId = await startOfframp(USDC(20));
       await mockDiamond.cancelSellOrder(orderId); // PLACED → CANCELLED, no refund needed
       // No syncOfframp; userStartOfframp tolerates a terminal prior order.
@@ -408,7 +646,7 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     });
 
     it("syncOfframp reverts on a non-terminal order", async function () {
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       const orderId = await startOfframp(USDC(20));
       await expect(integrator.syncOfframp(orderId)).to.be.revertedWithCustomError(
         integrator,
@@ -560,20 +798,8 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
       expect(await integrator.getTodayCount(user.address)).to.equal(0n);
     });
 
-    it("allocateOfframp guards: InvalidAddress / InvalidAmount / bad burn", async function () {
-      await expect(
-        integrator.connect(relayer).allocateOfframp(ethers.ZeroAddress, USDC(1), BURN("a1"), PUBKEY)
-      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
-      await expect(
-        integrator.connect(relayer).allocateOfframp(user.address, 0n, BURN("a2"), PUBKEY)
-      ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
-      await expect(
-        integrator.connect(relayer).allocateOfframp(user.address, USDC(1), ethers.ZeroHash, PUBKEY)
-      ).to.be.revertedWithCustomError(integrator, "InvalidSolanaRecipient");
-    });
-
     it("userStartOfframp blocked when offramp disabled", async function () {
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       await integrator.setOfframpEnabled(false);
       await expect(
         integrator.connect(user).userStartOfframp(USDC(5), INR, 0n, 1n, 0n, "pk")
@@ -593,12 +819,12 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
     it("_sellFee falls back to the unified getter when the per-type SELL getter reverts", async function () {
       await mockDiamond.setSmallOrderConfig(INR, USDC(10), USDC("0.125"));
       await mockDiamond.setSellFeeGetterReverts(true);
-      await allocate(USDC(20));
+      await fundProxy(USDC(20));
       const orderId = await startOfframp(USDC(5)); // 5<=10 → fee via fallback; 5.125<=20 places
       expect((await mockDiamond.getSellOrder(orderId)).amount).to.equal(USDC(5));
     });
 
-    it("allocate reverts VaultNotSet, and onOrderComplete skips deposit when no vault is set", async function () {
+    it("redeem reverts VaultNotSet, and onOrderComplete skips deposit when no vault is set", async function () {
       const Integrator = await ethers.getContractFactory("TradeStarsCheckoutIntegratorV2");
       const ig2 = await Integrator.deploy(
         await mockDiamond.getAddress(),
@@ -609,8 +835,10 @@ describe("TradeStarsCheckoutIntegratorV2 — user-driven offramp (pooled, partia
       await mockDiamond.registerIntegrator(await ig2.getAddress(), await ig2.proxyImpl());
       await ig2.setOfframpEnabled(true);
       await ig2.setOfframpRelayer(relayer.address);
+      const voucher = await makeVoucher(USDC(5), "b1");
+      const sig = await signVoucher(voucher, relayer, ig2);
       await expect(
-        ig2.connect(relayer).allocateOfframp(user.address, USDC(5), BURN("b1"), PUBKEY)
+        ig2.connect(user).userRedeemAndStartOfframp(voucher, sig, USDC(5), INR, 0n, 1n, 0n, "pk")
       ).to.be.revertedWithCustomError(ig2, "VaultNotSet");
       const oid = await placeBuy(USDC(10), "55", ig2);
       await mockDiamond.adminCallOnOrderComplete(
