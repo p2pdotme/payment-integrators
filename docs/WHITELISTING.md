@@ -41,7 +41,7 @@ Use the **"Whitelist request"** issue template. Required fields:
 - **Network**: `base` or `baseSepolia`
 - **Integrator address**: `0x...`
 - **Pinned `proxyImpl`**: `0x...` — output of `cast call <integrator> "proxyImpl()(address)" --rpc-url <rpc>`
-- **`usdcThroughIntegrator`**: `true` or `false` — pinned at registration. `true` routes BUY proceeds to the integrator on completion (e.g. LotPot, TradeStars); `false` routes direct to the order's `recipientAddr`. Must match what the integrator's `onOrderComplete` was coded to expect.
+- **`usdcThroughIntegrator`**: `true` or `false` — pinned at registration. `true` routes BUY proceeds to the integrator on completion (e.g. LotPot); `false` routes direct to the order's `recipientAddr`. Must match what the integrator's `onOrderComplete` was coded to expect.
 - **Deployer address**: `0x...`
 - **Merged commit hash**: short SHA, e.g. `8f89206`
 - **Bytecode hash**: `keccak256(<runtime bytecode>)` — paste output of `cast code <addr> | cast keccak`
