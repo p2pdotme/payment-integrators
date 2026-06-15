@@ -663,8 +663,9 @@ contract MarketplaceCheckoutIntegrator is IP2PIntegrator {
      * @notice Forward an encrypted UPI payload to the Diamond. Triggers the
      *         PAID transition (Diamond pulls USDC from this integrator).
      *         Callable by the original initiator (the user) or the configured
-     *         relayer — TradeStars-style integrations would use the relayer
-     *         path; the marketplace flow uses the user path.
+     *         relayer — relayer-driven integrations (users with no Base
+     *         identity) use the relayer path; the marketplace flow uses the
+     *         user path.
      */
     function deliverOfframpUpi(uint256 orderId, string calldata encUpi) external {
         OfframpRecord memory r = offramps[orderId];

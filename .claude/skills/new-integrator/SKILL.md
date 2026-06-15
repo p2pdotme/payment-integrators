@@ -43,7 +43,6 @@ Ask the user, one question at a time, with sensible defaults. Show the default i
 2. **Upstream flavor** — pick one:
    - `example` — direct fulfillment, no upstream protocol. Use [ExampleIntegrator](../../../contracts/integrators/ExampleIntegrator.sol) as the reference.
    - `lotpot` — credit/redemption pattern (USDC strands on proxy until upstream call succeeds). Use [LotPotCheckoutIntegrator](../../../contracts/integrators/lotpot/LotPotCheckoutIntegrator.sol) as the reference.
-   - `tradestars` — vault-backed offramp (40/60 split, Aave yield). Use [TradeStarsCheckoutIntegrator](../../../contracts/integrators/tradestars/TradeStarsCheckoutIntegrator.sol) as the reference.
    - `custom` — keep the bare template TODOs intact, let the user fill them in.
 3. **USDC routing** — `usdcThroughIntegrator: true | false`. Default `true` for `example` / `lotpot` flavor, `false` for direct-to-`recipientAddr` flows. Warn the user that this value is pinned at `registerIntegrator` time and cannot be changed without re-registration.
 4. **Maintainer contact** — email or GitHub handle that goes in the docs page and (later) the whitelist request issue. Default to the `dev@p2p.me` alias used elsewhere in the repo.
@@ -58,10 +57,10 @@ Start from `contracts/templates/MyIntegrator.sol`. Substitute:
 
 - Contract name `MyIntegrator` → the resolved Solidity name.
 - Update the NatSpec `@title` and `@notice` to describe THIS integrator (not the template).
-- For `example`/`lotpot`/`tradestars` flavors, replace the TODO blocks with the corresponding sections from the reference contract. **Read the reference file in full**, port only what's relevant (don't blindly copy storage layouts or events for unrelated flows), and keep imports limited to what's actually used.
+- For `example`/`lotpot` flavors, replace the TODO blocks with the corresponding sections from the reference contract. **Read the reference file in full**, port only what's relevant (don't blindly copy storage layouts or events for unrelated flows), and keep imports limited to what's actually used.
 - For `custom`, keep the TODO blocks in place and add a one-line comment at the top: `// SCAFFOLDED BY /new-integrator — fill in TODOs before review.`
 - SPDX line must be `// SPDX-License-Identifier: Apache-2.0` — this is non-negotiable for the repo and is what CI checks.
-- Pragma `^0.8.20` unless the user explicitly needs a newer version (warn if they ask for `^0.8.28` — it works but only the TradeStars flow currently uses it, see CONTRIBUTING.md §Code).
+- Pragma `^0.8.20` unless the user explicitly needs a newer version (see CONTRIBUTING.md §Code).
 
 ### `test/<kebab>-integrator.test.ts`
 
@@ -80,7 +79,7 @@ Reference: [scripts/deploy-example.ts](../../../scripts/deploy-example.ts). Gene
 
 ### `docs/integrators/<kebab>.md`
 
-Reference: [docs/integrators/example.md](../../../docs/integrators/example.md) and [docs/integrators/tradestars.md](../../../docs/integrators/tradestars.md) for tone. Generate a docs page that answers:
+Reference: [docs/integrators/example.md](../../../docs/integrators/example.md) for tone. Generate a docs page that answers:
 - What product / business client this integrator serves
 - External protocols + addresses (mainnet + Sepolia) — leave `<TBD>` placeholders if the user doesn't have addresses yet
 - Order lifecycle from the user's POV
