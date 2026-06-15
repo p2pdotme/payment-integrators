@@ -138,6 +138,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     mapping(address => bool) public registered;
     mapping(uint256 => address) public orderToMerchant;
     mapping(uint256 => PendingWithdrawal) public withdrawals;
+    /// @notice proxy address => the EOA it was deployed for. Set in
+    ///         _ensureProxy. Lets validateOrder recognize a SELL placed by one
+    ///         of our own merchant proxies (the carve-out) without trusting a
+    ///         caller-supplied address.
+    mapping(address => address) public proxyMerchant;
 
     // ─── Reentrancy guard ─────────────────────────────────────────────
     uint256 private _locked = 1;
@@ -192,10 +197,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint256 amount,
         bytes32 /* currency */
     ) external onlyDiamond returns (bool allowed) {
-        // SELL self-call: order.user is the system proxy (owned by this
-        // integrator). Withdrawal limits were enforced at the withdraw entry
-        // point; merchant buy-side limits do not apply here.
-        if (user == proxyAddress(address(this))) return true;
+        // SELL self-call: order.user is a merchant's own proxy (owned by this
+        // integrator), used as the placer for INR withdrawals. Withdrawal
+        // limits were already enforced at the withdraw entry point, so merchant
+        // buy-side limits do not apply here. proxyMerchant is set only for
+        // proxies this contract deployed, so an arbitrary address cannot spoof
+        // the carve-out.
+        if (proxyMerchant[user] != address(0)) return true;
 
         if (!registered[user]) revert NotRegistered();
         Merchant storage m = merchants[user];
@@ -281,21 +289,26 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     // ─── Withdrawals ──────────────────────────────────────────────────
 
     /// @notice Withdraw unlocked USDC as INR to the merchant's saved UPI.
-    ///         Places a SELL order through the system proxy (order.user =
-    ///         system proxy) funded at placement; the Diamond pulls the USDC
-    ///         from the proxy during settlement. The withdrawal is tracked so
-    ///         a Diamond-side cancellation can be reconciled (funds returned).
+    ///         Places a SELL order through the MERCHANT'S OWN proxy (order.user
+    ///         = merchant proxy) funded at placement; the Diamond pulls the
+    ///         USDC from the proxy during settlement. Each merchant uses their
+    ///         own proxy so in-flight withdrawal funds are physically isolated
+    ///         per merchant — a cancellation of one merchant's order can never
+    ///         touch another merchant's parked funds. The withdrawal is tracked
+    ///         so a Diamond-side cancellation can be reconciled (funds returned).
     function withdrawINR(uint256 amount) external nonReentrant returns (uint256 orderId) {
         Merchant storage m = _checkWithdraw(amount);
         _deductUnlocked(m, amount);
 
-        address sysProxy = _ensureProxy(address(this));
-        usdc.safeTransfer(sysProxy, amount);
+        // Per-merchant proxy: funds for THIS merchant's SELL sit only on the
+        // merchant's own proxy, never commingled with other merchants'.
+        address merchantProxy = _ensureProxy(msg.sender);
+        usdc.safeTransfer(merchantProxy, amount);
         bytes memory data = abi.encodeCall(
             IB2BGateway.placeB2BSellOrder,
-            (sysProxy, amount, bytes32("INR"), m.upiId, 0, 0, 0)
+            (merchantProxy, amount, bytes32("INR"), m.upiId, 0, 0, 0)
         );
-        bytes memory result = UserProxy(sysProxy).execute(diamond, data, address(usdc), 0);
+        bytes memory result = UserProxy(merchantProxy).execute(diamond, data, address(usdc), 0);
         orderId = abi.decode(result, (uint256));
 
         withdrawals[orderId] = PendingWithdrawal({
@@ -319,42 +332,52 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     }
 
     /// @notice Recover an INR withdrawal whose SELL order the Diamond
-    ///         cancelled. Reads the authoritative status from the Diamond
-    ///         (not a caller argument), sweeps the refunded USDC off the
-    ///         system proxy, and re-credits the merchant as a fresh unlocked
-    ///         bucket. Permissionless on purpose — anyone can trigger
-    ///         recovery; the merchant is the only beneficiary.
+    ///         cancelled WITHOUT the merchant receiving fiat. Reads the
+    ///         authoritative order from the Diamond (not a caller argument),
+    ///         sweeps the refunded USDC off the MERCHANT'S OWN proxy, and
+    ///         re-credits that merchant. Permissionless on purpose — anyone
+    ///         can trigger recovery; the merchant is the only beneficiary.
+    ///
+    ///         Two safety properties vs. a naive "status == CANCELLED" check:
+    ///         (1) funds are read from the merchant's own proxy, so attribution
+    ///         is exact — no other merchant's parked funds can be swept; and
+    ///         (2) we refuse to re-credit an order that shows evidence of fiat
+    ///         delivery (an open/closed dispute), which would otherwise let a
+    ///         merchant keep the INR AND reclaim USDC.
     function reconcileWithdrawal(uint256 orderId) external nonReentrant {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
 
-        uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
-        if (status != STATUS_CANCELLED) revert WithdrawalNotCancellable();
+        IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
+        if (order.status != STATUS_CANCELLED) revert WithdrawalNotCancellable();
+        // Guard against double-spend: an order that carries any dispute may
+        // have had fiat delivered to the merchant's UPI before cancellation.
+        // Refuse to re-credit USDC in that case — the merchant already got INR.
+        if (order.disputeInfo.status != 0 || order.disputeInfo.raisedBy != 0)
+            revert WithdrawalNotCancellable();
 
         w.settled = true;
 
-        // The cancelled order's USDC sits on the system proxy (funded at
-        // placement; the Diamond refunds there on cancel-while-PAID). Sweep
-        // back exactly this withdrawal's amount — never the whole proxy
-        // balance, since multiple in-flight withdrawals share one system
-        // proxy and sweeping all of it would let one reconcile steal another
-        // withdrawal's funds. Cap by the proxy's actual balance as a floor
-        // guard so a partial refund can't underflow the transfer.
-        address sysProxy = _ensureProxy(address(this));
-        uint256 proxyBal = usdc.balanceOf(sysProxy);
-        uint256 recover = w.amount < proxyBal ? w.amount : proxyBal;
-        if (recover > 0) {
-            UserProxy(sysProxy).transferERC20ToIntegrator(address(usdc), recover);
+        // The cancelled order's USDC sits on the MERCHANT'S OWN proxy (funded
+        // at placement; the Diamond refunds there on cancel). Because the proxy
+        // is per-merchant, its balance is unambiguously this merchant's — no
+        // cross-merchant attribution problem. Cap by the recorded amount and by
+        // the proxy's actual balance (floor guard against a partial refund).
+        address merchantProxy = _ensureProxy(w.merchant);
+        uint256 proxyBal = usdc.balanceOf(merchantProxy);
+        uint256 recovered = w.amount < proxyBal ? w.amount : proxyBal;
+        if (recovered > 0) {
+            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), recovered);
         }
 
         // Re-credit the merchant exactly what was recovered for their order.
         // Already past settlement (they withdrew from unlocked funds), so
         // unlock immediately. unlockTimestamp must be strictly < now to count
         // as available in getMerchantBalance, so use block.timestamp - 1.
-        _creditBucket(merchants[w.merchant], recover, block.timestamp - 1);
+        _creditBucket(merchants[w.merchant], recovered, block.timestamp - 1);
 
-        emit WithdrawalReconciled(w.merchant, orderId, recover);
+        emit WithdrawalReconciled(w.merchant, orderId, recovered);
     }
 
     /// @notice Mark an INR withdrawal as successfully completed (frees the
@@ -377,29 +400,32 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (amount == 0) revert NothingToWithdraw();
     }
 
-    /// @dev Append an unlocked/locked bucket, compacting any fully-spent
-    ///      leading buckets first so the array stays bounded by MAX_BUCKETS.
+    /// @dev Append an unlocked/locked bucket, compacting fully-spent buckets
+    ///      first so the array stays bounded by MAX_BUCKETS.
     function _creditBucket(Merchant storage m, uint256 amount, uint256 unlockTimestamp) internal {
         _compact(m);
         if (m.buckets.length >= MAX_BUCKETS) revert TooManyBuckets();
         m.buckets.push(SettlementBucket({ amount: amount, unlockTimestamp: unlockTimestamp }));
     }
 
-    /// @dev Removes fully-spent buckets from the front of the array. Buckets
-    ///      are spent oldest-first, so zeros cluster at the head — a single
-    ///      shift-and-pop pass keeps the array compact in O(live buckets).
+    /// @dev Removes ALL fully-spent (amount == 0) buckets, preserving order of
+    ///      the live ones. A stable compaction: spent buckets can appear
+    ///      anywhere (a locked bucket can sit in front of a spent unlocked
+    ///      one), so a head-only pass would leave interior zeros and let the
+    ///      array drift toward MAX_BUCKETS. This pass reclaims every zero.
     function _compact(Merchant storage m) internal {
         uint256 len = m.buckets.length;
-        uint256 firstLive = 0;
-        while (firstLive < len && m.buckets[firstLive].amount == 0) {
-            firstLive++;
+        uint256 write = 0;
+        for (uint256 read = 0; read < len; read++) {
+            if (m.buckets[read].amount != 0) {
+                if (write != read) {
+                    m.buckets[write] = m.buckets[read];
+                }
+                write++;
+            }
         }
-        if (firstLive == 0) return;
-        uint256 newLen = len - firstLive;
-        for (uint256 i = 0; i < newLen; i++) {
-            m.buckets[i] = m.buckets[i + firstLive];
-        }
-        for (uint256 i = 0; i < firstLive; i++) {
+        // Pop the tail left after compaction (len - write spent slots).
+        while (m.buckets.length > write) {
             m.buckets.pop();
         }
     }
@@ -519,6 +545,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
                 _salt(user)
             );
             assert(deployed == proxy);
+            // Record proxy => owner so validateOrder can recognize a SELL
+            // placed by one of our own merchant proxies.
+            proxyMerchant[proxy] = user;
             emit UserProxyDeployed(user, proxy);
         }
     }

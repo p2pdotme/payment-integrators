@@ -182,16 +182,17 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     );
   });
 
-  it("9. withdrawINR succeeds after 30 days (funds the system proxy, places SELL order)", async function () {
+  it("9. withdrawINR succeeds after 30 days (funds the merchant proxy, places SELL order)", async function () {
     await depositFor(merchant1, UPI_1, 2);
     await increaseTime(SETTLEMENT + 3600);
 
-    const sysProxy = await integrator.proxyAddress(await integrator.getAddress());
+    // SELL is placed through the MERCHANT'S OWN proxy now (per-merchant isolation)
+    const merchantProxy = await integrator.proxyAddress(merchant1.address);
     await expect(integrator.connect(merchant1).withdrawINR(USDC(20))).to.emit(
       integrator,
       "WithdrawalINR"
     );
-    expect(await mockUsdc.balanceOf(sysProxy)).to.equal(USDC(20));
+    expect(await mockUsdc.balanceOf(merchantProxy)).to.equal(USDC(20));
     expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(0);
 
     const [pending, available] = await integrator.getMerchantBalance(merchant1.address);
@@ -199,7 +200,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     expect(available).to.equal(0);
 
     const sellOrder = await mockDiamond.getSellOrder(2);
-    expect(sellOrder.user).to.equal(sysProxy);
+    expect(sellOrder.user).to.equal(merchantProxy);
     expect(sellOrder.amount).to.equal(USDC(20));
   });
 
@@ -416,13 +417,13 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         .find((l: any) => l?.name === "WithdrawalINR");
       const orderId = ev.args.orderId;
 
-      // merchant balance is zero, funds parked on system proxy at placement
+      // merchant balance is zero, funds parked on the MERCHANT'S OWN proxy
       expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(0);
-      const sysProxy = await integrator.proxyAddress(await integrator.getAddress());
-      expect(await mockUsdc.balanceOf(sysProxy)).to.equal(USDC(20));
+      const merchantProxy = await integrator.proxyAddress(merchant1.address);
+      expect(await mockUsdc.balanceOf(merchantProxy)).to.equal(USDC(20));
 
       // Diamond cancels the sell order (PLACED -> CANCELLED). Our integrator
-      // funded the proxy at placement, so the USDC sits on the proxy and
+      // funded the merchant proxy at placement, so the USDC sits there and
       // reconcileWithdrawal sweeps it back.
       await mockDiamond.cancelSellOrder(orderId);
       expect((await mockDiamond.getOrdersById(orderId)).status).to.equal(4); // CANCELLED
@@ -437,9 +438,10 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(USDC(20));
     });
 
-    it("two in-flight INR withdrawals on the shared proxy reconcile independently (no cross-steal)", async function () {
-      // m1 and m2 both withdraw INR; both fund the same system proxy.
-      // Cancelling m1's order must recover only m1's amount, leaving m2's intact.
+    it("two in-flight INR withdrawals are physically isolated on per-merchant proxies (no cross-steal)", async function () {
+      // m1 and m2 each withdraw INR; each funds their OWN proxy. Cancelling
+      // m1's order recovers only m1's funds; m2's are on a different proxy and
+      // cannot be touched — isolation is now structural, not amount-capped.
       await depositFor(merchant1, UPI_1, 2); // m1: 20
       await integrator.connect(merchant2).registerMerchant(UPI_2);
       const o2 = await placeOrder(merchant2, 3); // m2: 30
@@ -464,8 +466,11 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       );
       await grab(await integrator.connect(merchant2).withdrawINR(USDC(30)), "WithdrawalINR");
 
-      const sysProxy = await integrator.proxyAddress(await integrator.getAddress());
-      expect(await mockUsdc.balanceOf(sysProxy)).to.equal(USDC(50)); // both parked
+      const proxy1 = await integrator.proxyAddress(merchant1.address);
+      const proxy2 = await integrator.proxyAddress(merchant2.address);
+      // funds are on SEPARATE proxies — never commingled
+      expect(await mockUsdc.balanceOf(proxy1)).to.equal(USDC(20));
+      expect(await mockUsdc.balanceOf(proxy2)).to.equal(USDC(30));
 
       // cancel + reconcile only m1's
       await mockDiamond.cancelSellOrder(id1);
@@ -473,10 +478,11 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         .to.emit(integrator, "WithdrawalReconciled")
         .withArgs(merchant1.address, id1, USDC(20));
 
-      // m1 got exactly 20 back; m2 untouched (still 0 available, funds on proxy)
+      // m1 got exactly 20 back from m1's proxy; m2's proxy is completely untouched
       expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(20));
       expect((await integrator.getMerchantBalance(merchant2.address))[1]).to.equal(0);
-      expect(await mockUsdc.balanceOf(sysProxy)).to.equal(USDC(30)); // m2's still parked
+      expect(await mockUsdc.balanceOf(proxy1)).to.equal(0); // swept back
+      expect(await mockUsdc.balanceOf(proxy2)).to.equal(USDC(30)); // m2's untouched
     });
 
     it("reconcileWithdrawal reverts for a non-cancelled order", async function () {
@@ -547,6 +553,34 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       const buckets = await integrator.getMerchantBuckets(merchant1.address);
       expect(buckets.length).to.equal(1);
       expect(buckets[0].amount).to.equal(USDC(10));
+    });
+
+    it("compaction reclaims a spent bucket sitting BEHIND a still-locked bucket", async function () {
+      await integrator.connect(merchant1).registerMerchant(UPI_1);
+      // bucket A (will unlock), then bucket B (stays locked, sits in front of A
+      // chronologically? no — A is older). Build: old unlocked A + newer locked B,
+      // spend A fully, then deposit C. Interior zero (A) must be reclaimed even
+      // though it is followed by locked B.
+      let o = await placeOrder(merchant1, 1); // A = 10
+      await mockDiamond.simulateOrderComplete(o);
+      await increaseTime(SETTLEMENT + 100); // A now unlocked
+      o = await placeOrder(merchant1, 2); // B = 20, locked (fresh 30-day)
+      await mockDiamond.simulateOrderComplete(o);
+
+      // spend A fully (10 unlocked available) -> A becomes a zero bucket at index 0,
+      // B (locked) at index 1
+      await integrator.connect(merchant1).withdrawUSDC(USDC(10));
+
+      // deposit C -> _creditBucket compacts; A's zero must be removed
+      o = await placeOrder(merchant1, 1); // C = 10
+      await mockDiamond.simulateOrderComplete(o);
+
+      const buckets = await integrator.getMerchantBuckets(merchant1.address);
+      // should be exactly [B=20 locked, C=10 locked] — A reclaimed, no zeros
+      expect(buckets.length).to.equal(2);
+      for (const b of buckets) expect(b.amount).to.not.equal(0n);
+      const total = buckets.reduce((s: bigint, b: any) => s + b.amount, 0n);
+      expect(total).to.equal(USDC(30));
     });
   });
 
