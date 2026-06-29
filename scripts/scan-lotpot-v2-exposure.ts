@@ -20,11 +20,12 @@ async function findDeployBlock(addr: string, latest: number): Promise<number> {
   return lo;
 }
 
-async function getLogsChunked(addr: string, topic: string, from: number, to: number) {
+async function getLogsChunked(addr: string, topic: string, from: number, to: number, label = "") {
   const p = ethers.provider;
   const out: any[] = [];
-  let step = 40000;
+  let step = 9000;
   let start = from;
+  const total = to - from + 1;
   while (start <= to) {
     const end = Math.min(start + step - 1, to);
     try {
@@ -35,9 +36,11 @@ async function getLogsChunked(addr: string, topic: string, from: number, to: num
         toBlock: end,
       });
       out.push(...logs);
+      const pct = Math.floor(((end - from) / total) * 100);
+      console.log(`  [${label}] ${pct}% (block ${end}/${to}), ${out.length} logs so far`);
       start = end + 1;
     } catch (e: any) {
-      if (step > 1000) {
+      if (step > 500) {
         step = Math.floor(step / 2);
         continue;
       }
@@ -64,8 +67,8 @@ async function main() {
 
   console.log("\nscanning CreditIssued + UserProxyDeployed logs…");
   const [creditLogs, proxyLogs] = await Promise.all([
-    getLogsChunked(V2, creditTopic, deployBlock, latest),
-    getLogsChunked(V2, proxyTopic, deployBlock, latest),
+    getLogsChunked(V2, creditTopic, deployBlock, latest, "CreditIssued"),
+    getLogsChunked(V2, proxyTopic, deployBlock, latest, "UserProxyDeployed"),
   ]);
   console.log("  CreditIssued events:     ", creditLogs.length);
   console.log("  UserProxyDeployed events:", proxyLogs.length);
@@ -87,18 +90,30 @@ async function main() {
   const withLedger: [string, bigint][] = [];
   const withStranded: [string, bigint][] = [];
 
-  for (const u of users) {
-    const issued: bigint = await v2.issuedCredit(u);
-    const proxy: string = await v2.proxyAddress(u);
-    const bal: bigint = await erc20.balanceOf(proxy);
-    if (issued > 0n) {
-      totalIssued += issued;
-      withLedger.push([u, issued]);
+  const userList = [...users];
+  console.log(`\nreading per-user state for ${userList.length} users…`);
+  const CONC = 8;
+  for (let i = 0; i < userList.length; i += CONC) {
+    const batch = userList.slice(i, i + CONC);
+    const rows = await Promise.all(
+      batch.map(async (u) => {
+        const issued: bigint = await v2.issuedCredit(u);
+        const proxy: string = await v2.proxyAddress(u);
+        const bal: bigint = await erc20.balanceOf(proxy);
+        return { u, issued, bal };
+      })
+    );
+    for (const { u, issued, bal } of rows) {
+      if (issued > 0n) {
+        totalIssued += issued;
+        withLedger.push([u, issued]);
+      }
+      if (bal > 0n) {
+        totalStranded += bal;
+        withStranded.push([u, bal]);
+      }
     }
-    if (bal > 0n) {
-      totalStranded += bal;
-      withStranded.push([u, bal]);
-    }
+    console.log(`  …${Math.min(i + CONC, userList.length)}/${userList.length} users read`);
   }
 
   console.log("\n── OUTSTANDING V2 LIABILITY (does NOT migrate to V3) ──");
