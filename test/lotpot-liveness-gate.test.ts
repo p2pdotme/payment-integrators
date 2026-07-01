@@ -205,10 +205,11 @@ describe("LotPotCheckoutIntegratorV2 — liveness gate (anti-sybil)", function (
 
   // ─── The gate ───────────────────────────────────────────────────────
 
-  describe("gate enforcement (livenessRequired = true)", function () {
+  describe("verify-everyone mode (livenessRequiredForAll = true)", function () {
     beforeEach(async function () {
       await integrator.setLivenessAttestor(attestor.address);
       await integrator.setLivenessRequired(true);
+      await integrator.setLivenessRequiredForAll(true);
     });
 
     async function diamondSigner() {
@@ -265,6 +266,98 @@ describe("LotPotCheckoutIntegratorV2 — liveness gate (anti-sybil)", function (
     });
   });
 
+  // ─── Suspect-only mode (default when armed) — the fraud-engine flow ──
+
+  describe("suspect-only mode (armed, livenessRequiredForAll = false)", function () {
+    beforeEach(async function () {
+      await integrator.setLivenessAttestor(attestor.address);
+      await integrator.setLivenessRequired(true);
+      // livenessRequiredForAll stays false → only flagged users must verify.
+    });
+
+    async function diamondSigner() {
+      await ethers.provider.send("hardhat_impersonateAccount", [await mockDiamond.getAddress()]);
+      await ethers.provider.send("hardhat_setBalance", [
+        await mockDiamond.getAddress(),
+        "0xde0b6b3a7640000",
+      ]);
+      return ethers.getSigner(await mockDiamond.getAddress());
+    }
+
+    it("does NOT prompt an unflagged user — orders work without verification", async function () {
+      const d = await diamondSigner();
+      expect(
+        await integrator.connect(d).validateOrder.staticCall(user.address, USDC(1), INR)
+      ).to.equal(true);
+      await expect(integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])).to.not.be
+        .reverted;
+    });
+
+    it("blocks a flagged (suspect) user until they verify — userPlaceOrder + validateOrder", async function () {
+      await expect(integrator.setLivenessSuspect(user.address, true))
+        .to.emit(integrator, "LivenessSuspectUpdated")
+        .withArgs(user.address, true);
+      await expect(
+        integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])
+      ).to.be.revertedWithCustomError(integrator, "NotLivenessVerified");
+      const d = await diamondSigner();
+      expect(
+        await integrator.connect(d).validateOrder.staticCall(user.address, USDC(1), INR)
+      ).to.equal(false);
+    });
+
+    it("clears a flagged user once they pass liveness", async function () {
+      await integrator.setLivenessSuspect(user.address, true);
+      await verify(user);
+      const d = await diamondSigner();
+      expect(
+        await integrator.connect(d).validateOrder.staticCall(user.address, USDC(1), INR)
+      ).to.equal(true);
+      await expect(integrator.connect(user).userPlaceOrder(2, INR, 1, "", 0, 0, [], [])).to.not.be
+        .reverted;
+    });
+
+    it("un-flagging a suspect restores open access without verification", async function () {
+      await integrator.setLivenessSuspect(user.address, true);
+      await integrator.setLivenessSuspect(user.address, false);
+      await expect(integrator.connect(user).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])).to.not.be
+        .reverted;
+    });
+
+    it("batch-flags many fresh sybil wallets in one tx", async function () {
+      await integrator.setLivenessSuspectBatch([user.address, user2.address], true);
+      expect(await integrator.livenessSuspect(user.address)).to.equal(true);
+      expect(await integrator.livenessSuspect(user2.address)).to.equal(true);
+      await expect(
+        integrator.connect(user2).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])
+      ).to.be.revertedWithCustomError(integrator, "NotLivenessVerified");
+    });
+
+    it("a flagged sybil that verifies still can't spin a second wallet (nullifier spent)", async function () {
+      // Operator flags two fresh wallets of the same human.
+      await integrator.setLivenessSuspectBatch([user.address, user2.address], true);
+      await verify(user, "one-human"); // wallet #1 clears
+      // Wallet #2 presenting the SAME human's nullifier is rejected …
+      const expiry = await futureExpiry();
+      const sig = await signLiveness(
+        attestor,
+        user2.address,
+        nullifierFor("one-human"),
+        LIVENESS_LIMIT,
+        expiry
+      );
+      await expect(
+        integrator
+          .connect(user2)
+          .submitLivenessAttestation(nullifierFor("one-human"), LIVENESS_LIMIT, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "LivenessNullifierAlreadySpent");
+      // … so wallet #2 stays blocked.
+      await expect(
+        integrator.connect(user2).userPlaceOrder(1, INR, 1, "", 0, 0, [], [])
+      ).to.be.revertedWithCustomError(integrator, "NotLivenessVerified");
+    });
+  });
+
   // ─── Access control ─────────────────────────────────────────────────
 
   it("only the owner can configure the gate", async function () {
@@ -273,6 +366,15 @@ describe("LotPotCheckoutIntegratorV2 — liveness gate (anti-sybil)", function (
     ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
     await expect(
       integrator.connect(stranger).setLivenessRequired(true)
+    ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    await expect(
+      integrator.connect(stranger).setLivenessRequiredForAll(true)
+    ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    await expect(
+      integrator.connect(stranger).setLivenessSuspect(user.address, true)
+    ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    await expect(
+      integrator.connect(stranger).setLivenessSuspectBatch([user.address], true)
     ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
   });
 });

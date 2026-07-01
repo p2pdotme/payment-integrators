@@ -20,6 +20,16 @@ pragma solidity ^0.8.28;
  *         calls `setLivenessAttestor(...)` then `setLivenessRequired(true)`, and
  *         can be turned off again at any time.
  *
+ *         TWO ARMED MODES (once `setLivenessRequired(true)`):
+ *           - suspect-only (default, `livenessRequiredForAll == false`): only
+ *             users flagged via `setLivenessSuspect`/`setLivenessSuspectBatch`
+ *             must verify. Intended to be driven by the off-chain fraud engine
+ *             (sybil-cluster membership, rapid-cancellation restriction), so
+ *             honest users are never prompted. This is the "optional, enforced
+ *             only on suspicion" policy.
+ *           - verify-everyone (`setLivenessRequiredForAll(true)`): every user
+ *             must verify. Escalation path — flip one flag, no re-wiring.
+ *
  * @dev    The EIP-712 digest is byte-compatible with simple-kyc's reference
  *         `LivenessAttestationVerifier` and `UsdcDirectCheckoutIntegrator`:
  *         typehash `LivenessAttestation(address wallet,bytes32 nullifier,
@@ -44,6 +54,8 @@ abstract contract LivenessGate {
 
     event LivenessAttestorUpdated(address indexed attestor);
     event LivenessRequiredUpdated(bool required);
+    event LivenessRequiredForAllUpdated(bool requiredForAll);
+    event LivenessSuspectUpdated(address indexed user, bool suspect);
     event LivenessVerified(
         address indexed user,
         bytes32 indexed nullifier,
@@ -70,10 +82,22 @@ abstract contract LivenessGate {
     /// @notice secp256k1 signer of the liveness service's attestations
     ///         (simple-kyc liveness verifier, GET /v1/attestor). Unset = gate off.
     address public livenessAttestor;
-    /// @notice When true, gated actions require the caller to be liveness-verified.
+    /// @notice Master switch. When false the gate is fully off. When true the
+    ///         gate is armed but, by default, only applies to users flagged
+    ///         `livenessSuspect` — see `livenessRequiredForAll`.
     bool public livenessRequired;
+    /// @notice When true, an armed gate applies to EVERY user (compulsory mode).
+    ///         When false (default), an armed gate applies only to users flagged
+    ///         via `setLivenessSuspect`. Flip this on to escalate to
+    ///         verify-everyone without touching the rest of the wiring.
+    bool public livenessRequiredForAll;
     /// @notice Whether an address has spent a valid liveness attestation here.
     mapping(address => bool) public livenessVerified;
+    /// @notice Users flagged as suspicious (e.g. by the off-chain fraud engine:
+    ///         sybil-cluster membership, rapid-cancellation restriction). While
+    ///         the gate is armed in suspect-only mode, only these users must
+    ///         verify; everyone else is unaffected.
+    mapping(address => bool) public livenessSuspect;
     /// @notice Per-(tenant, human) nullifiers already consumed on this contract.
     mapping(bytes32 => bool) public livenessNullifierSpent;
 
@@ -92,6 +116,36 @@ abstract contract LivenessGate {
         _authorizeLivenessAdmin();
         livenessRequired = required;
         emit LivenessRequiredUpdated(required);
+    }
+
+    /// @notice Escalate an armed gate from suspect-only to verify-everyone (or
+    ///         back). No effect while `livenessRequired == false`.
+    function setLivenessRequiredForAll(bool requiredForAll) external {
+        _authorizeLivenessAdmin();
+        livenessRequiredForAll = requiredForAll;
+        emit LivenessRequiredForAllUpdated(requiredForAll);
+    }
+
+    /// @notice Flag/unflag a single user as suspicious. Intended to be driven by
+    ///         the off-chain fraud engine's operator wallet from fingerprint-
+    ///         cluster / rapid-cancellation signals. Idempotent.
+    function setLivenessSuspect(address user, bool suspect) external {
+        _authorizeLivenessAdmin();
+        livenessSuspect[user] = suspect;
+        emit LivenessSuspectUpdated(user, suspect);
+    }
+
+    /// @notice Batch variant of {setLivenessSuspect} — one tx to flag many fresh
+    ///         sybil wallets at once (the fraud engine sees ~50/week).
+    function setLivenessSuspectBatch(
+        address[] calldata users,
+        bool suspect
+    ) external {
+        _authorizeLivenessAdmin();
+        for (uint256 i = 0; i < users.length; i++) {
+            livenessSuspect[users[i]] = suspect;
+            emit LivenessSuspectUpdated(users[i], suspect);
+        }
     }
 
     // ─── Verification ─────────────────────────────────────────────────
@@ -124,10 +178,15 @@ abstract contract LivenessGate {
         emit LivenessVerified(msg.sender, nullifier, limit, expiry);
     }
 
-    /// @notice Whether `user` satisfies the current liveness policy. Always true
-    ///         while the gate is off (`livenessRequired == false`).
+    /// @notice Whether `user` satisfies the current liveness policy.
+    ///         - gate off (`!livenessRequired`)                        → always ok
+    ///         - already verified                                     → ok
+    ///         - armed, suspect-only mode, user not flagged           → ok
+    ///         - armed + (verify-everyone OR user flagged suspect)    → must verify
     function _livenessOk(address user) internal view returns (bool) {
-        return !livenessRequired || livenessVerified[user];
+        if (!livenessRequired) return true;
+        if (livenessVerified[user]) return true;
+        return !livenessRequiredForAll && !livenessSuspect[user];
     }
 
     // ─── Internals: EIP-712 ───────────────────────────────────────────
