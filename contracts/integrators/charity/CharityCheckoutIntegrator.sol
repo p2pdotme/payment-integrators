@@ -23,7 +23,9 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *         The per-user `UserProxy` is used only as the authenticated *caller* of
  *         `placeB2BOrder` (the B2B gateway is proxy-only); it never holds USDC.
  *
- *         No limits: `validateOrder` accepts any non-zero amount from any user.
+ *         No amount cap, but each wallet is limited to `MAX_ORDERS_PER_DAY`
+ *         donation orders per UTC day (`validateOrder` reserves the slot;
+ *         `onOrderCancel` releases it so a cancelled order doesn't burn the day).
  *
  * @dev    The `charityWallet` is owner-updatable (emits `CharityWalletUpdated`).
  *         Updating it only affects orders placed AFTER the change — each order's
@@ -42,6 +44,7 @@ contract CharityCheckoutIntegrator is IP2PIntegrator {
     error InvalidAmount();
     error OrderAlreadyFulfilled();
     error OrderAlreadyCancelled();
+    error DailyLimitReached();
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -77,6 +80,13 @@ contract CharityCheckoutIntegrator is IP2PIntegrator {
     ///         on the Diamond at `registerIntegrator` time.
     address public immutable proxyImpl;
 
+    // ─── Constants ────────────────────────────────────────────────────
+
+    /// @notice Hard cap on the number of donation orders a single wallet may
+    ///         place per UTC day. A cancelled order releases its slot (see
+    ///         `onOrderCancel`), so this bounds *open + settled* orders per day.
+    uint256 public constant MAX_ORDERS_PER_DAY = 1;
+
     // ─── State ────────────────────────────────────────────────────────
 
     /// @notice Destination for every donation's purchased USDC. Owner-updatable.
@@ -87,10 +97,15 @@ contract CharityCheckoutIntegrator is IP2PIntegrator {
     /// @notice Cumulative USDC a given user has successfully donated.
     mapping(address => uint256) public donatedBy;
 
+    /// @notice Orders placed per user per day-index (`block.timestamp / 1 days`).
+    ///         Incremented in `validateOrder`, decremented in `onOrderCancel`.
+    mapping(address => mapping(uint256 => uint256)) public userDailyCount;
+
     struct Session {
         address user; // 20 bytes
-        bool fulfilled; //  1 byte — packs with user
-        bool cancelled; //  1 byte — packs with user
+        bool fulfilled; //  1 byte  — packs with user
+        bool cancelled; //  1 byte  — packs with user
+        uint32 placementDay; //  4 bytes — pinned for onOrderCancel decrement keying
         uint256 amount;
     }
 
@@ -155,12 +170,19 @@ contract CharityCheckoutIntegrator is IP2PIntegrator {
         return sessions[orderId];
     }
 
+    /// @notice How many more donation orders `user` may place today (UTC).
+    function getRemainingDailyOrders(address user) external view returns (uint256) {
+        uint256 count = userDailyCount[user][block.timestamp / 1 days];
+        return count >= MAX_ORDERS_PER_DAY ? 0 : MAX_ORDERS_PER_DAY - count;
+    }
+
     // ─── User-facing donation ─────────────────────────────────────────
 
     /**
      * @notice Place a donation BUY order. The caller pays local fiat off-chain;
      *         on settlement the Diamond delivers `amount` USDC straight to the
-     *         current `charityWallet`. No limits.
+     *         current `charityWallet`. No amount cap, but limited to
+     *         `MAX_ORDERS_PER_DAY` orders per wallet per UTC day.
      * @param amount   USDC to donate (micro-USDC, 6dp).
      * @param currency Fiat currency the user pays in (e.g. bytes32("BRL")).
      */
@@ -173,6 +195,11 @@ contract CharityCheckoutIntegrator is IP2PIntegrator {
         uint256 fiatAmountLimit
     ) external returns (uint256 orderId) {
         if (amount == 0) revert InvalidAmount();
+
+        // Friendly pre-check — validateOrder re-enforces this authoritatively
+        // (and reserves the slot) when the Diamond calls back during placement.
+        if (userDailyCount[msg.sender][block.timestamp / 1 days] >= MAX_ORDERS_PER_DAY)
+            revert DailyLimitReached();
 
         address charity = charityWallet;
         orderId = _placeOrder(
@@ -189,6 +216,7 @@ contract CharityCheckoutIntegrator is IP2PIntegrator {
             user: msg.sender,
             fulfilled: false,
             cancelled: false,
+            placementDay: uint32(block.timestamp / 1 days),
             amount: amount
         });
 
@@ -233,15 +261,23 @@ contract CharityCheckoutIntegrator is IP2PIntegrator {
     // ─── IP2PIntegrator callbacks ─────────────────────────────────────
 
     /**
-     * @notice The Diamond's synchronous gate during placeB2BOrder. Charity has
-     *         no limits — accept any non-zero amount from any user.
+     * @notice The Diamond's synchronous gate during placeB2BOrder. Enforces the
+     *         per-wallet daily order cap authoritatively and reserves the slot on
+     *         success (released in `onOrderCancel`). No amount cap.
      */
     function validateOrder(
-        address /* user */,
+        address user,
         uint256 amount,
         bytes32 /* currency */
-    ) external view onlyDiamond returns (bool allowed) {
-        return amount > 0;
+    ) external onlyDiamond returns (bool allowed) {
+        if (amount == 0) return false;
+
+        uint256 day = block.timestamp / 1 days;
+        uint256 count = userDailyCount[user][day];
+        if (count >= MAX_ORDERS_PER_DAY) return false;
+
+        userDailyCount[user][day] = count + 1;
+        return true;
     }
 
     /**
@@ -268,9 +304,10 @@ contract CharityCheckoutIntegrator is IP2PIntegrator {
     }
 
     /**
-     * @notice Cancellation hook. Charity consumes no per-user accounting in
-     *         validateOrder, so there is nothing to release — just record the
-     *         terminal state. Tolerates unknown / already-finalized orders.
+     * @notice Cancellation hook. Releases the daily-order slot reserved in
+     *         validateOrder, keyed on the placement-day snapshot so a day
+     *         rollover between placement and cancellation can't corrupt another
+     *         day's counter. Tolerates unknown / already-finalized orders.
      */
     function onOrderCancel(uint256 orderId) external onlyDiamond {
         Session storage session = sessions[orderId];
@@ -278,6 +315,12 @@ contract CharityCheckoutIntegrator is IP2PIntegrator {
         if (session.fulfilled) revert OrderAlreadyFulfilled();
         if (session.cancelled) revert OrderAlreadyCancelled();
         session.cancelled = true;
+
+        uint256 day = uint256(session.placementDay);
+        uint256 count = userDailyCount[session.user][day];
+        if (count > 0) {
+            userDailyCount[session.user][day] = count - 1;
+        }
     }
 
     // ─── Internals: proxy ─────────────────────────────────────────────

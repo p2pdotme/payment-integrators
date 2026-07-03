@@ -33,6 +33,13 @@ describe("CharityCheckoutIntegrator", function () {
   const donate = (who: SignerWithAddress, amount: bigint) =>
     integrator.connect(who).donate(amount, BRL, 1, "", 0, 0);
 
+  // Advance the EVM clock past the next UTC day boundary so the per-wallet
+  // daily order counter (keyed on block.timestamp / 1 days) resets.
+  async function advanceOneDay() {
+    await ethers.provider.send("evm_increaseTime", [24 * 60 * 60 + 1]);
+    await ethers.provider.send("evm_mine", []);
+  }
+
   beforeEach(async function () {
     [owner, user, user2, stranger, charity, charity2] = await ethers.getSigners();
 
@@ -114,6 +121,7 @@ describe("CharityCheckoutIntegrator", function () {
       await donate(user, USDC(10));
       const predicted = await integrator.proxyAddress(user.address);
       const codeAfterFirst = await ethers.provider.getCode(predicted);
+      await advanceOneDay(); // second order is on the next day (daily cap = 1)
       await donate(user, USDC(20));
       expect(await ethers.provider.getCode(predicted)).to.equal(codeAfterFirst);
       // two distinct orders recorded
@@ -121,7 +129,7 @@ describe("CharityCheckoutIntegrator", function () {
       expect((await mockDiamond.orders(2)).amount).to.equal(USDC(20));
     });
 
-    it("imposes no limit — arbitrarily large donations are accepted", async function () {
+    it("imposes no amount cap — an arbitrarily large donation is accepted", async function () {
       await expect(donate(user, USDC(10_000_000))).to.not.be.reverted;
     });
   });
@@ -178,6 +186,59 @@ describe("CharityCheckoutIntegrator", function () {
     });
   });
 
+  describe("daily order limit (1 per wallet per day)", function () {
+    it("exposes the cap and the remaining quota", async function () {
+      expect(await integrator.MAX_ORDERS_PER_DAY()).to.equal(1);
+      expect(await integrator.getRemainingDailyOrders(user.address)).to.equal(1);
+    });
+
+    it("allows exactly one donation per wallet per day", async function () {
+      await donate(user, USDC(10));
+      // the slot was reserved by validateOrder during placement
+      expect(await integrator.getRemainingDailyOrders(user.address)).to.equal(0);
+      await expect(donate(user, USDC(10))).to.be.revertedWithCustomError(
+        integrator,
+        "DailyLimitReached"
+      );
+    });
+
+    it("caps completed orders too — completing the first still blocks a second", async function () {
+      await donate(user, USDC(10));
+      await mockDiamond.simulateOrderComplete(1);
+      await expect(donate(user, USDC(10))).to.be.revertedWithCustomError(
+        integrator,
+        "DailyLimitReached"
+      );
+    });
+
+    it("meters each wallet independently on the same day", async function () {
+      await donate(user, USDC(10));
+      await expect(donate(user2, USDC(10))).to.not.be.reverted;
+      expect(await integrator.getRemainingDailyOrders(user2.address)).to.equal(0);
+    });
+
+    it("resets the quota after the UTC day rolls over", async function () {
+      await donate(user, USDC(10));
+      await expect(donate(user, USDC(10))).to.be.revertedWithCustomError(
+        integrator,
+        "DailyLimitReached"
+      );
+      await advanceOneDay();
+      expect(await integrator.getRemainingDailyOrders(user.address)).to.equal(1);
+      await expect(donate(user, USDC(10))).to.not.be.reverted;
+    });
+
+    it("frees the slot when an order is cancelled (retry allowed same day)", async function () {
+      await donate(user, USDC(10));
+      expect(await integrator.getRemainingDailyOrders(user.address)).to.equal(0);
+      await mockDiamond.simulateOrderCancelled(1); // releases the reserved slot
+      expect(await integrator.getRemainingDailyOrders(user.address)).to.equal(1);
+      // can place a fresh order the same day
+      await expect(donate(user, USDC(10))).to.not.be.reverted;
+      expect(await integrator.getRemainingDailyOrders(user.address)).to.equal(0);
+    });
+  });
+
   describe("setCharityWallet", function () {
     it("lets the owner update the destination and routes new donations there", async function () {
       await expect(integrator.connect(owner).setCharityWallet(charity2.address))
@@ -194,6 +255,7 @@ describe("CharityCheckoutIntegrator", function () {
     it("only affects orders placed after the change (recipient pinned at placement)", async function () {
       await donate(user, USDC(40)); // order 1 -> charity
       await integrator.connect(owner).setCharityWallet(charity2.address);
+      await advanceOneDay(); // same wallet, next day (daily cap = 1)
       await donate(user, USDC(60)); // order 2 -> charity2
 
       await mockDiamond.simulateOrderComplete(1);
