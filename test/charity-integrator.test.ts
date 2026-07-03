@@ -79,6 +79,9 @@ describe("CharityCheckoutIntegrator", function () {
         Integrator.deploy(ethers.ZeroAddress, await mockUsdc.getAddress(), charity.address)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
       await expect(
+        Integrator.deploy(await mockDiamond.getAddress(), ethers.ZeroAddress, charity.address)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(
         Integrator.deploy(
           await mockDiamond.getAddress(),
           await mockUsdc.getAddress(),
@@ -170,6 +173,35 @@ describe("CharityCheckoutIntegrator", function () {
       // MockDiamond blocks a second completion at the protocol level
       await expect(mockDiamond.simulateOrderComplete(1)).to.be.revertedWith("Already completed");
       expect(await integrator.totalDonated()).to.equal(USDC(100));
+    });
+
+    it("rejects a replayed onOrderComplete callback (OrderAlreadyFulfilled)", async function () {
+      await donate(user, USDC(100));
+      await mockDiamond.simulateOrderComplete(1);
+      // Bypass the mock's protocol-level guard and replay the integrator hook
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          integratorAddr,
+          1,
+          user.address,
+          USDC(100),
+          charity.address
+        )
+      ).to.be.revertedWithCustomError(integrator, "OrderAlreadyFulfilled");
+      expect(await integrator.totalDonated()).to.equal(USDC(100));
+    });
+
+    it("ignores onOrderComplete for an unknown order (no-op)", async function () {
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          integratorAddr,
+          999,
+          user.address,
+          USDC(100),
+          charity.address
+        )
+      ).to.not.be.reverted;
+      expect(await integrator.totalDonated()).to.equal(0);
     });
   });
 
