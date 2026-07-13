@@ -56,6 +56,8 @@ contract MockDiamond {
         SellStatus status;
         string encUpi; // user's UPI encrypted to merchant
         string merchantPubkey;
+        uint8 disputeRaisedBy; // test-only: mirror Diamond's Dispute.raisedBy
+        uint8 disputeStatus; // test-only: mirror Diamond's Dispute.status
     }
 
     mapping(address => bool) public activeIntegrators;
@@ -130,10 +132,14 @@ contract MockDiamond {
         uint256 amount,
         bytes32 currency,
         string calldata /* userPubKey */,
-        uint256 /* circleId */,
+        uint256 circleId,
         uint256 /* preferredPaymentChannelConfigId */,
         uint256 /* fiatAmountLimit */
     ) external returns (uint256 orderId) {
+        // The real Diamond rejects circleId 0 (no such circle). Mirror that so
+        // tests catch integrators that forget to pass a valid circle.
+        require(circleId != 0, "InvalidCircle");
+
         address effectiveIntegrator = _resolveIntegrator();
 
         bool allowed = IP2PIntegrator(effectiveIntegrator).validateOrder(user, amount, currency);
@@ -146,7 +152,9 @@ contract MockDiamond {
             currency: currency,
             status: SellStatus.PLACED,
             encUpi: "",
-            merchantPubkey: ""
+            merchantPubkey: "",
+            disputeRaisedBy: 0,
+            disputeStatus: 0
         });
         emit MockSellOrderPlaced(orderId, user, amount, currency);
     }
@@ -265,7 +273,9 @@ contract MockDiamond {
             currency: currency,
             status: SellStatus.PLACED,
             encUpi: "",
-            merchantPubkey: ""
+            merchantPubkey: "",
+            disputeRaisedBy: 0,
+            disputeStatus: 0
         });
         emit MockSellOrderPlaced(orderId, msg.sender, amount, currency);
     }
@@ -294,7 +304,10 @@ contract MockDiamond {
         require(msg.sender == o.user, "Only order.user");
         o.encUpi = encUpi;
         o.status = SellStatus.PAID;
-        usdc.safeTransferFrom(o.user, address(this), o.amount);
+        // Pull principal + fee (actualUsdtAmount), exactly as the live Diamond.
+        // If the integrator only funded/approved principal, this reverts —
+        // catching the "fee bug" the unit suite previously missed.
+        usdc.safeTransferFrom(o.user, address(this), o.amount + sellFee);
         emit MockSellOrderPaid(orderId);
     }
 
@@ -316,7 +329,8 @@ contract MockDiamond {
         o.status = SellStatus.CANCELLED;
         uint256 refund = 0;
         if (wasPaid) {
-            refund = o.amount;
+            // Refund what was pulled (principal + fee).
+            refund = o.amount + sellFee;
             usdc.safeTransfer(o.user, refund);
         }
         emit MockSellOrderCancelled(orderId, refund);
@@ -344,17 +358,36 @@ contract MockDiamond {
         uint256 actualUsdtAmount;
         uint256 actualFiatAmount;
     }
+    /// @notice Per-order SELL fee the Diamond pulls ON TOP of principal during
+    ///         setSellOrderUpi (so actualUsdtAmount = principal + fee). Lets
+    ///         tests exercise the integrator's fee top-up + allowance path.
+    uint256 public sellFee;
+
+    function setSellFee(uint256 fee) external {
+        sellFee = fee;
+    }
+
+    /// @notice Test-only: stamp a dispute onto a SELL order so the integrator's
+    ///         reconcile dispute guard (and the disputed-clawback recovery path)
+    ///         can be exercised. Real Diamond sets these during dispute flow.
+    function setSellDispute(uint256 orderId, uint8 raisedBy, uint8 status) external {
+        sellOrders[orderId].disputeRaisedBy = raisedBy;
+        sellOrders[orderId].disputeStatus = status;
+    }
+
     function getAdditionalOrderDetails(
         uint256 orderId
     ) external view returns (AdditionalOrderDetailsView memory) {
         return
             AdditionalOrderDetailsView({
-                fixedFeePaid: 0,
+                fixedFeePaid: uint64(sellFee),
                 tipsPaid: 0,
                 acceptedTimestamp: 0,
                 paidTimestamp: 0,
                 reserved2: 0,
-                actualUsdtAmount: additionalOrderDetailsFeeUnready ? 0 : sellOrders[orderId].amount,
+                actualUsdtAmount: additionalOrderDetailsFeeUnready
+                    ? 0
+                    : sellOrders[orderId].amount + sellFee,
                 actualFiatAmount: 0
             });
     }
@@ -437,7 +470,8 @@ contract MockDiamond {
         o.user = s.user;
         o.currency = s.currency;
         o.id = orderId;
-        // Strings / arrays / dispute default-init to empty — fine for the
-        // status-only consumer.
+        o.disputeInfo.raisedBy = s.disputeRaisedBy;
+        o.disputeInfo.status = s.disputeStatus;
+        // Remaining strings / arrays default-init to empty.
     }
 }
