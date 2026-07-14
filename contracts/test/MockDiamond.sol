@@ -57,7 +57,7 @@ contract MockDiamond {
         string encUpi; // user's UPI encrypted to merchant
         string merchantPubkey;
         uint8 disputeRaisedBy; // test-only: mirror Diamond's Dispute.raisedBy
-        uint8 disputeStatus;   // test-only: mirror Diamond's Dispute.status
+        uint8 disputeStatus; // test-only: mirror Diamond's Dispute.status
     }
 
     mapping(address => bool) public activeIntegrators;
@@ -461,6 +461,23 @@ contract MockDiamond {
     }
 
     function getOrdersById(uint256 orderId) external view returns (OrderView memory o) {
+        // BUY orders live in `orders`; SELL orders in `sellOrders`. A BUY id is
+        // served as a BUY OrderView (so the integrator's BUY-side reads —
+        // sweepStrandedBuy's status/amount/recipientAddr — resolve correctly);
+        // otherwise fall through to the SELL view (reconcile/finalize/etc.).
+        Order storage b = orders[orderId];
+        if (b.integrator != address(0)) {
+            // Map the BUY flags to the Diamond's OrderStatus codes (COMPLETED=3,
+            // CANCELLED=4, else PLACED=0). Mirrors how a real completed BUY reads.
+            o.status = b.completed ? 3 : (b.cancelled ? 4 : 0);
+            o.orderType = 0; // BUY
+            o.amount = b.amount;
+            o.user = b.user;
+            o.recipientAddr = b.recipientAddr;
+            o.currency = b.currency;
+            o.id = orderId;
+            return o;
+        }
         SellOrder storage s = sellOrders[orderId];
         // SellStatus enum mirrors Diamond's OrderStatus (0..4) so the cast
         // is a no-op semantically.
@@ -473,5 +490,25 @@ contract MockDiamond {
         o.disputeInfo.raisedBy = s.disputeRaisedBy;
         o.disputeInfo.status = s.disputeStatus;
         // Remaining strings / arrays default-init to empty.
+    }
+
+    /**
+     * @notice TEST-ONLY: reproduce the exact end-state of a BUY whose
+     *         onOrderComplete callback reverted and was swallowed by the
+     *         try/catch in simulateOrderComplete — the USDC is routed to the
+     *         proxy and the order is marked COMPLETED protocol-side, but the
+     *         integrator callback NEVER runs (so the merchant is never credited
+     *         and the funds sit stranded on the proxy). This is the precise
+     *         scenario sweepStrandedBuy recovers, without needing to force a
+     *         contrived revert inside the real callback.
+     */
+    function simulateOrderCompleteNoCallback(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        require(!order.completed, "Already completed");
+        order.completed = true;
+        // Route USDC to the proxy exactly like a real completion, but skip the
+        // integrator callback (the swallowed-revert end state).
+        usdc.safeTransfer(order.recipientAddr, order.amount);
+        emit MockOrderCompleted(orderId);
     }
 }

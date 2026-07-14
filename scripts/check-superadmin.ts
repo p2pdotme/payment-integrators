@@ -1,17 +1,36 @@
+/**
+ * Read-only: print the on-chain super-admin (+ pending) of a deployed integrator.
+ *
+ * Env (addresses NOT hardcoded):
+ *   INTEGRATOR_ADDRESS   (required) the live integrator to read
+ *   RECORDED_SUPER_ADMIN (optional) if set, compared against the on-chain value
+ *
+ *   INTEGRATOR_ADDRESS=0x... npx hardhat run scripts/check-superadmin.ts --network baseSepolia
+ */
 import { ethers } from "hardhat";
 
-const INTEGRATOR = "0xC78222FFead42c8fc05A128966eb29590aD384d3";
-const RECORDED_SA = "0x4f45446a6E934Fd03A353eC4DAc7Cd544f03d426";
+const INTEGRATOR = process.env.INTEGRATOR_ADDRESS || "";
+const RECORDED_SA = process.env.RECORDED_SUPER_ADMIN || "";
 
 async function main() {
+  if (!ethers.isAddress(INTEGRATOR)) {
+    throw new Error(`INTEGRATOR_ADDRESS env var is missing or not an address: "${INTEGRATOR}"`);
+  }
   const net = await ethers.provider.getNetwork();
   const c = await ethers.getContractAt("MerchantTerminalIntegrator", INTEGRATOR);
   const sa: string = await c.superAdmin();
-  console.log("chainId            :", net.chainId.toString(), net.chainId === 84532n ? "(Base Sepolia)" : "(UNEXPECTED)");
+  const pending: string = await c.pendingSuperAdmin();
+  console.log("chainId            :", net.chainId.toString());
   console.log("integrator         :", INTEGRATOR);
   console.log("on-chain superAdmin:", sa);
-  console.log("recorded superAdmin:", RECORDED_SA);
-  console.log("match              :", sa.toLowerCase() === RECORDED_SA.toLowerCase());
+  console.log("pendingSuperAdmin  :", pending === ethers.ZeroAddress ? "(none)" : pending);
+  if (RECORDED_SA) {
+    console.log("recorded superAdmin:", RECORDED_SA);
+    console.log("match              :", sa.toLowerCase() === RECORDED_SA.toLowerCase());
+  }
 }
 
-main().catch((e) => { console.error(e); process.exitCode = 1; });
+main().catch((e) => {
+  console.error(e);
+  process.exitCode = 1;
+});
