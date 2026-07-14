@@ -33,20 +33,14 @@ async function main() {
   const before: bigint = await client.getProductPrice(PRODUCT_ID);
   const owner: string = await client.owner();
 
-  console.log(
-    "chainId         :",
-    net.chainId.toString(),
-    net.chainId === 84532n ? "(Base Sepolia)" : "(check network!)"
-  );
+  console.log("chainId         :", net.chainId.toString(), net.chainId === 84532n ? "(Base Sepolia)" : "(check network!)");
   console.log("client          :", CLIENT);
   console.log("signer          :", signer.address);
   console.log("client owner    :", owner);
   console.log("product 2 price :", before.toString(), `(= ${Number(before) / 1e6} USDC/unit)`);
 
   if (owner.toLowerCase() !== signer.address.toLowerCase()) {
-    throw new Error(
-      "Signer is NOT the client owner — setProductPrice is onlyOwner. Use the deployer key."
-    );
+    throw new Error("Signer is NOT the client owner — setProductPrice is onlyOwner. Use the deployer key.");
   }
   if (before === NEW_PRICE) {
     console.log("\nAlready at 1e-6 USDC/unit — nothing to do.");
@@ -60,14 +54,7 @@ async function main() {
 
   const after: bigint = await client.getProductPrice(PRODUCT_ID);
   console.log("product 2 price :", after.toString(), `(= ${Number(after) / 1e6} USDC/unit)`);
-  console.log(
-    after === NEW_PRICE
-      ? "✓ done — decimal drift fixed at the source."
-      : "✗ price did not update as expected."
-  );
+  console.log(after === NEW_PRICE ? "✓ done — decimal drift fixed at the source." : "✗ price did not update as expected.");
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exitCode = 1;
-});
+main().catch((e) => { console.error(e); process.exitCode = 1; });

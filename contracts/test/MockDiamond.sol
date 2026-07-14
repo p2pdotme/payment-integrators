@@ -57,7 +57,7 @@ contract MockDiamond {
         string encUpi; // user's UPI encrypted to merchant
         string merchantPubkey;
         uint8 disputeRaisedBy; // test-only: mirror Diamond's Dispute.raisedBy
-        uint8 disputeStatus; // test-only: mirror Diamond's Dispute.status
+        uint8 disputeStatus;   // test-only: mirror Diamond's Dispute.status
     }
 
     mapping(address => bool) public activeIntegrators;

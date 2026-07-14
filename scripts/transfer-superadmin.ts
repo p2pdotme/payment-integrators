@@ -59,14 +59,12 @@ async function main() {
   if (signerAddr.toLowerCase() !== currentSA.toLowerCase()) {
     throw new Error(
       `Signer (${signerAddr}) is NOT the current super-admin (${currentSA}). ` +
-        `Only the current super-admin can transfer root — the tx would revert OnlySuperAdmin. ` +
-        `Set DEPLOYER_PRIVATE_KEY to the current super-admin's key.`
+      `Only the current super-admin can transfer root — the tx would revert OnlySuperAdmin. ` +
+      `Set DEPLOYER_PRIVATE_KEY to the current super-admin's key.`
     );
   }
   if (NEW_SUPER_ADMIN.toLowerCase() === currentSA.toLowerCase()) {
-    throw new Error(
-      `NEW_SUPER_ADMIN is already the super-admin — nothing to do (a no-op handoff reverts).`
-    );
+    throw new Error(`NEW_SUPER_ADMIN is already the super-admin — nothing to do (a no-op handoff reverts).`);
   }
 
   console.log("All checks passed. Sending transferSuperAdmin(NEW_SUPER_ADMIN)…");
@@ -74,12 +72,7 @@ async function main() {
   const tx = await c.transferSuperAdmin(NEW_SUPER_ADMIN);
   console.log("tx sent:", tx.hash);
   const rc = await tx.wait();
-  console.log(
-    "mined in block:",
-    rc?.blockNumber,
-    "status:",
-    rc?.status === 1 ? "success" : "REVERTED"
-  );
+  console.log("mined in block:", rc?.blockNumber, "status:", rc?.status === 1 ? "success" : "REVERTED");
 
   // ─── Verify the on-chain result ───
   const newSA: string = await c.superAdmin();
@@ -94,7 +87,4 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exitCode = 1;
-});
+main().catch((e) => { console.error(e); process.exitCode = 1; });

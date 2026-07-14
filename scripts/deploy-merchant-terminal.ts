@@ -22,8 +22,10 @@ import { ethers } from "hardhat";
  *                                       vault and the integrator alongside the
  *                                       deployer. Keep the two owner sets aligned.
  *
- * The client's product 2 is priced at 0.01 USDC/unit — the POS maps any local
- * amount to quantity = USDC cents.
+ * The client's product 2 is priced at 1e-6 USDC/unit (one 6-decimal unit), so the
+ * on-chain `quantity` IS the plain 6-dec USDC amount — the POS sizes quantity in
+ * full 6-dec units (no cent-snapping), which lands the customer's charged fiat on
+ * the exact quote with zero rounding drift (ISSUE-fiat-decimal-drift.md, Option B).
  */
 
 const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
@@ -63,12 +65,7 @@ async function main() {
   //    handshake in step 3 passes). Same owner set as the vault.
   console.log("Deploying MerchantTerminalIntegrator (vault-wired)...");
   const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
-  const integrator = await Integrator.deploy(
-    DIAMOND_ADDRESS,
-    USDC_ADDRESS,
-    vaultAddress,
-    EXTRA_OWNERS
-  );
+  const integrator = await Integrator.deploy(DIAMOND_ADDRESS, USDC_ADDRESS, vaultAddress, EXTRA_OWNERS);
   await integrator.deploymentTransaction()?.wait(3);
   const address = await integrator.getAddress();
   const code = await ethers.provider.getCode(address);
@@ -85,9 +82,7 @@ async function main() {
     throw new Error(`Handshake check failed: vault.integrator()=${linkedIntegrator} != ${address}`);
   }
   if (integratorVault.toLowerCase() !== vaultAddress.toLowerCase()) {
-    throw new Error(
-      `Handshake check failed: integrator.vault()=${integratorVault} != ${vaultAddress}`
-    );
+    throw new Error(`Handshake check failed: integrator.vault()=${integratorVault} != ${vaultAddress}`);
   }
   console.log("  ✓ mutual link verified (vault ↔ integrator point at each other)");
 
@@ -120,9 +115,7 @@ async function main() {
   console.log(`Price client:          ${clientAddress}`);
   console.log(`Diamond:               ${await integrator.diamond()}`);
   console.log(`USDC:                  ${await integrator.usdc()}`);
-  console.log(
-    `Owners (count):        ${(await integrator.ownerCount()).toString()} (integrator), ${(await vault.ownerCount()).toString()} (vault)`
-  );
+  console.log(`Owners (count):        ${(await integrator.ownerCount()).toString()} (integrator), ${(await vault.ownerCount()).toString()} (vault)`);
   console.log(`Vault→integrator:      ${linkedIntegrator}`);
   console.log(`Integrator→vault:      ${integratorVault}`);
   console.log(`Vault locked:          ${await vault.locked()}`);

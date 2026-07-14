@@ -31,9 +31,7 @@ async function main() {
 
   // --- pre-flight guards: fail loudly BEFORE sending value-bearing state changes ---
   if (net.chainId !== 84532n) {
-    throw new Error(
-      `Wrong network: chainId ${net.chainId}, expected 84532 (Base Sepolia). Aborting.`
-    );
+    throw new Error(`Wrong network: chainId ${net.chainId}, expected 84532 (Base Sepolia). Aborting.`);
   }
   if (!ethers.isAddress(GRANTEE)) {
     throw new Error(`Grantee is not a valid address: ${GRANTEE}`);
@@ -50,14 +48,10 @@ async function main() {
   console.log("Grantee         :", GRANTEE);
 
   if (onChainSuperAdmin.toLowerCase() !== EXPECTED_SUPER_ADMIN.toLowerCase()) {
-    throw new Error(
-      `On-chain super-admin (${onChainSuperAdmin}) != expected (${EXPECTED_SUPER_ADMIN}). Deployment record may be stale — verify before proceeding.`
-    );
+    throw new Error(`On-chain super-admin (${onChainSuperAdmin}) != expected (${EXPECTED_SUPER_ADMIN}). Deployment record may be stale — verify before proceeding.`);
   }
   if (signer.address.toLowerCase() !== onChainSuperAdmin.toLowerCase()) {
-    throw new Error(
-      `Signer ${signer.address} is NOT the super-admin ${onChainSuperAdmin}. addAdmin would revert. Use the super-admin key.`
-    );
+    throw new Error(`Signer ${signer.address} is NOT the super-admin ${onChainSuperAdmin}. addAdmin would revert. Use the super-admin key.`);
   }
 
   // Report current role so a re-run is obvious.
@@ -76,9 +70,7 @@ async function main() {
 
   const after: bigint = await integrator.roleOf(GRANTEE);
   console.log(`Grantee new role: ${ROLE_NAMES[Number(after)] ?? after}`);
-  console.log(
-    after === 4n ? "✅ Full admin granted." : "⚠️ Role not FINANCE — check contract state."
-  );
+  console.log(after === 4n ? "✅ Full admin granted." : "⚠️ Role not FINANCE — check contract state.");
 }
 
 main().catch((e) => {

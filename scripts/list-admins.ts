@@ -34,17 +34,12 @@ const ABI = [
 ];
 
 /** Lowest block where the contract has code (its deployment block). */
-async function findDeployBlock(
-  provider: InstanceType<typeof ethers.JsonRpcProvider>,
-  latest: number
-): Promise<number> {
-  let lo = 0,
-    hi = latest;
+async function findDeployBlock(provider: InstanceType<typeof ethers.JsonRpcProvider>, latest: number): Promise<number> {
+  let lo = 0, hi = latest;
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     const code = await provider.getCode(INTEGRATOR, mid);
-    if (code === "0x") lo = mid + 1;
-    else hi = mid;
+    if (code === "0x") lo = mid + 1; else hi = mid;
   }
   return lo;
 }
@@ -52,42 +47,26 @@ async function findDeployBlock(
 async function main() {
   const provider = new ethers.JsonRpcProvider(PUBLIC_RPC);
   const net = await provider.getNetwork();
-  if (net.chainId !== 84532n)
-    throw new Error(`Wrong network: ${net.chainId}, expected 84532 (Base Sepolia)`);
+  if (net.chainId !== 84532n) throw new Error(`Wrong network: ${net.chainId}, expected 84532 (Base Sepolia)`);
   const c = new ethers.Contract(INTEGRATOR, ABI, provider);
   const iface = c.interface;
 
   const latest = await provider.getBlockNumber();
   const deployBlock = await findDeployBlock(provider, latest);
-  console.log(
-    `Deployed at block ${deployBlock}; scanning ${latest - deployBlock + 1} blocks to ${latest}...`
-  );
+  console.log(`Deployed at block ${deployBlock}; scanning ${latest - deployBlock + 1} blocks to ${latest}...`);
 
   // Scan ALL logs from the contract (address-only filter), decode, keep the
   // access-control events. Adaptive chunk: halve on range errors.
   const candidates = new Set<string>();
-  const wanted = new Set([
-    "AdminAdded",
-    "AdminRemoved",
-    "AdminRoleSet",
-    "OwnershipTransferred",
-    "OwnerAdded",
-    "OwnerRemoved",
-    "SuperAdminTransferred",
-  ]);
-  let from = deployBlock,
-    chunk = 10_000;
+  const wanted = new Set(["AdminAdded", "AdminRemoved", "AdminRoleSet",
+    "OwnershipTransferred", "OwnerAdded", "OwnerRemoved", "SuperAdminTransferred"]);
+  let from = deployBlock, chunk = 10_000;
   while (from <= latest) {
     const to = Math.min(from + chunk - 1, latest);
     try {
       const logs = await provider.getLogs({ address: INTEGRATOR, fromBlock: from, toBlock: to });
       for (const log of logs) {
-        let parsed;
-        try {
-          parsed = iface.parseLog(log);
-        } catch {
-          continue;
-        }
+        let parsed; try { parsed = iface.parseLog(log); } catch { continue; }
         if (!parsed || !wanted.has(parsed.name)) continue;
         for (const arg of parsed.args) {
           if (typeof arg === "string" && ethers.isAddress(arg) && arg !== ethers.ZeroAddress) {
@@ -112,12 +91,8 @@ async function main() {
   const rows: Row[] = [];
   for (const addr of candidates) {
     const [role, own] = await Promise.all([c.roleOf(addr), c.isOwner(addr)]);
-    rows.push({
-      addr,
-      role: Number(role),
-      isOwner: Boolean(own),
-      isSuper: addr.toLowerCase() === superAdmin.toLowerCase(),
-    });
+    rows.push({ addr, role: Number(role), isOwner: Boolean(own),
+      isSuper: addr.toLowerCase() === superAdmin.toLowerCase() });
   }
 
   const active = rows.filter((r) => r.role > 0).sort((a, b) => b.role - a.role);
@@ -129,13 +104,8 @@ async function main() {
   console.log("ownerCount :", ownerCount.toString());
   console.log(`\n── Active admins/owners: ${active.length} ──`);
   for (const r of active) {
-    const tags = [
-      ROLE_NAMES[r.role] ?? String(r.role),
-      r.isOwner ? "OWNER" : null,
-      r.isSuper ? "SUPER-ADMIN" : null,
-    ]
-      .filter(Boolean)
-      .join(" · ");
+    const tags = [ROLE_NAMES[r.role] ?? String(r.role),
+      r.isOwner ? "OWNER" : null, r.isSuper ? "SUPER-ADMIN" : null].filter(Boolean).join(" · ");
     console.log(`  ${r.addr}  ${tags}`);
   }
   if (former.length) {
@@ -144,7 +114,4 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exitCode = 1;
-});
+main().catch((e) => { console.error(e); process.exitCode = 1; });

@@ -17,8 +17,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
   const UNIT_PRICE = USDC(10);
   const PRODUCT_ID = 1;
-  const INR_CODE = "INR"; // human-readable code
-  const INR = ethers.encodeBytes32String("INR"); // packed bytes32 (events)
+  const INR_CODE = "INR";                              // human-readable code
+  const INR = ethers.encodeBytes32String("INR");       // packed bytes32 (events)
   const DAY = 86400;
   // Read from the deployed contract in beforeEach so the suite matches whatever
   // SETTLEMENT_PERIOD is compiled in (30 days in prod, 10 min for the withdraw test build).
@@ -131,23 +131,19 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     const newEnc = enc("new@upi");
     await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
     await expect(integrator.connect(merchant1).updateProfile(newEnc, "New Shop"))
-      .to.emit(integrator, "MerchantProfileUpdated")
-      .withArgs(merchant1.address, "New Shop"); // handle NOT in event
+      .to.emit(integrator, "MerchantProfileUpdated").withArgs(merchant1.address, "New Shop"); // handle NOT in event
     const [payout, shop, currency] = await integrator.getMerchantInfo(merchant1.address);
     expect(payout).to.equal(newEnc); // opaque ciphertext round-trips
     expect(shop).to.equal("New Shop");
     expect(currency).to.equal(INR); // currency unchanged
     // guards: unregistered can't update, empty payout reverts, frozen can't edit
-    await expect(
-      integrator.connect(merchant2).updateProfile(enc("x@upi"), "X")
-    ).to.be.revertedWithCustomError(integrator, "NotRegistered");
-    await expect(
-      integrator.connect(merchant1).updateProfile("0x", "X")
-    ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    await expect(integrator.connect(merchant2).updateProfile(enc("x@upi"), "X"))
+      .to.be.revertedWithCustomError(integrator, "NotRegistered");
+    await expect(integrator.connect(merchant1).updateProfile("0x", "X"))
+      .to.be.revertedWithCustomError(integrator, "InvalidAddress");
     await integrator.connect(owner).freezeMerchant(merchant1.address);
-    await expect(
-      integrator.connect(merchant1).updateProfile(enc("y@upi"), "Y")
-    ).to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
+    await expect(integrator.connect(merchant1).updateProfile(enc("y@upi"), "Y"))
+      .to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
   });
 
   // ─── multi-country: currency naming + per-country registration ─────
@@ -169,9 +165,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   it("2c. a Brazil merchant registers with BRL + (encrypted) PIX and reads it back", async function () {
     const pixKey = enc("joao@email.com");
     await integrator.connect(merchant1).registerMerchant(pixKey, "Café Rio", "BRL");
-    const [payoutId, shopName, currency, isReg] = await integrator.getMerchantInfo(
-      merchant1.address
-    );
+    const [payoutId, shopName, currency, isReg] = await integrator.getMerchantInfo(merchant1.address);
     expect(payoutId).to.equal(pixKey); // opaque ciphertext round-trips
     expect(shopName).to.equal("Café Rio");
     expect(currency).to.equal(ethers.encodeBytes32String("BRL"));
@@ -190,20 +184,18 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   });
 
   it("2g. registration rejects an empty payout blob (both entry points)", async function () {
-    await expect(
-      integrator.connect(merchant1).registerMerchant("0x", "Shop", INR_CODE)
-    ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
-    await expect(
-      integrator.connect(merchant1).registerMerchantRaw("0x", "Shop", INR)
-    ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    await expect(integrator.connect(merchant1).registerMerchant("0x", "Shop", INR_CODE))
+      .to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    await expect(integrator.connect(merchant1).registerMerchantRaw("0x", "Shop", INR))
+      .to.be.revertedWithCustomError(integrator, "InvalidAddress");
   });
 
   it("AUDIT-FIX (privacy): the raw payout handle never appears on-chain — only the opaque blob, and NOT in any event", async function () {
     // The app encrypts the real handle client-side; on-chain we only ever see the
     // ciphertext. This test proves (a) the handle round-trips as opaque bytes and
     // (b) the plaintext is not recoverable from the registration event.
-    const secret = "alice@okaxis"; // the real-world UPI id — must NEVER leak
-    const blob = enc(secret); // what the app would actually send (ciphertext)
+    const secret = "alice@okaxis";          // the real-world UPI id — must NEVER leak
+    const blob = enc(secret);               // what the app would actually send (ciphertext)
     const tx = await integrator.connect(merchant1).registerMerchant(blob, "Alice Shop", INR_CODE);
     const receipt = await tx.wait();
 
@@ -220,13 +212,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     }
     // And the event's decoded args are exactly (merchant, shopName, currency) — no handle.
     const ev = receipt.logs
-      .map((l: any) => {
-        try {
-          return integrator.interface.parseLog(l);
-        } catch {
-          return null;
-        }
-      })
+      .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
       .find((l: any) => l?.name === "MerchantRegistered");
     expect(ev.args.length).to.equal(3); // merchant, shopName, currency — no payout
   });
@@ -237,9 +223,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     // canonical bytes32("INR"), which would have self-granted the 100 USDC default
     // cap instead of INR's 50. The guard in _register must reject it.
     const bad = "0x494e520058" + "00".repeat(27);
-    await expect(
-      integrator.connect(merchant1).registerMerchantRaw(UPI_1, "Shop", bad as any)
-    ).to.be.revertedWithCustomError(integrator, "InvalidCurrency");
+    await expect(integrator.connect(merchant1).registerMerchantRaw(UPI_1, "Shop", bad as any))
+      .to.be.revertedWithCustomError(integrator, "InvalidCurrency");
     // The canonical form still works.
     await integrator.connect(merchant1).registerMerchantRaw(UPI_1, "Shop", INR);
     expect(await integrator.getMerchantCurrency(merchant1.address)).to.equal("INR");
@@ -253,29 +238,23 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
     const diamond = await diamondSigner();
     expect(await integrator.perTxCap(INR)).to.equal(USDC(50));
-    await expect(integrator.connect(diamond).validateOrder(merchant1.address, USDC(50), INR)).to.not
-      .be.reverted;
-    await expect(
-      integrator.connect(diamond).validateOrder(merchant1.address, USDC(51), INR)
-    ).to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
+    await expect(integrator.connect(diamond).validateOrder(merchant1.address, USDC(50), INR)).to.not.be.reverted;
+    await expect(integrator.connect(diamond).validateOrder(merchant1.address, USDC(51), INR))
+      .to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
     // BYPASS CLOSED: passing BRL as the order currency does NOT lift an INR
     // merchant to the 100 cap — 51 still reverts because m.currency is INR.
-    await expect(
-      integrator.connect(diamond).validateOrder(merchant1.address, USDC(51), BRL)
-    ).to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
+    await expect(integrator.connect(diamond).validateOrder(merchant1.address, USDC(51), BRL))
+      .to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
 
     // A BRL-registered merchant → 100 cap.
     await integrator.connect(merchant2).registerMerchant(enc("joao@pix"), "Café", "BRL");
     expect(await integrator.perTxCap(BRL)).to.equal(USDC(100));
-    await expect(integrator.connect(diamond).validateOrder(merchant2.address, USDC(100), BRL)).to
-      .not.be.reverted;
-    await expect(
-      integrator.connect(diamond).validateOrder(merchant2.address, USDC(101), BRL)
-    ).to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
+    await expect(integrator.connect(diamond).validateOrder(merchant2.address, USDC(100), BRL)).to.not.be.reverted;
+    await expect(integrator.connect(diamond).validateOrder(merchant2.address, USDC(101), BRL))
+      .to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
     // And a BRL merchant can't be forced under the INR cap by passing INR either
     // (still uses their registered 100). 51 ok.
-    await expect(integrator.connect(diamond).validateOrder(merchant2.address, USDC(51), INR)).to.not
-      .be.reverted;
+    await expect(integrator.connect(diamond).validateOrder(merchant2.address, USDC(51), INR)).to.not.be.reverted;
   });
 
   it("3c. admin can change the daily limit on-chain (no redeploy)", async function () {
@@ -284,26 +263,20 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(25n);
     // admin lowers to 2
     await expect(integrator.connect(owner).setDailyLimit(2))
-      .to.emit(integrator, "DailyLimitSet")
-      .withArgs(2);
+      .to.emit(integrator, "DailyLimitSet").withArgs(2);
     expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(2n);
     await integrator.connect(diamond).validateOrder(merchant1.address, UNIT_PRICE, INR);
     await integrator.connect(diamond).validateOrder(merchant1.address, UNIT_PRICE, INR);
-    await expect(
-      integrator.connect(diamond).validateOrder(merchant1.address, UNIT_PRICE, INR)
-    ).to.be.revertedWithCustomError(integrator, "DailyLimitReached"); // 3rd blocked at limit 2
+    await expect(integrator.connect(diamond).validateOrder(merchant1.address, UNIT_PRICE, INR))
+      .to.be.revertedWithCustomError(integrator, "DailyLimitReached"); // 3rd blocked at limit 2
     // admin raises to 50
     await integrator.connect(owner).setDailyLimit(50);
     expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(50n);
     // guards: zero rejected, non-admin rejected
-    await expect(integrator.connect(owner).setDailyLimit(0)).to.be.revertedWithCustomError(
-      integrator,
-      "InvalidQuantity"
-    );
-    await expect(integrator.connect(attacker).setDailyLimit(10)).to.be.revertedWithCustomError(
-      integrator,
-      "NotAuthorized"
-    );
+    await expect(integrator.connect(owner).setDailyLimit(0))
+      .to.be.revertedWithCustomError(integrator, "InvalidQuantity");
+    await expect(integrator.connect(attacker).setDailyLimit(10))
+      .to.be.revertedWithCustomError(integrator, "NotAuthorized");
   });
 
   it("4. validateOrder reverts on the 26th transaction in the same day (25/day limit)", async function () {
@@ -330,22 +303,18 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     expect(await integrator.perTxCap(MXN)).to.equal(USDC(100));
     // Owner tunes MXN to 75 USDC on-chain (admin dashboard).
     await expect(integrator.connect(owner).setPerTxCap(MXN, USDC(75)))
-      .to.emit(integrator, "PerTxCapSet")
-      .withArgs(MXN, USDC(75));
+      .to.emit(integrator, "PerTxCapSet").withArgs(MXN, USDC(75));
     expect(await integrator.perTxCap(MXN)).to.equal(USDC(75));
     // The new cap is enforced for the MXN merchant: 76 reverts, 75 ok.
-    await expect(
-      integrator.connect(diamond).validateOrder(merchant1.address, USDC(76), MXN)
-    ).to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
-    await expect(integrator.connect(diamond).validateOrder(merchant1.address, USDC(75), MXN)).to.not
-      .be.reverted;
+    await expect(integrator.connect(diamond).validateOrder(merchant1.address, USDC(76), MXN))
+      .to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
+    await expect(integrator.connect(diamond).validateOrder(merchant1.address, USDC(75), MXN)).to.not.be.reverted;
     // Clearing (cap=0) falls back to the default 100.
     await integrator.connect(owner).setPerTxCap(MXN, 0);
     expect(await integrator.perTxCap(MXN)).to.equal(USDC(100));
     // Non-manager cannot set caps.
-    await expect(
-      integrator.connect(attacker).setPerTxCap(MXN, USDC(1))
-    ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+    await expect(integrator.connect(attacker).setPerTxCap(MXN, USDC(1)))
+      .to.be.revertedWithCustomError(integrator, "NotAuthorized");
   });
 
   it("5. daily count resets after one day", async function () {
@@ -388,44 +357,32 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     expect(await integrator.lockPeriod(BRL)).to.equal(SETTLEMENT); // falls back to global
 
     // ── access control: only the super-admin may change locks ──
-    await expect(
-      integrator.connect(attacker).setSettlementPeriod(3600)
-    ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-    await expect(
-      integrator.connect(merchant1).setLockPeriod(BRL, 3600)
-    ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+    await expect(integrator.connect(attacker).setSettlementPeriod(3600))
+      .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+    await expect(integrator.connect(merchant1).setLockPeriod(BRL, 3600))
+      .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
 
     // ── bounds: reject out-of-range values on both setters ──
     const MIN = Number(await integrator.MIN_SETTLEMENT_PERIOD());
     const MAX = Number(await integrator.MAX_SETTLEMENT_PERIOD());
-    await expect(integrator.setSettlementPeriod(MIN - 1)).to.be.revertedWithCustomError(
-      integrator,
-      "InvalidLockPeriod"
-    );
-    await expect(integrator.setSettlementPeriod(MAX + 1)).to.be.revertedWithCustomError(
-      integrator,
-      "InvalidLockPeriod"
-    );
-    await expect(integrator.setLockPeriod(BRL, MIN - 1)).to.be.revertedWithCustomError(
-      integrator,
-      "InvalidLockPeriod"
-    );
-    await expect(integrator.setLockPeriod(ethers.ZeroHash, 3600)).to.be.revertedWithCustomError(
-      integrator,
-      "InvalidCurrency"
-    );
+    await expect(integrator.setSettlementPeriod(MIN - 1))
+      .to.be.revertedWithCustomError(integrator, "InvalidLockPeriod");
+    await expect(integrator.setSettlementPeriod(MAX + 1))
+      .to.be.revertedWithCustomError(integrator, "InvalidLockPeriod");
+    await expect(integrator.setLockPeriod(BRL, MIN - 1))
+      .to.be.revertedWithCustomError(integrator, "InvalidLockPeriod");
+    await expect(integrator.setLockPeriod(ethers.ZeroHash, 3600))
+      .to.be.revertedWithCustomError(integrator, "InvalidCurrency");
 
     // ── set a new global default (20 min) ──
     await expect(integrator.setSettlementPeriod(1200))
-      .to.emit(integrator, "SettlementPeriodSet")
-      .withArgs(1200);
+      .to.emit(integrator, "SettlementPeriodSet").withArgs(1200);
     expect(await integrator.lockPeriod(INR)).to.equal(1200); // INR now follows global
     expect(await integrator.lockPeriod(BRL)).to.equal(1200);
 
     // ── set a per-currency override for BRL (30 min) — INR stays on global ──
     await expect(integrator.setLockPeriod(BRL, 1800))
-      .to.emit(integrator, "LockPeriodSet")
-      .withArgs(BRL, 1800);
+      .to.emit(integrator, "LockPeriodSet").withArgs(BRL, 1800);
     expect(await integrator.lockPeriod(BRL)).to.equal(1800); // override wins
     expect(await integrator.lockPeriod(INR)).to.equal(1200); // still global
 
@@ -436,12 +393,12 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     const receipt = await tx.wait();
     const blk = await ethers.provider.getBlock(receipt!.blockNumber);
     const buckets = await integrator.getMerchantBuckets(merchant2.address);
-    expect(buckets[buckets.length - 1].unlockTimestamp).to.equal(BigInt(blk!.timestamp) + 1800n); // BRL override, not the 1200 global
+    expect(buckets[buckets.length - 1].unlockTimestamp)
+      .to.equal(BigInt(blk!.timestamp) + 1800n); // BRL override, not the 1200 global
 
     // ── clear the BRL override (period 0) → falls back to global again ──
     await expect(integrator.setLockPeriod(BRL, 0))
-      .to.emit(integrator, "LockPeriodSet")
-      .withArgs(BRL, 0);
+      .to.emit(integrator, "LockPeriodSet").withArgs(BRL, 0);
     expect(await integrator.lockPeriod(BRL)).to.equal(1200);
   });
 
@@ -452,16 +409,13 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
     expect(await integrator.paused()).to.equal(false);
     // access control: only an owner can pause; a plain merchant / non-owner cannot
-    await expect(integrator.connect(merchant1).pause()).to.be.revertedWithCustomError(
-      integrator,
-      "OnlyOwner"
-    );
-    await expect(integrator.connect(attacker).pause()).to.be.revertedWithCustomError(
-      integrator,
-      "OnlyOwner"
-    );
+    await expect(integrator.connect(merchant1).pause())
+      .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    await expect(integrator.connect(attacker).pause())
+      .to.be.revertedWithCustomError(integrator, "OnlyOwner");
     // unpause when not paused is a no-op guard
-    await expect(integrator.unpause()).to.be.revertedWithCustomError(integrator, "PauseUnchanged");
+    await expect(integrator.unpause())
+      .to.be.revertedWithCustomError(integrator, "PauseUnchanged");
 
     // pause (any owner) — emits with the caller
     await expect(integrator.pause()).to.emit(integrator, "PausedSet").withArgs(owner.address);
@@ -470,41 +424,26 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     await expect(integrator.pause()).to.be.revertedWithCustomError(integrator, "PauseUnchanged");
 
     // NEW activity is halted: place order + both fiat withdrawals + USDC withdrawal
-    await expect(
-      integrator
-        .connect(merchant1)
-        .userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, "")
-    ).to.be.revertedWithCustomError(integrator, "Paused");
-    await expect(
-      integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, "")
-    ).to.be.revertedWithCustomError(integrator, "Paused");
-    await expect(
-      integrator.connect(merchant1).withdrawFiatIn(USDC(5), 1, INR, PK)
-    ).to.be.revertedWithCustomError(integrator, "Paused");
-    await expect(integrator.connect(merchant1).withdrawUSDC(USDC(5))).to.be.revertedWithCustomError(
-      integrator,
-      "Paused"
-    );
+    await expect(integrator.connect(merchant1).userPlaceOrder(await erc721Client.getAddress(), PRODUCT_ID, 1, INR, 1, ""))
+      .to.be.revertedWithCustomError(integrator, "Paused");
+    await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, ""))
+      .to.be.revertedWithCustomError(integrator, "Paused");
+    await expect(integrator.connect(merchant1).withdrawFiatIn(USDC(5), 1, INR, PK))
+      .to.be.revertedWithCustomError(integrator, "Paused");
+    await expect(integrator.connect(merchant1).withdrawUSDC(USDC(5)))
+      .to.be.revertedWithCustomError(integrator, "Paused");
 
     // RECOVERY / admin paths still work while paused — freeze is a safety action
     // and config is unaffected, so an incident can be wound down while paused.
-    await expect(integrator.freezeMerchant(merchant1.address)).to.emit(
-      integrator,
-      "MerchantFrozen"
-    );
-    await expect(integrator.unfreezeMerchant(merchant1.address)).to.emit(
-      integrator,
-      "MerchantUnfrozen"
-    );
+    await expect(integrator.freezeMerchant(merchant1.address)).to.emit(integrator, "MerchantFrozen");
+    await expect(integrator.unfreezeMerchant(merchant1.address)).to.emit(integrator, "MerchantUnfrozen");
     await expect(integrator.setDailyLimit(30)).to.emit(integrator, "DailyLimitSet");
 
     // unpause resumes activity
     await expect(integrator.unpause()).to.emit(integrator, "UnpausedSet").withArgs(owner.address);
     expect(await integrator.paused()).to.equal(false);
-    await expect(integrator.connect(merchant1).withdrawUSDC(USDC(5))).to.emit(
-      integrator,
-      "WithdrawalUSDC"
-    );
+    await expect(integrator.connect(merchant1).withdrawUSDC(USDC(5)))
+      .to.emit(integrator, "WithdrawalUSDC");
   });
 
   it("7. getMerchantBalance is correct after a deposit", async function () {
@@ -522,9 +461,10 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
   it("8. withdrawINR reverts before the 30-day settlement", async function () {
     await depositFor(merchant1, UPI_1, 2);
-    await expect(
-      integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-    ).to.be.revertedWithCustomError(integrator, "InsufficientAvailableBalance");
+    await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")).to.be.revertedWithCustomError(
+      integrator,
+      "InsufficientAvailableBalance"
+    );
   });
 
   it("9. withdrawINR succeeds after 30 days (funds the merchant proxy, places SELL order)", async function () {
@@ -563,17 +503,11 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     const tx = await integrator.connect(merchant2).withdrawFiat(USDC(20), 1, PK, "");
     const rcpt = await tx.wait();
     const sellId = rcpt.logs
-      .map((l: any) => {
-        try {
-          return integrator.interface.parseLog(l);
-        } catch {
-          return null;
-        }
-      })
+      .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
       .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
 
     const sellOrder = await mockDiamond.getSellOrder(sellId);
-    expect(sellOrder.currency).to.equal(BRL); // ← BRL, not INR
+    expect(sellOrder.currency).to.equal(BRL);  // ← BRL, not INR
   });
 
   it("9-cross. an INR-registered merchant can withdraw IN BRL via withdrawFiatIn (cross-currency)", async function () {
@@ -581,24 +515,18 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     // cash out as BRL to a PIX key. withdrawFiatIn places the SELL in BRL with
     // the chosen payout — proving currency + payout are caller-supplied.
     const BRL = ethers.encodeBytes32String("BRL");
-    await depositFor(merchant1, UPI_1, 2); // registered INR
+    await depositFor(merchant1, UPI_1, 2);          // registered INR
     await increaseTime(SETTLEMENT + 3600);
 
     const tx = await integrator.connect(merchant1).withdrawFiatIn(USDC(20), 2, BRL, PK);
     const rcpt = await tx.wait();
     const ev = rcpt.logs
-      .map((l: any) => {
-        try {
-          return integrator.interface.parseLog(l);
-        } catch {
-          return null;
-        }
-      })
+      .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
       .find((l: any) => l?.name === "WithdrawalFiat");
-    expect(ev.args.currency).to.equal(BRL); // event carries BRL, not INR
+    expect(ev.args.currency).to.equal(BRL);        // event carries BRL, not INR
 
     const sell = await mockDiamond.getSellOrder(ev.args.orderId);
-    expect(sell.currency).to.equal(BRL); // SELL placed in BRL
+    expect(sell.currency).to.equal(BRL);           // SELL placed in BRL
     // merchant's registered currency is UNCHANGED (still INR)
     const [, , savedCurrency] = await integrator.getMerchantInfo(merchant1.address);
     expect(savedCurrency).to.equal(ethers.encodeBytes32String("INR"));
@@ -608,22 +536,19 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     await depositFor(merchant1, UPI_1, 2);
     await increaseTime(SETTLEMENT + 3600);
     const BRL = ethers.encodeBytes32String("BRL");
-    await expect(
-      integrator.connect(merchant1).withdrawFiatIn(USDC(5), 2, ethers.ZeroHash, PK)
-    ).to.be.revertedWithCustomError(integrator, "InvalidCurrency");
-    await expect(
-      integrator.connect(merchant1).withdrawFiatIn(USDC(5), 2, BRL, "")
-    ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    await expect(integrator.connect(merchant1).withdrawFiatIn(USDC(5), 2, ethers.ZeroHash, PK))
+      .to.be.revertedWithCustomError(integrator, "InvalidCurrency");
+    await expect(integrator.connect(merchant1).withdrawFiatIn(USDC(5), 2, BRL, ""))
+      .to.be.revertedWithCustomError(integrator, "InvalidAddress");
   });
 
   it("9-cross. withdrawFiatIn still caps by the merchant's OWN balance (no cross-merchant drain)", async function () {
     // m1 has 20; even choosing any currency, they can't withdraw more than theirs.
-    await depositFor(merchant1, UPI_1, 2); // 20
+    await depositFor(merchant1, UPI_1, 2);  // 20
     await increaseTime(SETTLEMENT + 3600);
     const BRL = ethers.encodeBytes32String("BRL");
-    await expect(
-      integrator.connect(merchant1).withdrawFiatIn(USDC(50), 2, BRL, PK)
-    ).to.be.revertedWithCustomError(integrator, "InsufficientAvailableBalance");
+    await expect(integrator.connect(merchant1).withdrawFiatIn(USDC(50), 2, BRL, PK))
+      .to.be.revertedWithCustomError(integrator, "InsufficientAvailableBalance");
   });
 
   it("9a. withdrawFiat places the SELL with the relay pubkey; saved profile unchanged", async function () {
@@ -632,10 +557,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
     // The SELL carries the relay pubKey (not the payout); the UPI is delivered
     // later via deliverFiatPayout. Placement should succeed and emit WithdrawalFiat.
-    await expect(integrator.connect(merchant1).withdrawFiat(USDC(10), 1, PK, "")).to.emit(
-      integrator,
-      "WithdrawalFiat"
-    );
+    await expect(integrator.connect(merchant1).withdrawFiat(USDC(10), 1, PK, ""))
+      .to.emit(integrator, "WithdrawalFiat");
     // saved profile (payout/shop) is untouched by a withdrawal
     const [savedUpi] = await integrator.getMerchantInfo(merchant1.address);
     expect(savedUpi).to.equal(UPI_1);
@@ -666,13 +589,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     const tx = await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "");
     const rcpt = await tx.wait();
     const ev = rcpt.logs
-      .map((l: any) => {
-        try {
-          return integrator.interface.parseLog(l);
-        } catch {
-          return null;
-        }
-      })
+      .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
       .find((l: any) => l?.name === "WithdrawalFiat");
     const orderId = ev.args.orderId;
     expect(await mockUsdc.balanceOf(merchantProxy)).to.equal(USDC(20)); // principal only
@@ -685,9 +602,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
     // AUDIT-MED: a stranger CANNOT deliver the payout (would let them front-run
     // with an attacker payload + brick the channel). Only merchant/owner/relayer.
-    await expect(
-      integrator.connect(attacker).deliverFiatPayout(orderId, "evil")
-    ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    await expect(integrator.connect(attacker).deliverFiatPayout(orderId, "evil"))
+      .to.be.revertedWithCustomError(integrator, "OnlyOwner");
 
     // 3) deliver: tops up the FEE (charged to merchant's own balance) + allowance
     await expect(integrator.connect(merchant1).deliverFiatPayout(orderId, "encUpi"))
@@ -714,13 +630,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     const tx = await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "");
     const rcpt = await tx.wait();
     const orderId = rcpt.logs
-      .map((l: any) => {
-        try {
-          return integrator.interface.parseLog(l);
-        } catch {
-          return null;
-        }
-      })
+      .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
       .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
     await mockDiamond.acceptSellOrder(orderId, "lp");
 
@@ -755,6 +665,67 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     expect(available).to.equal(0);
   });
 
+  it("11a. NO ROUNDING/DRIFT: totalOwed == Σ buckets == custody, exactly, across deposit→withdraw→fee→recredit (odd amounts)", async function () {
+    // The accounting has NO division in any value path (only add/subtract/min), so
+    // there is no place a rounding residue can appear. This test PROVES it: at every
+    // step, totalOwed must equal the exact sum of every merchant's bucket amounts,
+    // AND the physical custody (vault + any integrator-held USDC) must cover it to
+    // the wei. We use ODD amounts and an ODD fee so any rounding would show up as a
+    // 1-wei divergence.
+    const custody = async () =>
+      (await mockUsdc.balanceOf(await vault.getAddress())) +
+      (await mockUsdc.balanceOf(await integrator.getAddress()));
+    const sumBuckets = async (m: string) => {
+      const bs = await integrator.getMerchantBuckets(m);
+      return bs.reduce((acc: bigint, b: any) => acc + b.amount, 0n);
+    };
+    // invariant check: totalOwed == Σ(all merchants' buckets) AND custody >= totalOwed
+    const checkInvariant = async () => {
+      const owed = await integrator.totalOwed();
+      const bucketSum = (await sumBuckets(merchant1.address)) + (await sumBuckets(merchant2.address));
+      expect(bucketSum, "totalOwed must equal the exact sum of all buckets (no drift)").to.equal(owed);
+      expect(await custody(), "custody must cover totalOwed to the wei").to.be.gte(owed);
+    };
+
+    // Two merchants deposit round 10-USDC multiples (the test client's unit price).
+    await depositFor(merchant1, UPI_1, 3); // 30
+    await depositFor(merchant2, UPI_2, 2); // 20 (funds the fee pool too)
+    await checkInvariant();
+    expect(await integrator.totalOwed()).to.equal(USDC(50));
+
+    await increaseTime(SETTLEMENT + 3600);
+
+    // Merchant1 withdraws an ODD principal as USDC — subtraction only, no residue.
+    await integrator.connect(merchant1).withdrawUSDC(USDC(7)); // 30 → 23
+    await checkInvariant();
+
+    // A fiat withdrawal with an ODD fee (1.234567 USDC) — the fee is debited from the
+    // merchant's own buckets (subtract) and advanced from the pool; totalOwed drops by
+    // exactly principal+fee, custody drops by the same. No rounding anywhere.
+    const ODD_FEE = ethers.parseUnits("1.234567", 6);
+    await mockDiamond.setSellFee(ODD_FEE);
+    const tx = await integrator.connect(merchant1).withdrawFiat(ethers.parseUnits("3.5", 6), 1, PK, "");
+    const rcpt = await tx.wait();
+    const orderId = rcpt.logs
+      .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
+      .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
+    await checkInvariant(); // principal escrowed off buckets; still exact
+
+    await mockDiamond.acceptSellOrder(orderId, "lp");
+    await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"); // fee debited (odd)
+    await checkInvariant(); // totalOwed dropped by principal+odd-fee, still exact
+
+    // Cancel → refund principal+fee to the proxy → reconcile re-credits EXACTLY the
+    // physical refund (min(owedBack, proxyBal)); no over/under-credit, no residue.
+    await mockDiamond.cancelSellOrder(orderId);
+    await integrator.reconcileWithdrawal(orderId);
+    await checkInvariant();
+
+    // Final: drain merchant2 entirely and confirm the invariant holds at zero.
+    await integrator.connect(merchant2).withdrawUSDC(USDC(20));
+    await checkInvariant();
+  });
+
   // ─── 12: Freeze ────────────────────────────────────────────────────
 
   it("12. a frozen merchant cannot withdraw even after 30 days", async function () {
@@ -765,9 +736,10 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       .to.emit(integrator, "MerchantFrozen")
       .withArgs(merchant1.address);
 
-    await expect(
-      integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-    ).to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
+    await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")).to.be.revertedWithCustomError(
+      integrator,
+      "MerchantIsFrozen"
+    );
     await expect(
       integrator.connect(merchant1).withdrawUSDC(USDC(20))
     ).to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
@@ -776,6 +748,78 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       .to.emit(integrator, "MerchantUnfrozen")
       .withArgs(merchant1.address);
     await integrator.connect(merchant1).withdrawUSDC(USDC(20));
+  });
+
+  it("12a. ESCHEAT: a 90-day continuously-frozen merchant's funds are super-admin-recoverable (never permanently lost)", async function () {
+    const ESCHEAT = 90 * DAY;
+    await depositFor(merchant1, UPI_1, 3); // 30 (some locked, some soon-unlocked)
+    await depositFor(merchant2, UPI_2, 2); // 20 — a bystander who must NOT be touched
+    const treasury = attacker; // any address the super-admin chooses as destination
+
+    // Not frozen → not escheatable (clock not running).
+    expect(await integrator.escheatableAt(merchant1.address)).to.equal(0);
+    await expect(integrator.adminEscheat(merchant1.address, treasury.address))
+      .to.be.revertedWithCustomError(integrator, "NotEscheatable");
+
+    // Freeze → clock starts; escheatableAt = frozenAt + 90d.
+    const fzTx = await integrator.freezeMerchant(merchant1.address);
+    const fzBlk = await ethers.provider.getBlock((await fzTx.wait()).blockNumber);
+    expect(await integrator.escheatableAt(merchant1.address)).to.equal(BigInt(fzBlk!.timestamp) + BigInt(ESCHEAT));
+
+    // Before 90 days → still not escheatable.
+    await increaseTime(ESCHEAT - 3600);
+    await expect(integrator.adminEscheat(merchant1.address, treasury.address))
+      .to.be.revertedWithCustomError(integrator, "NotEscheatable");
+
+    // UNFREEZE RESETS the clock: even long after, a fresh freeze restarts 90 days.
+    await integrator.unfreezeMerchant(merchant1.address);
+    expect(await integrator.escheatableAt(merchant1.address)).to.equal(0);
+    await integrator.freezeMerchant(merchant1.address); // clock restarts here
+    await increaseTime(ESCHEAT - 100); // just shy of the new window
+    await expect(integrator.adminEscheat(merchant1.address, treasury.address))
+      .to.be.revertedWithCustomError(integrator, "NotEscheatable"); // reset worked
+
+    // Cross the full continuous 90 days from the LAST freeze.
+    await increaseTime(200);
+
+    // Access control: only the super-admin (not a mere FINANCE admin) can escheat.
+    await integrator.connect(owner).setRole(merchant2.address, 4); // FINANCE
+    await expect(integrator.connect(merchant2).adminEscheat(merchant1.address, treasury.address))
+      .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+    await integrator.connect(owner).setRole(merchant2.address, 0);
+
+    // Snapshot solvency before: totalOwed == vault balance; capture merchant1's full balance.
+    const owedBefore = await integrator.totalOwed();
+    const vaultBefore = await mockUsdc.balanceOf(await vault.getAddress());
+    const [pending1, avail1] = await integrator.getMerchantBalance(merchant1.address);
+    const m1Full = pending1 + avail1; // ENTIRE balance (locked + unlocked)
+    expect(m1Full).to.equal(USDC(30));
+    const treasuryBefore = await mockUsdc.balanceOf(treasury.address);
+
+    // ESCHEAT: super-admin recovers merchant1's entire balance to the treasury.
+    await expect(integrator.adminEscheat(merchant1.address, treasury.address))
+      .to.emit(integrator, "MerchantEscheated").withArgs(merchant1.address, treasury.address, USDC(30));
+
+    // Funds moved out to the chosen destination, exactly.
+    expect((await mockUsdc.balanceOf(treasury.address)) - treasuryBefore).to.equal(USDC(30));
+    // Merchant1 is zeroed.
+    const [p2, a2] = await integrator.getMerchantBalance(merchant1.address);
+    expect(p2 + a2).to.equal(0);
+    expect((await integrator.getMerchantBuckets(merchant1.address)).length).to.equal(0);
+    // totalOwed dropped by EXACTLY merchant1's balance; solvency still holds.
+    expect(await integrator.totalOwed()).to.equal(owedBefore - USDC(30));
+    expect(await mockUsdc.balanceOf(await vault.getAddress())).to.equal(vaultBefore - USDC(30));
+    expect(await mockUsdc.balanceOf(await vault.getAddress())).to.be.gte(await integrator.totalOwed());
+    // Bystander merchant2 is completely untouched.
+    const [pB, aB] = await integrator.getMerchantBalance(merchant2.address);
+    expect(pB + aB).to.equal(USDC(20));
+
+    // Cannot double-escheat (balance is now 0).
+    await expect(integrator.adminEscheat(merchant1.address, treasury.address))
+      .to.be.revertedWithCustomError(integrator, "NothingToEscheat");
+    // Reverts on zero destination.
+    await expect(integrator.adminEscheat(merchant2.address, ethers.ZeroAddress))
+      .to.be.revertedWithCustomError(integrator, "InvalidAddress");
   });
 
   // ─── 13: Isolation ─────────────────────────────────────────────────
@@ -861,38 +905,31 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     it("multi-admin: owner adds an admin who can freeze; non-admin cannot; owner-only mgmt", async function () {
       await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop", INR_CODE);
       // Initially merchant2 is not an admin → cannot freeze.
-      await expect(
-        integrator.connect(merchant2).freezeMerchant(merchant1.address)
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(merchant2).freezeMerchant(merchant1.address))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
       expect(await integrator.isAdmin(merchant2.address)).to.equal(false);
 
       // Owner adds merchant2 as an admin.
       await expect(integrator.connect(owner).addAdmin(merchant2.address))
-        .to.emit(integrator, "AdminAdded")
-        .withArgs(merchant2.address);
+        .to.emit(integrator, "AdminAdded").withArgs(merchant2.address);
       expect(await integrator.isAdmin(merchant2.address)).to.equal(true);
 
       // Now merchant2 (admin) CAN freeze/unfreeze.
-      await expect(integrator.connect(merchant2).freezeMerchant(merchant1.address)).to.emit(
-        integrator,
-        "MerchantFrozen"
-      );
+      await expect(integrator.connect(merchant2).freezeMerchant(merchant1.address))
+        .to.emit(integrator, "MerchantFrozen");
       await integrator.connect(merchant2).unfreezeMerchant(merchant1.address);
 
       // But an admin CANNOT add/remove admins or transfer ownership (super-admin only).
-      await expect(
-        integrator.connect(merchant2).addAdmin(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(merchant2).transferOwnership(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).addAdmin(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).transferOwnership(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
 
       // Owner removes the admin → can no longer freeze.
       await integrator.connect(owner).removeAdmin(merchant2.address);
       expect(await integrator.isAdmin(merchant2.address)).to.equal(false);
-      await expect(
-        integrator.connect(merchant2).freezeMerchant(merchant1.address)
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(merchant2).freezeMerchant(merchant1.address))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
     });
 
     it("5-tier RBAC: VIEWER < SUPPORT < MANAGER < FINANCE, hierarchical, owner=FINANCE", async function () {
@@ -902,81 +939,63 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       // ── VIEWER (1): read-only. No write action. ──
       await expect(integrator.connect(owner).setRole(admin.address, 1))
-        .to.emit(integrator, "AdminRoleSet")
-        .withArgs(admin.address, 1);
+        .to.emit(integrator, "AdminRoleSet").withArgs(admin.address, 1);
       expect(await integrator.isAdmin(admin.address)).to.equal(true);
       expect(await integrator.isManager(admin.address)).to.equal(false);
       expect(await integrator.isFinance(admin.address)).to.equal(false);
       expect(await integrator.roleOf(admin.address)).to.equal(1);
       // VIEWER cannot even freeze (needs SUPPORT).
-      await expect(
-        integrator.connect(admin).freezeMerchant(merchant1.address)
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
-      await expect(
-        integrator.connect(admin).setPerTxCap(MXN, USDC(75))
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(admin).freezeMerchant(merchant1.address))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(admin).setPerTxCap(MXN, USDC(75)))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
 
       // ── SUPPORT (2): + freeze/unfreeze, still no money/config. ──
       await integrator.connect(owner).setRole(admin.address, 2);
       expect(await integrator.roleOf(admin.address)).to.equal(2);
-      await expect(integrator.connect(admin).freezeMerchant(merchant1.address)).to.emit(
-        integrator,
-        "MerchantFrozen"
-      );
+      await expect(integrator.connect(admin).freezeMerchant(merchant1.address))
+        .to.emit(integrator, "MerchantFrozen");
       await integrator.connect(admin).unfreezeMerchant(merchant1.address);
-      await expect(
-        integrator.connect(admin).setPerTxCap(MXN, USDC(75))
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
-      await expect(integrator.connect(admin).adminAbortWithdrawal(1)).to.be.revertedWithCustomError(
-        integrator,
-        "NotAuthorized"
-      );
+      await expect(integrator.connect(admin).setPerTxCap(MXN, USDC(75)))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(admin).adminAbortWithdrawal(1))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
 
       // ── MANAGER (3): + caps/limit/relayer AND still freeze (hierarchical). ──
       await integrator.connect(owner).setRole(admin.address, 3);
       expect(await integrator.isManager(admin.address)).to.equal(true);
       expect(await integrator.roleOf(admin.address)).to.equal(3);
-      await expect(integrator.connect(admin).setPerTxCap(MXN, USDC(75))).to.emit(
-        integrator,
-        "PerTxCapSet"
-      );
+      await expect(integrator.connect(admin).setPerTxCap(MXN, USDC(75)))
+        .to.emit(integrator, "PerTxCapSet");
       await integrator.connect(admin).setDailyLimit(10);
       await integrator.connect(admin).freezeMerchant(merchant1.address); // still can (lower tier)
       await integrator.connect(admin).unfreezeMerchant(merchant1.address);
       // But NOT money-recovery (needs FINANCE).
-      await expect(integrator.connect(admin).adminAbortWithdrawal(1)).to.be.revertedWithCustomError(
-        integrator,
-        "NotAuthorized"
-      );
-      await expect(integrator.connect(admin).adminForceSettle(1)).to.be.revertedWithCustomError(
-        integrator,
-        "NotAuthorized"
-      );
+      await expect(integrator.connect(admin).adminAbortWithdrawal(1))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(admin).adminForceSettle(1))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
 
       // ── FINANCE (4): + money recovery. (abort reverts on unknown id, but with
       //    a DIFFERENT error than NotAuthorized — proving the gate now passes.) ──
       await integrator.connect(owner).setRole(admin.address, 4);
       expect(await integrator.isFinance(admin.address)).to.equal(true);
       expect(await integrator.roleOf(admin.address)).to.equal(4);
-      await expect(
-        integrator.connect(admin).adminAbortWithdrawal(999999)
-      ).to.be.revertedWithCustomError(integrator, "UnknownWithdrawal");
+      await expect(integrator.connect(admin).adminAbortWithdrawal(999999))
+        .to.be.revertedWithCustomError(integrator, "UnknownWithdrawal");
 
       // No tier can manage roles / ownership (super-admin only).
-      await expect(
-        integrator.connect(admin).setRole(attacker.address, 2)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(admin).transferOwnership(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(admin).setRole(attacker.address, 2))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(admin).transferOwnership(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
 
       // ── Revoke (0). ──
       await integrator.connect(owner).setRole(admin.address, 0);
       expect(await integrator.isAdmin(admin.address)).to.equal(false);
       expect(await integrator.roleOf(admin.address)).to.equal(0);
-      await expect(
-        integrator.connect(admin).freezeMerchant(merchant1.address)
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(admin).freezeMerchant(merchant1.address))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
 
       // Owner reads as FINANCE (4, top tier) and satisfies every check.
       expect(await integrator.roleOf(owner.address)).to.equal(4);
@@ -993,15 +1012,12 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     it("transferOwnership adds new owner but NEVER drops the super-admin caller", async function () {
       // Only the super-admin (deployer) may call; a non-super-admin owner cannot.
       await integrator.connect(owner).addOwner(merchant2.address);
-      await expect(
-        integrator.connect(merchant2).transferOwnership(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(attacker).transferOwnership(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(owner).transferOwnership(ethers.ZeroAddress)
-      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(integrator.connect(merchant2).transferOwnership(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(attacker).transferOwnership(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(owner).transferOwnership(ethers.ZeroAddress))
+        .to.be.revertedWithCustomError(integrator, "InvalidAddress");
       // Super-admin "hands off" to merchant1 — merchant1 becomes an owner, but the
       // super-admin is NOT dropped (root control must stay with the super-admin).
       await integrator.connect(owner).transferOwnership(merchant1.address);
@@ -1009,9 +1025,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await integrator.isOwner(owner.address)).to.equal(true); // super-admin retained
       expect(await integrator.superAdmin()).to.equal(owner.address);
       // The new owner still cannot manage admins — that's super-admin only.
-      await expect(
-        integrator.connect(merchant1).addAdmin(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant1).addAdmin(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
     });
 
     it("MULTI-OWNER: only super-admin manages the owner set; owners get FINANCE but not governance", async function () {
@@ -1021,53 +1036,39 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await integrator.ownerCount()).to.equal(1);
       // Super-admin adds a second owner → it gets full FINANCE-tier access...
       await expect(integrator.connect(owner).addOwner(merchant2.address))
-        .to.emit(integrator, "OwnerAdded")
-        .withArgs(merchant2.address);
+        .to.emit(integrator, "OwnerAdded").withArgs(merchant2.address);
       expect(await integrator.isOwner(merchant2.address)).to.equal(true);
       expect(await integrator.roleOf(merchant2.address)).to.equal(4); // FINANCE (top)
       // ...but a NON-super-admin owner canNOT manage roles or owners.
-      await expect(
-        integrator.connect(merchant2).setRole(merchant1.address, 2)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(merchant2).addOwner(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(merchant2).removeOwner(owner.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(merchant2).addAdmin(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(merchant2).removeAdmin(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).setRole(merchant1.address, 2))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).addOwner(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).removeOwner(owner.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).addAdmin(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).removeAdmin(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       // ...BUT a non-super-admin owner DOES keep every FINANCE-tier OPERATIONAL
       // power (the re-gating lifted only GOVERNANCE to the super-admin — it must
       // NOT have stripped owners of their day-to-day admin actions). Prove it:
       await expect(integrator.connect(merchant2).freezeMerchant(merchant1.address))
-        .to.emit(integrator, "MerchantFrozen")
-        .withArgs(merchant1.address);
+        .to.emit(integrator, "MerchantFrozen").withArgs(merchant1.address);
       await expect(integrator.connect(merchant2).unfreezeMerchant(merchant1.address))
-        .to.emit(integrator, "MerchantUnfrozen")
-        .withArgs(merchant1.address);
+        .to.emit(integrator, "MerchantUnfrozen").withArgs(merchant1.address);
       await expect(integrator.connect(merchant2).setDailyLimit(30))
-        .to.emit(integrator, "DailyLimitSet")
-        .withArgs(30);
+        .to.emit(integrator, "DailyLimitSet").withArgs(30);
       // ...and canNOT repoint/seed custody (root-of-trust: super-admin only).
-      await expect(
-        integrator.connect(merchant2).setVault(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(integrator.connect(merchant2).flushToVault()).to.be.revertedWithCustomError(
-        integrator,
-        "OnlySuperAdmin"
-      );
-      await expect(
-        integrator.connect(merchant2).migrateState(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).setVault(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).flushToVault())
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).migrateState(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       // A non-owner likewise cannot.
-      await expect(
-        integrator.connect(merchant1).addOwner(merchant1.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant1).addOwner(merchant1.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       // Super-admin adds a third owner then removes down.
       await integrator.connect(owner).addOwner(attacker.address);
       expect(await integrator.ownerCount()).to.equal(3);
@@ -1075,9 +1076,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await integrator.connect(owner).removeOwner(merchant2.address);
       expect(await integrator.ownerCount()).to.equal(1);
       // The super-admin can never be removed as an owner (even by itself).
-      await expect(
-        integrator.connect(owner).removeOwner(owner.address)
-      ).to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
+      await expect(integrator.connect(owner).removeOwner(owner.address))
+        .to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
     });
 
     it("SUPER-ADMIN: unremovable + undemotable; handoff via transferSuperAdmin only", async function () {
@@ -1085,40 +1085,32 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await integrator.superAdmin()).to.equal(owner.address);
       expect(await integrator.isOwner(owner.address)).to.equal(true);
       // Cannot demote the super-admin via setRole.
-      await expect(
-        integrator.connect(owner).setRole(owner.address, 0)
-      ).to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
+      await expect(integrator.connect(owner).setRole(owner.address, 0))
+        .to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
       // Only the super-admin can PROPOSE a handoff; others cannot.
-      await expect(
-        integrator.connect(attacker).transferSuperAdmin(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(owner).transferSuperAdmin(owner.address)
-      ).to.be.revertedWithCustomError(integrator, "InvalidAddress"); // no-op handoff
+      await expect(integrator.connect(attacker).transferSuperAdmin(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(owner).transferSuperAdmin(owner.address))
+        .to.be.revertedWithCustomError(integrator, "InvalidAddress"); // no-op handoff
       // AUDIT FIX B — TWO-STEP handoff. Proposing does NOT move root yet.
       await expect(integrator.connect(owner).transferSuperAdmin(merchant2.address))
-        .to.emit(integrator, "SuperAdminTransferStarted")
-        .withArgs(owner.address, merchant2.address);
-      expect(await integrator.superAdmin()).to.equal(owner.address); // unchanged until accept
+        .to.emit(integrator, "SuperAdminTransferStarted").withArgs(owner.address, merchant2.address);
+      expect(await integrator.superAdmin()).to.equal(owner.address);      // unchanged until accept
       expect(await integrator.pendingSuperAdmin()).to.equal(merchant2.address);
       // A non-pending address cannot accept.
-      await expect(integrator.connect(attacker).acceptSuperAdmin()).to.be.revertedWithCustomError(
-        integrator,
-        "OnlySuperAdmin"
-      );
+      await expect(integrator.connect(attacker).acceptSuperAdmin())
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       // The pending address accepts → it becomes super-admin AND an owner; the
       // previous super-admin stays an owner (not auto-evicted); pending clears.
       await expect(integrator.connect(merchant2).acceptSuperAdmin())
-        .to.emit(integrator, "SuperAdminTransferred")
-        .withArgs(owner.address, merchant2.address);
+        .to.emit(integrator, "SuperAdminTransferred").withArgs(owner.address, merchant2.address);
       expect(await integrator.superAdmin()).to.equal(merchant2.address);
       expect(await integrator.pendingSuperAdmin()).to.equal(ethers.ZeroAddress);
       expect(await integrator.isOwner(merchant2.address)).to.equal(true);
       expect(await integrator.isOwner(owner.address)).to.equal(true); // previous retained as owner
       // The OLD super-admin can no longer manage roles/owners.
-      await expect(
-        integrator.connect(owner).setRole(merchant1.address, 2)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(owner).setRole(merchant1.address, 2))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       // The NEW super-admin can, and can now remove the old one as a plain owner.
       await integrator.connect(merchant2).setRole(merchant1.address, 2);
       expect(await integrator.roleOf(merchant1.address)).to.equal(2);
@@ -1136,13 +1128,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         Integrator.deploy(await mockDiamond.getAddress(), ethers.ZeroAddress, v, [])
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
       // Seed extra owners at construction.
-      const ig2 = await Integrator.deploy(
-        await mockDiamond.getAddress(),
-        await mockUsdc.getAddress(),
-        v,
-        [merchant1.address, merchant2.address]
-      );
-      expect(await ig2.isOwner(owner.address)).to.equal(true); // deployer
+      const ig2 = await Integrator.deploy(await mockDiamond.getAddress(), await mockUsdc.getAddress(), v, [merchant1.address, merchant2.address]);
+      expect(await ig2.isOwner(owner.address)).to.equal(true);   // deployer
       expect(await ig2.isOwner(merchant1.address)).to.equal(true);
       expect(await ig2.isOwner(merchant2.address)).to.equal(true);
       expect(await ig2.ownerCount()).to.equal(3);
@@ -1153,9 +1140,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await integrator.connect(owner).addOwner(merchant2.address);
       expect(await integrator.ownerCount()).to.equal(2);
       // Owner hands off "to self" — must revert, NOT strip the caller.
-      await expect(
-        integrator.connect(owner).transferOwnership(owner.address)
-      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(integrator.connect(owner).transferOwnership(owner.address))
+        .to.be.revertedWithCustomError(integrator, "InvalidAddress");
       // Caller is still an owner; set is unchanged.
       expect(await integrator.isOwner(owner.address)).to.equal(true);
       expect(await integrator.ownerCount()).to.equal(2);
@@ -1173,10 +1159,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         await mockDiamond.getAddress(), // some non-vault address as its "vault"
         []
       );
-      await expect(vault.setIntegrator(await stray.getAddress())).to.be.revertedWithCustomError(
-        vault,
-        "LinkMismatch"
-      );
+      await expect(vault.setIntegrator(await stray.getAddress()))
+        .to.be.revertedWithCustomError(vault, "LinkMismatch");
       // The real integrator (points back) was accepted in beforeEach.
       expect(await vault.integrator()).to.equal(await integrator.getAddress());
     });
@@ -1192,12 +1176,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       );
       await mockDiamond.registerIntegrator(await ig.getAddress(), await ig.proxyImpl());
       const Client = await ethers.getContractFactory("SimpleERC721Client");
-      const client = await Client.deploy(
-        await ig.getAddress(),
-        await mockUsdc.getAddress(),
-        "I",
-        "I"
-      );
+      const client = await Client.deploy(await ig.getAddress(), await mockUsdc.getAddress(), "I", "I");
       await client.setProductPrice(PRODUCT_ID, UNIT_PRICE);
 
       await ig.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
@@ -1231,12 +1210,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       );
       await mockDiamond.registerIntegrator(await ig.getAddress(), await ig.proxyImpl());
       const Client = await ethers.getContractFactory("SimpleERC721Client");
-      const client = await Client.deploy(
-        await ig.getAddress(),
-        await mockUsdc.getAddress(),
-        "I",
-        "I"
-      );
+      const client = await Client.deploy(await ig.getAddress(), await mockUsdc.getAddress(), "I", "I");
       await client.setProductPrice(PRODUCT_ID, UNIT_PRICE);
       await ig.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
       const tx = await ig
@@ -1254,7 +1228,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await v2.setIntegrator(await ig.getAddress()); // handshake ok (ig.vault()==v2)
 
       // Flush the held balance into the vault.
-      await expect(ig.flushToVault()).to.emit(ig, "FlushedToVault").withArgs(USDC(20));
+      await expect(ig.flushToVault())
+        .to.emit(ig, "FlushedToVault").withArgs(USDC(20));
       expect(await mockUsdc.balanceOf(await ig.getAddress())).to.equal(0);
       expect(await v2.balance()).to.equal(USDC(20));
       // Solvency restored: vault.balance() >= totalOwed.
@@ -1283,87 +1258,60 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       // Seed its totalOwed from the prior integrator.
       await expect(next.migrateState(await integrator.getAddress()))
-        .to.emit(next, "MigratedState")
-        .withArgs(await integrator.getAddress(), USDC(20));
+        .to.emit(next, "MigratedState").withArgs(await integrator.getAddress(), USDC(20));
       expect(await next.totalOwed()).to.equal(USDC(20));
       expect(await next.stateMigrated()).to.equal(true);
 
       // One-shot: cannot run again.
-      await expect(next.migrateState(await integrator.getAddress())).to.be.revertedWithCustomError(
-        next,
-        "AlreadyMigrated"
-      );
+      await expect(next.migrateState(await integrator.getAddress()))
+        .to.be.revertedWithCustomError(next, "AlreadyMigrated");
     });
 
     it("migrateState: refuses when local accounting already exists (totalOwed != 0) or vault unset", async function () {
       const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
       // vault unset → precondition fail.
       const noVault = await Integrator.deploy(
-        await mockDiamond.getAddress(),
-        await mockUsdc.getAddress(),
-        ethers.ZeroAddress,
-        []
+        await mockDiamond.getAddress(), await mockUsdc.getAddress(), ethers.ZeroAddress, []
       );
-      await expect(
-        noVault.migrateState(await integrator.getAddress())
-      ).to.be.revertedWithCustomError(noVault, "MigrateStatePreconditions");
+      await expect(noVault.migrateState(await integrator.getAddress()))
+        .to.be.revertedWithCustomError(noVault, "MigrateStatePreconditions");
       // zero prior integrator → precondition fail.
       const withVault = await Integrator.deploy(
-        await mockDiamond.getAddress(),
-        await mockUsdc.getAddress(),
-        await vault.getAddress(),
-        []
+        await mockDiamond.getAddress(), await mockUsdc.getAddress(), await vault.getAddress(), []
       );
-      await expect(withVault.migrateState(ethers.ZeroAddress)).to.be.revertedWithCustomError(
-        withVault,
-        "MigrateStatePreconditions"
-      );
+      await expect(withVault.migrateState(ethers.ZeroAddress))
+        .to.be.revertedWithCustomError(withVault, "MigrateStatePreconditions");
     });
 
     it("migrateState is super-admin-only (repointing/seeding custody is root-of-trust)", async function () {
       const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
       const next = await Integrator.deploy(
-        await mockDiamond.getAddress(),
-        await mockUsdc.getAddress(),
-        await vault.getAddress(),
-        []
+        await mockDiamond.getAddress(), await mockUsdc.getAddress(), await vault.getAddress(), []
       );
-      await expect(
-        next.connect(attacker).migrateState(await integrator.getAddress())
-      ).to.be.revertedWithCustomError(next, "OnlySuperAdmin");
+      await expect(next.connect(attacker).migrateState(await integrator.getAddress()))
+        .to.be.revertedWithCustomError(next, "OnlySuperAdmin");
     });
 
     it("flushToVault is super-admin-only and reverts if the vault is unset", async function () {
       const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
       const ig = await Integrator.deploy(
-        await mockDiamond.getAddress(),
-        await mockUsdc.getAddress(),
-        ethers.ZeroAddress,
-        []
+        await mockDiamond.getAddress(), await mockUsdc.getAddress(), ethers.ZeroAddress, []
       );
       await expect(ig.flushToVault()).to.be.revertedWithCustomError(ig, "VaultNotSet");
-      await expect(ig.connect(attacker).flushToVault()).to.be.revertedWithCustomError(
-        ig,
-        "OnlySuperAdmin"
-      );
+      await expect(ig.connect(attacker).flushToVault()).to.be.revertedWithCustomError(ig, "OnlySuperAdmin");
     });
 
     it("setVault is super-admin-only — rejects an attacker (root-of-trust custody pointer)", async function () {
-      await expect(
-        integrator.connect(attacker).setVault(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(attacker).setVault(ethers.ZeroAddress)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(attacker).setVault(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(attacker).setVault(ethers.ZeroAddress))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
     });
 
     it("constructor seeds superAdmin = deployer and emits SuperAdminTransferred(0, deployer)", async function () {
       const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
       const fresh = await Integrator.deploy(
-        await mockDiamond.getAddress(),
-        await mockUsdc.getAddress(),
-        ethers.ZeroAddress,
-        []
+        await mockDiamond.getAddress(), await mockUsdc.getAddress(), ethers.ZeroAddress, []
       );
       // superAdmin is the deployer (the connected signer), who is also an owner.
       expect(await fresh.superAdmin()).to.equal(owner.address);
@@ -1373,26 +1321,21 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       const logs = await ethers.provider.getLogs({
         address: await fresh.getAddress(),
         topics: [ev!.topicHash],
-        fromBlock: 0,
-        toBlock: "latest",
+        fromBlock: 0, toBlock: "latest",
       });
       const parsed = logs.map((l) => fresh.interface.parseLog(l)!);
       const seed = parsed.find((p) => p.args.previous === ethers.ZeroAddress);
-      expect(seed, "constructor should emit SuperAdminTransferred(0, deployer)").to.not.equal(
-        undefined
-      );
+      expect(seed, "constructor should emit SuperAdminTransferred(0, deployer)").to.not.equal(undefined);
       expect(seed!.args.next).to.equal(owner.address);
     });
 
     it("super-admin cannot be re-roled to ANY tier (not just demoted to NONE)", async function () {
       // The role-0 (demote) case is covered elsewhere; also block promoting/setting
       // any non-zero tier on the super-admin (its access never comes from adminRole).
-      await expect(
-        integrator.connect(owner).setRole(owner.address, 4)
-      ).to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
-      await expect(
-        integrator.connect(owner).setRole(owner.address, 2)
-      ).to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
+      await expect(integrator.connect(owner).setRole(owner.address, 4))
+        .to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
+      await expect(integrator.connect(owner).setRole(owner.address, 2))
+        .to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
     });
   });
 
@@ -1401,9 +1344,10 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await expect(
         integrator.connect(attacker).withdrawUSDC(USDC(1))
       ).to.be.revertedWithCustomError(integrator, "NotRegistered");
-      await expect(
-        integrator.connect(attacker).withdrawFiat(USDC(1), 1, PK, "")
-      ).to.be.revertedWithCustomError(integrator, "NotRegistered");
+      await expect(integrator.connect(attacker).withdrawFiat(USDC(1), 1, PK, "")).to.be.revertedWithCustomError(
+        integrator,
+        "NotRegistered"
+      );
     });
 
     it("zero-amount withdrawal reverts NothingToWithdraw", async function () {
@@ -1496,13 +1440,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       const tx = await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "");
       const receipt = await tx.wait();
       const ev = receipt.logs
-        .map((l: any) => {
-          try {
-            return integrator.interface.parseLog(l);
-          } catch {
-            return null;
-          }
-        })
+        .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
         .find((l: any) => l?.name === "WithdrawalFiat");
       const orderId = ev.args.orderId;
 
@@ -1514,8 +1452,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       // Because the merchant is frozen, the re-credit is LOCKED under a fresh
       // settlement window — NOT immediately available (mirrors adminAbortWithdrawal).
       const [pending, available] = await integrator.getMerchantBalance(merchant1.address);
-      expect(available).to.equal(0); // nothing instantly spendable
-      expect(pending).to.equal(USDC(20)); // held until the window elapses
+      expect(available).to.equal(0);        // nothing instantly spendable
+      expect(pending).to.equal(USDC(20));   // held until the window elapses
 
       // After the window passes AND unfreeze, it becomes available normally.
       await increaseTime(SETTLEMENT + 10);
@@ -1549,10 +1487,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""),
         "WithdrawalFiat"
       );
-      await grab(
-        await integrator.connect(merchant2).withdrawFiat(USDC(30), 1, PK, ""),
-        "WithdrawalFiat"
-      );
+      await grab(await integrator.connect(merchant2).withdrawFiat(USDC(30), 1, PK, ""), "WithdrawalFiat");
 
       const proxy1 = await integrator.proxyAddress(merchant1.address);
       const proxy2 = await integrator.proxyAddress(merchant2.address);
@@ -1691,13 +1626,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       const tx = await txPromise;
       const r = await tx.wait();
       return r.logs
-        .map((l: any) => {
-          try {
-            return integrator.interface.parseLog(l);
-          } catch {
-            return null;
-          }
-        })
+        .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
         .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
     };
 
@@ -1712,9 +1641,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await increaseTime(SETTLEMENT + 3600);
 
       await mockDiamond.setSellFee(USDC(1));
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.acceptSellOrder(orderId, "lp");
       await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc");
 
@@ -1722,10 +1649,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(9));
       // m2 fully intact and actually withdrawable — pool is still solvent
       expect((await integrator.getMerchantBalance(merchant2.address))[1]).to.equal(USDC(20));
-      await expect(integrator.connect(merchant2).withdrawUSDC(USDC(20))).to.emit(
-        integrator,
-        "WithdrawalUSDC"
-      );
+      await expect(integrator.connect(merchant2).withdrawUSDC(USDC(20)))
+        .to.emit(integrator, "WithdrawalUSDC");
       // solvency invariant holds
       const owed = await integrator.totalOwed();
       const bal = await mockUsdc.balanceOf(await vault.getAddress());
@@ -1739,13 +1664,10 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await depositFor(merchant2, UPI_2, 2); // pool has USDC to forward
       await increaseTime(SETTLEMENT + 3600);
       await mockDiamond.setSellFee(USDC(1));
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.acceptSellOrder(orderId, "lp");
-      await expect(
-        integrator.connect(merchant1).deliverFiatPayout(orderId, "enc")
-      ).to.be.revertedWithCustomError(integrator, "InsufficientAvailableBalance");
+      await expect(integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"))
+        .to.be.revertedWithCustomError(integrator, "InsufficientAvailableBalance");
     });
 
     it("HIGH-2: a frozen merchant's in-flight withdrawal cannot be delivered", async function () {
@@ -1753,74 +1675,57 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await depositFor(merchant2, UPI_2, 2);
       await increaseTime(SETTLEMENT + 3600);
       await mockDiamond.setSellFee(USDC(1));
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.acceptSellOrder(orderId, "lp");
       // owner freezes BETWEEN placement and delivery
       await integrator.freezeMerchant(merchant1.address);
-      await expect(
-        integrator.connect(merchant1).deliverFiatPayout(orderId, "enc")
-      ).to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
+      await expect(integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"))
+        .to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
     });
 
     it("HIGH-2: owner can adminAbortWithdrawal to claw a frozen in-flight withdrawal back", async function () {
       await depositFor(merchant1, UPI_1, 2); // 20
       await increaseTime(SETTLEMENT + 3600);
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await integrator.freezeMerchant(merchant1.address);
-      await expect(integrator.adminAbortWithdrawal(orderId)).to.emit(
-        integrator,
-        "WithdrawalReconciled"
-      );
+      await expect(integrator.adminAbortWithdrawal(orderId))
+        .to.emit(integrator, "WithdrawalReconciled");
       // funds back on the integrator, re-credited but LOCKED again (frozen)
       expect(await mockUsdc.balanceOf(await vault.getAddress())).to.equal(USDC(20));
       const [pending, available] = await integrator.getMerchantBalance(merchant1.address);
-      expect(available).to.equal(0); // re-locked under a fresh settlement window
+      expect(available).to.equal(0);       // re-locked under a fresh settlement window
       expect(pending).to.equal(USDC(20));
     });
 
     it("HIGH-2: adminAbortWithdrawal only works on a FROZEN merchant and only for the owner", async function () {
       await depositFor(merchant1, UPI_1, 2);
       await increaseTime(SETTLEMENT + 3600);
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       // not frozen → reverts
-      await expect(integrator.adminAbortWithdrawal(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "MerchantIsFrozen"
-      );
+      await expect(integrator.adminAbortWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
       await integrator.freezeMerchant(merchant1.address);
       // non-manager → reverts (money-recovery action is MANAGER-tier)
-      await expect(
-        integrator.connect(attacker).adminAbortWithdrawal(orderId)
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(attacker).adminAbortWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
     });
 
     it("MED-1: a second concurrent fiat withdrawal is rejected until the first settles", async function () {
       await depositFor(merchant1, UPI_1, 4); // 40
       await increaseTime(SETTLEMENT + 3600);
       await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "");
-      await expect(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      ).to.be.revertedWithCustomError(integrator, "WithdrawalInFlight");
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalInFlight");
     });
 
     it("MED-1: after the first withdrawal reconciles, a new one is allowed again", async function () {
       await depositFor(merchant1, UPI_1, 4); // 40
       await increaseTime(SETTLEMENT + 3600);
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.cancelSellOrder(orderId);
       await integrator.reconcileWithdrawal(orderId); // settles + frees the slot
-      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")).to.emit(
-        integrator,
-        "WithdrawalFiat"
-      );
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""))
+        .to.emit(integrator, "WithdrawalFiat");
     });
 
     it("MED-2 + NEW-1: a COMPLETED (fiat-delivered) order can never re-credit USDC (double-spend blocked)", async function () {
@@ -1831,23 +1736,17 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await depositFor(merchant2, UPI_2, 2);
       await increaseTime(SETTLEMENT + 3600);
       await mockDiamond.setSellFee(USDC(1));
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.acceptSellOrder(orderId, "lp");
       await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"); // fiat PAID
-      await mockDiamond.completeSellOrder(orderId); // fiat DELIVERED
+      await mockDiamond.completeSellOrder(orderId);                          // fiat DELIVERED
       // completed → reconcile refuses (status != CANCELLED)
-      await expect(integrator.reconcileWithdrawal(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "WithdrawalNotCancellable"
-      );
+      await expect(integrator.reconcileWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable");
       // finalize settles it and frees the slot (the happy path)
       await integrator.finalizeWithdrawal(orderId);
-      await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, "")).to.emit(
-        integrator,
-        "WithdrawalFiat"
-      ); // channel not bricked
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, ""))
+        .to.emit(integrator, "WithdrawalFiat"); // channel not bricked
     });
 
     it("NEW-1: a PAID-then-CANCELLED SELL is fully recoverable (refund re-credited, slot freed, no DoS)", async function () {
@@ -1857,9 +1756,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await depositFor(merchant2, UPI_2, 2);
       await increaseTime(SETTLEMENT + 3600);
       await mockDiamond.setSellFee(USDC(1));
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.acceptSellOrder(orderId, "lp");
       await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"); // PAID, merchant charged 21
       // after deliver: merchant available = 30 - 20 principal - 1 fee = 9
@@ -1869,26 +1766,22 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await mockDiamond.cancelSellOrder(orderId);
 
       // recovery succeeds (was permanently bricked before the NEW-1 fix)
-      await expect(integrator.reconcileWithdrawal(orderId)).to.emit(
-        integrator,
-        "WithdrawalReconciled"
-      );
+      await expect(integrator.reconcileWithdrawal(orderId))
+        .to.emit(integrator, "WithdrawalReconciled");
 
       // principal + fee (21) re-credited, re-locked under a fresh settlement
       // window because the order had reached PAID. Merchant is fully whole.
       const [pending, available] = await integrator.getMerchantBalance(merchant1.address);
-      expect(available).to.equal(USDC(9)); // unchanged: re-credit is locked
-      expect(pending).to.equal(USDC(21)); // principal 20 + fee 1 back, settling
+      expect(available).to.equal(USDC(9));   // unchanged: re-credit is locked
+      expect(pending).to.equal(USDC(21));    // principal 20 + fee 1 back, settling
       // proxy emptied, funds back on the integrator
       const proxy = await integrator.proxyAddress(merchant1.address);
       expect(await mockUsdc.balanceOf(proxy)).to.equal(0);
 
       // and the in-flight slot is freed → the merchant can withdraw again
       await increaseTime(SETTLEMENT + 100);
-      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")).to.emit(
-        integrator,
-        "WithdrawalFiat"
-      );
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""))
+        .to.emit(integrator, "WithdrawalFiat");
     });
 
     it("FINAL: a PAID→DISPUTED→CANCELLED order is recoverable via adminForceSettle (no channel-brick)", async function () {
@@ -1899,32 +1792,24 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await depositFor(merchant2, UPI_2, 2);
       await increaseTime(SETTLEMENT + 3600);
       await mockDiamond.setSellFee(USDC(1));
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.acceptSellOrder(orderId, "lp");
       await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"); // PAID, charged 21
 
       // dispute is raised, then the order is cancelled WITH a dispute recorded
       await mockDiamond.setSellDispute(orderId, 1, 1); // raisedBy=1, status=1
-      await mockDiamond.cancelSellOrder(orderId); // refunds 21 to proxy
+      await mockDiamond.cancelSellOrder(orderId);      // refunds 21 to proxy
 
       // every normal settle path refuses this state
-      await expect(integrator.reconcileWithdrawal(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "WithdrawalNotCancellable"
-      ); // dispute guard
-      await expect(integrator.finalizeWithdrawal(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "WithdrawalNotCancellable"
-      ); // not COMPLETED
+      await expect(integrator.reconcileWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable"); // dispute guard
+      await expect(integrator.finalizeWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable"); // not COMPLETED
 
       // owner force-settles: sweeps the 21 refund, re-credits principal+fee (20+1)
       // re-locked, frees the slot.
-      await expect(integrator.adminForceSettle(orderId)).to.emit(
-        integrator,
-        "WithdrawalReconciled"
-      );
+      await expect(integrator.adminForceSettle(orderId))
+        .to.emit(integrator, "WithdrawalReconciled");
       const proxy = await integrator.proxyAddress(merchant1.address);
       expect(await mockUsdc.balanceOf(proxy)).to.equal(0); // refund recovered
 
@@ -1935,28 +1820,21 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       // channel no longer bricked
       await increaseTime(SETTLEMENT + 100);
-      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")).to.emit(
-        integrator,
-        "WithdrawalFiat"
-      );
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""))
+        .to.emit(integrator, "WithdrawalFiat");
     });
 
     it("FINAL: adminForceSettle is owner-only and refuses a non-CANCELLED order", async function () {
       await depositFor(merchant1, UPI_1, 2);
       await increaseTime(SETTLEMENT + 3600);
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       // not cancelled yet → reverts
-      await expect(integrator.adminForceSettle(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "WithdrawalNotCancellable"
-      );
+      await expect(integrator.adminForceSettle(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable");
       // non-manager → reverts (money-recovery action is MANAGER-tier)
       await mockDiamond.cancelSellOrder(orderId);
-      await expect(
-        integrator.connect(attacker).adminForceSettle(orderId)
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(attacker).adminForceSettle(orderId))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
     });
 
     it("FIX #9: a PAID-but-never-terminalised SELL wedges the slot; adminForceUnwedge frees it (frozen-gated, double-spend-safe)", async function () {
@@ -1964,41 +1842,29 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await depositFor(merchant2, UPI_2, 2);
       await increaseTime(SETTLEMENT + 3600);
       await mockDiamond.setSellFee(USDC(1));
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.acceptSellOrder(orderId, "lp");
       await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"); // PAID — Diamond pulled principal+fee
 
       // The Diamond NEVER terminalises it (no complete, no cancel) → the order is
       // stuck PAID. Every normal path refuses this state, wedging the in-flight slot.
-      await expect(integrator.finalizeWithdrawal(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "WithdrawalNotCancellable"
-      ); // not COMPLETED
-      await expect(integrator.reconcileWithdrawal(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "WithdrawalNotCancellable"
-      ); // not CANCELLED
-      await expect(integrator.adminAbortWithdrawal(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "FiatAlreadyDelivered"
-      ); // upiDelivered
+      await expect(integrator.finalizeWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable"); // not COMPLETED
+      await expect(integrator.reconcileWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable"); // not CANCELLED
+      await expect(integrator.adminAbortWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "FiatAlreadyDelivered");     // upiDelivered
       // channel is bricked: a new withdrawal reverts WithdrawalInFlight
-      await expect(
-        integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, "")
-      ).to.be.revertedWithCustomError(integrator, "WithdrawalInFlight");
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, ""))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalInFlight");
 
       // adminForceUnwedge is FROZEN-gated (incident tool) — refuses an unfrozen merchant.
-      await expect(integrator.adminForceUnwedge(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "MerchantIsFrozen"
-      );
+      await expect(integrator.adminForceUnwedge(orderId))
+        .to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
       // and non-FINANCE cannot call it
       await integrator.freezeMerchant(merchant1.address);
-      await expect(
-        integrator.connect(attacker).adminForceUnwedge(orderId)
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(integrator.connect(attacker).adminForceUnwedge(orderId))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");
 
       // Owner (FINANCE) unwedges: the slot is freed. Proxy was drained by the
       // Diamond (fiat likely delivered) → proxyBal ≈ 0 → recredit ≈ 0 (structural
@@ -2007,8 +1873,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       const proxy = await integrator.proxyAddress(merchant1.address);
       expect(await mockUsdc.balanceOf(proxy)).to.equal(0);
       await expect(integrator.adminForceUnwedge(orderId))
-        .to.emit(integrator, "WithdrawalReconciled")
-        .withArgs(merchant1.address, orderId, 0);
+        .to.emit(integrator, "WithdrawalReconciled").withArgs(merchant1.address, orderId, 0);
       // FIX #10: because NO refund had landed (proxyBal==0), the unwedge credited
       // nothing and did NOT settle or free the slot — the channel stays serialized
       // on this one order so a late refund is recoverable AND cannot be mixed with a
@@ -2023,41 +1888,32 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       // so the block is the IN-FLIGHT slot (the brick), not the freeze.
       await integrator.unfreezeMerchant(merchant1.address);
       await increaseTime(SETTLEMENT + 100);
-      await expect(
-        integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, "")
-      ).to.be.revertedWithCustomError(integrator, "WithdrawalInFlight");
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, ""))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalInFlight");
 
       // FIX #11: the operator has confirmed the Diamond will never refund this dead
       // order. adminForceAbandonWedge UNCONDITIONALLY frees the channel and closes
       // the order — this is the guaranteed un-brick that adminForceUnwedge (which
       // won't free without a refund) can't provide. Frozen + FINANCE gated.
-      await expect(integrator.adminForceAbandonWedge(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "MerchantIsFrozen"
-      ); // frozen-gated (not frozen now)
-      await integrator.freezeMerchant(merchant1.address);
-      await expect(
-        integrator.connect(attacker).adminForceAbandonWedge(orderId)
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized"); // FINANCE-gated
       await expect(integrator.adminForceAbandonWedge(orderId))
-        .to.emit(integrator, "WithdrawalReconciled")
-        .withArgs(merchant1.address, orderId, 0);
+        .to.be.revertedWithCustomError(integrator, "MerchantIsFrozen"); // frozen-gated (not frozen now)
+      await integrator.freezeMerchant(merchant1.address);
+      await expect(integrator.connect(attacker).adminForceAbandonWedge(orderId))
+        .to.be.revertedWithCustomError(integrator, "NotAuthorized");    // FINANCE-gated
+      await expect(integrator.adminForceAbandonWedge(orderId))
+        .to.emit(integrator, "WithdrawalReconciled").withArgs(merchant1.address, orderId, 0);
       const wa = await integrator.withdrawals(orderId);
-      expect(wa.settled).to.equal(true); // order closed
+      expect(wa.settled).to.equal(true);   // order closed
       expect(wa.slotFreed).to.equal(true); // slot freed
       // channel is UN-BRICKED: after unfreeze the merchant can withdraw fiat again
       await integrator.unfreezeMerchant(merchant1.address);
       await increaseTime(SETTLEMENT + 100);
-      await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, "")).to.emit(
-        integrator,
-        "WithdrawalFiat"
-      );
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, ""))
+        .to.emit(integrator, "WithdrawalFiat");
       // and abandon cannot be replayed (order already settled)
       await integrator.freezeMerchant(merchant1.address);
-      await expect(integrator.adminForceAbandonWedge(orderId)).to.be.revertedWithCustomError(
-        integrator,
-        "WithdrawalAlreadySettled"
-      );
+      await expect(integrator.adminForceAbandonWedge(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalAlreadySettled");
     });
 
     it("FIX #10: a late PAID→CANCELLED refund is recoverable AFTER adminForceUnwedge freed the slot (no permanent stranding)", async function () {
@@ -2068,9 +1924,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await depositFor(merchant1, UPI_1, 3); // 30 (fee headroom)
       await increaseTime(SETTLEMENT + 3600);
       await mockDiamond.setSellFee(USDC(1));
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.acceptSellOrder(orderId, "lp");
       await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"); // PAID: Diamond pulled principal+fee, proxyBal==0
 
@@ -2082,8 +1936,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       // the eventual refund stays recoverable and the channel stays serialized.
       await integrator.freezeMerchant(merchant1.address);
       await expect(integrator.adminForceUnwedge(orderId))
-        .to.emit(integrator, "WithdrawalReconciled")
-        .withArgs(merchant1.address, orderId, 0);
+        .to.emit(integrator, "WithdrawalReconciled").withArgs(merchant1.address, orderId, 0);
       const wAfterUnwedge = await integrator.withdrawals(orderId);
       expect(wAfterUnwedge.settled).to.equal(false); // <-- the fix: not sealed
       expect(wAfterUnwedge.slotFreed).to.equal(false);
@@ -2096,8 +1949,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       // path. adminForceSettle sweeps the proxy and re-credits principal+fee (21),
       // capped by the physical refund — the funds are NOT stranded.
       await expect(integrator.adminForceSettle(orderId))
-        .to.emit(integrator, "WithdrawalReconciled")
-        .withArgs(merchant1.address, orderId, USDC(21));
+        .to.emit(integrator, "WithdrawalReconciled").withArgs(merchant1.address, orderId, USDC(21));
       expect(await mockUsdc.balanceOf(proxy)).to.equal(0); // swept to vault
       const wFinal = await integrator.withdrawals(orderId);
       expect(wFinal.settled).to.equal(true); // now terminal
@@ -2112,10 +1964,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       // Idempotency: the slot was freed exactly once (not double-decremented). The
       // channel is usable after unfreeze.
       await integrator.unfreezeMerchant(merchant1.address);
-      await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, "")).to.emit(
-        integrator,
-        "WithdrawalFiat"
-      );
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, ""))
+        .to.emit(integrator, "WithdrawalFiat");
     });
 
     it("FIX #4: a duplicate/out-of-order cancel AFTER completion does not decrement the daily-tx count", async function () {
@@ -2164,20 +2014,18 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     it("MED-5: deposits sharing an unlock window coalesce, so the bucket count stays bounded", async function () {
       // Two deposits credited at the same unlock timestamp fold into ONE bucket,
       // so the credit path can never grow unboundedly or revert at the cap.
-      await depositFor(merchant1, UPI_1, 1); // 10, one bucket
+      await depositFor(merchant1, UPI_1, 1);  // 10, one bucket
       const o = await placeOrder(merchant1, 1);
       await mockDiamond.simulateOrderComplete(o); // same-window credit → coalesces
       const buckets = await integrator.getMerchantBuckets(merchant1.address);
       const total = buckets.reduce((s: bigint, b: any) => s + b.amount, 0n);
-      expect(total).to.equal(USDC(20)); // both credited, nothing stranded
+      expect(total).to.equal(USDC(20));        // both credited, nothing stranded
     });
 
     it("INFO-2: a currency code with an interior NUL byte is rejected", async function () {
       const withNul = "IN" + String.fromCharCode(0) + "R";
-      await expect(integrator.toCurrency(withNul)).to.be.revertedWithCustomError(
-        integrator,
-        "InvalidCurrency"
-      );
+      await expect(integrator.toCurrency(withNul))
+        .to.be.revertedWithCustomError(integrator, "InvalidCurrency");
     });
 
     it("NEW-2: a reconcile re-credit (past-dated) never unlocks a merchant's other STILL-LOCKED funds", async function () {
@@ -2186,10 +2034,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       // cancel→reconcile re-credits past-dated. The remaining bucket must stay
       // correct; a fresh locked deposit must remain locked afterward.
       await depositFor(merchant1, UPI_1, 4); // 40
-      await increaseTime(SETTLEMENT + 100); // 40 unlocked
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      ); // 20 left unlocked
+      await increaseTime(SETTLEMENT + 100);  // 40 unlocked
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")); // 20 left unlocked
       // add a FRESH locked deposit (still within settlement)
       const o = await placeOrder(merchant1, 2); // +20, locked
       await mockDiamond.simulateOrderComplete(o);
@@ -2213,18 +2059,15 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await integrator.superAdmin()).to.equal(owner.address);
       // Propose merchant2 — root does NOT move; it's only pending.
       await expect(integrator.connect(owner).transferSuperAdmin(merchant2.address))
-        .to.emit(integrator, "SuperAdminTransferStarted")
-        .withArgs(owner.address, merchant2.address);
+        .to.emit(integrator, "SuperAdminTransferStarted").withArgs(owner.address, merchant2.address);
       expect(await integrator.superAdmin()).to.equal(owner.address);
       expect(await integrator.pendingSuperAdmin()).to.equal(merchant2.address);
       // The current super-admin can CANCEL a pending handoff (address(0)).
       await integrator.connect(owner).transferSuperAdmin(ethers.ZeroAddress);
       expect(await integrator.pendingSuperAdmin()).to.equal(ethers.ZeroAddress);
       // A now-stale pending address cannot accept.
-      await expect(integrator.connect(merchant2).acceptSuperAdmin()).to.be.revertedWithCustomError(
-        integrator,
-        "OnlySuperAdmin"
-      );
+      await expect(integrator.connect(merchant2).acceptSuperAdmin())
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       // Re-propose and complete: only the pending address moves root.
       await integrator.connect(owner).transferSuperAdmin(merchant2.address);
       await integrator.connect(merchant2).acceptSuperAdmin();
@@ -2235,10 +2078,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await integrator.connect(merchant2).transferSuperAdmin(attacker.address); // a "wrong" address
       await integrator.connect(merchant2).transferSuperAdmin(merchant1.address); // corrected before accept
       expect(await integrator.pendingSuperAdmin()).to.equal(merchant1.address);
-      await expect(integrator.connect(attacker).acceptSuperAdmin()).to.be.revertedWithCustomError(
-        integrator,
-        "OnlySuperAdmin"
-      ); // the wrong target can't take root
+      await expect(integrator.connect(attacker).acceptSuperAdmin())
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin"); // the wrong target can't take root
     });
 
     it("FIX C: the offramp fee is charged from the merchant's buckets even when their proxy is pre-seeded with stray USDC", async function () {
@@ -2254,9 +2095,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       const proxy = await integrator.proxyAddress(merchant1.address);
       await mockUsdc.mint(proxy, USDC(50)); // stray, merchant's own funds
 
-      const orderId = await grabFiat(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
       await mockDiamond.acceptSellOrder(orderId, "lp");
       await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc");
 
@@ -2281,13 +2120,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     const fiatOrderId = async (txPromise: any) => {
       const r = await (await txPromise).wait();
       return r.logs
-        .map((l: any) => {
-          try {
-            return integrator.interface.parseLog(l);
-          } catch {
-            return null;
-          }
-        })
+        .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
         .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
     };
 
@@ -2314,24 +2147,24 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         "registered(address)",
         // governance + recovery surface (admin panel / ops)
         "transferSuperAdmin(address)",
-        "acceptSuperAdmin()", // round-1 fix B: two-step handoff completion
+        "acceptSuperAdmin()",       // round-1 fix B: two-step handoff completion
         "pendingSuperAdmin()",
         "adminForceUnwedge(uint256)", // round-2 fix #9: recover a wedged in-flight slot (refund landed)
         "adminForceAbandonWedge(uint256)", // fix #11: guaranteed channel un-brick (never-refund case)
         "setSettlementPeriod(uint256)", // configurable global settlement lock
         "setLockPeriod(bytes32,uint256)", // per-currency settlement lock override
         "lockPeriod(bytes32)",
-        "pause()", // break-glass: halt new activity
+        "pause()",     // break-glass: halt new activity
         "unpause()",
+        "adminEscheat(address,address)", // 90-day dormant-freeze fund recovery (super-admin)
+        "escheatableAt(address)",
         "paused()",
       ];
       for (const s of sigs) {
         expect(integrator.interface.getFunction(s), s).to.not.equal(null);
       }
       // getMerchantInfo returns 5 values; [0] is now the ENCRYPTED payout blob (bytes).
-      const out = integrator.interface
-        .getFunction("getMerchantInfo")!
-        .outputs.map((o: any) => o.type);
+      const out = integrator.interface.getFunction("getMerchantInfo")!.outputs.map((o: any) => o.type);
       expect(out).to.deep.equal(["bytes", "string", "bytes32", "bool", "bool"]);
     });
 
@@ -2343,34 +2176,29 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(fn.inputs.length).to.equal(3);
       expect(fn.inputs.map((i: any) => i.type)).to.deep.equal(["bytes", "string", "string"]);
       // Encoding with only 2 args throws (wrong argument count).
-      expect(() =>
-        integrator.interface.encodeFunctionData("registerMerchant", [UPI_1, "Shop One"])
-      ).to.throw();
+      expect(() => integrator.interface.encodeFunctionData("registerMerchant", [UPI_1, "Shop One"]))
+        .to.throw();
       // The 3-arg form works + locks the currency.
       await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", "INR");
       expect(await integrator.getMerchantCurrency(merchant1.address)).to.equal("INR");
     });
 
     it("LIFECYCLE A: accept → settle → withdraw USDC to wallet (full happy path)", async function () {
-      await depositFor(merchant1, UPI_1, 2); // accept 20, locked
-      await increaseTime(SETTLEMENT + 60); // settle
+      await depositFor(merchant1, UPI_1, 2);                 // accept 20, locked
+      await increaseTime(SETTLEMENT + 60);                   // settle
       const before = await mockUsdc.balanceOf(merchant1.address);
-      await expect(integrator.connect(merchant1).withdrawUSDC(USDC(20))).to.emit(
-        integrator,
-        "WithdrawalUSDC"
-      );
+      await expect(integrator.connect(merchant1).withdrawUSDC(USDC(20)))
+        .to.emit(integrator, "WithdrawalUSDC");
       const after = await mockUsdc.balanceOf(merchant1.address);
-      expect(after - before).to.equal(USDC(20)); // exact USDC landed
+      expect(after - before).to.equal(USDC(20));             // exact USDC landed
       expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(0); // drained
     });
 
     it("LIFECYCLE B: accept → settle → withdraw HOME fiat → LP pays → COMPLETED (slot freed)", async function () {
       await depositFor(merchant1, UPI_1, 2);
       await increaseTime(SETTLEMENT + 60);
-      const orderId = await fiatOrderId(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
-      );
-      await mockDiamond.acceptSellOrder(orderId, "lp"); // no fee set → actual = principal
+      const orderId = await fiatOrderId(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, ""));
+      await mockDiamond.acceptSellOrder(orderId, "lp");   // no fee set → actual = principal
       await integrator.deliverFiatPayout(orderId, "encPayout");
       await mockDiamond.completeSellOrder(orderId);
       await integrator.finalizeWithdrawal(orderId);
@@ -2379,10 +2207,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       const o2 = await placeOrder(merchant1, 1);
       await mockDiamond.simulateOrderComplete(o2);
       await increaseTime(SETTLEMENT + 60);
-      await expect(integrator.connect(merchant1).withdrawFiat(USDC(10), 1, PK, "")).to.emit(
-        integrator,
-        "WithdrawalFiat"
-      );
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(10), 1, PK, ""))
+        .to.emit(integrator, "WithdrawalFiat");
     });
 
     it("LIFECYCLE C: a non-INR (BRL) merchant withdraws in their OWN currency via withdrawFiat", async function () {
@@ -2392,9 +2218,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       const o = await placeOrder(merchant1, 2);
       await mockDiamond.simulateOrderComplete(o);
       await increaseTime(SETTLEMENT + 60);
-      const orderId = await fiatOrderId(
-        integrator.connect(merchant1).withdrawFiat(USDC(20), 2, PK, "")
-      );
+      const orderId = await fiatOrderId(integrator.connect(merchant1).withdrawFiat(USDC(20), 2, PK, ""));
       // The WithdrawalFiat event carries the merchant's registered currency = BRL.
       const r = await integrator.queryFilter(integrator.filters.WithdrawalFiat());
       const ev = r.find((e: any) => e.args.orderId === orderId);

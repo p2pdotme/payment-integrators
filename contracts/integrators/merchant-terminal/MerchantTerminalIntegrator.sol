@@ -115,6 +115,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error Paused();
     /// @dev pause()/unpause() called when already in that state (no-op guard).
     error PauseUnchanged();
+    /// @dev adminEscheat called on a merchant that is NOT frozen, or that has not
+    ///      been continuously frozen for the full ESCHEAT_PERIOD (90 days) yet.
+    error NotEscheatable();
+    /// @dev adminEscheat called for a merchant with a zero balance (nothing to move).
+    error NothingToEscheat();
 
     // ─── Events ───────────────────────────────────────────────────────
     event OrderPlaced(uint256 indexed orderId, address indexed user, uint256 amount);
@@ -132,17 +137,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint256 unlockTimestamp
     );
     event OrderCancelled(uint256 indexed orderId, address indexed merchant);
-    event WithdrawalFiat(
-        address indexed merchant,
-        uint256 indexed orderId,
-        bytes32 currency,
-        uint256 amount
-    );
+    event WithdrawalFiat(address indexed merchant, uint256 indexed orderId, bytes32 currency, uint256 amount);
     event WithdrawalUpiDelivered(uint256 indexed orderId, uint256 actualUsdtAmount);
     event WithdrawalUSDC(address indexed merchant, uint256 amount);
     event WithdrawalReconciled(address indexed merchant, uint256 indexed orderId, uint256 amount);
     event MerchantFrozen(address indexed merchant);
     event MerchantUnfrozen(address indexed merchant);
+    /// @notice A dormant (90-day continuously-frozen) merchant's entire remaining
+    ///         balance was withdrawn by the super-admin to `to`. `amount` is the full
+    ///         balance moved; totalOwed drops by exactly this and the merchant's
+    ///         buckets are zeroed so the funds can never be double-claimed.
+    event MerchantEscheated(address indexed merchant, address indexed to, uint256 amount);
     event PerTxCapSet(bytes32 indexed currency, uint256 cap);
     event DailyLimitSet(uint256 newLimit);
     /// @notice The GLOBAL settlement lock (default for currencies with no override)
@@ -220,8 +225,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev Per-transaction cap depends on the sale currency: India (INR) is
     ///      capped lower than other markets. `perTxCap(currency)` resolves it.
     ///      PER_TX_CAP is kept as the INR cap for source/ABI compatibility.
-    uint256 public constant PER_TX_CAP = 50 * 1e6; // INR: 50 USDC
-    uint256 public constant PER_TX_CAP_INR = 50 * 1e6; // India: 50 USDC
+    uint256 public constant PER_TX_CAP = 50 * 1e6;         // INR: 50 USDC
+    uint256 public constant PER_TX_CAP_INR = 50 * 1e6;     // India: 50 USDC
     uint256 public constant PER_TX_CAP_DEFAULT = 100 * 1e6; // other markets: 100 USDC
     /// @dev Default daily order limit. The LIVE limit is the mutable `dailyLimit`
     ///      below (admin-settable via setDailyLimit), initialised to this. The
@@ -244,6 +249,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      an unbounded-array gas-griefing / self-DoS surface.
     uint256 public constant MAX_BUCKETS = 256;
 
+    /// @dev Dormant-account escheat window. A merchant frozen CONTINUOUSLY for at
+    ///      least this long (see Merchant.frozenAt, reset on any unfreeze) can have
+    ///      their remaining balance withdrawn by the super-admin via adminEscheat,
+    ///      so funds behind a permanently-abandoned/blocked account are never lost.
+    ///      90 days gives ample time for a legitimate merchant to be unfrozen first.
+    uint256 public constant ESCHEAT_PERIOD = 90 days;
+
     /// @dev Mirrors OrderProcessorStorage.OrderStatus on the Diamond — used
     ///      by reconcileWithdrawal to read the authoritative terminal state.
     uint8 internal constant STATUS_COMPLETED = 3;
@@ -265,12 +277,19 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // decodes. The LP/app decrypts off-chain when building the payout.
         bytes encPayoutId;
         string shopName;
-        bytes32 currency; // offramp currency, e.g. bytes32("INR"|"BRL"|"ARS") — set once at registration
+        bytes32 currency;    // offramp currency, e.g. bytes32("INR"|"BRL"|"ARS") — set once at registration
         uint256 totalDeposited;
         bool isFrozen;
         uint256 dailyTxCount;
         uint256 lastTxDate;
         uint256 inFlightWithdrawals; // count of this merchant's unsettled SELL withdrawals
+        // UNIX time this merchant was CONTINUOUSLY frozen since (set on freeze,
+        // cleared to 0 on unfreeze). Drives the 90-day dormant-account escheat:
+        // adminEscheat is only reachable once (now - frozenAt) >= ESCHEAT_PERIOD.
+        // Placed AFTER inFlightWithdrawals (index 9) so the public `merchants`
+        // getter's earlier positional fields (0..8, which the frontend ABI reads)
+        // are unchanged; the trailing `buckets` array is omitted by the getter.
+        uint256 frozenAt;
         SettlementBucket[] buckets;
     }
 
@@ -280,7 +299,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      bucket. `settled` is a replay guard.
     struct PendingWithdrawal {
         address merchant;
-        uint256 amount; // principal escrowed for THIS order (excludes fee)
+        uint256 amount;     // principal escrowed for THIS order (excludes fee)
         bool settled;
         bool upiDelivered; // setSellOrderUpi (fund+approve) has run for this SELL
         uint256 feeAdvanced; // fee topped up from the pool for THIS order (for exact recovery)
@@ -368,13 +387,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         • FINANCE (4): + money recovery — adminAbortWithdrawal, adminForceSettle.
     ///         The OWNER sits above all tiers (implicitly FINANCE) and is the ONLY
     ///         one who can assign roles, add/remove admins, or transfer ownership.
-    enum Role {
-        NONE,
-        VIEWER,
-        SUPPORT,
-        MANAGER,
-        FINANCE
-    }
+    enum Role { NONE, VIEWER, SUPPORT, MANAGER, FINANCE }
     mapping(address => Role) public adminRole;
 
     // ─── Reentrancy guard ─────────────────────────────────────────────
@@ -521,21 +534,15 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         for (uint256 i = 0; i < b.length; i++) {
             if (b[i] == 0) revert InvalidCurrency();
         }
-        assembly {
-            out := mload(add(b, 32))
-        }
+        assembly { out := mload(add(b, 32)) }
     }
 
     /// @notice Unpack a bytes32 currency back to its readable code string.
     function fromCurrency(bytes32 cur) public pure returns (string memory) {
         uint256 len = 0;
-        while (len < 32 && cur[len] != 0) {
-            len++;
-        }
+        while (len < 32 && cur[len] != 0) { len++; }
         bytes memory out = new bytes(len);
-        for (uint256 i = 0; i < len; i++) {
-            out[i] = cur[i];
-        }
+        for (uint256 i = 0; i < len; i++) { out[i] = cur[i]; }
         return string(out);
     }
 
@@ -608,11 +615,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // (and dodging any admin setPerTxCap("INR") override).
         bool seenNul = false;
         for (uint256 i = 0; i < 32; i++) {
-            if (currency[i] == 0) {
-                seenNul = true;
-            } else if (seenNul) {
-                revert InvalidCurrency();
-            }
+            if (currency[i] == 0) { seenNul = true; }
+            else if (seenNul) { revert InvalidCurrency(); }
         }
         Merchant storage m = merchants[msg.sender];
         m.merchantAddr = msg.sender;
@@ -797,12 +801,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @param circleId The offramp circle on the Diamond for this currency,
     ///        resolved off-chain via the subgraph.
     /// @param pubKey Relay public key (the same identity used for BUY orders).
-    function withdrawFiat(
-        uint256 amount,
-        uint256 circleId,
-        string calldata pubKey,
-        string calldata /* payoutOverride */
-    ) external whenNotPaused nonReentrant returns (uint256 orderId) {
+    function withdrawFiat(uint256 amount, uint256 circleId, string calldata pubKey, string calldata /* payoutOverride */)
+        external
+        whenNotPaused
+        nonReentrant
+        returns (uint256 orderId)
+    {
         Merchant storage m = _checkWithdraw(amount);
         return _withdrawFiat(m, amount, circleId, m.currency, pubKey);
     }
@@ -922,8 +926,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // (the merchant proxy) during setSellOrderUpi. Read it; refuse to run
         // until the Diamond has computed it (0 = not ready) rather than fall
         // back to principal-only, which re-introduces the fee bug.
-        IOrderFlow.AdditionalOrderDetailsView memory aod = IOrderFlow(diamond)
-            .getAdditionalOrderDetails(orderId);
+        IOrderFlow.AdditionalOrderDetailsView memory aod =
+            IOrderFlow(diamond).getAdditionalOrderDetails(orderId);
         uint256 needed = aod.actualUsdtAmount;
         if (needed == 0) revert OfframpFeeNotReady();
         // AUDIT FIX #1 (trust-boundary guard): the Diamond documents
@@ -973,7 +977,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // setSellOrderUpi. UserProxy.execute does NOT auto-sweep the USDC
         // remainder; any surplus left on the proxy is recovered later by
         // reconcileWithdrawal (which sweeps the full proxy balance).
-        bytes memory data = abi.encodeCall(IOrderFlow.setSellOrderUpi, (orderId, encPayout, 0));
+        bytes memory data = abi.encodeCall(
+            IOrderFlow.setSellOrderUpi,
+            (orderId, encPayout, 0)
+        );
         UserProxy(merchantProxy).execute(diamond, data, address(usdc), needed);
 
         emit WithdrawalUpiDelivered(orderId, needed);
@@ -1158,21 +1165,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             // correctly-timestamped bucket. Every bucket keeps its true lock-state;
             // nothing is re-locked or unlocked early. This is a rare cap edge (256
             // buckets all one state, incoming the other, no exact-ts match).
-            uint256 a = type(uint256).max;
-            uint256 aTs = type(uint256).max;
-            uint256 b = type(uint256).max;
-            uint256 bTs = type(uint256).max;
+            uint256 a = type(uint256).max; uint256 aTs = type(uint256).max;
+            uint256 b = type(uint256).max; uint256 bTs = type(uint256).max;
             for (uint256 i = 0; i < len; i++) {
                 uint256 ts = m.buckets[i].unlockTimestamp; // all are !incomingLocked here
-                if (ts < aTs) {
-                    b = a;
-                    bTs = aTs;
-                    a = i;
-                    aTs = ts;
-                } else if (ts < bTs) {
-                    b = i;
-                    bTs = ts;
-                }
+                if (ts < aTs) { b = a; bTs = aTs; a = i; aTs = ts; }
+                else if (ts < bTs) { b = i; bTs = ts; }
             }
             // Merge b into a using the safe (later) timestamp — both share the
             // opposite lock-state, so max() never crosses the locked/unlocked line.
@@ -1549,15 +1547,85 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     }
 
     /// @dev SUPPORT tier or higher — freezing is the baseline safety action.
+    ///      Stamps `frozenAt` (only on a fresh freeze, so re-calling while already
+    ///      frozen does NOT extend the dormancy clock) to start the 90-day escheat
+    ///      window. A subsequent unfreeze clears it, so escheat needs a CONTINUOUS
+    ///      90-day freeze.
     function freezeMerchant(address merchant) external onlyRole(Role.SUPPORT) {
-        merchants[merchant].isFrozen = true;
+        Merchant storage m = merchants[merchant];
+        if (!m.isFrozen) {
+            m.isFrozen = true;
+            m.frozenAt = block.timestamp; // start the dormancy clock
+        }
         emit MerchantFrozen(merchant);
     }
 
-    /// @dev SUPPORT tier or higher.
+    /// @dev SUPPORT tier or higher. Clears `frozenAt` so any freeze/unfreeze cycle
+    ///      RESETS the 90-day dormancy clock (escheat requires continuous freeze).
     function unfreezeMerchant(address merchant) external onlyRole(Role.SUPPORT) {
-        merchants[merchant].isFrozen = false;
+        Merchant storage m = merchants[merchant];
+        m.isFrozen = false;
+        m.frozenAt = 0; // reset the dormancy clock
         emit MerchantUnfrozen(merchant);
+    }
+
+    /// @notice The UNIX time at which `merchant` becomes escheatable, or 0 if they
+    ///         are not currently frozen (not on the dormancy clock at all). Lets the
+    ///         dashboard show a countdown. `block.timestamp >= this (and != 0)` ⇒
+    ///         adminEscheat is callable.
+    function escheatableAt(address merchant) external view returns (uint256) {
+        Merchant storage m = merchants[merchant];
+        if (!m.isFrozen || m.frozenAt == 0) return 0;
+        return m.frozenAt + ESCHEAT_PERIOD;
+    }
+
+    /// @notice SUPER-ADMIN-ONLY, DORMANT-ACCOUNT ESCHEAT: withdraw the ENTIRE
+    ///         remaining balance of a merchant who has been frozen CONTINUOUSLY for
+    ///         at least ESCHEAT_PERIOD (90 days) to `to`. This exists so funds behind
+    ///         a permanently-abandoned or indefinitely-blocked account are never lost
+    ///         in the contract — after a long grace period, the super-admin can
+    ///         recover them (e.g. to a treasury / the rightful party off-chain).
+    ///
+    ///         GUARANTEES / SAFETY:
+    ///           • Gated on isFrozen AND (block.timestamp - frozenAt) >= 90 days. Any
+    ///             unfreeze resets frozenAt, so a merchant only reaches this after a
+    ///             genuinely continuous 90-day freeze — an unfreeze at any point
+    ///             (e.g. the merchant returns / the block is lifted) cancels it.
+    ///           • Moves ONLY this merchant's own funds: it sums and ZEROES this
+    ///             merchant's buckets and decrements totalOwed by exactly that amount,
+    ///             so the solvency invariant vault.balance() >= totalOwed is preserved
+    ///             and no other merchant is touched.
+    ///           • Buckets are zeroed BEFORE the external pull (CEI + nonReentrant),
+    ///             so the balance can never be escheated twice.
+    ///         This is a deliberate, audited exception to "funds move only by the
+    ///         merchant's own action" — bounded by the 90-day continuous-freeze gate
+    ///         and restricted to the single super-admin root.
+    /// @param merchant The dormant (90-day frozen) merchant whose funds to recover.
+    /// @param to       Destination for the recovered USDC (non-zero).
+    function adminEscheat(address merchant, address to) external onlySuperAdmin nonReentrant {
+        if (to == address(0)) revert InvalidAddress();
+        Merchant storage m = merchants[merchant];
+        // Must be frozen AND continuously so for the full window.
+        if (!m.isFrozen || m.frozenAt == 0 || block.timestamp < m.frozenAt + ESCHEAT_PERIOD)
+            revert NotEscheatable();
+
+        // Sum the merchant's ENTIRE balance (locked + unlocked) and zero every
+        // bucket, so the funds are accounted out exactly once.
+        uint256 amount = 0;
+        uint256 len = m.buckets.length;
+        for (uint256 i = 0; i < len; i++) {
+            amount += m.buckets[i].amount;
+            m.buckets[i].amount = 0;
+        }
+        if (amount == 0) revert NothingToEscheat();
+        _compact(m); // drop the now-zeroed buckets
+
+        // Decrement the global owed by exactly what we removed (solvency preserved),
+        // then pull the funds out of the vault to the chosen destination.
+        totalOwed -= amount;
+        _vaultPull(to, amount);
+
+        emit MerchantEscheated(merchant, to, amount);
     }
 
     /// @notice BREAK-GLASS: halt all NEW activity (place order + every withdrawal).
@@ -1834,13 +1902,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     )
         external
         view
-        returns (
-            bytes memory encPayoutId,
-            string memory shopName,
-            bytes32 currency,
-            bool isRegistered,
-            bool isFrozen
-        )
+        returns (bytes memory encPayoutId, string memory shopName, bytes32 currency, bool isRegistered, bool isFrozen)
     {
         Merchant storage m = merchants[merchant];
         return (m.encPayoutId, m.shopName, m.currency, registered[merchant], m.isFrozen);
