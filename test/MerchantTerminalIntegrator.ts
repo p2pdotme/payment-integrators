@@ -1769,6 +1769,65 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         await integrator.totalOwed()
       );
     });
+
+    // Reviewer follow-up (Medium — fund loss): the capped-sweep fix originally
+    // landed only in reconcile/finalize/sweepStrandedBuy; the FOUR admin recovery
+    // paths (adminAbortWithdrawal / adminForceSettle / adminForceUnwedge /
+    // adminForceAbandonWedge) still swept the WHOLE proxy and credited only their
+    // own cap — so M-1 still bit through them. These are incident tools, so a
+    // stranded BUY (itself an incident artifact) is MORE likely to be co-resident
+    // exactly when they run. All seven now route through _sweepCapped.
+    //
+    // Exact repro from the review: SELL principal 40 + stranded BUY 25 on the
+    // proxy → freeze + adminAbortWithdrawal. Before: swept 65, re-credited 40, the
+    // 25 went to surplus and the now-empty proxy made sweepStrandedBuy revert
+    // NothingToWithdraw (merchant's 25 unrecoverable). After: abort takes only 40,
+    // leaves 25 for sweepStrandedBuy, merchant ends up whole with zero surplus.
+    it("admin recovery paths also cap the sweep — adminAbortWithdrawal leaves a co-resident stranded BUY recoverable", async function () {
+      // Deposit 40, mature, start a fiat withdrawal of 40 (principal A on proxy).
+      await depositFor(merchant1, UPI_1, 4); // 40 USDC
+      await increaseTime(SETTLEMENT + 3600);
+      const proxy = await integrator.proxyAddress(merchant1.address);
+      const wId = await fiatOrderId(
+        await integrator.connect(merchant1).withdrawFiat(USDC(40), 1, PK, "")
+      );
+
+      // A stranded BUY of 25 lands on the SAME proxy (callback reverted). Use a
+      // fresh deposit-sized order: qty is ×10 USDC, so a 25 stranded amount isn't a
+      // clean multiple — place a 30 BUY (qty 3) to mirror "a second incident pot"
+      // co-resident with the in-flight withdrawal. Proxy now holds 40 + 30 = 70.
+      const buyId = await placeOrder(merchant1, 3); // 30 USDC BUY
+      await mockDiamond.simulateOrderCompleteNoCallback(buyId);
+      const strandedAmt = (await mockDiamond.getOrdersById(buyId)).amount; // 30 USDC
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(USDC(40) + strandedAmt); // A + B
+
+      // Incident: freeze the merchant, then admin-abort the (never-delivered)
+      // in-flight withdrawal. It must sweep ONLY its own 40, NOT the whole 70.
+      await integrator.connect(owner).freezeMerchant(merchant1.address);
+      await expect(integrator.connect(owner).adminAbortWithdrawal(wId))
+        .to.emit(integrator, "WithdrawalReconciled")
+        .withArgs(merchant1.address, wId, USDC(40)); // re-credit == 40, not 70
+
+      // The stranded BUY's 30 is STILL on the proxy — not absorbed into surplus.
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(strandedAmt);
+
+      // With the withdrawal settled, sweepStrandedBuy recovers B on its own path
+      // (unfreeze first so the account can operate its normal recovery).
+      await integrator.connect(owner).unfreezeMerchant(merchant1.address);
+      await expect(integrator.connect(merchant1).sweepStrandedBuy(buyId))
+        .to.emit(integrator, "StrandedBuyRecovered")
+        .withArgs(buyId, merchant1.address, strandedAmt);
+
+      // Merchant owed the FULL 70 (40 + 30); custody exactly equals totalOwed, so
+      // nothing leaked into skimmable surplus — the loss the reviewer found is gone.
+      const owed = await integrator.totalOwed();
+      expect(owed).to.equal(USDC(40) + strandedAmt);
+      const bal = await mockUsdc.balanceOf(await integrator.getAddress());
+      expect(bal).to.equal(owed);
+      await expect(
+        integrator.connect(owner).skimExcess(owner.address)
+      ).to.be.revertedWithCustomError(integrator, "NothingToSkim");
+    });
   });
 
   describe("trusted relayer (keeper) authorization", function () {

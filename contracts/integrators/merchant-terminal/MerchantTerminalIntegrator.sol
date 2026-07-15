@@ -1123,11 +1123,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
         uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
-        if (recredit > 0) {
-            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), recredit);
-            _toVault(recredit);
-        }
+        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
         // Re-lock under a fresh settlement window when the SELL had reached PAID
         // (fiat attempted) OR the merchant is FROZEN — a frozen account must not
         // get instantly-spendable funds back (mirrors adminAbortWithdrawal's
@@ -1172,10 +1168,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
         uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
         if (recredit > 0) {
-            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), recredit);
-            _toVault(recredit); // sweep proxy → integrator (custody)
             _creditBucket(m, recredit, block.timestamp + _lockFor(m));
         }
         // #4: emit unconditionally — the clean (proxy-empty) COMPLETED case still
@@ -1254,9 +1248,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // than what was physically on the proxy. Sweeping exactly `credit` (== the
         // re-credit) leaves any co-resident funds on the proxy for their own path,
         // so one order's recovery can never absorb another's into surplus.
-        uint256 credit = order.amount < proxyBal ? order.amount : proxyBal;
-        UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), credit);
-        _toVault(credit); // sweep proxy → integrator (custody)
+        uint256 credit = _sweepCapped(merchantProxy, order.amount, proxyBal);
 
         // Locked under a fresh settlement window, exactly like a normal on-time
         // completion would have been.
@@ -1552,6 +1544,29 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         amount; // no-op: funds are already custodied on this contract
     }
 
+    /// @dev THE single capped-sweep primitive for EVERY proxy recovery path
+    ///      (M-1). A merchant has ONE shared proxy on which a second pot of funds
+    ///      can legitimately sit (a stranded-BUY payout, or another order's
+    ///      leftover). Sweeping the FULL proxy balance while re-crediting only the
+    ///      order's own cap silently absorbs that other pot into unattributed
+    ///      surplus — the exact M-1 loss. So every path must sweep EXACTLY what it
+    ///      credits: `min(cap, proxyBal)`. This helper computes that amount, sweeps
+    ///      only it off the proxy (leaving any remainder for its own recovery
+    ///      path), and returns it for the caller to credit. Routing all seven
+    ///      recovery paths through here keeps sweep == credit and stops the pattern
+    ///      from drifting out of sync (which is how the admin paths first missed it).
+    function _sweepCapped(
+        address merchantProxy,
+        uint256 cap,
+        uint256 proxyBal
+    ) internal returns (uint256 swept) {
+        swept = cap < proxyBal ? cap : proxyBal;
+        if (swept > 0) {
+            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), swept);
+            _toVault(swept); // sweep proxy → integrator (custody)
+        }
+    }
+
     /// @dev Move `amount` USDC out of custody to `to`, straight from this
     ///      contract's own balance. The sole outward fund primitive.
     function _vaultPull(address to, uint256 amount) internal {
@@ -1814,16 +1829,15 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         w.settled = true;
         _releaseSlot(w, m);
 
+        // M-1 (admin path): sweep only THIS order's own capped amount off the
+        // shared proxy — never the whole balance — so a co-resident stranded BUY
+        // (itself an incident artifact, MORE likely to be present exactly when an
+        // incident tool runs) is left for its own recovery path instead of being
+        // absorbed into unattributed surplus. sweep == credit, via _sweepCapped.
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        if (proxyBal > 0) {
-            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
-            _toVault(proxyBal); // sweep proxy → integrator (custody)
-        }
-        // Make the merchant whole for principal + any fee advanced (capped by
-        // the actual proxy refund, so still double-spend-safe).
         uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
         // Re-lock under a fresh settlement window — a frozen merchant shouldn't
         // get instantly-available funds back; unfreeze + normal flow applies.
         _creditBucket(m, recredit, block.timestamp + _lockFor(m));
@@ -1858,15 +1872,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         Merchant storage m = merchants[w.merchant];
         _releaseSlot(w, m); // idempotent — may already be freed by adminForceUnwedge
 
+        // M-1 (admin path): capped sweep — leave any co-resident stranded funds
+        // on the shared proxy for their own recovery path (sweep == credit).
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        if (proxyBal > 0) {
-            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
-            _toVault(proxyBal); // sweep proxy → integrator (custody)
-        }
-        // Make whole for principal + fee, capped by the physical refund.
         uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
         // Re-lock under a fresh settlement window (the order had reached PAID).
         _creditBucket(m, recredit, block.timestamp + _lockFor(m));
 
@@ -1915,16 +1926,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // terminalised order that adminAbort cannot touch.
         if (!m.isFrozen) revert MerchantNotFrozen();
 
+        // M-1 (admin path): capped sweep. Taking min(owedBack, proxyBal) instead
+        // of the full balance leaves a co-resident stranded BUY / other order's
+        // funds on the shared proxy for their own recovery path. This also does
+        // NOT change the finalize decision below: when the full refund has landed
+        // recredit still == owedBack, and when it hasn't recredit < owedBack — the
+        // cap only ever removes SURPLUS above owedBack, which was never this
+        // order's to credit anyway.
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        if (proxyBal > 0) {
-            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
-            _toVault(proxyBal); // sweep proxy → integrator (custody)
-        }
-        // Structural double-spend guard: re-credit only what was physically
-        // refunded to the proxy (fiat delivered → no refund → recredit ≈ 0).
         uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
         _creditBucket(m, recredit, block.timestamp + _lockFor(m));
 
         // AUDIT FIX #10: only finalise (settle + free the slot) when the FULL refund
@@ -1990,16 +2002,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         w.settled = true;
         _releaseSlot(w, m);
 
+        // M-1 (admin path): capped sweep — re-credit only min(owedBack, proxyBal),
+        // leaving any co-resident stranded funds on the shared proxy for their own
+        // recovery path (fiat delivered → no refund → recredit ≈ 0).
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        if (proxyBal > 0) {
-            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
-            _toVault(proxyBal); // sweep proxy → integrator (custody)
-        }
-        // Structural double-spend guard: re-credit only what's physically on the
-        // proxy now (fiat delivered → no refund → recredit ≈ 0).
         uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
         _creditBucket(m, recredit, block.timestamp + _lockFor(m));
 
         emit WithdrawalReconciled(w.merchant, orderId, recredit);
