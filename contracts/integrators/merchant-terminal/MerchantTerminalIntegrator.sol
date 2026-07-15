@@ -40,9 +40,11 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *         USDC is refunded to the proxy; `reconcileWithdrawal` sweeps it back and
  *         re-credits the merchant so no funds are stranded.
  *
- *         Limits enforced in validateOrder: 50 USDC per transaction and 4
- *         transactions per merchant per UTC day. The system proxy is carved
- *         out so withdrawals never hit merchant buy-side limits.
+ *         Limits enforced in validateOrder: a per-transaction cap of 50 USDC for
+ *         INR merchants / 100 USDC default (perTxCap, admin-tunable via setPerTxCap)
+ *         and DAILY_TX_LIMIT = 25 orders per merchant per UTC day (admin-tunable via
+ *         setDailyLimit). The system proxy is carved out so withdrawals never hit
+ *         merchant buy-side limits.
  */
 contract MerchantTerminalIntegrator is IP2PIntegrator {
     using SafeERC20 for IERC20;
@@ -85,6 +87,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error InvalidCurrency();
     error WithdrawalInFlight();
     error FiatAlreadyDelivered();
+    /// @dev deliverFiatPayout called on an order the Diamond no longer holds in
+    ///      ACCEPTED — e.g. a retry after an auto-cancel. Blocks the retry window
+    ///      where the fee could be debited a second time (feeAdvanced overwrite).
+    error WithdrawalNotDeliverable();
     /// @dev An admin-set settlement lock fell outside [MIN,MAX]_SETTLEMENT_PERIOD.
     error InvalidLockPeriod();
     /// @dev A new-activity action (place order / withdraw) was attempted while the
@@ -131,6 +137,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     event WithdrawalUpiDelivered(uint256 indexed orderId, uint256 actualUsdtAmount);
     event WithdrawalUSDC(address indexed merchant, uint256 amount);
     event WithdrawalReconciled(address indexed merchant, uint256 indexed orderId, uint256 amount);
+    /// @dev Emitted when a COMPLETED SELL withdrawal is finalised and its in-flight
+    ///      slot freed. `recredit` is any proxy leftover swept back (0 on the clean
+    ///      path). Emitted unconditionally so the freed slot is observable off-chain.
+    event WithdrawalFinalized(address indexed merchant, uint256 indexed orderId, uint256 recredit);
     /// @notice A COMPLETED BUY whose onOrderComplete callback had reverted (leaving
     ///         the merchant's USDC stranded on their proxy, uncredited) was recovered
     ///         by an owner via sweepStrandedBuy: the proxy balance was swept into
@@ -164,6 +174,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         removal). `role` is the Role enum value
     ///         (0=NONE,1=VIEWER,2=SUPPORT,3=MANAGER,4=FINANCE).
     event AdminRoleSet(address indexed admin, uint8 role);
+    /// @dev DEPRECATED / never emitted (audit #6). This multi-owner integrator has
+    ///      no single-owner "transfer": ownership changes go through OwnerAdded /
+    ///      OwnerRemoved, and ROOT changes through SuperAdminTransferred. Kept only
+    ///      for ABI stability with legacy indexers; it will never fire.
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event OwnerAdded(address indexed owner);
     event OwnerRemoved(address indexed owner);
@@ -258,6 +272,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     /// @dev Mirrors OrderProcessorStorage.OrderStatus on the Diamond — used
     ///      by reconcileWithdrawal to read the authoritative terminal state.
+    ///      Enum order: PLACED=0, ACCEPTED=1, PAID=2, COMPLETED=3, CANCELLED=4.
+    uint8 internal constant STATUS_ACCEPTED = 1;
+    uint8 internal constant STATUS_PAID = 2;
     uint8 internal constant STATUS_COMPLETED = 3;
     uint8 internal constant STATUS_CANCELLED = 4;
 
@@ -963,6 +980,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // merchant's funds. Recoverable afterwards via the CANCELLED paths.
         if (needed < w.amount) revert OfframpFeeNotReady();
 
+        // AUDIT (retry double-debit guard): only an ACCEPTED SELL is deliverable.
+        // After a Diamond auto-cancel we roll back `upiDelivered` (below) so
+        // reconcile can run — but that also re-opens this function for the same
+        // orderId. Without this check a redundant retry against the now-CANCELLED
+        // order would debit the merchant's fee a SECOND time (and overwrite
+        // `feeAdvanced`, so reconcile could only ever re-credit one of them),
+        // relying solely on the Diamond to reject the stale setSellOrderUpi.
+        // Enforce it here instead of trusting the facet's internal state checks.
+        uint8 preStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
+        if (preStatus != STATUS_ACCEPTED) revert WithdrawalNotDeliverable();
+
         // CEI: set the replay flag before the external call; a revert rolls it
         // back so a legitimate retry still works.
         w.upiDelivered = true;
@@ -998,11 +1026,27 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // Grant the Diamond an allowance of exactly `needed` and call
         // setSellOrderUpi. UserProxy.execute does NOT auto-sweep the USDC
         // remainder; any surplus left on the proxy is recovered later by
-        // reconcileWithdrawal (which sweeps the full proxy balance).
+        // reconcileWithdrawal (which re-sweeps this order's own capped amount).
         bytes memory data = abi.encodeCall(IOrderFlow.setSellOrderUpi, (orderId, encPayout, 0));
         UserProxy(merchantProxy).execute(diamond, data, address(usdc), needed);
 
-        emit WithdrawalUpiDelivered(orderId, needed);
+        // #2 (event integrity vs the real Diamond): the live OrderFlowFacet wraps
+        // its USDC pull in try/catch and, on failure (or a re-price/liquidity
+        // branch), AUTO-CANCELS the order and returns success — it does NOT revert.
+        // So a returned `execute` is not proof of delivery. Read the order status
+        // back: only latch upiDelivered / emit WithdrawalUpiDelivered when the
+        // Diamond actually moved the order to PAID. If it auto-cancelled, roll the
+        // latch back so reconcileWithdrawal can make the merchant whole and the
+        // event stream never reports a delivery that didn't happen.
+        uint8 postStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
+        if (postStatus == STATUS_PAID) {
+            emit WithdrawalUpiDelivered(orderId, needed);
+        } else {
+            // Not delivered — undo the optimistic replay latch. The order is now
+            // (auto-)cancelled; the refund lands on the proxy and is recovered by
+            // reconcileWithdrawal, which re-credits the merchant.
+            w.upiDelivered = false;
+        }
     }
 
     /// @notice Withdraw unlocked USDC straight to the merchant's wallet.
@@ -1058,32 +1102,32 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         Merchant storage m = merchants[w.merchant];
         _releaseSlot(w, m); // idempotent — may already be freed by adminForceUnwedge
 
-        // MED-3: sweep the ENTIRE proxy balance back to the VAULT. Whatever the
-        // Diamond refunded (principal only for PLACED→CANCELLED, principal+fee
-        // for PAID→CANCELLED) is swept proxy → integrator (custody).
+        // M-1 (cross-order fund absorption): sweep only THIS order's own capped
+        // amount off the proxy, never the whole balance. A merchant has a single
+        // shared proxy on which a second pot of funds can legitimately sit (a
+        // stranded-BUY payout, or another order's leftover). Sweeping the full
+        // balance here while re-crediting only min(owedBack, proxyBal) would
+        // silently absorb that other pot into unattributed surplus. Taking exactly
+        // `take` (== the re-credit) and leaving the remainder on the proxy keeps
+        // every pot claimable by its own recovery path — sweep == credit, always.
+        //
+        // The cap is min(owedBack, proxyBal), the same structural double-spend
+        // guard as before (no refund on the proxy → no re-credit):
+        //
+        // AUDIT NOTE (informational): if the Diamond keeps the offramp fee on a
+        // clawback (refunds principal only, not principal+fee), proxyBal is short
+        // of owedBack and the merchant is not re-credited that fee — the CORRECT
+        // outcome, the fee was genuinely spent on the offramp attempt. If instead
+        // the Diamond refunds principal+fee, proxyBal covers owedBack and the full
+        // amount is re-credited. The cap self-adjusts to whatever the Diamond did.
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        if (proxyBal > 0) {
-            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
-            _toVault(proxyBal);
-        }
-
-        // Re-credit principal + any fee advanced (the fee was charged to the
-        // merchant at delivery but no fiat was rendered, so refund it), capped by
-        // what was ACTUALLY refunded to the proxy (structural double-spend guard:
-        // no refund → no re-credit).
-        //
-        // AUDIT NOTE (informational, #3): the min(owedBack, proxyBal) cap means
-        // that IF the Diamond keeps the offramp fee on a clawback (refunds only
-        // the principal, not principal+fee), the merchant is not re-credited that
-        // fee. That is the CORRECT outcome — the fee was genuinely spent by the
-        // protocol on the offramp attempt, so it isn't owed back. If instead the
-        // Diamond refunds principal+fee on a never-delivered clawback, proxyBal
-        // covers owedBack and the full amount (incl. fee) is re-credited. The cap
-        // self-adjusts to whichever the Diamond actually did — no assumption baked
-        // in, and never over-credits beyond the physical refund.
         uint256 owedBack = w.amount + w.feeAdvanced;
         uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        if (recredit > 0) {
+            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), recredit);
+            _toVault(recredit);
+        }
         // Re-lock under a fresh settlement window when the SELL had reached PAID
         // (fiat attempted) OR the merchant is FROZEN — a frozen account must not
         // get instantly-spendable funds back (mirrors adminAbortWithdrawal's
@@ -1122,16 +1166,22 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         Merchant storage m = merchants[w.merchant];
         _releaseSlot(w, m); // idempotent — may already be freed by adminForceUnwedge
 
+        // M-1: sweep only this order's own capped amount (min(owedBack, proxyBal)),
+        // never the whole proxy balance — any co-resident funds (a stranded BUY, or
+        // another order's leftover) stay on the proxy for their own recovery path.
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        if (proxyBal > 0) {
-            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
-            _toVault(proxyBal); // sweep proxy → integrator (custody)
-            uint256 owedBack = w.amount + w.feeAdvanced;
-            uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        uint256 owedBack = w.amount + w.feeAdvanced;
+        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        if (recredit > 0) {
+            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), recredit);
+            _toVault(recredit); // sweep proxy → integrator (custody)
             _creditBucket(m, recredit, block.timestamp + _lockFor(m));
-            emit WithdrawalReconciled(w.merchant, orderId, recredit);
         }
+        // #4: emit unconditionally — the clean (proxy-empty) COMPLETED case still
+        // flips w.settled and frees the in-flight slot, a state change the backend
+        // must be able to observe. recredit is 0 on the clean path.
+        emit WithdrawalFinalized(w.merchant, orderId, recredit);
     }
 
     /// @notice RECOVER a COMPLETED BUY whose onOrderComplete callback reverted,
@@ -1177,6 +1227,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
         if (order.status != STATUS_COMPLETED) revert WithdrawalNotCancellable();
 
+        Merchant storage m = merchants[merchant];
+        // M-1 (belt-and-suspenders serialization): refuse while a SELL withdrawal is
+        // in flight. An in-flight withdrawal parks its principal on this same shared
+        // proxy; combined with the capped-sweep fix below either alone prevents the
+        // cross-order absorption, but the gate also keeps the proxy balance
+        // attributable to exactly one order for the strongest invariant.
+        if (m.inFlightWithdrawals != 0) revert WithdrawalInFlight();
+
         address merchantProxy = _ensureProxy(merchant);
         // The completion must have paid THIS merchant's proxy — ties the swept
         // balance to this order and blocks recovering against any other proxy.
@@ -1190,14 +1248,18 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
         if (proxyBal == 0) revert NothingToWithdraw(); // nothing stranded to recover
-        UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
-        _toVault(proxyBal); // sweep proxy → integrator (custody)
 
+        // M-1: sweep only this order's own capped amount, never the whole proxy.
         // Structural cap: credit at most the order's real amount, and never more
-        // than what was physically swept in. Locked under a fresh settlement window,
-        // exactly like a normal on-time completion would have been.
-        Merchant storage m = merchants[merchant];
+        // than what was physically on the proxy. Sweeping exactly `credit` (== the
+        // re-credit) leaves any co-resident funds on the proxy for their own path,
+        // so one order's recovery can never absorb another's into surplus.
         uint256 credit = order.amount < proxyBal ? order.amount : proxyBal;
+        UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), credit);
+        _toVault(credit); // sweep proxy → integrator (custody)
+
+        // Locked under a fresh settlement window, exactly like a normal on-time
+        // completion would have been.
         _creditBucket(m, credit, block.timestamp + _lockFor(m));
         m.totalDeposited += credit;
 
@@ -1502,11 +1564,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         return usdc.balanceOf(address(this));
     }
 
-    /// @notice Back-compat: transferOwnership now means "add the new owner and drop
-    ///         the caller" (a 1→1 handoff). With multi-owner, prefer addOwner /
-    ///         removeOwner. Super-admin-only (it mutates the owner set), and it can
-    ///         NEVER drop the super-admin — the super-admin must always stay an
-    ///         owner. To move ROOT control, use transferSuperAdmin instead.
+    /// @notice Back-compat shim: transferOwnership here only ADDS `newOwner` to the
+    ///         owner set — it does NOT drop the caller (the caller is the super-admin,
+    ///         who must always remain an owner). Nothing is actually "transferred", so
+    ///         it emits OwnerAdded (via _addOwner), NOT OwnershipTransferred, to avoid
+    ///         misleading indexers into recording a handoff that never happened. With
+    ///         multi-owner, prefer addOwner / removeOwner directly. To move ROOT
+    ///         control, use transferSuperAdmin (the real two-step handoff).
     function transferOwnership(address newOwner) external onlySuperAdmin {
         if (newOwner == address(0)) revert InvalidAddress();
         // Guard the self-transfer foot-gun: transferOwnership(self) would fall
@@ -1519,8 +1583,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // would lose FINANCE-tier owner powers while still gating governance). So
         // add the new owner but do NOT evict the super-admin caller. Root handoff
         // is transferSuperAdmin's job, not this shim's.
+        // #6: _addOwner emits OwnerAdded — the accurate event for what happened. We
+        // deliberately do NOT emit OwnershipTransferred: the caller is never dropped,
+        // so no ownership actually transfers, and emitting it would mislead indexers.
         if (!isOwner[newOwner]) _addOwner(newOwner);
-        emit OwnershipTransferred(msg.sender, newOwner);
     }
 
     // NOTE: there is intentionally NO setVault / flushToVault / migrateState.

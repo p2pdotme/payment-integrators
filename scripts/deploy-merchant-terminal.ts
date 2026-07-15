@@ -1,4 +1,4 @@
-import { ethers } from "hardhat";
+import { ethers, network } from "hardhat";
 
 /**
  * Deploy MerchantTerminalIntegrator + the SimpleERC721Client price source.
@@ -37,8 +37,15 @@ const EXTRA_OWNERS = (process.env.EXTRA_OWNERS || "")
   .filter((s) => s.length > 0);
 
 async function main() {
-  if (!DIAMOND_ADDRESS || !USDC_ADDRESS) {
-    throw new Error("DIAMOND_ADDRESS and USDC_ADDRESS env vars required");
+  // Validate as ADDRESSES, not just non-empty — a malformed value would
+  // otherwise die later inside an opaque ethers ABI-encode error.
+  if (!ethers.isAddress(DIAMOND_ADDRESS)) {
+    throw new Error(
+      `DIAMOND_ADDRESS env var is missing or not a valid address: "${DIAMOND_ADDRESS}"`
+    );
+  }
+  if (!ethers.isAddress(USDC_ADDRESS)) {
+    throw new Error(`USDC_ADDRESS env var is missing or not a valid address: "${USDC_ADDRESS}"`);
   }
   for (const o of EXTRA_OWNERS) {
     if (!ethers.isAddress(o)) throw new Error(`EXTRA_OWNERS contains a non-address: ${o}`);
@@ -125,12 +132,17 @@ async function main() {
   console.log("     0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913). The constructor pinned it as");
   console.log("     immutable and this script already asserted usdc()==USDC_ADDRESS, but the");
   console.log("     RIGHT-token check is manual — a valid-but-wrong ERC-20 would still pass.");
-  console.log("  1. Verify on the explorer:");
+  console.log("  1. Verify on the explorer (hardhat-verify can't take an ARRAY constructor");
+  console.log("     arg inline — write it to a --constructor-args module):");
+  console.log("       // verify-args.js");
   console.log(
-    `     integrator: npx hardhat verify --network baseSepolia ${address} ${DIAMOND_ADDRESS} ${USDC_ADDRESS} "[${EXTRA_OWNERS.map((o) => `\\"${o}\\"`).join(",")}]"`
+    `       module.exports = ["${DIAMOND_ADDRESS}", "${USDC_ADDRESS}", ${JSON.stringify(EXTRA_OWNERS)}];`
   );
   console.log(
-    `     client:     npx hardhat verify --network baseSepolia ${clientAddress} ${address} ${USDC_ADDRESS} "Merchant Terminal Item" "MTI"`
+    `     integrator: npx hardhat verify --network ${network.name} --constructor-args verify-args.js ${address}`
+  );
+  console.log(
+    `     client:     npx hardhat verify --network ${network.name} ${clientAddress} ${address} ${USDC_ADDRESS} "Merchant Terminal Item" "MTI"`
   );
   console.log("  2. File the whitelist request (docs/WHITELISTING.md):");
   console.log(`       integrator             = ${address}`);

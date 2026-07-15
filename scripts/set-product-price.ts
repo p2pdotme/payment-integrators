@@ -14,19 +14,36 @@ import { ethers } from "hardhat";
  * flip. Still, deploy the drift-fix frontend around the same time so the UX and
  * on-chain price move together.
  *
+ * Env (addresses are NOT hardcoded — repo convention forbids it):
+ *   CLIENT   (required) the live SimpleERC721Client (price source) to operate on
+ *
  * Run (Base Sepolia), from payment-integrators/:
- *   CLIENT=0x733De42AE944f0eFF2895aA76E7d73F5e948FCb3 \
- *     npx hardhat run scripts/set-product-price.ts --network baseSepolia
+ *   CLIENT=0x... npx hardhat run scripts/set-product-price.ts --network baseSepolia
  * The signer MUST be the client's owner (the deployer) — setProductPrice is onlyOwner.
  */
 
-// Live SimpleERC721Client (price source) on Base Sepolia. Override with CLIENT env.
-const CLIENT = process.env.CLIENT || "0x733De42AE944f0eFF2895aA76E7d73F5e948FCb3";
+// SimpleERC721Client (price source). Required from env — no hardcoded default,
+// matching grant-admin.ts / transfer-superadmin.ts (repo convention forbids it).
+const CLIENT = process.env.CLIENT || "";
 const PRODUCT_ID = 2n;
 const NEW_PRICE = 1n; // 1e-6 USDC — full 6-decimal precision
 
 async function main() {
+  // Fail loudly BEFORE any on-chain read/write if the target isn't supplied.
+  if (!ethers.isAddress(CLIENT)) {
+    throw new Error(`CLIENT env var is missing or not a valid address: "${CLIENT}"`);
+  }
   const net = await ethers.provider.getNetwork();
+  // HARD network guard — this is a mutating one-off aimed at Base Sepolia; a
+  // soft "(check network!)" log is not enough for the only script that will
+  // happily write on the wrong chain. Explicit env override for a future
+  // mainnet run.
+  if (net.chainId !== 84532n && process.env.ALLOW_NON_SEPOLIA !== "1") {
+    throw new Error(
+      `Refusing to run on chainId ${net.chainId} — this one-off targets Base Sepolia (84532). ` +
+        "Set ALLOW_NON_SEPOLIA=1 to override deliberately."
+    );
+  }
   const [signer] = await ethers.getSigners();
   const client = await ethers.getContractAt("SimpleERC721Client", CLIENT);
 

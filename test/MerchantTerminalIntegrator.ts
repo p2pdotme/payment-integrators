@@ -1555,15 +1555,286 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         .to.emit(integrator, "StrandedBuyRecovered")
         .withArgs(orderId, merchant1.address, USDC(20));
       expect(await integrator.totalOwed()).to.equal(USDC(20)); // NOT 25
-      // The extra 5 was swept into custody but not credited → recoverable as excess
-      // by the super-admin (solvency: balance 25 >= owed 20).
-      expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(USDC(25));
+      // M-1: the sweep now takes ONLY the capped amount (20), leaving the extra 5
+      // on the proxy — it is no longer pulled into custody at all. (Previously the
+      // whole 25 was swept and the 5 became skimmable excess; capping the sweep to
+      // what we credit is exactly what stops cross-order absorption.)
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(USDC(5)); // remainder stays put
+      expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(USDC(20));
       expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.be.gte(
         await integrator.totalOwed()
       );
-      await expect(integrator.connect(owner).skimExcess(owner.address))
-        .to.emit(integrator, "ExcessSkimmed")
-        .withArgs(owner.address, USDC(5));
+      // Nothing to skim — custody exactly equals totalOwed now.
+      await expect(
+        integrator.connect(owner).skimExcess(owner.address)
+      ).to.be.revertedWithCustomError(integrator, "NothingToSkim");
+    });
+  });
+
+  describe("M-1: cross-order fund absorption on the shared merchant proxy", function () {
+    // Grab a WithdrawalFiat orderId from a withdrawFiat tx receipt.
+    async function fiatOrderId(tx: any): Promise<bigint> {
+      const r = await tx.wait();
+      const ev = r.logs
+        .map((l: any) => {
+          try {
+            return integrator.interface.parseLog(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((l: any) => l?.name === "WithdrawalFiat");
+      return ev.args.orderId;
+    }
+
+    // The exact PoC the reviewer described (amounts scaled to the 10-USDC unit
+    // price): deposit 40, withdraw 40 (principal A parked on the proxy), a customer
+    // BUY of 20 strands (payout B on the SAME proxy), then sweepStrandedBuy runs.
+    // BEFORE the fix: the sweep took A+B=60 but credited only 20 → 40 lost to
+    // surplus, merchant owed 20 instead of 60.
+    // AFTER: sweepStrandedBuy is gated on inFlightWithdrawals==0, so it can't even
+    // run while the withdrawal is live; and every path caps its sweep. We assert
+    // the merchant ends up whole (60) with ZERO surplus created.
+    it("BUY strands while a SELL withdrawal is in flight — no absorption, merchant owed the full amount", async function () {
+      // Deposit 40 (quantity 4 @ 10 USDC), matured.
+      await depositFor(merchant1, UPI_1, 4); // 40 USDC
+      await increaseTime(SETTLEMENT + 3600);
+      expect(await integrator.totalOwed()).to.equal(USDC(40));
+
+      // Start a fiat withdrawal of the full 40 → principal A parks on the proxy,
+      // inFlightWithdrawals == 1, totalOwed drops while it's escrowed.
+      const proxy = await integrator.proxyAddress(merchant1.address);
+      const wId = await fiatOrderId(
+        await integrator.connect(merchant1).withdrawFiat(USDC(40), 1, PK, "")
+      );
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(USDC(40)); // A on proxy
+
+      // A customer BUY of 20 to THIS merchant strands on the same proxy (its
+      // completion callback reverted). Proxy now holds A+B = 60.
+      // (simulateOrderCompleteNoCallback routes order.amount to recipientAddr = proxy.)
+      const buyId = await placeOrder(merchant1, 2); // 20 USDC BUY
+      await mockDiamond.simulateOrderCompleteNoCallback(buyId);
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(USDC(60)); // A + B co-resident
+
+      // M-1 GUARD: sweepStrandedBuy must REFUSE while the withdrawal is in flight —
+      // this is what prevents the absorption at the source.
+      await expect(
+        integrator.connect(merchant1).sweepStrandedBuy(buyId)
+      ).to.be.revertedWithCustomError(integrator, "WithdrawalInFlight");
+
+      // Resolve the withdrawal the normal way: the SELL is cancelled, reconcile
+      // sweeps ONLY this order's own 40 back and re-credits it — leaving B (20)
+      // untouched on the proxy for its own recovery path.
+      await mockDiamond.cancelSellOrder(wId);
+      await integrator.reconcileWithdrawal(wId);
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(USDC(20)); // B still there
+      expect(await integrator.totalOwed()).to.equal(USDC(40)); // A restored, B not yet
+
+      // Now no withdrawal is in flight → sweepStrandedBuy runs and credits B.
+      await expect(integrator.connect(merchant1).sweepStrandedBuy(buyId))
+        .to.emit(integrator, "StrandedBuyRecovered")
+        .withArgs(buyId, merchant1.address, USDC(20));
+
+      // Merchant is owed the FULL 60 (40 + 20), NOT 20. Zero surplus: custody
+      // exactly equals totalOwed, so there is nothing skimmable.
+      expect(await integrator.totalOwed()).to.equal(USDC(60));
+      const bal = await mockUsdc.balanceOf(await integrator.getAddress());
+      expect(bal).to.equal(USDC(60));
+      expect(bal).to.equal(await integrator.totalOwed()); // surplus == 0
+      await expect(
+        integrator.connect(owner).skimExcess(owner.address)
+      ).to.be.revertedWithCustomError(integrator, "NothingToSkim");
+    });
+
+    // Mirror ordering: stranded-BUY funds already sit on the proxy, THEN a SELL
+    // withdrawal starts. The withdrawal's own recovery (reconcile) must sweep only
+    // its own principal and never absorb the pre-existing stranded-BUY funds.
+    it("SELL withdrawal starts while stranded-BUY funds sit on the proxy — reconcile takes only its own principal", async function () {
+      await depositFor(merchant1, UPI_1, 4); // 40 USDC
+      await increaseTime(SETTLEMENT + 3600);
+      const proxy = await integrator.proxyAddress(merchant1.address);
+
+      // A stranded BUY of 20 lands on the proxy FIRST (callback reverted).
+      const buyId = await placeOrder(merchant1, 2); // 20 USDC BUY
+      await mockDiamond.simulateOrderCompleteNoCallback(buyId);
+      const strandedAmt = (await mockDiamond.getOrdersById(buyId)).amount; // 20 USDC
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(strandedAmt); // B on proxy
+
+      // Now a fiat withdrawal of 40 starts → its principal A is added to the proxy.
+      const wId = await fiatOrderId(
+        await integrator.connect(merchant1).withdrawFiat(USDC(40), 1, PK, "")
+      );
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(strandedAmt + USDC(40)); // A + B
+
+      // The SELL is cancelled; reconcile sweeps ONLY its own 40 (capped), leaving
+      // the stranded-BUY funds B on the proxy.
+      await mockDiamond.cancelSellOrder(wId);
+      await expect(integrator.reconcileWithdrawal(wId))
+        .to.emit(integrator, "WithdrawalReconciled")
+        .withArgs(merchant1.address, wId, USDC(40));
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(strandedAmt); // B untouched
+
+      // B is then recovered on its own path; merchant ends up whole, no surplus.
+      await integrator.connect(merchant1).sweepStrandedBuy(buyId);
+      const owed = await integrator.totalOwed();
+      expect(owed).to.equal(USDC(40) + strandedAmt);
+      expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(owed);
+    });
+
+    // #2/#3: the live Diamond's setSellOrderUpi auto-cancels + returns success on a
+    // failed pull instead of reverting. deliverFiatPayout must NOT report a delivery
+    // for an order that actually cancelled: it reads the status back and only latches
+    // upiDelivered / emits WithdrawalUpiDelivered when the order reached PAID.
+    it("#2: deliverFiatPayout does NOT latch/emit for an order the Diamond auto-cancelled", async function () {
+      await depositFor(merchant1, UPI_1, 2); // 20 USDC
+      await increaseTime(SETTLEMENT + 3600);
+      const wId = await fiatOrderId(
+        await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
+      );
+      await mockDiamond.acceptSellOrder(wId, "lp");
+
+      // Force the Diamond's auto-cancel-and-return-success branch (mirrors a failed
+      // USDC pull in production). execute() returns normally, but the order is now
+      // CANCELLED — deliverFiatPayout must detect that and NOT emit a delivery.
+      await mockDiamond.setForceSellUpiAutoCancel(true);
+      await expect(integrator.connect(merchant1).deliverFiatPayout(wId, "encUpi")).to.not.emit(
+        integrator,
+        "WithdrawalUpiDelivered"
+      );
+
+      // upiDelivered was rolled back (not latched to a dead order), and the order
+      // is CANCELLED — so the standard reconcile path can make the merchant whole.
+      const w = await integrator.withdrawals(wId);
+      expect(w.upiDelivered).to.equal(false);
+      expect((await mockDiamond.getOrdersById(wId)).status).to.equal(4); // CANCELLED
+
+      // Retry guard: the rolled-back latch re-opens deliverFiatPayout for this
+      // orderId, but the order is CANCELLED on the Diamond — a redundant retry
+      // must revert at OUR boundary (not rely on the facet rejecting the stale
+      // setSellOrderUpi), otherwise the fee would be debited a second time with
+      // feeAdvanced overwritten (only one of the two ever re-creditable).
+      await mockDiamond.setForceSellUpiAutoCancel(false);
+      const availBeforeRetry = (await integrator.getMerchantBalance(merchant1.address))[1];
+      await expect(
+        integrator.connect(merchant1).deliverFiatPayout(wId, "encUpi")
+      ).to.be.revertedWithCustomError(integrator, "WithdrawalNotDeliverable");
+      // no second debit happened
+      expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(
+        availBeforeRetry
+      );
+
+      // Recover: reconcile sweeps the principal back off the proxy and re-credits.
+      await integrator.reconcileWithdrawal(wId);
+      expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(20));
+      expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.be.gte(
+        await integrator.totalOwed()
+      );
+    });
+
+    // #2 with a NON-ZERO fee: the auto-cancel lands AFTER deliverFiatPayout has
+    // already debited the merchant's fee and pushed it to the proxy (feeAdvanced
+    // recorded). The Diamond pulled nothing, so the proxy holds principal + fee
+    // and reconcile must make the merchant FULLY whole — including the fee —
+    // instantly spendable (the order never reached PAID, no fiat can have moved)
+    // and with zero surplus absorbed into custody.
+    it("#2 + fee: auto-cancel after the fee top-up — reconcile re-credits principal AND fee", async function () {
+      await mockDiamond.setSellFee(USDC(1)); // offramp fee = 1 USDC
+      await depositFor(merchant1, UPI_1, 3); // 30 USDC
+      await increaseTime(SETTLEMENT + 3600);
+      const wId = await fiatOrderId(
+        await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
+      );
+      await mockDiamond.acceptSellOrder(wId, "lp");
+
+      await mockDiamond.setForceSellUpiAutoCancel(true);
+      await expect(integrator.connect(merchant1).deliverFiatPayout(wId, "encUpi")).to.not.emit(
+        integrator,
+        "WithdrawalUpiDelivered"
+      );
+
+      // Fee was debited (30 - 20 principal - 1 fee = 9 available) and sits on
+      // the proxy together with the principal.
+      expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(9));
+      const proxy = await integrator.proxyAddress(merchant1.address);
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(USDC(21));
+
+      // Reconcile: owedBack = principal 20 + feeAdvanced 1 = 21, all on the proxy.
+      await expect(integrator.reconcileWithdrawal(wId))
+        .to.emit(integrator, "WithdrawalReconciled")
+        .withArgs(merchant1.address, wId, USDC(21));
+      expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(30));
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(0);
+      // Exact solvency — nothing leaked into unattributed surplus.
+      expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(
+        await integrator.totalOwed()
+      );
+    });
+  });
+
+  describe("trusted relayer (keeper) authorization", function () {
+    const fiatOrderId = async (txPromise: any) => {
+      const r = await (await txPromise).wait();
+      return r.logs
+        .map((l: any) => {
+          try {
+            return integrator.interface.parseLog(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
+    };
+
+    it("MANAGER-gated set; appointed relayer can deliver; clearing re-blocks it", async function () {
+      // A no-role caller cannot appoint a relayer (MANAGER tier required).
+      await expect(
+        integrator.connect(attacker).setTrustedRelayer(attacker.address)
+      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+
+      // Owner (implicit FINANCE ≥ MANAGER) appoints merchant2 as the keeper.
+      await expect(integrator.setTrustedRelayer(merchant2.address))
+        .to.emit(integrator, "TrustedRelayerSet")
+        .withArgs(merchant2.address);
+
+      // An ACCEPTED SELL for merchant1…
+      await depositFor(merchant1, UPI_1, 2); // 20 USDC
+      await increaseTime(SETTLEMENT + 3600);
+      const wId = await fiatOrderId(
+        integrator.connect(merchant1).withdrawFiat(USDC(20), 1, PK, "")
+      );
+      await mockDiamond.acceptSellOrder(wId, "lp");
+
+      // …delivered by the relayer — who is NOT the merchant and NOT an owner.
+      await expect(integrator.connect(merchant2).deliverFiatPayout(wId, "encUpi")).to.emit(
+        integrator,
+        "WithdrawalUpiDelivered"
+      );
+
+      // Close it out, set up a second withdrawal, then CLEAR the relayer:
+      // the ex-keeper must be refused on the fresh order (auth arm, not the
+      // upiDelivered replay latch).
+      await mockDiamond.completeSellOrder(wId);
+      await integrator.finalizeWithdrawal(wId);
+      const o2 = await placeOrder(merchant1, 1); // +10 USDC
+      await mockDiamond.simulateOrderComplete(o2);
+      await increaseTime(SETTLEMENT + 3600);
+      const wId2 = await fiatOrderId(
+        integrator.connect(merchant1).withdrawFiat(USDC(10), 1, PK, "")
+      );
+      await mockDiamond.acceptSellOrder(wId2, "lp");
+
+      await expect(integrator.setTrustedRelayer(ethers.ZeroAddress))
+        .to.emit(integrator, "TrustedRelayerSet")
+        .withArgs(ethers.ZeroAddress);
+      await expect(
+        integrator.connect(merchant2).deliverFiatPayout(wId2, "encUpi")
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+
+      // The merchant themself is of course still allowed.
+      await expect(integrator.connect(merchant1).deliverFiatPayout(wId2, "encUpi")).to.emit(
+        integrator,
+        "WithdrawalUpiDelivered"
+      );
     });
   });
 
@@ -2333,14 +2604,25 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     });
 
     it("MED-5: deposits sharing an unlock window coalesce, so the bucket count stays bounded", async function () {
-      // Two deposits credited at the same unlock timestamp fold into ONE bucket,
-      // so the credit path can never grow unboundedly or revert at the cap.
-      await depositFor(merchant1, UPI_1, 1); // 10, one bucket
-      const o = await placeOrder(merchant1, 1);
-      await mockDiamond.simulateOrderComplete(o); // same-window credit → coalesces
+      // Two deposits credited at the SAME unlock timestamp fold into ONE bucket.
+      // _creditBucket folds only on an EXACT timestamp match, so both credits
+      // must land in the SAME block — auto-mined blocks get different timestamps
+      // and never coalesce (which made the old version of this test vacuous:
+      // it only summed amounts and passed with or without coalescing).
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop", INR_CODE);
+      const o1 = await placeOrder(merchant1, 1); // 10
+      const o2 = await placeOrder(merchant1, 1); // 10
+      await ethers.provider.send("evm_setAutomine", [false]);
+      const t1 = await mockDiamond.simulateOrderComplete(o1);
+      const t2 = await mockDiamond.simulateOrderComplete(o2);
+      await ethers.provider.send("evm_mine", []);
+      await ethers.provider.send("evm_setAutomine", [true]);
+      await t1.wait();
+      await t2.wait();
+
       const buckets = await integrator.getMerchantBuckets(merchant1.address);
-      const total = buckets.reduce((s: bigint, b: any) => s + b.amount, 0n);
-      expect(total).to.equal(USDC(20)); // both credited, nothing stranded
+      expect(buckets.length).to.equal(1); // folded — NOT two buckets
+      expect(buckets[0].amount).to.equal(USDC(20)); // both credited, nothing stranded
     });
 
     it("INFO-2: a currency code with an interior NUL byte is rejected", async function () {
@@ -2641,7 +2923,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       const owedBefore = await integrator.totalOwed();
       await expect(integrator.finalizeWithdrawal(orderId))
-        .to.emit(integrator, "WithdrawalReconciled")
+        .to.emit(integrator, "WithdrawalFinalized")
         .withArgs(merchant1.address, orderId, USDC(5)); // leftover < owedBack → full re-credit
       // Swept into custody and credited to the merchant — RE-LOCKED (fiat was
       // delivered, mirror the reconcile rule), so pending not available.
@@ -2661,7 +2943,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(w.slotFreed).to.equal(true);
     });
 
-    it("LOW-2: a clean COMPLETED finalize (empty proxy) neither credits nor emits", async function () {
+    it("LOW-2 / #4: a clean COMPLETED finalize (empty proxy) credits nothing but STILL emits WithdrawalFinalized(0)", async function () {
       await depositFor(merchant1, UPI_1, 2);
       await increaseTime(SETTLEMENT + 60);
       const orderId = await fiatOrderId(
@@ -2671,14 +2953,19 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await integrator.deliverFiatPayout(orderId, "encPayout");
       await mockDiamond.completeSellOrder(orderId);
       const owedBefore = await integrator.totalOwed();
-      await expect(integrator.finalizeWithdrawal(orderId)).to.not.emit(
-        integrator,
-        "WithdrawalReconciled"
-      );
-      expect(await integrator.totalOwed()).to.equal(owedBefore);
+      // #4: the clean path frees the in-flight slot — a state change the backend
+      // must observe — so it now emits WithdrawalFinalized unconditionally (recredit 0).
+      await expect(integrator.finalizeWithdrawal(orderId))
+        .to.emit(integrator, "WithdrawalFinalized")
+        .withArgs(merchant1.address, orderId, 0);
+      expect(await integrator.totalOwed()).to.equal(owedBefore); // no credit on the clean path
+      // Slot freed even on the clean path.
+      const w = await integrator.withdrawals(orderId);
+      expect(w.settled).to.equal(true);
+      expect(w.slotFreed).to.equal(true);
     });
 
-    it("LOW-2 + LOW-1 composed: leftover ABOVE owedBack is capped, remainder skimmable", async function () {
+    it("LOW-2 + M-1: leftover ABOVE owedBack is capped — remainder LEFT ON THE PROXY, not swept into surplus", async function () {
       await depositFor(merchant1, UPI_1, 2); // 20
       await increaseTime(SETTLEMENT + 60);
       const orderId = await fiatOrderId(
@@ -2688,17 +2975,26 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await integrator.deliverFiatPayout(orderId, "encPayout");
       await mockDiamond.completeSellOrder(orderId);
 
-      // Leftover exceeds this order's owedBack (10): the cap stops the merchant
-      // from being over-credited; the excess lands as skimmable surplus.
+      // Leftover (25) exceeds this order's owedBack (10). M-1: finalize now sweeps
+      // ONLY its own capped amount (10) and credits 10 — it does NOT vacuum the
+      // whole proxy. The extra 15 STAYS ON THE PROXY (it may belong to another
+      // order), rather than being pulled into unattributed surplus.
       const proxy = await integrator.proxyAddress(merchant1.address);
       await mockUsdc.mint(proxy, USDC(25));
+      const owedBefore = await integrator.totalOwed();
       await expect(integrator.finalizeWithdrawal(orderId))
-        .to.emit(integrator, "WithdrawalReconciled")
+        .to.emit(integrator, "WithdrawalFinalized")
         .withArgs(merchant1.address, orderId, USDC(10)); // capped at owedBack
-      // 25 swept, 10 credited → 15 surplus above totalOwed, recoverable via skim.
-      await expect(integrator.connect(owner).skimExcess(owner.address))
-        .to.emit(integrator, "ExcessSkimmed")
-        .withArgs(owner.address, USDC(15));
+      // Exactly 10 swept + credited; 15 remains on the proxy, untouched.
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(USDC(15));
+      expect(await integrator.totalOwed()).to.equal(owedBefore + USDC(10));
+      // No surplus was created in custody, so there is nothing to skim.
+      expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(
+        await integrator.totalOwed()
+      );
+      await expect(
+        integrator.connect(owner).skimExcess(owner.address)
+      ).to.be.revertedWithCustomError(integrator, "NothingToSkim");
     });
 
     it("handoff TTL: an expired super-admin proposal cannot be accepted; a fresh one can", async function () {

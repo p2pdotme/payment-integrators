@@ -205,6 +205,9 @@ contract MockDiamond {
     function simulateOrderComplete(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(!order.completed, "Already completed");
+        // CANCELLED is terminal on the real Diamond — a test must never be able
+        // to "complete" a cancelled BUY and validate an impossible transition.
+        require(!order.cancelled, "Cancelled is terminal");
         order.completed = true;
 
         // Transfer USDC to recipientAddr (mirrors usdcThroughIntegrator = false)
@@ -291,8 +294,12 @@ contract MockDiamond {
     }
 
     /**
-     * @notice Mocks OrderFlowFacet.setSellOrderUpi: pulls USDC from order.user
-     *         (= integrator) into the Diamond and transitions to PAID.
+     * @notice Mocks OrderFlowFacet.setSellOrderUpi. The LIVE facet wraps its USDC
+     *         pull in try/catch and, on a failed pull, AUTO-CANCELS the order and
+     *         returns success (it does NOT revert) — so a successful call is not
+     *         proof of delivery. This mock mirrors that: it try/catches the pull
+     *         via the external `_pullFor` shim, moving to PAID on success and to
+     *         CANCELLED (returning normally) on failure. (audit #3)
      */
     function setSellOrderUpi(
         uint256 orderId,
@@ -303,12 +310,45 @@ contract MockDiamond {
         require(o.status == SellStatus.ACCEPTED, "Bad state");
         require(msg.sender == o.user, "Only order.user");
         o.encUpi = encUpi;
-        o.status = SellStatus.PAID;
-        // Pull principal + fee (actualUsdtAmount), exactly as the live Diamond.
-        // If the integrator only funded/approved principal, this reverts —
-        // catching the "fee bug" the unit suite previously missed.
-        usdc.safeTransferFrom(o.user, address(this), o.amount + sellFee);
-        emit MockSellOrderPaid(orderId);
+        uint256 needed = o.amount + sellFee; // actualUsdtAmount (principal + fee)
+        // Test hook: force the live facet's "pull failed → auto-cancel, return
+        // success (no revert)" branch even when the proxy is fully funded, so the
+        // integrator's deliverFiatPayout status-read-back (#2) can be exercised
+        // deterministically without contriving an underfunding.
+        if (forceSellUpiAutoCancel) {
+            o.status = SellStatus.CANCELLED;
+            emit MockSellOrderCancelled(orderId, 0);
+            return;
+        }
+        // try/catch the pull exactly like the live facet. `_pullFor` is external so
+        // the failure is caught here instead of bubbling up as a revert.
+        try this._pullFor(o.user, needed) {
+            o.status = SellStatus.PAID;
+            emit MockSellOrderPaid(orderId);
+        } catch {
+            // Underfunded / failed pull → auto-cancel, return success. Nothing was
+            // pulled, so there is nothing to refund; the principal the integrator
+            // parked on the proxy stays there for reconcileWithdrawal to recover.
+            o.status = SellStatus.CANCELLED;
+            emit MockSellOrderCancelled(orderId, 0);
+        }
+    }
+
+    /// @notice Test-only: when set, setSellOrderUpi takes the live Diamond's
+    ///         auto-cancel-and-return-success branch (see #2/#3) regardless of
+    ///         proxy funding, so the integrator's post-execute status check can be
+    ///         tested directly.
+    bool public forceSellUpiAutoCancel;
+
+    function setForceSellUpiAutoCancel(bool v) external {
+        forceSellUpiAutoCancel = v;
+    }
+
+    /// @dev External so setSellOrderUpi can try/catch it (Solidity only catches
+    ///      external calls). Reverts if the integrator underfunded/underapproved.
+    function _pullFor(address from, uint256 amount) external {
+        require(msg.sender == address(this), "internal");
+        usdc.safeTransferFrom(from, address(this), amount);
     }
 
     function completeSellOrder(uint256 orderId) external {
@@ -505,6 +545,7 @@ contract MockDiamond {
     function simulateOrderCompleteNoCallback(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(!order.completed, "Already completed");
+        require(!order.cancelled, "Cancelled is terminal");
         order.completed = true;
         // Route USDC to the proxy exactly like a real completion, but skip the
         // integrator callback (the swallowed-revert end state).
