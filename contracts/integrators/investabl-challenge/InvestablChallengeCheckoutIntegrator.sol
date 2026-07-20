@@ -17,12 +17,26 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
  *         backend — the user never receives spendable USDC, so this is the
  *         low-fraud goods model (not the USDC-to-user model that requires KYC).
  *
- *         Because the purchased asset is a non-liquid service, orders are gated
- *         only by an absolute per-tx USDC cap (`perTxUsdcCap`, default ≤ 50 USDC
- *         — P2P's no-KYC ceiling) plus a daily order-count limit. No reputation,
- *         no ZK-KYC: a brand-new wallet can buy immediately.
+ *         Orders are gated on a simple-kyc **liveness** attestation plus a daily
+ *         order-count limit:
+ *
+ *           - No attestation       -> cannot buy at all.
+ *           - Liveness attestation -> per-tx cap = min(attested limit,
+ *                                     tierCap[TIER_LIVENESS]), deployed at 20 USDC.
+ *
+ *         The service signs a dollar limit into the attestation and this contract
+ *         additionally clamps it to an on-chain per-tier ceiling, so a compromised
+ *         attestor key cannot authorize more than the tier allows. Verification is
+ *         the on-chain twin of simple-kyc's `LivenessAttestationVerifier`: EIP-712
+ *         typehash `LivenessAttestation(address wallet,bytes32 nullifier,uint256
+ *         limit,uint256 expiry)`, domain name `LivenessVerifier`, recovered with
+ *         `ecrecover`. Register this contract's address as the tenant
+ *         `contract_address` with the liveness service; the per-(tenant, human)
+ *         `nullifier` is single-use for on-chain Sybil resistance.
  *
  *         Flow:
+ *           0. User completes the liveness check once and calls
+ *              `submitLivenessAttestation(...)` from their wallet.
  *           1. User's wallet calls `buyChallenge(...)` → places a B2B BUY order
  *              through their `UserProxy`, with `recipientAddr = this integrator`.
  *           2. User pays fiat off-chain (UPI) to the matched liquidity provider.
@@ -33,8 +47,10 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
  *           4. Accrued USDC is swept to the treasury by the owner (`sweepUsdc`),
  *              then bridged to the Arbitrum treasury out of band.
  *
- *         Registration: `usdcThroughIntegrator = true`, `recipientAddr` is this
- *         contract (mirrors the canonical ExampleIntegrator goods pattern).
+ *         Registration: **`usdcThroughIntegrator = false`**. `buyChallenge` pins
+ *         `recipientAddr = address(this)`, so the recipient pin already routes
+ *         settlement USDC here; setting the flag as well would double-route.
+ *         Every integrator in this repo registers `false` — see docs/WHITELISTING.md.
  *
  * @dev    Security invariants (see CONTRIBUTING.md):
  *           - `validateOrder` / `onOrderComplete` / `onOrderCancel` are
@@ -59,9 +75,24 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     error OrderAlreadyFulfilled();
     error OrderAlreadyCancelled();
 
+    // KYC / attestation
+    error AttestorNotSet();
+    error AttestationExpired();
+    error NullifierAlreadySpent();
+    error InvalidSignature();
+
     // ─── Events ───────────────────────────────────────────────────────
 
-    event PerTxUsdcCapUpdated(uint256 cap);
+    event TierCapUpdated(uint8 indexed tier, uint256 cap);
+    event LivenessAttestorUpdated(address indexed attestor);
+    /// @param tier 1 = liveness
+    event LivenessClaimed(
+        address indexed user,
+        uint8 indexed tier,
+        bytes32 nullifier,
+        uint256 attestedLimit,
+        uint256 grantedLimit
+    );
     event DailyTxCountLimitUpdated(uint256 count);
     event TreasuryUpdated(address indexed treasury);
     /// @notice A challenge BUY order was placed on the Diamond.
@@ -96,15 +127,51 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     /// @notice Pinned at deploy; submitted with the whitelist request.
     address public immutable proxyImpl;
 
+    // ─── Tier constants ───────────────────────────────────────────────
+
+    uint8 public constant TIER_NONE = 0;
+    uint8 public constant TIER_LIVENESS = 1;
+
+    // ─── EIP-712 constants ────────────────────────────────────────────
+
+    /// @dev keccak256("LivenessAttestation(address wallet,bytes32 nullifier,uint256 limit,uint256 expiry)")
+    bytes32 private constant _LIVENESS_TYPEHASH =
+        keccak256(
+            "LivenessAttestation(address wallet,bytes32 nullifier,uint256 limit,uint256 expiry)"
+        );
+    bytes32 private constant _EIP712_DOMAIN_TYPEHASH =
+        keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+        );
+    bytes32 private constant _LIVENESS_DOMAIN_NAME = keccak256(bytes("LivenessVerifier"));
+    bytes32 private constant _DOMAIN_VERSION = keccak256(bytes("1"));
+
+    // ─── Attestation config ───────────────────────────────────────────
+
+    /// @notice secp256k1 signer of the liveness service's attestations. While
+    ///         unset every user is TIER_NONE, whose per-tx limit is 0 — the
+    ///         contract fails closed and no order can be placed.
+    address public livenessAttestor;
+
     // ─── Configurable limits ──────────────────────────────────────────
 
-    /// @notice Absolute per-tx USDC ceiling (micro-USDC, 6dp). No RP/KYC — this
-    ///         cap alone gates every order. Keep ≤ 50 USDC (P2P no-KYC ceiling).
-    uint256 public perTxUsdcCap;
+    /// @notice On-chain per-tx ceiling per tier (micro-USDC, 6dp).
+    ///         A tier whose cap is 0 is effectively disabled.
+    mapping(uint8 => uint256) public tierCap;
     /// @notice Max challenge orders a single user can place per UTC day.
     uint256 public dailyTxCountLimit;
     /// @notice Destination for swept USDC proceeds. Defaults to `owner`.
     address public treasury;
+
+    // ─── Per-user entitlement ─────────────────────────────────────────
+
+    /// @notice Per-tx USDC ceiling attested by the simple-kyc service. The
+    ///         effective cap is this clamped by `tierCap[userTier[user]]`.
+    mapping(address => uint256) public grantedLimit;
+    /// @notice Highest tier the user has claimed (see TIER_* constants).
+    mapping(address => uint8) public userTier;
+    /// @notice Per-(tenant, human) Sybil nullifiers already consumed.
+    mapping(bytes32 => bool) public livenessNullifierSpent;
 
     // ─── Order accounting ─────────────────────────────────────────────
 
@@ -137,34 +204,49 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     /**
      * @param _diamond           P2P Diamond (B2B gateway) address.
      * @param _usdc              USDC token address (native Circle USDC on Base).
-     * @param _perTxUsdcCap      Absolute per-tx cap, micro-USDC (e.g. 50e6).
+     * @param _livenessTierCap   Per-tx ceiling for the liveness tier, micro-USDC
+     *                           (e.g. 20e6).
      * @param _dailyTxCountLimit Max challenge orders per user per day.
+     * @param _livenessAttestor  Liveness service signer. May be 0 and set later
+     *                           with `setLivenessAttestor`, but no order can be
+     *                           placed until it is set.
      */
     constructor(
         address _diamond,
         address _usdc,
-        uint256 _perTxUsdcCap,
-        uint256 _dailyTxCountLimit
+        uint256 _livenessTierCap,
+        uint256 _dailyTxCountLimit,
+        address _livenessAttestor
     ) {
         if (_diamond == address(0) || _usdc == address(0)) revert InvalidAddress();
-        if (_perTxUsdcCap == 0 || _dailyTxCountLimit == 0) revert InvalidAmount();
+        if (_livenessTierCap == 0 || _dailyTxCountLimit == 0) revert InvalidAmount();
         diamond = _diamond;
         usdc = IERC20(_usdc);
         owner = msg.sender;
-        perTxUsdcCap = _perTxUsdcCap;
+        tierCap[TIER_LIVENESS] = _livenessTierCap;
         dailyTxCountLimit = _dailyTxCountLimit;
+        livenessAttestor = _livenessAttestor;
         treasury = msg.sender;
         proxyImpl = address(new UserProxy());
+
+        emit TierCapUpdated(TIER_LIVENESS, _livenessTierCap);
+        emit DailyTxCountLimitUpdated(_dailyTxCountLimit);
+        emit LivenessAttestorUpdated(_livenessAttestor);
     }
 
     // ─── Admin ────────────────────────────────────────────────────────
 
-    /// @notice Update the absolute per-tx USDC cap. Keep ≤ 50 USDC to stay in
-    ///         the no-KYC lane; a higher value would fail P2P review.
-    function setPerTxUsdcCap(uint256 cap) external onlyOwner {
-        if (cap == 0) revert InvalidAmount();
-        perTxUsdcCap = cap;
-        emit PerTxUsdcCapUpdated(cap);
+    /// @notice Update the per-tx USDC ceiling for a tier. Raising the liveness
+    ///         tier above P2P's agreed cap would fail the quarterly review.
+    function setTierCap(uint8 tier, uint256 cap) external onlyOwner {
+        tierCap[tier] = cap;
+        emit TierCapUpdated(tier, cap);
+    }
+
+    /// @notice Point the contract at the liveness service's signing key.
+    function setLivenessAttestor(address attestor) external onlyOwner {
+        livenessAttestor = attestor;
+        emit LivenessAttestorUpdated(attestor);
     }
 
     /// @notice Update the per-user daily order-count limit.
@@ -188,7 +270,54 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
         emit UsdcSwept(treasury, amount);
     }
 
+    // ─── Attestations ─────────────────────────────────────────────────
+
+    /**
+     * @notice Verify and record a liveness-tier attestation for `msg.sender`.
+     * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
+     * @param limit     Attested per-tx USDC ceiling (micro-USDC, 6dp). The
+     *                  effective cap is `min(limit, tierCap[TIER_LIVENESS])`.
+     * @param expiry    Unix seconds; the attestation must be claimed before this.
+     * @param signature 65-byte secp256k1 signature (r ‖ s ‖ v) from the service.
+     */
+    function submitLivenessAttestation(
+        bytes32 nullifier,
+        uint256 limit,
+        uint256 expiry,
+        bytes calldata signature
+    ) external {
+        if (livenessAttestor == address(0)) revert AttestorNotSet();
+        if (block.timestamp >= expiry) revert AttestationExpired();
+        if (livenessNullifierSpent[nullifier]) revert NullifierAlreadySpent();
+
+        bytes32 digest = _digest(msg.sender, nullifier, limit, expiry);
+        if (_recover(digest, signature) != livenessAttestor) revert InvalidSignature();
+
+        livenessNullifierSpent[nullifier] = true;
+
+        // Monotonic: a claim only ever raises the user's limit / tier. The
+        // `expiry` is a claim-freshness deadline, not an ongoing clock — the
+        // nullifier is single-use, so a grant can never be re-claimed.
+        if (limit > grantedLimit[msg.sender]) grantedLimit[msg.sender] = limit;
+        if (TIER_LIVENESS > userTier[msg.sender]) userTier[msg.sender] = TIER_LIVENESS;
+
+        emit LivenessClaimed(msg.sender, TIER_LIVENESS, nullifier, limit, grantedLimit[msg.sender]);
+    }
+
     // ─── Views ────────────────────────────────────────────────────────
+
+    /**
+     * @notice The effective per-tx USDC ceiling for `user`: the limit their
+     *         attestation carries, clamped by this contract's ceiling for the
+     *         tier they reached. 0 means "cannot transact".
+     */
+    function effectiveLimit(address user) public view returns (uint256) {
+        uint8 tier = userTier[user];
+        if (tier == TIER_NONE) return 0;
+        uint256 lim = grantedLimit[user];
+        uint256 cap = tierCap[tier];
+        return lim < cap ? lim : cap;
+    }
 
     /// @notice Predicts the deterministic UserProxy address for `user`.
     function proxyAddress(address user) public view returns (address) {
@@ -240,8 +369,10 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
         if (amount == 0) revert InvalidAmount();
 
         // Friendly pre-checks — validateOrder re-enforces these authoritatively
-        // (and does the daily-count bump) when the Diamond calls back.
-        if (amount > perTxUsdcCap) revert AmountExceedsCap();
+        // (and does the daily-count bump) when the Diamond calls back. A user
+        // with no liveness attestation has an effective limit of 0, so this is
+        // also the "you must verify first" gate.
+        if (amount > effectiveLimit(msg.sender)) revert AmountExceedsCap();
         if (userDailyCount[msg.sender][block.timestamp / 1 days] + 1 > dailyTxCountLimit) {
             revert DailyCountExceeded();
         }
@@ -282,15 +413,16 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
 
     /**
      * @notice Authoritative synchronous gate the Diamond calls inside
-     *         placeB2BOrder. Enforces the absolute per-tx cap and the daily
-     *         count budget (reserving the slot on success). No RP / KYC.
+     *         placeB2BOrder. Enforces the liveness-tier per-tx cap and the daily
+     *         count budget (reserving the slot on success). A user with no
+     *         attestation has an effective limit of 0 and is rejected here.
      */
     function validateOrder(
         address user,
         uint256 amount,
         bytes32 /* currency */
     ) external onlyDiamond returns (bool allowed) {
-        if (amount == 0 || amount > perTxUsdcCap) return false;
+        if (amount == 0 || amount > effectiveLimit(user)) return false;
 
         uint256 dayIndex = block.timestamp / 1 days;
         uint256 count = userDailyCount[user][dayIndex];
@@ -362,5 +494,53 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
             assert(deployed == proxy);
             emit UserProxyDeployed(user, proxy);
         }
+    }
+
+    // ─── Internals: EIP-712 attestation verification ──────────────────
+
+    function _domainSeparator() private view returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    _EIP712_DOMAIN_TYPEHASH,
+                    _LIVENESS_DOMAIN_NAME,
+                    _DOMAIN_VERSION,
+                    block.chainid,
+                    address(this)
+                )
+            );
+    }
+
+    function _digest(
+        address wallet,
+        bytes32 nullifier,
+        uint256 limit,
+        uint256 expiry
+    ) private view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(_LIVENESS_TYPEHASH, wallet, nullifier, limit, expiry)
+        );
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+    }
+
+    function _recover(bytes32 digest, bytes calldata sig) private pure returns (address) {
+        if (sig.length != 65) revert InvalidSignature();
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        // Reject the high-`s` half of each signature (EIP-2): otherwise every
+        // signature has a malleated twin that recovers the same signer, so the
+        // sig bytes aren't a unique id for off-chain consumers.
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0)
+            revert InvalidSignature();
+        if (v != 27 && v != 28) revert InvalidSignature();
+        address signer = ecrecover(digest, v, r, s);
+        if (signer == address(0)) revert InvalidSignature();
+        return signer;
     }
 }

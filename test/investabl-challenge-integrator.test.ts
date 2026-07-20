@@ -2,18 +2,19 @@ import { expect } from "chai";
 import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
-describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KYC", function () {
+describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $20 cap", function () {
   let owner: SignerWithAddress;
   let user: SignerWithAddress;
   let user2: SignerWithAddress;
   let treasury: SignerWithAddress;
+  let attestor: SignerWithAddress;
 
   let mockUsdc: any;
   let mockDiamond: any;
   let integrator: any;
 
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
-  const PER_TX_CAP = USDC(50);
+  const LIVENESS_CAP = USDC(20);
   const DAILY_COUNT_LIMIT = 10;
   const BUYIN = USDC(15); // the $15 challenge buy-in
   const INR = ethers.encodeBytes32String("INR");
@@ -24,8 +25,52 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
   const buy = (signer: SignerWithAddress, amount = BUYIN, ref = SESSION_REF) =>
     integrator.connect(signer).buyChallenge(amount, INR, CIRCLE_ID, "", 0, 0, ref);
 
+  /**
+   * Current EVM block timestamp. Other suites time-travel the chain, so
+   * wall-clock can sit behind block.timestamp when the full suite runs.
+   */
+  async function now() {
+    return BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+  }
+
+  /** Signs a simple-kyc liveness attestation the way the service would. */
+  async function attest(
+    wallet: string,
+    limit: bigint,
+    opts: { nullifier?: string; expiry?: bigint; signer?: SignerWithAddress } = {}
+  ) {
+    const nullifier = opts.nullifier ?? ethers.keccak256(ethers.toUtf8Bytes(`null:${wallet}`));
+    const expiry = opts.expiry ?? (await now()) + 3600n;
+    const signer = opts.signer ?? attestor;
+    const domain = {
+      name: "LivenessVerifier",
+      version: "1",
+      chainId: (await ethers.provider.getNetwork()).chainId,
+      verifyingContract: await integrator.getAddress(),
+    };
+    const types = {
+      LivenessAttestation: [
+        { name: "wallet", type: "address" },
+        { name: "nullifier", type: "bytes32" },
+        { name: "limit", type: "uint256" },
+        { name: "expiry", type: "uint256" },
+      ],
+    };
+    const signature = await signer.signTypedData(domain, types, { wallet, nullifier, limit, expiry });
+    return { nullifier, limit, expiry, signature };
+  }
+
+  /** Claims the liveness tier for `who`. */
+  async function claimLiveness(who: SignerWithAddress, limit = LIVENESS_CAP) {
+    const a = await attest(who.address, limit);
+    await integrator
+      .connect(who)
+      .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature);
+    return a;
+  }
+
   beforeEach(async function () {
-    [owner, user, user2, treasury] = await ethers.getSigners();
+    [owner, user, user2, treasury, attestor] = await ethers.getSigners();
 
     const MockUSDC = await ethers.getContractFactory("MockUSDC");
     mockUsdc = await MockUSDC.deploy();
@@ -37,8 +82,9 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
     integrator = await Integrator.deploy(
       await mockDiamond.getAddress(),
       await mockUsdc.getAddress(),
-      PER_TX_CAP,
-      DAILY_COUNT_LIMIT
+      LIVENESS_CAP,
+      DAILY_COUNT_LIMIT,
+      attestor.address
     );
 
     await mockDiamond.registerIntegrator(
@@ -47,6 +93,10 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
     );
     // Fund the Diamond so it can deliver USDC to the integrator on completion.
     await mockUsdc.mint(await mockDiamond.getAddress(), USDC(100000));
+
+    // Every buyer must clear liveness first — the contract fails closed.
+    await claimLiveness(user);
+    await claimLiveness(user2);
   });
 
   describe("Happy path", function () {
@@ -86,13 +136,101 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
     });
   });
 
-  describe("Per-tx cap (no KYC, absolute cap)", function () {
+  describe("Liveness gate", function () {
+    it("a wallet with no attestation cannot buy at all", async function () {
+      // `user3` never claimed — effective limit is 0, so even $1 is refused.
+      const [, , , , , user3] = await ethers.getSigners();
+      expect(await integrator.effectiveLimit(user3.address)).to.equal(0);
+      await expect(buy(user3, USDC(1))).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsCap"
+      );
+    });
+
+    it("grants the attested limit and sets the tier", async function () {
+      expect(await integrator.userTier(user.address)).to.equal(1);
+      expect(await integrator.effectiveLimit(user.address)).to.equal(LIVENESS_CAP);
+    });
+
+    it("clamps an over-attested limit to the on-chain tier cap", async function () {
+      const [, , , , , user3] = await ethers.getSigners();
+      await claimLiveness(user3, USDC(10000));
+      expect(await integrator.effectiveLimit(user3.address)).to.equal(LIVENESS_CAP);
+    });
+
+    it("rejects a signature from the wrong signer", async function () {
+      const [, , , , , user3] = await ethers.getSigners();
+      const a = await attest(user3.address, LIVENESS_CAP, { signer: user2 });
+      await expect(
+        integrator
+          .connect(user3)
+          .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
+      ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
+    });
+
+    it("rejects an attestation bound to a different wallet", async function () {
+      const [, , , , , user3] = await ethers.getSigners();
+      const a = await attest(user2.address, LIVENESS_CAP, {
+        nullifier: ethers.keccak256(ethers.toUtf8Bytes("other")),
+      });
+      await expect(
+        integrator
+          .connect(user3)
+          .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
+      ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
+    });
+
+    it("rejects an expired attestation", async function () {
+      const [, , , , , user3] = await ethers.getSigners();
+      const a = await attest(user3.address, LIVENESS_CAP, { expiry: (await now()) - 10n });
+      await expect(
+        integrator
+          .connect(user3)
+          .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
+      ).to.be.revertedWithCustomError(integrator, "AttestationExpired");
+    });
+
+    it("rejects a replayed nullifier (Sybil resistance)", async function () {
+      const [, , , , , user3] = await ethers.getSigners();
+      const spent = ethers.keccak256(ethers.toUtf8Bytes(`null:${user.address}`));
+      const a = await attest(user3.address, LIVENESS_CAP, { nullifier: spent });
+      await expect(
+        integrator
+          .connect(user3)
+          .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
+      ).to.be.revertedWithCustomError(integrator, "NullifierAlreadySpent");
+    });
+
+    it("reverts AttestorNotSet when no attestor is configured", async function () {
+      const [, , , , , user3] = await ethers.getSigners();
+      const a = await attest(user3.address, LIVENESS_CAP);
+      await integrator.setLivenessAttestor(ethers.ZeroAddress);
+      await expect(
+        integrator
+          .connect(user3)
+          .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
+      ).to.be.revertedWithCustomError(integrator, "AttestorNotSet");
+    });
+
+    it("validateOrder refuses an unattested user even at $1", async function () {
+      const [, , , , , user3] = await ethers.getSigners();
+      const addr = await mockDiamond.getAddress();
+      await ethers.provider.send("hardhat_impersonateAccount", [addr]);
+      await ethers.provider.send("hardhat_setBalance", [addr, "0x56BC75E2D63100000"]);
+      const asDiamond = await ethers.getSigner(addr);
+      expect(
+        await integrator.connect(asDiamond).validateOrder.staticCall(user3.address, USDC(1), INR)
+      ).to.equal(false);
+    });
+  });
+
+  describe("Per-tx cap (liveness tier)", function () {
     it("allows amount == cap", async function () {
-      await expect(buy(user, PER_TX_CAP)).to.emit(integrator, "ChallengeOrderCreated");
+      await expect(buy(user, LIVENESS_CAP)).to.emit(integrator, "ChallengeOrderCreated");
     });
 
     it("reverts AmountExceedsCap above the cap", async function () {
-      await expect(buy(user, PER_TX_CAP + 1n)).to.be.revertedWithCustomError(
+      await expect(buy(user, LIVENESS_CAP + 1n)).to.be.revertedWithCustomError(
         integrator,
         "AmountExceedsCap"
       );
@@ -142,7 +280,7 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
       expect(
         await integrator
           .connect(asDiamond)
-          .validateOrder.staticCall(user.address, PER_TX_CAP + 1n, INR)
+          .validateOrder.staticCall(user.address, LIVENESS_CAP + 1n, INR)
       ).to.equal(false);
     });
     it("returns false on zero amount", async function () {
@@ -207,11 +345,17 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
   });
 
   describe("Admin", function () {
-    it("setPerTxUsdcCap updates + emits", async function () {
-      await expect(integrator.setPerTxUsdcCap(USDC(40)))
-        .to.emit(integrator, "PerTxUsdcCapUpdated")
-        .withArgs(USDC(40));
-      expect(await integrator.perTxUsdcCap()).to.equal(USDC(40));
+    it("setTierCap updates + emits", async function () {
+      await expect(integrator.setTierCap(1, USDC(40)))
+        .to.emit(integrator, "TierCapUpdated")
+        .withArgs(1, USDC(40));
+      expect(await integrator.tierCap(1)).to.equal(USDC(40));
+    });
+    it("setLivenessAttestor updates + emits", async function () {
+      await expect(integrator.setLivenessAttestor(user.address))
+        .to.emit(integrator, "LivenessAttestorUpdated")
+        .withArgs(user.address);
+      expect(await integrator.livenessAttestor()).to.equal(user.address);
     });
     it("setDailyTxCountLimit updates + emits", async function () {
       await expect(integrator.setDailyTxCountLimit(5))
@@ -222,12 +366,6 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
       await expect(integrator.setTreasury(treasury.address))
         .to.emit(integrator, "TreasuryUpdated")
         .withArgs(treasury.address);
-    });
-    it("setPerTxUsdcCap(0) reverts InvalidAmount", async function () {
-      await expect(integrator.setPerTxUsdcCap(0)).to.be.revertedWithCustomError(
-        integrator,
-        "InvalidAmount"
-      );
     });
     it("setDailyTxCountLimit(0) reverts InvalidAmount", async function () {
       await expect(integrator.setDailyTxCountLimit(0)).to.be.revertedWithCustomError(
@@ -248,10 +386,13 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
       );
     });
     it("rejects non-owner on every setter", async function () {
-      await expect(integrator.connect(user).setPerTxUsdcCap(USDC(1))).to.be.revertedWithCustomError(
+      await expect(integrator.connect(user).setTierCap(1, USDC(1))).to.be.revertedWithCustomError(
         integrator,
         "OnlyOwner"
       );
+      await expect(
+        integrator.connect(user).setLivenessAttestor(user.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
       await expect(integrator.connect(user).setDailyTxCountLimit(1)).to.be.revertedWithCustomError(
         integrator,
         "OnlyOwner"
@@ -273,17 +414,17 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
     });
     it("reverts InvalidAddress when diamond is zero", async function () {
       await expect(
-        Integrator.deploy(ethers.ZeroAddress, await mockUsdc.getAddress(), PER_TX_CAP, 10)
+        Integrator.deploy(ethers.ZeroAddress, await mockUsdc.getAddress(), LIVENESS_CAP, 10, attestor.address)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
     it("reverts InvalidAddress when usdc is zero", async function () {
       await expect(
-        Integrator.deploy(await mockDiamond.getAddress(), ethers.ZeroAddress, PER_TX_CAP, 10)
+        Integrator.deploy(await mockDiamond.getAddress(), ethers.ZeroAddress, LIVENESS_CAP, 10, attestor.address)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
     it("reverts InvalidAmount when cap is zero", async function () {
       await expect(
-        Integrator.deploy(await mockDiamond.getAddress(), await mockUsdc.getAddress(), 0, 10)
+        Integrator.deploy(await mockDiamond.getAddress(), await mockUsdc.getAddress(), 0, 10, attestor.address)
       ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
     });
     it("reverts InvalidAmount when daily limit is zero", async function () {
@@ -291,8 +432,9 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, ≤50 cap, no KY
         Integrator.deploy(
           await mockDiamond.getAddress(),
           await mockUsdc.getAddress(),
-          PER_TX_CAP,
-          0
+          LIVENESS_CAP,
+          0,
+          attestor.address
         )
       ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
     });

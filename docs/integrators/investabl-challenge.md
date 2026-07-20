@@ -7,8 +7,9 @@ user pay local fiat (INR via UPI) to buy a prop-trading **challenge**.
 
 The "product" is a prop-firm challenge account (a simulated-balance evaluation).
 It is granted **off-chain** in Investabl's backend and is non-transferable — the
-user never receives spendable USDC. This is the low-fraud goods/service model, so
-orders need no reputation or ZK-KYC.
+user never receives spendable USDC. That makes it the low-fraud goods/service
+model, so there is no reputation system and no passport-tier KYC — but every
+buyer must still clear a one-time **liveness** check.
 
 ## External protocols + addresses
 
@@ -36,30 +37,62 @@ No upstream protocol beyond the P2P Diamond. Investabl's backend consumes the
 
 ## Custody / fund flow
 
-`usdcThroughIntegrator = true`, `recipientAddr = address(this)`. Purchased USDC
+Register with **`usdcThroughIntegrator = false`**. `buyChallenge` pins
+`recipientAddr = address(this)`, so the recipient pin already routes settlement
+USDC to the integrator — setting the flag as well would double-route. Every
+integrator in this repo registers `false`; see
+[WHITELISTING.md](../WHITELISTING.md). Purchased USDC
 accrues on the integrator and leaves **only** via the owner's `sweepUsdc(amount)`
 to `treasury` (default: owner). It is then bridged to Investabl's Arbitrum
 treasury out of band (CCTP). USDC is never routed to a user EOA.
 
-## Limits / RP
+## Limits — liveness-gated
 
-Overrides the RP model with a simple **absolute cap** (see
+Replaces the RP model with a **liveness-tier cap** (see
 [LIMITS-AND-RP.md](../LIMITS-AND-RP.md) §"Overriding limits"):
 
-- `perTxUsdcCap` — absolute per-tx USDC ceiling. Default **50 USDC** (P2P's
-  no-KYC ceiling). The $15 challenge sits well under it, so any brand-new wallet
-  can buy immediately with no KYC.
-- `dailyTxCountLimit` — max challenge orders per user per UTC day (default 10),
-  reserved in `validateOrder`, released in `onOrderCancel`.
+| Tier | Requirement | Per-tx cap |
+|---|---|---|
+| `TIER_NONE` (0) | none | **0 — cannot buy** |
+| `TIER_LIVENESS` (1) | one-time liveness check | `min(attested limit, tierCap[1])`, deployed at **20 USDC** |
 
-No reputation points, no per-currency rate, no ZK-KYC.
+The effective cap is `min(attested limit, tierCap[tier])`: the simple-kyc service
+signs a dollar limit into the attestation and the contract additionally clamps it
+to an on-chain ceiling, so a compromised attestor key cannot authorize more than
+the tier allows. The $15 challenge sits under the $20 cap.
+
+`dailyTxCountLimit` — max challenge orders per user per UTC day (default 10),
+reserved in `validateOrder`, released in `onOrderCancel`.
+
+There is **no passport tier**. Adding one later means a new contract and a fresh
+whitelist request — integrators are immutable.
+
+### Attestation format
+
+EIP-712, byte-compatible with simple-kyc's `LivenessAttestationVerifier`:
+
+```
+domain:   name "LivenessVerifier", version "1", chainId, verifyingContract = integrator
+typehash: LivenessAttestation(address wallet,bytes32 nullifier,uint256 limit,uint256 expiry)
+sig:      65-byte secp256k1 (r + s + v), low-s only (EIP-2)
+```
+
+Register the integrator address as the tenant `contract_address` with the liveness
+service. The per-(tenant, human) `nullifier` is single-use on-chain — derive it
+from the verified human, not the wallet, or one person can claim from many wallets.
 
 ## Operational notes
 
 - Sweep proceeds periodically with `sweepUsdc`; point `treasury` at a Base
   address you control (`setTreasury`).
-- `perTxUsdcCap` / `dailyTxCountLimit` are owner-tunable; keep the cap ≤ 50 USDC
-  to remain in the no-KYC lane.
+- `tierCap` / `dailyTxCountLimit` are owner-tunable (`setTierCap`,
+  `setDailyTxCountLimit`); raising the liveness cap above the agreed 20 USDC
+  would fail the quarterly review.
+- **`livenessAttestor` must be set before anything works.** While it is unset
+  every user is `TIER_NONE` with a per-tx limit of 0 and `buyChallenge` reverts
+  `AmountExceedsCap`. This is deliberate fail-closed behaviour.
+- Gate the checkout UI on `effectiveLimit(user) >= amount` so users see a
+  "verify to continue" screen instead of a revert.
 - The Diamond callback is best-effort (try/catch). `onOrderComplete` only emits
   the grant event and finalizes bookkeeping — it makes no external calls, so it
   cannot strand a completion.
