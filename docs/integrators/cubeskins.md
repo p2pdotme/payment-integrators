@@ -42,12 +42,12 @@ Per-tx ceilings are gated on a simple-kyc **liveness** attestation, not on RP:
 | Tier | Requirement | Per-tx cap |
 |---|---|---|
 | `TIER_NONE` (0) | none | **0 — cannot transact** |
-| `TIER_LIVENESS` (1) | liveness check | `min(attested limit, tierCap[1])`, deployed at **600 USDC** |
+| `TIER_LIVENESS` (1) | liveness check | `min(attested limit, tierCap[1])`, deployed at **200 USDC** |
 
 Effective cap is `min(attested limit, tierCap[tier])`: the simple-kyc service signs
 a dollar limit into the attestation, and the contract additionally clamps it to an
 on-chain per-tier ceiling. A compromised attestor key therefore cannot authorize
-more than 600 USDC per transaction.
+more than 200 USDC per transaction.
 
 Passport-tier KYC is deliberately **not** implemented — CubeSkins' approved policy
 is liveness-only. Adding a higher tier later means a new contract and a fresh

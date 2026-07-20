@@ -14,7 +14,7 @@ describe("CubeSkinsIntegrator", function () {
   let integrator: any;
 
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
-  const LIVENESS_TIER_CAP = USDC(600);
+  const LIVENESS_TIER_CAP = USDC(200);
   const DAILY_COUNT_LIMIT = 10;
   const MARKETPLACE_ORDER_ID = 42;
   const BRL = ethers.encodeBytes32String("BRL");
@@ -133,26 +133,26 @@ describe("CubeSkinsIntegrator", function () {
 
   describe("liveness attestation", function () {
     it("grants the attested limit clamped to the tier cap", async function () {
-      await claimLiveness(buyer, USDC(600));
+      await claimLiveness(buyer, USDC(200));
       expect(await integrator.userTier(buyer.address)).to.equal(1);
-      expect(await integrator.effectiveLimit(buyer.address)).to.equal(USDC(600));
+      expect(await integrator.effectiveLimit(buyer.address)).to.equal(USDC(200));
     });
 
     it("clamps an over-attested limit to the on-chain tier cap", async function () {
-      // A compromised attestor signing $10k must not be able to exceed $600.
+      // A compromised attestor signing $10k must not be able to exceed $200.
       await claimLiveness(buyer, USDC(10000));
       expect(await integrator.effectiveLimit(buyer.address)).to.equal(LIVENESS_TIER_CAP);
     });
 
     it("rejects a signature from the wrong signer", async function () {
-      const a = await attest(buyer.address, USDC(600), { signer: stranger });
+      const a = await attest(buyer.address, USDC(200), { signer: stranger });
       await expect(
         integrator.connect(buyer).submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
     it("rejects an attestation bound to a different wallet", async function () {
-      const a = await attest(stranger.address, USDC(600));
+      const a = await attest(stranger.address, USDC(200));
       await expect(
         integrator.connect(buyer).submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
@@ -160,16 +160,16 @@ describe("CubeSkinsIntegrator", function () {
 
     it("rejects an expired attestation", async function () {
       const past = (await now()) - 10n;
-      const a = await attest(buyer.address, USDC(600), { expiry: past });
+      const a = await attest(buyer.address, USDC(200), { expiry: past });
       await expect(
         integrator.connect(buyer).submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
       ).to.be.revertedWithCustomError(integrator, "AttestationExpired");
     });
 
     it("rejects a replayed nullifier (Sybil resistance)", async function () {
-      const a = await claimLiveness(buyer, USDC(600));
+      const a = await claimLiveness(buyer, USDC(200));
       // Same nullifier, re-signed for a different wallet — must still be spent.
-      const replay = await attest(stranger.address, USDC(600), { nullifier: a.nullifier });
+      const replay = await attest(stranger.address, USDC(200), { nullifier: a.nullifier });
       await expect(
         integrator
           .connect(stranger)
@@ -179,7 +179,7 @@ describe("CubeSkinsIntegrator", function () {
 
     it("reverts when no attestor is configured", async function () {
       await integrator.connect(owner).setLivenessAttestor(ethers.ZeroAddress);
-      const a = await attest(buyer.address, USDC(600));
+      const a = await attest(buyer.address, USDC(200));
       await expect(
         integrator.connect(buyer).submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
       ).to.be.revertedWithCustomError(integrator, "AttestorNotSet");
@@ -353,16 +353,16 @@ describe("CubeSkinsIntegrator", function () {
     });
 
     it("allows an order at the liveness cap", async function () {
-      await claimLiveness(buyer, USDC(600));
-      await registerOrder(MARKETPLACE_ORDER_ID, USDC(600));
+      await claimLiveness(buyer, USDC(200));
+      await registerOrder(MARKETPLACE_ORDER_ID, USDC(200));
       await integrator.connect(buyer).userPlaceOrder(MARKETPLACE_ORDER_ID, BRL, 1, "", 0, 0);
       const session = await integrator.sessions(1);
-      expect(session.usdcAmount).to.equal(USDC(600));
+      expect(session.usdcAmount).to.equal(USDC(200));
     });
 
     it("blocks amounts above the liveness cap", async function () {
-      await claimLiveness(buyer, USDC(600));
-      await registerOrder(MARKETPLACE_ORDER_ID, USDC(601));
+      await claimLiveness(buyer, USDC(200));
+      await registerOrder(MARKETPLACE_ORDER_ID, USDC(201));
       await expect(integrator.connect(buyer).userPlaceOrder(MARKETPLACE_ORDER_ID, BRL, 1, "", 0, 0))
         .to.be.reverted;
     });

@@ -5,7 +5,7 @@ import { ethers } from "hardhat";
  *
  * Usage:
  *   DIAMOND_ADDRESS=0x... USDC_ADDRESS=0x... TREASURY_ADDRESS=0x... \
- *   INTEGRATOR_OWNER=0x... LIVENESS_TIER_CAP=600000000 DAILY_TX_COUNT_LIMIT=5 \
+ *   INTEGRATOR_OWNER=0x... LIVENESS_TIER_CAP=200000000 DAILY_TX_COUNT_LIMIT=5 \
  *   LIVENESS_ATTESTOR=0x... \
  *   npx hardhat run scripts/deploy-cubeskins.ts --network baseSepolia
  *
@@ -22,7 +22,7 @@ const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
 const USDC_ADDRESS = process.env.USDC_ADDRESS || "";
 const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS || "";
 const INTEGRATOR_OWNER = process.env.INTEGRATOR_OWNER || "";
-const LIVENESS_TIER_CAP = process.env.LIVENESS_TIER_CAP || "600000000"; // 600 USDC
+const LIVENESS_TIER_CAP = process.env.LIVENESS_TIER_CAP || "200000000"; // 200 USDC
 const DAILY_TX_COUNT_LIMIT = process.env.DAILY_TX_COUNT_LIMIT || "5";
 const LIVENESS_ATTESTOR = process.env.LIVENESS_ATTESTOR || ethers.ZeroAddress;
 

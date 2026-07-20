@@ -5,7 +5,7 @@ Status as of **2026-07-20**. This is the working checklist for taking
 
 Two decisions are already settled and need no further discussion:
 
-- **Liveness-only KYC is approved.** Per-tx cap **600 USDC**, gated on a
+- **Liveness-only KYC is approved.** Per-tx cap **200 USDC**, gated on a
   simple-kyc liveness attestation. No passport tier.
 - **Settlement routing is `usdcThroughIntegrator = false`.** See
   [Routing](#3-routing-correction-important) below — this is a correction to the
@@ -26,11 +26,18 @@ attestation:
 | Tier | Requirement | Per-tx cap |
 |---|---|---|
 | `TIER_NONE` (0) | none | **0 — cannot transact** |
-| `TIER_LIVENESS` (1) | liveness check | `min(attested limit, 600 USDC)` |
+| `TIER_LIVENESS` (1) | liveness check | `min(attested limit, 200 USDC)` |
 
 A user with no attestation cannot place any order. The effective cap is the
 lower of what your liveness service signed and the on-chain `tierCap[1]`, so a
-compromised attestor key still cannot authorize more than 600 USDC.
+compromised attestor key still cannot authorize more than 200 USDC.
+
+**On the 200 vs 600 figure:** you asked for 600 USDC/tx; the approved starting
+cap is **200**. This is a config value, not a structural one — `setTierCap` is
+owner-only and takes effect immediately, with **no redeploy and no
+re-whitelisting**. So the cap can be raised once there is settled Sepolia and
+early mainnet volume to point at. Nothing about the integration needs to change
+when it moves.
 
 ### Two stranding bugs fixed
 
@@ -109,7 +116,7 @@ Flow to implement:
 
 1. User completes the liveness check in your frontend.
 2. Your service signs an attestation for their **wallet address** with
-   `limit` (≤ 600e6) and a short `expiry`.
+   `limit` (≤ 200e6) and a short `expiry`.
 3. Frontend calls `submitLivenessAttestation(nullifier, limit, expiry, signature)`
    from the user's wallet. One-time per wallet.
 4. From then on `effectiveLimit(user)` is non-zero and orders can be placed.
@@ -149,7 +156,7 @@ satisfy this; it must be one real order through `CubeSkinsIntegrator` itself.
 
 Confirm all of these on Sepolia before we move to mainnet:
 
-- [ ] `submitLivenessAttestation` succeeds and `effectiveLimit(buyer)` is 600e6
+- [ ] `submitLivenessAttestation` succeeds and `effectiveLimit(buyer)` is 200e6
 - [ ] `registerOrder` from your relayer succeeds; a non-relayer key is rejected
 - [ ] `userPlaceOrder` from a different wallet than the registered buyer reverts
       `BuyerMismatch`
@@ -171,7 +178,7 @@ Confirm all of these on Sepolia before we move to mainnet:
 | Base Sepolia Diamond | `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9` |
 | Base Sepolia USDC | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` |
 | Base mainnet Diamond | provided at step 9 |
-| `tierCap[TIER_LIVENESS]` | `600000000` (600 USDC, 6dp) |
+| `tierCap[TIER_LIVENESS]` | `200000000` (200 USDC, 6dp) |
 | `dailyTxCountLimit` | `5` |
 | `usdcThroughIntegrator` | **`false`** |
 
