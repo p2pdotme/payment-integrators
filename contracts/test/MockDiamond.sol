@@ -552,4 +552,52 @@ contract MockDiamond {
         usdc.safeTransfer(order.recipientAddr, order.amount);
         emit MockOrderCompleted(orderId);
     }
+
+    // ─── IP2PUserLimits (UserLimitsFacet subset, 0xramp V2) ──────────
+
+    /// @notice Per-user, per-currency protocol tx limits served to integrators
+    ///         that enforce the Diamond's native limits (0xramp V2 reads these
+    ///         via IP2PUserLimits.userTxLimit). Defaults to (0, 0) — i.e. "no
+    ///         allowance granted" — so fail-closed integrators must have their
+    ///         tests grant limits explicitly.
+    mapping(address => mapping(bytes32 => uint256)) public userBuyTxLimit;
+    mapping(address => mapping(bytes32 => uint256)) public userSellTxLimit;
+
+    /// @notice Test-only: when set, `userTxLimit` reverts — simulates the
+    ///         limits facet being unavailable (diamond cut in progress, facet
+    ///         bug) so fail-closed integrators can assert their
+    ///         P2PLimitsUnavailable path.
+    bool public userTxLimitReverts;
+
+    function setUserTxLimit(
+        address user,
+        bytes32 currency,
+        uint256 buyLimit,
+        uint256 sellLimit
+    ) external {
+        userBuyTxLimit[user][currency] = buyLimit;
+        userSellTxLimit[user][currency] = sellLimit;
+    }
+
+    function setUserTxLimitReverts(bool v) external {
+        userTxLimitReverts = v;
+    }
+
+    /// @notice Mock of the Diamond's UserLimitsFacet userTxLimit getter.
+    function userTxLimit(
+        address user,
+        bytes32 currency
+    ) external view returns (uint256 buyLimit, uint256 sellLimit) {
+        require(!userTxLimitReverts, "limits facet unavailable");
+        return (userBuyTxLimit[user][currency], userSellTxLimit[user][currency]);
+    }
+
+    /// @notice Test-only helper mirroring `adminCallOnOrderComplete`: directly
+    ///         invokes `IP2PIntegrator.onOrderCancel` with the Diamond as
+    ///         msg.sender, so tests can drive the cancel callback for order
+    ///         kinds `simulateOrderCancelled` does not track (e.g. B2B sell
+    ///         orders) and exercise callback replay tolerance.
+    function adminCallOnOrderCancel(address integrator_, uint256 orderId) external {
+        IP2PIntegrator(integrator_).onOrderCancel(orderId);
+    }
 }
