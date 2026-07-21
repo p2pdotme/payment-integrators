@@ -9,9 +9,18 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
+interface IP2PUserLimits {
+    function userTxLimit(
+        address user,
+        bytes32 currency
+    ) external view returns (uint256 buyLimit, uint256 sellLimit);
+}
+
 /**
  * @title ZeroXRampDirectSettlementIntegrator
- * @notice 0xramp integrator for P2P.me Base Diamond.
+ * @notice EXPERIMENTAL V2 candidate for the 0xramp P2P.me Base Diamond adapter.
+ *         This source is not the bytecode deployed at the documented V1
+ *         addresses and must not be deployed before issue #12 is complete.
  *
  * BUY/onramp:
  *   - user calls userBuyAsset(... recipientAddr = NEAR 1Click Base deposit)
@@ -46,6 +55,14 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
         bool cancelled;
     }
 
+    struct PendingValidation {
+        uint256 amount;
+        uint256 protocolLimit;
+        bytes32 currency;
+        bool isSell;
+        bool active;
+    }
+
     error OnlyDiamond();
     error OnlyOwner();
     error InvalidAddress();
@@ -53,6 +70,10 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
     error DailyTxCountExceeded();
     error DailyVolumeExceeded();
     error PerTxLimitExceeded();
+    error P2PAccountLimitExceeded(uint256 amount, uint256 limit);
+    error P2PLimitsUnavailable();
+    error PendingValidationExists();
+    error ValidationNotConsumed();
     error UnknownOrder();
     error NotOrderUser();
     error OrderAlreadyFulfilled();
@@ -60,6 +81,7 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
     error PaymentAlreadyDelivered();
     error CashoutAlreadyActive();
     error OrderNotTerminal();
+    error OrderNotPaid(uint8 status);
 
     event UserProxyDeployed(address indexed user, address proxy);
     event ZeroXRampCheckoutOrderCreated(
@@ -104,6 +126,7 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
     mapping(address => bool) public activeCashout;
     mapping(address => mapping(uint256 => uint256)) public userDailyCount;
     mapping(address => mapping(uint256 => uint256)) public userDailyVolume;
+    mapping(address => PendingValidation) private pendingValidations;
 
     constructor(
         address _diamond,
@@ -151,6 +174,16 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
         return perTxUsdcLimit;
     }
 
+    function effectiveUserTxLimit(
+        address user,
+        bytes32 currency,
+        bool isSell
+    ) external view returns (uint256) {
+        uint256 protocolLimit = _protocolTxLimit(user, currency, isSell);
+        uint256 appLimit = perTxUsdcLimit;
+        return appLimit != 0 && appLimit < protocolLimit ? appLimit : protocolLimit;
+    }
+
     function proxyAddress(address user) public view returns (address) {
         return
             Clones.predictDeterministicAddressWithImmutableArgs(
@@ -176,7 +209,7 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
         uint256 fiatAmountLimit
     ) external returns (uint256 orderId) {
         if (recipientAddr == address(0)) revert InvalidAddress();
-        _precheckLimit(msg.sender, amount);
+        _prepareValidation(msg.sender, amount, currency, false);
 
         address proxy = _ensureProxy(msg.sender);
         bytes memory data = abi.encodeCall(
@@ -193,6 +226,7 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
             )
         );
         bytes memory result = UserProxy(proxy).execute(diamond, data, address(usdc), 0);
+        _assertValidationConsumed(msg.sender);
         orderId = abi.decode(result, (uint256));
 
         sessions[orderId] = Session({
@@ -226,7 +260,7 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
         string calldata userPubKey
     ) external returns (uint256 orderId) {
         if (activeCashout[msg.sender]) revert CashoutAlreadyActive();
-        _precheckLimit(msg.sender, amount);
+        _prepareValidation(msg.sender, amount, currency, true);
 
         address proxy = _ensureProxy(msg.sender);
         usdc.safeTransferFrom(msg.sender, proxy, amount);
@@ -244,6 +278,7 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
             )
         );
         bytes memory result = UserProxy(proxy).execute(diamond, data, address(usdc), 0);
+        _assertValidationConsumed(msg.sender);
         orderId = abi.decode(result, (uint256));
 
         activeCashout[msg.sender] = true;
@@ -287,6 +322,13 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
             (orderId, encUpi, uint256(0))
         );
         UserProxy(proxy).execute(diamond, data, address(usdc), actualUsdcAmount);
+
+        // The Diamond's setSellOrderUpi can auto-cancel the order and return
+        // success instead of reverting; a delivery may only be recorded when
+        // the order actually reached PAID (status 2) — any other outcome did
+        // not survive the call and reverts atomically.
+        uint8 statusAfter = IOrderFlow(diamond).getOrdersById(orderId).status;
+        if (statusAfter != 2) revert OrderNotPaid(statusAfter);
         session.paymentDelivered = true;
 
         emit ZeroXRampCashoutPaymentDelivered(orderId, msg.sender, actualUsdcAmount);
@@ -295,10 +337,11 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
     function syncOfframp(uint256 orderId, uint8 currentStatus) external {
         Session storage session = _requireSession(orderId);
         if (session.kind != SessionKind.Cashout) revert UnknownOrder();
-        if (session.fulfilled || session.cancelled) {
-            activeCashout[session.user] = false;
-            return;
-        }
+        // Every terminal transition already clears the cashout lock at
+        // transition time (below and in onOrderComplete/onOrderCancel); a
+        // replayed sync on an already-final session must not touch the lock,
+        // which may belong to a newer in-flight cashout.
+        if (session.fulfilled || session.cancelled) return;
 
         IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
         uint8 status = order.status;
@@ -321,10 +364,25 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
     function validateOrder(
         address user,
         uint256 amount,
-        bytes32
+        bytes32 currency
     ) external onlyDiamond returns (bool allowed) {
-        address account = proxyToUser[user] == address(0) ? user : proxyToUser[user];
+        address mappedUser = proxyToUser[user];
+        bool isSell = mappedUser != address(0);
+        address account = isSell ? mappedUser : user;
         if (account == address(0) || amount == 0) return false;
+
+        PendingValidation memory pending = pendingValidations[account];
+        if (
+            !pending.active ||
+            pending.amount != amount ||
+            pending.currency != currency ||
+            pending.isSell != isSell ||
+            amount > pending.protocolLimit
+        ) {
+            return false;
+        }
+        delete pendingValidations[account];
+
         if (perTxUsdcLimit != 0 && amount > perTxUsdcLimit) return false;
 
         uint256 day = block.timestamp / 1 days;
@@ -372,7 +430,49 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
         emit ZeroXRampOrderCancelled(orderId, session.user);
     }
 
-    function _precheckLimit(address user, uint256 amount) internal view {
+    function _prepareValidation(
+        address user,
+        uint256 amount,
+        bytes32 currency,
+        bool isSell
+    ) internal {
+        _precheckAppLimit(user, amount);
+        if (pendingValidations[user].active) revert PendingValidationExists();
+
+        uint256 protocolLimit = _protocolTxLimit(user, currency, isSell);
+        if (protocolLimit == 0 || amount > protocolLimit) {
+            revert P2PAccountLimitExceeded(amount, protocolLimit);
+        }
+
+        pendingValidations[user] = PendingValidation({
+            amount: amount,
+            protocolLimit: protocolLimit,
+            currency: currency,
+            isSell: isSell,
+            active: true
+        });
+    }
+
+    function _assertValidationConsumed(address user) internal view {
+        if (pendingValidations[user].active) revert ValidationNotConsumed();
+    }
+
+    function _protocolTxLimit(
+        address user,
+        bytes32 currency,
+        bool isSell
+    ) internal view returns (uint256) {
+        try IP2PUserLimits(diamond).userTxLimit(user, currency) returns (
+            uint256 buyLimit,
+            uint256 sellLimit
+        ) {
+            return isSell ? sellLimit : buyLimit;
+        } catch {
+            revert P2PLimitsUnavailable();
+        }
+    }
+
+    function _precheckAppLimit(address user, uint256 amount) internal view {
         if (amount == 0) revert InvalidAmount();
         if (perTxUsdcLimit != 0 && amount > perTxUsdcLimit) revert PerTxLimitExceeded();
 

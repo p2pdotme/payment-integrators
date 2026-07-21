@@ -56,6 +56,8 @@ contract MockDiamond {
         SellStatus status;
         string encUpi; // user's UPI encrypted to merchant
         string merchantPubkey;
+        uint8 disputeRaisedBy; // test-only: mirror Diamond's Dispute.raisedBy
+        uint8 disputeStatus; // test-only: mirror Diamond's Dispute.status
     }
 
     mapping(address => bool) public activeIntegrators;
@@ -130,10 +132,14 @@ contract MockDiamond {
         uint256 amount,
         bytes32 currency,
         string calldata /* userPubKey */,
-        uint256 /* circleId */,
+        uint256 circleId,
         uint256 /* preferredPaymentChannelConfigId */,
         uint256 /* fiatAmountLimit */
     ) external returns (uint256 orderId) {
+        // The real Diamond rejects circleId 0 (no such circle). Mirror that so
+        // tests catch integrators that forget to pass a valid circle.
+        require(circleId != 0, "InvalidCircle");
+
         address effectiveIntegrator = _resolveIntegrator();
 
         bool allowed = IP2PIntegrator(effectiveIntegrator).validateOrder(user, amount, currency);
@@ -146,7 +152,9 @@ contract MockDiamond {
             currency: currency,
             status: SellStatus.PLACED,
             encUpi: "",
-            merchantPubkey: ""
+            merchantPubkey: "",
+            disputeRaisedBy: 0,
+            disputeStatus: 0
         });
         emit MockSellOrderPlaced(orderId, user, amount, currency);
     }
@@ -197,6 +205,9 @@ contract MockDiamond {
     function simulateOrderComplete(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(!order.completed, "Already completed");
+        // CANCELLED is terminal on the real Diamond — a test must never be able
+        // to "complete" a cancelled BUY and validate an impossible transition.
+        require(!order.cancelled, "Cancelled is terminal");
         order.completed = true;
 
         // Transfer USDC to recipientAddr (mirrors usdcThroughIntegrator = false)
@@ -265,7 +276,9 @@ contract MockDiamond {
             currency: currency,
             status: SellStatus.PLACED,
             encUpi: "",
-            merchantPubkey: ""
+            merchantPubkey: "",
+            disputeRaisedBy: 0,
+            disputeStatus: 0
         });
         emit MockSellOrderPlaced(orderId, msg.sender, amount, currency);
     }
@@ -281,8 +294,12 @@ contract MockDiamond {
     }
 
     /**
-     * @notice Mocks OrderFlowFacet.setSellOrderUpi: pulls USDC from order.user
-     *         (= integrator) into the Diamond and transitions to PAID.
+     * @notice Mocks OrderFlowFacet.setSellOrderUpi. The LIVE facet wraps its USDC
+     *         pull in try/catch and, on a failed pull, AUTO-CANCELS the order and
+     *         returns success (it does NOT revert) — so a successful call is not
+     *         proof of delivery. This mock mirrors that: it try/catches the pull
+     *         via the external `_pullFor` shim, moving to PAID on success and to
+     *         CANCELLED (returning normally) on failure. (audit #3)
      */
     function setSellOrderUpi(
         uint256 orderId,
@@ -293,9 +310,45 @@ contract MockDiamond {
         require(o.status == SellStatus.ACCEPTED, "Bad state");
         require(msg.sender == o.user, "Only order.user");
         o.encUpi = encUpi;
-        o.status = SellStatus.PAID;
-        usdc.safeTransferFrom(o.user, address(this), o.amount);
-        emit MockSellOrderPaid(orderId);
+        uint256 needed = o.amount + sellFee; // actualUsdtAmount (principal + fee)
+        // Test hook: force the live facet's "pull failed → auto-cancel, return
+        // success (no revert)" branch even when the proxy is fully funded, so the
+        // integrator's deliverFiatPayout status-read-back (#2) can be exercised
+        // deterministically without contriving an underfunding.
+        if (forceSellUpiAutoCancel) {
+            o.status = SellStatus.CANCELLED;
+            emit MockSellOrderCancelled(orderId, 0);
+            return;
+        }
+        // try/catch the pull exactly like the live facet. `_pullFor` is external so
+        // the failure is caught here instead of bubbling up as a revert.
+        try this._pullFor(o.user, needed) {
+            o.status = SellStatus.PAID;
+            emit MockSellOrderPaid(orderId);
+        } catch {
+            // Underfunded / failed pull → auto-cancel, return success. Nothing was
+            // pulled, so there is nothing to refund; the principal the integrator
+            // parked on the proxy stays there for reconcileWithdrawal to recover.
+            o.status = SellStatus.CANCELLED;
+            emit MockSellOrderCancelled(orderId, 0);
+        }
+    }
+
+    /// @notice Test-only: when set, setSellOrderUpi takes the live Diamond's
+    ///         auto-cancel-and-return-success branch (see #2/#3) regardless of
+    ///         proxy funding, so the integrator's post-execute status check can be
+    ///         tested directly.
+    bool public forceSellUpiAutoCancel;
+
+    function setForceSellUpiAutoCancel(bool v) external {
+        forceSellUpiAutoCancel = v;
+    }
+
+    /// @dev External so setSellOrderUpi can try/catch it (Solidity only catches
+    ///      external calls). Reverts if the integrator underfunded/underapproved.
+    function _pullFor(address from, uint256 amount) external {
+        require(msg.sender == address(this), "internal");
+        usdc.safeTransferFrom(from, address(this), amount);
     }
 
     function completeSellOrder(uint256 orderId) external {
@@ -316,7 +369,8 @@ contract MockDiamond {
         o.status = SellStatus.CANCELLED;
         uint256 refund = 0;
         if (wasPaid) {
-            refund = o.amount;
+            // Refund what was pulled (principal + fee).
+            refund = o.amount + sellFee;
             usdc.safeTransfer(o.user, refund);
         }
         emit MockSellOrderCancelled(orderId, refund);
@@ -344,17 +398,36 @@ contract MockDiamond {
         uint256 actualUsdtAmount;
         uint256 actualFiatAmount;
     }
+    /// @notice Per-order SELL fee the Diamond pulls ON TOP of principal during
+    ///         setSellOrderUpi (so actualUsdtAmount = principal + fee). Lets
+    ///         tests exercise the integrator's fee top-up + allowance path.
+    uint256 public sellFee;
+
+    function setSellFee(uint256 fee) external {
+        sellFee = fee;
+    }
+
+    /// @notice Test-only: stamp a dispute onto a SELL order so the integrator's
+    ///         reconcile dispute guard (and the disputed-clawback recovery path)
+    ///         can be exercised. Real Diamond sets these during dispute flow.
+    function setSellDispute(uint256 orderId, uint8 raisedBy, uint8 status) external {
+        sellOrders[orderId].disputeRaisedBy = raisedBy;
+        sellOrders[orderId].disputeStatus = status;
+    }
+
     function getAdditionalOrderDetails(
         uint256 orderId
     ) external view returns (AdditionalOrderDetailsView memory) {
         return
             AdditionalOrderDetailsView({
-                fixedFeePaid: 0,
+                fixedFeePaid: uint64(sellFee),
                 tipsPaid: 0,
                 acceptedTimestamp: 0,
                 paidTimestamp: 0,
                 reserved2: 0,
-                actualUsdtAmount: additionalOrderDetailsFeeUnready ? 0 : sellOrders[orderId].amount,
+                actualUsdtAmount: additionalOrderDetailsFeeUnready
+                    ? 0
+                    : sellOrders[orderId].amount + sellFee,
                 actualFiatAmount: 0
             });
     }
@@ -428,6 +501,23 @@ contract MockDiamond {
     }
 
     function getOrdersById(uint256 orderId) external view returns (OrderView memory o) {
+        // BUY orders live in `orders`; SELL orders in `sellOrders`. A BUY id is
+        // served as a BUY OrderView (so the integrator's BUY-side reads —
+        // sweepStrandedBuy's status/amount/recipientAddr — resolve correctly);
+        // otherwise fall through to the SELL view (reconcile/finalize/etc.).
+        Order storage b = orders[orderId];
+        if (b.integrator != address(0)) {
+            // Map the BUY flags to the Diamond's OrderStatus codes (COMPLETED=3,
+            // CANCELLED=4, else PLACED=0). Mirrors how a real completed BUY reads.
+            o.status = b.completed ? 3 : (b.cancelled ? 4 : 0);
+            o.orderType = 0; // BUY
+            o.amount = b.amount;
+            o.user = b.user;
+            o.recipientAddr = b.recipientAddr;
+            o.currency = b.currency;
+            o.id = orderId;
+            return o;
+        }
         SellOrder storage s = sellOrders[orderId];
         // SellStatus enum mirrors Diamond's OrderStatus (0..4) so the cast
         // is a no-op semantically.
@@ -437,7 +527,77 @@ contract MockDiamond {
         o.user = s.user;
         o.currency = s.currency;
         o.id = orderId;
-        // Strings / arrays / dispute default-init to empty — fine for the
-        // status-only consumer.
+        o.disputeInfo.raisedBy = s.disputeRaisedBy;
+        o.disputeInfo.status = s.disputeStatus;
+        // Remaining strings / arrays default-init to empty.
+    }
+
+    /**
+     * @notice TEST-ONLY: reproduce the exact end-state of a BUY whose
+     *         onOrderComplete callback reverted and was swallowed by the
+     *         try/catch in simulateOrderComplete — the USDC is routed to the
+     *         proxy and the order is marked COMPLETED protocol-side, but the
+     *         integrator callback NEVER runs (so the merchant is never credited
+     *         and the funds sit stranded on the proxy). This is the precise
+     *         scenario sweepStrandedBuy recovers, without needing to force a
+     *         contrived revert inside the real callback.
+     */
+    function simulateOrderCompleteNoCallback(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        require(!order.completed, "Already completed");
+        require(!order.cancelled, "Cancelled is terminal");
+        order.completed = true;
+        // Route USDC to the proxy exactly like a real completion, but skip the
+        // integrator callback (the swallowed-revert end state).
+        usdc.safeTransfer(order.recipientAddr, order.amount);
+        emit MockOrderCompleted(orderId);
+    }
+
+    // ─── IP2PUserLimits (UserLimitsFacet subset, 0xramp V2) ──────────
+
+    /// @notice Per-user, per-currency protocol tx limits served to integrators
+    ///         that enforce the Diamond's native limits (0xramp V2 reads these
+    ///         via IP2PUserLimits.userTxLimit). Defaults to (0, 0) — i.e. "no
+    ///         allowance granted" — so fail-closed integrators must have their
+    ///         tests grant limits explicitly.
+    mapping(address => mapping(bytes32 => uint256)) public userBuyTxLimit;
+    mapping(address => mapping(bytes32 => uint256)) public userSellTxLimit;
+
+    /// @notice Test-only: when set, `userTxLimit` reverts — simulates the
+    ///         limits facet being unavailable (diamond cut in progress, facet
+    ///         bug) so fail-closed integrators can assert their
+    ///         P2PLimitsUnavailable path.
+    bool public userTxLimitReverts;
+
+    function setUserTxLimit(
+        address user,
+        bytes32 currency,
+        uint256 buyLimit,
+        uint256 sellLimit
+    ) external {
+        userBuyTxLimit[user][currency] = buyLimit;
+        userSellTxLimit[user][currency] = sellLimit;
+    }
+
+    function setUserTxLimitReverts(bool v) external {
+        userTxLimitReverts = v;
+    }
+
+    /// @notice Mock of the Diamond's UserLimitsFacet userTxLimit getter.
+    function userTxLimit(
+        address user,
+        bytes32 currency
+    ) external view returns (uint256 buyLimit, uint256 sellLimit) {
+        require(!userTxLimitReverts, "limits facet unavailable");
+        return (userBuyTxLimit[user][currency], userSellTxLimit[user][currency]);
+    }
+
+    /// @notice Test-only helper mirroring `adminCallOnOrderComplete`: directly
+    ///         invokes `IP2PIntegrator.onOrderCancel` with the Diamond as
+    ///         msg.sender, so tests can drive the cancel callback for order
+    ///         kinds `simulateOrderCancelled` does not track (e.g. B2B sell
+    ///         orders) and exercise callback replay tolerance.
+    function adminCallOnOrderCancel(address integrator_, uint256 orderId) external {
+        IP2PIntegrator(integrator_).onOrderCancel(orderId);
     }
 }
