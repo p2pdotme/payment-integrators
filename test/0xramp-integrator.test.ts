@@ -1057,7 +1057,8 @@ describe("ZeroXRampDirectSettlementIntegrator (V2)", function () {
         proxy
       );
       const receipt = await tx.wait();
-      const completedEvents = receipt.logs
+      expect(receipt).to.not.equal(null);
+      const completedEvents = receipt!.logs
         .filter((l: any) => l.address === integ2Addr)
         .map((l: any) => integ2.interface.parseLog(l))
         .filter((e: any) => e?.name === "ZeroXRampOrderCompleted");
