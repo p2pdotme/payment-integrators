@@ -81,6 +81,7 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
     error PaymentAlreadyDelivered();
     error CashoutAlreadyActive();
     error OrderNotTerminal();
+    error OrderNotPaid(uint8 status);
 
     event UserProxyDeployed(address indexed user, address proxy);
     event ZeroXRampCheckoutOrderCreated(
@@ -321,6 +322,13 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
             (orderId, encUpi, uint256(0))
         );
         UserProxy(proxy).execute(diamond, data, address(usdc), actualUsdcAmount);
+
+        // The Diamond's setSellOrderUpi can auto-cancel the order and return
+        // success instead of reverting; a delivery may only be recorded when
+        // the order actually reached PAID (status 2) — any other outcome did
+        // not survive the call and reverts atomically.
+        uint8 statusAfter = IOrderFlow(diamond).getOrdersById(orderId).status;
+        if (statusAfter != 2) revert OrderNotPaid(statusAfter);
         session.paymentDelivered = true;
 
         emit ZeroXRampCashoutPaymentDelivered(orderId, msg.sender, actualUsdcAmount);
@@ -329,10 +337,11 @@ contract ZeroXRampDirectSettlementIntegrator is IP2PIntegrator {
     function syncOfframp(uint256 orderId, uint8 currentStatus) external {
         Session storage session = _requireSession(orderId);
         if (session.kind != SessionKind.Cashout) revert UnknownOrder();
-        if (session.fulfilled || session.cancelled) {
-            activeCashout[session.user] = false;
-            return;
-        }
+        // Every terminal transition already clears the cashout lock at
+        // transition time (below and in onOrderComplete/onOrderCancel); a
+        // replayed sync on an already-final session must not touch the lock,
+        // which may belong to a newer in-flight cashout.
+        if (session.fulfilled || session.cancelled) return;
 
         IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
         uint8 status = order.status;

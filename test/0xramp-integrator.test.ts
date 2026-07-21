@@ -1111,43 +1111,41 @@ describe("ZeroXRampDirectSettlementIntegrator (V2)", function () {
     });
   });
 
-  // ─── documented current-behavior quirks ───────────────────────────
+  // ─── regressions for fixed findings ───────────────────────────────
 
-  describe("documented current-behavior quirks", function () {
-    it("KNOWN ISSUE: deliverOfframpUpi trusts setSellOrderUpi's success and marks paymentDelivered even when the Diamond auto-cancelled", async function () {
+  describe("regressions for fixed findings", function () {
+    it("deliverOfframpUpi reverts and records nothing when the Diamond auto-cancels during setSellOrderUpi", async function () {
       // The live Diamond's setSellOrderUpi wraps its USDC pull in try/catch
-      // and, on failure, auto-cancels the order and RETURNS SUCCESS (repo
-      // audit #3). Peer integrators re-read the order status afterwards
-      // (audit #2); this V2 candidate does not, so it records
-      // paymentDelivered=true and emits ZeroXRampCashoutPaymentDelivered for
-      // an order that is actually CANCELLED. Funds are not lost — the
-      // principal stays on the proxy and syncOfframp recovers it — but the
-      // event/flag are false signals. Test documents CURRENT behavior.
-      const startingBalance = await mockUsdc.balanceOf(user.address);
-      const { orderId, amount, proxy } = await placeCashout(USDC(100));
+      // and, on failure, auto-cancels the order and returns success. The
+      // integrator re-reads the order status after the call and only records
+      // a delivery when the order actually reached PAID; the revert also
+      // rolls back the fee top-up and the mock's auto-cancel atomically.
+      const { orderId, amount } = await placeCashout(USDC(100));
       await mockDiamond.acceptSellOrder(orderId, "mp");
       await mockDiamond.setForceSellUpiAutoCancel(true);
 
       await expect(integrator.connect(user).deliverOfframpUpi(orderId, "pix"))
+        .to.be.revertedWithCustomError(integrator, "OrderNotPaid")
+        .withArgs(STATUS.CANCELLED);
+
+      // No false delivery signal; the auto-cancel rolled back with the
+      // transaction, so the order is still ACCEPTED and retryable.
+      expect((await integrator.sessions(orderId)).paymentDelivered).to.equal(false);
+      expect((await mockDiamond.getSellOrder(orderId)).status).to.equal(STATUS.ACCEPTED);
+
+      // Once the transient failure clears, delivery works normally.
+      await mockDiamond.setForceSellUpiAutoCancel(false);
+      await expect(integrator.connect(user).deliverOfframpUpi(orderId, "pix"))
         .to.emit(integrator, "ZeroXRampCashoutPaymentDelivered")
         .withArgs(orderId, user.address, amount);
-
-      // Diamond side: CANCELLED; integrator side: paymentDelivered=true.
-      expect((await mockDiamond.getSellOrder(orderId)).status).to.equal(STATUS.CANCELLED);
       expect((await integrator.sessions(orderId)).paymentDelivered).to.equal(true);
-
-      // Recovery path still works: syncOfframp returns the principal.
-      await integrator.syncOfframp(orderId, STATUS.CANCELLED);
-      expect(await mockUsdc.balanceOf(proxy)).to.equal(0n);
-      expect(await mockUsdc.balanceOf(user.address)).to.equal(startingBalance);
     });
 
-    it("KNOWN ISSUE: syncOfframp on an already-final session clears the cashout lock of an unrelated in-flight cashout", async function () {
-      // syncOfframp's early-return branch sets activeCashout[user] = false
-      // unconditionally. Because syncOfframp is permissionless, anyone can
-      // replay it on an old finalized order to unlock a user's CURRENT
-      // cashout single-flight lock, breaking the CashoutAlreadyActive
-      // invariant. Test documents CURRENT behavior.
+    it("syncOfframp replay on a finalized session leaves an unrelated in-flight cashout lock intact", async function () {
+      // syncOfframp is permissionless; replaying it on an old finalized
+      // order must not release the single-flight lock owned by the user's
+      // CURRENT cashout. Terminal transitions clear the lock exactly once,
+      // at transition time.
       // Widen the daily count budget so only the cashout lock is in play.
       await integrator.connect(owner).setLimits(PER_TX_LIMIT, 10, DAILY_VOLUME_LIMIT);
       const a = await placeCashout(USDC(50));
@@ -1159,14 +1157,15 @@ describe("ZeroXRampDirectSettlementIntegrator (V2)", function () {
       await placeCashout(USDC(50)); // cashout B in flight
       expect(await integrator.activeCashout(user.address)).to.equal(true);
 
-      // Replaying the finalized A clears B's lock...
+      // Replaying the finalized A is a lock no-op...
       await integrator.connect(stranger).syncOfframp(a.orderId, 0);
-      expect(await integrator.activeCashout(user.address)).to.equal(false);
+      expect(await integrator.activeCashout(user.address)).to.equal(true);
 
-      // ...so a THIRD concurrent cashout sails past CashoutAlreadyActive.
+      // ...so a concurrent third cashout is still rejected.
       await mockUsdc.connect(user).approve(integratorAddr, USDC(50));
-      await expect(integrator.connect(user).userStartOfframp(USDC(50), BRL, 0, 1, 0, "pk")).to.not
-        .be.reverted;
+      await expect(
+        integrator.connect(user).userStartOfframp(USDC(50), BRL, 0, 1, 0, "pk")
+      ).to.be.revertedWithCustomError(integrator, "CashoutAlreadyActive");
     });
   });
 });
