@@ -59,11 +59,27 @@ Set a limit to `0` to disable that 0xramp-specific rule and inherit P2P.me accou
 
 ## Deployment status
 
-This source has no live deployment. Addresses mentioned in earlier revisions
-of this proposal contain the bytecode of a previous contract revision and must
-not be whitelisted or configured as this contract. Deployment and the
-whitelist request happen after review, from this exact source, following
-[`../WHITELISTING.md`](../WHITELISTING.md).
+An experimental pre-audit deployment of this exact source (fork commit
+`13010d8`) exists on Base Sepolia for P2P.me review and integration testing:
+
+| Contract           | Base Sepolia address                         |
+| ------------------ | -------------------------------------------- |
+| Integrator         | `0x1e14bbD7B86d5831a21FE46034881aCc199c9331` |
+| Pinned `proxyImpl` | `0x273C28A640CA32d84aBBdFC26cfACCed3C3A4B53` |
+| P2P.me Diamond     | `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9` |
+| USDC               | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` |
+
+Deployment transaction
+[`0x8988...4fcf`](https://sepolia.basescan.org/tx/0x8988ed9d5b3aef2f15155753a5447f280623e839cdfbc79879f4f0c6134a4fcf),
+owner `0x4d86534353C5FE30D7bf400560ffFe6e48225cdd`, app-side limits disabled
+(`0/0/0`, inheriting P2P.me enforcement only).
+
+The independent audit of this source is still pending; if the audited source
+changes, this deployment is superseded by a redeploy of the audited bytecode.
+Addresses mentioned in earlier revisions of this proposal contain the bytecode
+of a previous contract revision and must not be treated as this contract. The
+production whitelist request follows
+[`../WHITELISTING.md`](../WHITELISTING.md) and targets the audited deployment.
 
 ## Testing
 
