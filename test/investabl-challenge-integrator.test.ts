@@ -14,8 +14,8 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
   let integrator: any;
 
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
-  const LIVENESS_CAP = USDC(20);
-  const DAILY_COUNT_LIMIT = 10;
+  const LIVENESS_CAP = USDC(20); // == MAX_LIVENESS_TIER_CAP (the immutable ceiling)
+  const DAILY_COUNT_LIMIT = 5; // == MAX_DAILY_TX_COUNT_LIMIT (the immutable ceiling)
   const BUYIN = USDC(15); // the $15 challenge buy-in
   const INR = ethers.encodeBytes32String("INR");
   const SESSION_REF = ethers.encodeBytes32String("sess-1");
@@ -345,11 +345,23 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
   });
 
   describe("Admin", function () {
-    it("setTierCap updates + emits", async function () {
-      await expect(integrator.setTierCap(1, USDC(40)))
+    it("setTierCap lowers the cap (within ceiling) + emits", async function () {
+      await expect(integrator.setTierCap(USDC(15)))
         .to.emit(integrator, "TierCapUpdated")
-        .withArgs(1, USDC(40));
-      expect(await integrator.tierCap(1)).to.equal(USDC(40));
+        .withArgs(USDC(15));
+      expect(await integrator.livenessTierCap()).to.equal(USDC(15));
+    });
+    it("setTierCap reverts CapExceedsCeiling above the $20 ceiling", async function () {
+      await expect(integrator.setTierCap(USDC(20) + 1n)).to.be.revertedWithCustomError(
+        integrator,
+        "CapExceedsCeiling"
+      );
+    });
+    it("setTierCap(0) reverts InvalidAmount", async function () {
+      await expect(integrator.setTierCap(0)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidAmount"
+      );
     });
     it("setLivenessAttestor updates + emits", async function () {
       await expect(integrator.setLivenessAttestor(user.address))
@@ -357,10 +369,17 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
         .withArgs(user.address);
       expect(await integrator.livenessAttestor()).to.equal(user.address);
     });
-    it("setDailyTxCountLimit updates + emits", async function () {
-      await expect(integrator.setDailyTxCountLimit(5))
+    it("setDailyTxCountLimit lowers the count (within ceiling) + emits", async function () {
+      await expect(integrator.setDailyTxCountLimit(3))
         .to.emit(integrator, "DailyTxCountLimitUpdated")
-        .withArgs(5);
+        .withArgs(3);
+      expect(await integrator.dailyTxCountLimit()).to.equal(3);
+    });
+    it("setDailyTxCountLimit reverts CapExceedsCeiling above the 5/day ceiling", async function () {
+      await expect(integrator.setDailyTxCountLimit(6)).to.be.revertedWithCustomError(
+        integrator,
+        "CapExceedsCeiling"
+      );
     });
     it("setTreasury updates + emits", async function () {
       await expect(integrator.setTreasury(treasury.address))
@@ -385,8 +404,12 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
         "InvalidAmount"
       );
     });
+    it("exposes the immutable policy ceilings", async function () {
+      expect(await integrator.MAX_LIVENESS_TIER_CAP()).to.equal(USDC(20));
+      expect(await integrator.MAX_DAILY_TX_COUNT_LIMIT()).to.equal(5);
+    });
     it("rejects non-owner on every setter", async function () {
-      await expect(integrator.connect(user).setTierCap(1, USDC(1))).to.be.revertedWithCustomError(
+      await expect(integrator.connect(user).setTierCap(USDC(1))).to.be.revertedWithCustomError(
         integrator,
         "OnlyOwner"
       );
@@ -414,17 +437,17 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
     });
     it("reverts InvalidAddress when diamond is zero", async function () {
       await expect(
-        Integrator.deploy(ethers.ZeroAddress, await mockUsdc.getAddress(), LIVENESS_CAP, 10, attestor.address)
+        Integrator.deploy(ethers.ZeroAddress, await mockUsdc.getAddress(), LIVENESS_CAP, DAILY_COUNT_LIMIT, attestor.address)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
     it("reverts InvalidAddress when usdc is zero", async function () {
       await expect(
-        Integrator.deploy(await mockDiamond.getAddress(), ethers.ZeroAddress, LIVENESS_CAP, 10, attestor.address)
+        Integrator.deploy(await mockDiamond.getAddress(), ethers.ZeroAddress, LIVENESS_CAP, DAILY_COUNT_LIMIT, attestor.address)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
     it("reverts InvalidAmount when cap is zero", async function () {
       await expect(
-        Integrator.deploy(await mockDiamond.getAddress(), await mockUsdc.getAddress(), 0, 10, attestor.address)
+        Integrator.deploy(await mockDiamond.getAddress(), await mockUsdc.getAddress(), 0, DAILY_COUNT_LIMIT, attestor.address)
       ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
     });
     it("reverts InvalidAmount when daily limit is zero", async function () {
@@ -437,6 +460,28 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
           attestor.address
         )
       ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
+    });
+    it("reverts CapExceedsCeiling when the tier cap is above the $20 ceiling", async function () {
+      await expect(
+        Integrator.deploy(
+          await mockDiamond.getAddress(),
+          await mockUsdc.getAddress(),
+          USDC(20) + 1n,
+          DAILY_COUNT_LIMIT,
+          attestor.address
+        )
+      ).to.be.revertedWithCustomError(integrator, "CapExceedsCeiling");
+    });
+    it("reverts CapExceedsCeiling when the daily count is above the 5/day ceiling", async function () {
+      await expect(
+        Integrator.deploy(
+          await mockDiamond.getAddress(),
+          await mockUsdc.getAddress(),
+          LIVENESS_CAP,
+          6,
+          attestor.address
+        )
+      ).to.be.revertedWithCustomError(integrator, "CapExceedsCeiling");
     });
     it("defaults treasury to owner", async function () {
       expect(await integrator.treasury()).to.equal(owner.address);

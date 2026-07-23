@@ -3,9 +3,11 @@ import { ethers } from "hardhat";
 /**
  * Deploy InvestablChallengeCheckoutIntegrator.
  *
- *   - tierCap[LIVENESS]: per-tx USDC cap for the liveness tier (default 20 USDC,
- *                        P2P's agreed liveness ceiling; the $15 challenge fits)
- *   - dailyTxCountLimit: max challenge orders per user per day (default 10)
+ *   - livenessTierCap:   per-tx USDC cap for the liveness tier (default 20 USDC,
+ *                        = MAX_LIVENESS_TIER_CAP; the $15 challenge fits). Owner
+ *                        may later lower it but never raise it past the ceiling.
+ *   - dailyTxCountLimit: max challenge orders per user per day (default 5,
+ *                        = MAX_DAILY_TX_COUNT_LIMIT; owner may only lower it).
  *   - livenessAttestor:  simple-kyc signer. Until this is set, every user is
  *                        TIER_NONE with a per-tx limit of 0 and NO order can be
  *                        placed — the contract fails closed.
@@ -14,16 +16,16 @@ import { ethers } from "hardhat";
  *   DIAMOND_ADDRESS=0x... USDC_ADDRESS=0x... LIVENESS_ATTESTOR=0x... \
  *     npx hardhat run scripts/deploy-investabl-challenge.ts --network baseSepolia
  *
- * Optional:
- *   LIVENESS_TIER_CAP=20000000   (6 decimals, default 20 USDC)
- *   DAILY_TX_COUNT_LIMIT=10      (default 10)
+ * Optional (both are clamped to their on-chain ceilings — deploy reverts if over):
+ *   LIVENESS_TIER_CAP=20000000   (6 decimals, default 20 USDC, max 20 USDC)
+ *   DAILY_TX_COUNT_LIMIT=5       (default 5, max 5)
  */
 
 const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
 const USDC_ADDRESS = process.env.USDC_ADDRESS || "";
 const LIVENESS_TIER_CAP = process.env.LIVENESS_TIER_CAP || "20000000";
 const LIVENESS_ATTESTOR = process.env.LIVENESS_ATTESTOR || "";
-const DAILY_TX_COUNT_LIMIT = process.env.DAILY_TX_COUNT_LIMIT || "10";
+const DAILY_TX_COUNT_LIMIT = process.env.DAILY_TX_COUNT_LIMIT || "5";
 
 async function main() {
   if (!DIAMOND_ADDRESS || !USDC_ADDRESS) {
@@ -67,10 +69,14 @@ async function main() {
   console.log(`Owner:               ${await integrator.owner()}`);
   console.log(`Treasury:            ${await integrator.treasury()}`);
   console.log(
-    `Liveness tier cap:   ${ethers.formatUnits(await integrator.tierCap(1), 6)} USDC`
+    `Liveness tier cap:   ${ethers.formatUnits(await integrator.livenessTierCap(), 6)} USDC` +
+      ` (immutable ceiling ${ethers.formatUnits(await integrator.MAX_LIVENESS_TIER_CAP(), 6)} USDC)`
   );
   console.log(`Liveness attestor:   ${await integrator.livenessAttestor()}`);
-  console.log(`Daily TX Count:      ${(await integrator.dailyTxCountLimit()).toString()} per day`);
+  console.log(
+    `Daily TX Count:      ${(await integrator.dailyTxCountLimit()).toString()} per day` +
+      ` (immutable ceiling ${(await integrator.MAX_DAILY_TX_COUNT_LIMIT()).toString()})`
+  );
   console.log("");
   console.log("Verify command:");
   console.log(

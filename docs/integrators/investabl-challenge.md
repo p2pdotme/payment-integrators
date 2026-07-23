@@ -54,15 +54,18 @@ Replaces the RP model with a **liveness-tier cap** (see
 | Tier | Requirement | Per-tx cap |
 |---|---|---|
 | `TIER_NONE` (0) | none | **0 — cannot buy** |
-| `TIER_LIVENESS` (1) | one-time liveness check | `min(attested limit, tierCap[1])`, deployed at **20 USDC** |
+| `TIER_LIVENESS` (1) | one-time liveness check | `min(attested limit, livenessTierCap)`, deployed at **20 USDC** (the immutable ceiling) |
 
-The effective cap is `min(attested limit, tierCap[tier])`: the simple-kyc service
+The effective cap is `min(attested limit, livenessTierCap)`: the simple-kyc service
 signs a dollar limit into the attestation and the contract additionally clamps it
-to an on-chain ceiling, so a compromised attestor key cannot authorize more than
-the tier allows. The $15 challenge sits under the $20 cap.
+to `livenessTierCap`. That cap is owner-tunable but hard-bounded by the immutable
+`MAX_LIVENESS_TIER_CAP` (20 USDC), so neither a compromised attestor key nor a
+compromised owner can authorize more than the agreed policy. The $15 challenge sits
+under the $20 cap.
 
-`dailyTxCountLimit` — max challenge orders per user per UTC day (default 10),
-reserved in `validateOrder`, released in `onOrderCancel`.
+`dailyTxCountLimit` — max challenge orders per user per UTC day (default 5, the
+immutable `MAX_DAILY_TX_COUNT_LIMIT` ceiling), reserved in `validateOrder`,
+released in `onOrderCancel`.
 
 There is **no passport tier**. Adding one later means a new contract and a fresh
 whitelist request — integrators are immutable.
@@ -85,9 +88,12 @@ from the verified human, not the wallet, or one person can claim from many walle
 
 - Sweep proceeds periodically with `sweepUsdc`; point `treasury` at a Base
   address you control (`setTreasury`).
-- `tierCap` / `dailyTxCountLimit` are owner-tunable (`setTierCap`,
-  `setDailyTxCountLimit`); raising the liveness cap above the agreed 20 USDC
-  would fail the quarterly review.
+- `livenessTierCap` / `dailyTxCountLimit` are owner-tunable (`setTierCap`,
+  `setDailyTxCountLimit`) but can only be **lowered** — both are hard-bounded by
+  the immutable `MAX_LIVENESS_TIER_CAP` (20 USDC) and `MAX_DAILY_TX_COUNT_LIMIT`
+  (5) ceilings, fixed in bytecode. Any setter (or constructor arg) that would
+  exceed a ceiling reverts `CapExceedsCeiling`, so the owner can never raise a
+  limit past what P2P whitelisted. Changing a ceiling needs a new deployment.
 - **`livenessAttestor` must be set before anything works.** While it is unset
   every user is `TIER_NONE` with a per-tx limit of 0 and `buyChallenge` reverts
   `AmountExceedsCap`. This is deliberate fail-closed behaviour.

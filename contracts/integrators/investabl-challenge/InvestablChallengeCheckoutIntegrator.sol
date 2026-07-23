@@ -22,11 +22,14 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
  *
  *           - No attestation       -> cannot buy at all.
  *           - Liveness attestation -> per-tx cap = min(attested limit,
- *                                     tierCap[TIER_LIVENESS]), deployed at 20 USDC.
+ *                                     livenessTierCap), deployed at 20 USDC.
  *
  *         The service signs a dollar limit into the attestation and this contract
- *         additionally clamps it to an on-chain per-tier ceiling, so a compromised
- *         attestor key cannot authorize more than the tier allows. Verification is
+ *         additionally clamps it to `livenessTierCap`. That cap is owner-tunable
+ *         but can only ever be *lowered* — it is hard-bounded by the immutable
+ *         MAX_LIVENESS_TIER_CAP (20 USDC), so neither a compromised attestor key
+ *         nor a compromised owner can authorize more than P2P's agreed policy.
+ *         Verification is
  *         the on-chain twin of simple-kyc's `LivenessAttestationVerifier`: EIP-712
  *         typehash `LivenessAttestation(address wallet,bytes32 nullifier,uint256
  *         limit,uint256 expiry)`, domain name `LivenessVerifier`, recovered with
@@ -55,6 +58,10 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
  * @dev    Security invariants (see CONTRIBUTING.md):
  *           - `validateOrder` / `onOrderComplete` / `onOrderCancel` are
  *             `onlyDiamond` and authoritatively enforce the caps.
+ *           - The per-tx cap and the daily order count are owner-tunable but
+ *             hard-bounded by the immutable `MAX_LIVENESS_TIER_CAP` (20 USDC)
+ *             and `MAX_DAILY_TX_COUNT_LIMIT` (5) ceilings. The owner can only
+ *             tighten policy, never raise it past what P2P whitelisted.
  *           - USDC is never routed to a user EOA. It accrues here and leaves
  *             only via the owner's `sweepUsdc` to `treasury`. All movements use
  *             SafeERC20.
@@ -72,6 +79,8 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     error InvalidAmount();
     error AmountExceedsCap();
     error DailyCountExceeded();
+    /// @dev Raised when a setter would push a limit above its immutable ceiling.
+    error CapExceedsCeiling();
     error OrderAlreadyFulfilled();
     error OrderAlreadyCancelled();
 
@@ -83,7 +92,7 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
 
     // ─── Events ───────────────────────────────────────────────────────
 
-    event TierCapUpdated(uint8 indexed tier, uint256 cap);
+    event TierCapUpdated(uint256 cap);
     event LivenessAttestorUpdated(address indexed attestor);
     /// @param tier 1 = liveness
     event LivenessClaimed(
@@ -132,6 +141,17 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     uint8 public constant TIER_NONE = 0;
     uint8 public constant TIER_LIVENESS = 1;
 
+    // ─── Immutable policy ceilings ────────────────────────────────────
+
+    /// @notice Hard ceiling on the liveness per-tx cap (micro-USDC, 6dp). The
+    ///         owner may set `livenessTierCap` to any non-zero value at or below
+    ///         this, but never above it — the whitelisted maximum is fixed in
+    ///         bytecode. P2P's agreed policy for Investabl = 20 USDC.
+    uint256 public constant MAX_LIVENESS_TIER_CAP = 20e6;
+    /// @notice Hard ceiling on the per-user daily order count. Same rule: the
+    ///         owner may lower `dailyTxCountLimit` but never raise it past this.
+    uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5;
+
     // ─── EIP-712 constants ────────────────────────────────────────────
 
     /// @dev keccak256("LivenessAttestation(address wallet,bytes32 nullifier,uint256 limit,uint256 expiry)")
@@ -153,12 +173,15 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     ///         contract fails closed and no order can be placed.
     address public livenessAttestor;
 
-    // ─── Configurable limits ──────────────────────────────────────────
+    // ─── Owner-tunable limits (bounded by the ceilings above) ─────────
 
-    /// @notice On-chain per-tx ceiling per tier (micro-USDC, 6dp).
-    ///         A tier whose cap is 0 is effectively disabled.
-    mapping(uint8 => uint256) public tierCap;
+    /// @notice Effective per-tx USDC ceiling for the liveness tier (micro-USDC,
+    ///         6dp). Owner-settable via `setTierCap`, always in
+    ///         (0, MAX_LIVENESS_TIER_CAP].
+    uint256 public livenessTierCap;
     /// @notice Max challenge orders a single user can place per UTC day.
+    ///         Owner-settable via `setDailyTxCountLimit`, always in
+    ///         (0, MAX_DAILY_TX_COUNT_LIMIT].
     uint256 public dailyTxCountLimit;
     /// @notice Destination for swept USDC proceeds. Defaults to `owner`.
     address public treasury;
@@ -166,7 +189,7 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     // ─── Per-user entitlement ─────────────────────────────────────────
 
     /// @notice Per-tx USDC ceiling attested by the simple-kyc service. The
-    ///         effective cap is this clamped by `tierCap[userTier[user]]`.
+    ///         effective cap is this clamped by `livenessTierCap`.
     mapping(address => uint256) public grantedLimit;
     /// @notice Highest tier the user has claimed (see TIER_* constants).
     mapping(address => uint8) public userTier;
@@ -220,38 +243,49 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     ) {
         if (_diamond == address(0) || _usdc == address(0)) revert InvalidAddress();
         if (_livenessTierCap == 0 || _dailyTxCountLimit == 0) revert InvalidAmount();
+        if (
+            _livenessTierCap > MAX_LIVENESS_TIER_CAP ||
+            _dailyTxCountLimit > MAX_DAILY_TX_COUNT_LIMIT
+        ) revert CapExceedsCeiling();
         diamond = _diamond;
         usdc = IERC20(_usdc);
         owner = msg.sender;
-        tierCap[TIER_LIVENESS] = _livenessTierCap;
+        livenessTierCap = _livenessTierCap;
         dailyTxCountLimit = _dailyTxCountLimit;
         livenessAttestor = _livenessAttestor;
         treasury = msg.sender;
         proxyImpl = address(new UserProxy());
 
-        emit TierCapUpdated(TIER_LIVENESS, _livenessTierCap);
+        emit TierCapUpdated(_livenessTierCap);
         emit DailyTxCountLimitUpdated(_dailyTxCountLimit);
         emit LivenessAttestorUpdated(_livenessAttestor);
     }
 
     // ─── Admin ────────────────────────────────────────────────────────
 
-    /// @notice Update the per-tx USDC ceiling for a tier. Raising the liveness
-    ///         tier above P2P's agreed cap would fail the quarterly review.
-    function setTierCap(uint8 tier, uint256 cap) external onlyOwner {
-        tierCap[tier] = cap;
-        emit TierCapUpdated(tier, cap);
+    /// @notice Set the liveness per-tx USDC cap. Owner-tunable but bounded: the
+    ///         value must be non-zero and can never exceed the immutable
+    ///         `MAX_LIVENESS_TIER_CAP`, so the owner may only tighten policy.
+    function setTierCap(uint256 cap) external onlyOwner {
+        if (cap == 0) revert InvalidAmount();
+        if (cap > MAX_LIVENESS_TIER_CAP) revert CapExceedsCeiling();
+        livenessTierCap = cap;
+        emit TierCapUpdated(cap);
     }
 
-    /// @notice Point the contract at the liveness service's signing key.
+    /// @notice Point the contract at the liveness service's signing key. Kept
+    ///         mutable for key rotation; the immutable `MAX_LIVENESS_TIER_CAP`
+    ///         bounds what any attestor (even a compromised one) can authorize.
     function setLivenessAttestor(address attestor) external onlyOwner {
         livenessAttestor = attestor;
         emit LivenessAttestorUpdated(attestor);
     }
 
-    /// @notice Update the per-user daily order-count limit.
+    /// @notice Update the per-user daily order-count limit. Owner-tunable but
+    ///         bounded: non-zero and never above `MAX_DAILY_TX_COUNT_LIMIT`.
     function setDailyTxCountLimit(uint256 count) external onlyOwner {
         if (count == 0) revert InvalidAmount();
+        if (count > MAX_DAILY_TX_COUNT_LIMIT) revert CapExceedsCeiling();
         dailyTxCountLimit = count;
         emit DailyTxCountLimitUpdated(count);
     }
@@ -276,7 +310,7 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
      * @notice Verify and record a liveness-tier attestation for `msg.sender`.
      * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
      * @param limit     Attested per-tx USDC ceiling (micro-USDC, 6dp). The
-     *                  effective cap is `min(limit, tierCap[TIER_LIVENESS])`.
+     *                  effective cap is `min(limit, livenessTierCap)`.
      * @param expiry    Unix seconds; the attestation must be claimed before this.
      * @param signature 65-byte secp256k1 signature (r ‖ s ‖ v) from the service.
      */
@@ -314,8 +348,10 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     function effectiveLimit(address user) public view returns (uint256) {
         uint8 tier = userTier[user];
         if (tier == TIER_NONE) return 0;
+        // TIER_LIVENESS is the only tier above NONE, so the ceiling is the
+        // (bounded) liveness cap; grantedLimit is clamped by it.
         uint256 lim = grantedLimit[user];
-        uint256 cap = tierCap[tier];
+        uint256 cap = livenessTierCap;
         return lim < cap ? lim : cap;
     }
 
