@@ -184,6 +184,16 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     /// @notice Max challenge orders a single user can place per UTC day.
     ///         Owner-settable via `setDailyTxCountLimit`, always in
     ///         (0, MAX_DAILY_TX_COUNT_LIMIT].
+    /// @dev    Reserved in `validateOrder` at placement, released in
+    ///         `onOrderCancel`. The live protocol does not yet call
+    ///         `onOrderCancel` (see that hook), so on current mainnet the slot
+    ///         is never released: this bounds PLACEMENTS per day — a cancelled /
+    ///         expired order keeps consuming its slot until UTC midnight. This
+    ///         is strictly safer than the intended released-on-cancel model (a
+    ///         slot can never be freed early, so the cap can't be exceeded), but
+    ///         a user whose orders keep failing can be locked out for the day.
+    ///         The forward-compat hook restores per-order release once the
+    ///         protocol feature ships.
     uint256 public dailyTxCountLimit;
     /// @notice Destination for swept USDC proceeds. Defaults to `owner`.
     address public treasury;
@@ -500,6 +510,16 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
      *         validateOrder, keyed on the placement-day snapshot. Tolerates
      *         unknown / already-finalized orders. MUST NOT touch on-chain order
      *         state (protocol-side has already finalized).
+     *
+     * @dev    FORWARD-COMPAT — the live P2P Diamond (contracts-v4) does NOT yet
+     *         call this. Verified on Base mainnet: the `onOrderCancel` selector
+     *         (0x7ff83a04) is absent from every deployed facet; only
+     *         `validateOrder` and `onOrderComplete` fire. The protocol-side call
+     *         is wired best-effort (try/catch) only in the unmerged
+     *         `feat/integrator-on-order-cancel` branch. Until that ships this is
+     *         inert and the daily-count slot is never released (see
+     *         `dailyTxCountLimit`). Kept so per-order release activates
+     *         automatically once the protocol feature lands.
      */
     function onOrderCancel(uint256 orderId) external onlyDiamond {
         Session storage session = sessions[orderId];

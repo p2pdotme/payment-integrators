@@ -57,6 +57,21 @@ accrues on the integrator and leaves **only** via the owner's `sweepUsdc(amount)
 to `treasury` (default: owner). It is then bridged to Investabl's Arbitrum
 treasury out of band (CCTP). USDC is never routed to a user EOA.
 
+### Disputes — where the USDC lands
+A BUY order can be disputed only once it is CANCELLED and was marked PAID
+(`OrderProcessorFacet.raiseDispute`). If a circle admin settles **in the user's
+favor** (fault = merchant/bank, not user), `adminSettleDispute` calls the normal
+`completeOrder` → `onB2BOrderComplete` — the *same* settlement path as any
+completion. With `usdcThroughIntegrator = false` + `recipientAddr = address(this)`
+the **USDC lands on the integrator contract**, `onOrderComplete` fires →
+`ChallengePurchased` → the backend grants the challenge. So the user who won the
+dispute gets their challenge, Investabl receives the USDC, and the user **never**
+touches spendable USDC — the goods-model invariant holds through disputes. A
+user-fault settlement moves no USDC (the order stays CANCELLED, reputation-only).
+Because the live protocol never calls `onOrderCancel`, `session.cancelled` is
+never set, so `onOrderComplete` completes this cleanly (and must **not** gain a
+`cancelled`-guard, which would suppress the challenge grant the user just won).
+
 ## Limits — liveness-gated
 
 Replaces the RP model with a **liveness-tier cap** (see
@@ -75,8 +90,20 @@ compromised owner can authorize more than the agreed policy. The $15 challenge s
 under the $20 cap.
 
 `dailyTxCountLimit` — max challenge orders per user per UTC day (default 5, the
-immutable `MAX_DAILY_TX_COUNT_LIMIT` ceiling), reserved in `validateOrder`,
-released in `onOrderCancel`.
+immutable `MAX_DAILY_TX_COUNT_LIMIT` ceiling), reserved in `validateOrder`.
+
+> **Daily-count semantics on current mainnet.** The slot is *released* in
+> `onOrderCancel`, but the live P2P Diamond does **not** call `onOrderCancel`
+> (verified on Base mainnet — its selector `0x7ff83a04` is in none of the
+> deployed facets; it is wired only in the unmerged
+> `feat/integrator-on-order-cancel` protocol branch). So today the count bounds
+> **placements per UTC day**: a cancelled or expired order keeps consuming its
+> slot until UTC midnight. This is strictly safe (a slot can never be freed
+> early, so the cap can't be exceeded) but a user whose orders keep failing can
+> be locked out for the day. **Decision before whitelisting:** ship that protocol
+> feature (restores per-order release — recommended; the integrator is already
+> forward-compat for it) or accept placements/day. This is **systemic** — every
+> daily-count integrator (Showdown, CubeSkins, …) is in the same position.
 
 There is **no passport tier**. Adding one later means a new contract and a fresh
 whitelist request — integrators are immutable.

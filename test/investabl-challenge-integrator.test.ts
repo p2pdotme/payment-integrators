@@ -250,7 +250,11 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
       await expect(buy(user)).to.be.revertedWithCustomError(integrator, "DailyCountExceeded");
     });
 
-    it("onOrderCancel releases a daily-count slot + emits ChallengeOrderCancelled", async function () {
+    // FORWARD-COMPAT: the live P2P Diamond does NOT call onOrderCancel yet — its
+    // selector is absent from every deployed mainnet facet. The MockDiamond models
+    // the *planned* protocol (feat/integrator-on-order-cancel), where the slot is
+    // released on cancel. This locks in that future behavior.
+    it("[forward-compat] onOrderCancel releases a daily-count slot + emits ChallengeOrderCancelled", async function () {
       await buy(user);
       expect(await integrator.getTodayCount(user.address)).to.equal(1);
       await expect(mockDiamond.simulateOrderCancelled(1))
@@ -259,6 +263,25 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
       expect(await integrator.getTodayCount(user.address)).to.equal(0);
       const s = await integrator.sessions(1);
       expect(s.cancelled).to.equal(true);
+    });
+
+    // LIVE PROTOCOL: with no onOrderCancel call, a cancelled/expired order does NOT
+    // free its slot — dailyTxCountLimit bounds PLACEMENTS per UTC day. Modeled by
+    // driving validateOrder directly (the authoritative gate) with no onOrderCancel,
+    // exactly as the deployed Diamond behaves today.
+    it("[live protocol] a cancel without onOrderCancel does NOT free a daily-count slot", async function () {
+      const addr = await mockDiamond.getAddress();
+      await ethers.provider.send("hardhat_impersonateAccount", [addr]);
+      await ethers.provider.send("hardhat_setBalance", [addr, "0x56BC75E2D63100000"]);
+      const asDiamond = await ethers.getSigner(addr);
+      for (let i = 0; i < DAILY_COUNT_LIMIT; i++) {
+        await integrator.connect(asDiamond).validateOrder(user.address, BUYIN, INR);
+      }
+      expect(await integrator.getTodayCount(user.address)).to.equal(DAILY_COUNT_LIMIT);
+      // No onOrderCancel fires → slot stays consumed → the next placement is refused.
+      expect(
+        await integrator.connect(asDiamond).validateOrder.staticCall(user.address, BUYIN, INR)
+      ).to.equal(false);
     });
   });
 
