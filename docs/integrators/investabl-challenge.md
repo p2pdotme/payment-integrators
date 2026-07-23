@@ -35,6 +35,17 @@ No upstream protocol beyond the P2P Diamond. Investabl's backend consumes the
 4. Investabl's backend watches that event and grants the challenge, mapping
    `sessionRef` back to the checkout session.
 
+> **Backend MUST validate before granting.** The contract only enforces
+> `amount ≤ effectiveLimit` and blindly echoes the client-supplied `sessionRef`
+> into `ChallengePurchased`; it has no notion of challenge prices. So the backend
+> must independently verify: **(a)** `sessionRef` belongs to `user`, and **(b)**
+> the delivered `amount` equals the price of the challenge that `sessionRef` maps
+> to. Treat `sessionRef` as **single-use** to guard against replay/forged refs.
+> Without this, a user could pay for a cheap challenge on-chain while passing the
+> `sessionRef` of a more expensive one. (`onOrderComplete` additionally reverts
+> `AmountMismatch` if the Diamond ever delivers an amount other than the order's,
+> so the emitted `amount` is always the settled amount.)
+
 ## Custody / fund flow
 
 Register with **`usdcThroughIntegrator = false`**. `buyChallenge` pins

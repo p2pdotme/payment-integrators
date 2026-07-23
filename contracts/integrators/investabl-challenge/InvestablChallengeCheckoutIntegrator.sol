@@ -83,6 +83,8 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
     error CapExceedsCeiling();
     error OrderAlreadyFulfilled();
     error OrderAlreadyCancelled();
+    /// @dev Delivered USDC on completion != the order's stored amount.
+    error AmountMismatch();
 
     // KYC / attestation
     error AttestorNotSet();
@@ -470,19 +472,25 @@ contract InvestablChallengeCheckoutIntegrator is IP2PIntegrator, ReentrancyGuard
 
     /**
      * @notice Completion hook. The Diamond has already delivered `amount` USDC
-     *         to this contract (recipientAddr = address(this)). We only finalize
-     *         bookkeeping and emit `ChallengePurchased` for the backend to grant
-     *         the challenge. Best-effort from the gateway's POV (try/catch there).
+     *         to this contract (recipientAddr = address(this)). We assert the
+     *         delivered amount matches the order, finalize bookkeeping, and emit
+     *         `ChallengePurchased` for the backend to grant the challenge.
+     *         Best-effort from the gateway's POV (try/catch there).
      */
     function onOrderComplete(
         uint256 orderId,
         address /* user */,
-        uint256 /* amount */,
+        uint256 amount,
         address /* recipientAddr */
     ) external onlyDiamond {
         Session storage session = sessions[orderId];
         if (session.user == address(0)) return; // unknown order — no-op
         if (session.fulfilled) revert OrderAlreadyFulfilled();
+        // Defense-in-depth: the delivered USDC must equal the order amount (no
+        // netting in this flow, so they are always equal); a mismatch signals a
+        // Diamond-side discrepancy and blocks the grant instead of emitting a
+        // wrong amount. Mirrors LotPot's AmountMismatch guard.
+        if (amount != session.amount) revert AmountMismatch();
         session.fulfilled = true;
         emit ChallengePurchased(orderId, session.user, session.amount, session.sessionRef);
     }

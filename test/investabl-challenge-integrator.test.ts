@@ -342,6 +342,22 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
       ).to.not.be.reverted;
       await expect(integrator.connect(asDiamond).onOrderCancel(999)).to.not.be.reverted;
     });
+    it("onOrderComplete reverts AmountMismatch when the delivered amount != the order", async function () {
+      await buy(user); // orderId 1, session.amount = BUYIN
+      const addr = await mockDiamond.getAddress();
+      await ethers.provider.send("hardhat_impersonateAccount", [addr]);
+      await ethers.provider.send("hardhat_setBalance", [addr, "0x56BC75E2D63100000"]);
+      const asDiamond = await ethers.getSigner(addr);
+      await expect(
+        integrator.connect(asDiamond).onOrderComplete(1, user.address, BUYIN + 1n, user.address)
+      ).to.be.revertedWithCustomError(integrator, "AmountMismatch");
+      // the matching amount still finalizes + emits (the reverted call left it unfulfilled)
+      await expect(
+        integrator.connect(asDiamond).onOrderComplete(1, user.address, BUYIN, user.address)
+      )
+        .to.emit(integrator, "ChallengePurchased")
+        .withArgs(1, user.address, BUYIN, SESSION_REF);
+    });
   });
 
   describe("Admin", function () {
