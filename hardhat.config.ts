@@ -25,6 +25,13 @@ const config: HardhatUserConfig = {
     },
     hardhat: {
       chainId: 1337,
+      // Pin the in-process EVM to the same hardfork the contracts are compiled
+      // for (solidity.settings.evmVersion = "cancun"). Hardhat >= 2.26 defaults
+      // to Osaka, which enforces the EIP-7825 per-transaction gas cap (2^24);
+      // solidity-coverage honours that cap and its instrumented deployment of
+      // MerchantTerminalIntegrator then runs out of gas, killing the coverage
+      // run. On cancun the cap does not apply and coverage completes.
+      hardfork: "cancun",
     },
   },
   solidity: {
