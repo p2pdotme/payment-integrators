@@ -80,22 +80,72 @@ Note the Diamond's fee comes off the same proxy balance, so the proxy needs **pr
 
 **Escape hatch.** `userBridgeBackToSolana(amount, ata)` returns bridged-in funds to Solana instead of offramping — worth exposing for users who change their mind or whose tier doesn't cover the amount.
 
-## 5. Solana side + attestation delivery — the missing service
+## 5. Attestation delivery — the missing service, and the launch blocker
 
-**CCTP does not auto-deliver.** A burn only authorizes a mint; someone must fetch the attestation from Circle's attestation (Iris) API and submit `receiveMessage` on the destination chain. Without this, an onramp burns on Base and **the user's USDC never appears on Solana**. This is required work, not a nice-to-have.
+**CCTP does not auto-deliver.** `depositForBurn` burns the USDC and emits a message; that is _all_ it does. It authorizes a mint — it does not perform one. The mint only happens when someone calls `receiveMessage(message, attestation)` on the **destination** chain. Nothing in the contract, on either side, does this. Without a service that does, an onramp burns on Base and **the user's USDC never appears on Solana**, while `unbridgedTotal` reads 0 and the integrator looks perfectly healthy.
 
-- **Onramp (Base → Solana):** watch `BridgedToSolana(orderId, user, amount, solanaRecipient, maxFee)`, fetch the attestation for that burn, submit `receiveMessage` to the Solana `MessageTransmitterV2` program. Standard Transfer finality from Base is ~13–19 minutes.
-- **Offramp (Solana → Base):** watch the Solana burn, fetch the attestation, submit on Base. Permissionless, so a relayer can do it for the user.
+**Sizing the risk correctly:** this is an _availability_ problem, not a _safety_ one. Showdown burns with `destinationCaller = bytes32(0)`, so delivery is permissionless, and Circle's attestations do not expire — anyone can submit a stale message months later and the mint still lands, to the recipient encoded in the message and nobody else. So funds are never lost. But an onramp that doesn't deliver is a user who paid fiat and has nothing, which is a support incident on day one.
 
-The shape is close to what `tradestars-relayer` already did (Base event → Solana action, Helius webhook → drives the SELL lifecycle), so that's the reference even though TradeStars itself was removed. Circle also offers a forwarding service — worth evaluating before we build a relayer.
+### The three steps, per transfer
 
-**To confirm before building:** the exact Iris endpoint + auth for V2 testnet, and whether Circle's forwarding service covers Solana for our volume. I did not verify these against the docs (the API page 404'd), so treat any endpoint you find in older notes as unconfirmed.
+1. **Burn** — happens on-chain already (`_bridge` on Base; the user's wallet on Solana).
+2. **Attest** — Circle's Iris service observes the burn, waits for the finality threshold, and signs the message. Nothing to build; just wait and poll.
+3. **Deliver** — fetch `(message, attestation)` from Iris and submit `receiveMessage` on the destination. **This is the part that does not exist.**
 
-Solana program IDs (mainnet and devnet share these): MessageTransmitterV2 `CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC`, TokenMessengerMinterV2 `CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe`.
+### Iris API — verified 2026-07-27
+
+|              |                                                                                       |
+| ------------ | ------------------------------------------------------------------------------------- |
+| Attestation  | `GET https://iris-api.circle.com/v2/messages/{sourceDomain}?transactionHash={txHash}` |
+| Sandbox      | `https://iris-api-sandbox.circle.com` (same paths)                                    |
+| Fee schedule | `GET https://iris-api.circle.com/v2/burn/USDC/fees/{srcDomain}/{dstDomain}`           |
+
+Both confirmed live against the real service (a bogus hash returns a structured `404 {"error":"Message not found for provided parameters"}`, i.e. the route resolves). Source domain is **6** for a Base burn, **5** for a Solana burn. Poll until the message reports complete, then submit. This supersedes the earlier note that the endpoints were unconfirmed.
+
+**Fee schedule for Base → Solana, live today:**
+
+```
+[{"finalityThreshold":1000,"minimumFee":1.3},   // Fast:     1.3 bps
+ {"finalityThreshold":2000,"minimumFee":0}]     // Standard: free
+```
+
+So the contract's shipped defaults (`bridgeMinFinalityThreshold = 2000`, `bridgeMaxFeeBps = 0`) are **valid on mainnet today** — previously only verified on Sepolia. Switching to Fast needs `setBridgeMaxFeeBps(≥ 2)` to clear the 1.3 bps minimum, comfortably inside the immutable `MAX_BRIDGE_MAX_FEE_BPS = 100` ceiling. A burn whose `maxFee` is under Circle's minimum reverts _at burn time_ ("Insufficient max fee") and lands in the retry path — it does not lose funds.
+
+### Onramp delivery (Base → Solana) — the harder half
+
+- **Trigger:** the integrator's `BridgedToSolana(orderId, user, amount, solanaRecipient, maxFee)`.
+- **Message bytes:** from the `MessageSent(bytes message)` log that MessageTransmitterV2 emits in the same transaction — the integrator does not return or store it, so the watcher must read the receipt logs.
+- **Deliver on Solana:** `receiveMessage` on MessageTransmitterV2 `CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC` (with TokenMessengerMinterV2 `CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe`). This is a real Solana transaction: several PDAs to derive plus the recipient's ATA in the account list, per Circle's `solana-cctp-contracts` IDL.
+- **Costs SOL**, paid by whoever submits — budget a funded Solana keypair.
+- **Latency:** Standard Transfer finality from Base is ~13–19 min, so the watcher must be durable across restarts, not an in-memory timer.
+
+### Offramp delivery (Solana → Base) — the easier half
+
+- **Trigger:** the user's Solana burn naming `offrampMintRecipient(user)` as `mintRecipient`. A Helius webhook is the natural watcher — the same shape `tradestars-relayer` used.
+- **Deliver on Base:** `receiveMessage(message, attestation)`, either directly on MessageTransmitterV2 or through the integrator's `receiveFromSolana` passthrough (identical effect; the passthrough exists so the widget has one ABI).
+- **Costs Base ETH.** Cheap.
+- Then the funds sit on the user's proxy and `bridgedBalance(user)` reflects them.
+
+### Who builds it — three options
+
+1. **Own relayer.** Full control, handles both directions, works whether or not the user is still on the page. Needs: an event watcher per chain, a durable retry queue, a funded Solana keypair + Base EOA, and monitoring. Closest reference is `tradestars-relayer` (Base event → Solana action, Helius webhook → lifecycle).
+2. **Client-side, in the widget.** The user already has a Solana wallet — they can sign `receiveMessage` themselves. Near-zero infra, but it breaks if they close the tab, and ~15 min of Standard finality makes that likely.
+3. **Circle's forwarding service.** No infra at all. **Confirm it covers Solana as a destination and the pricing at our volume** — that is the open question.
+
+**Recommendation: 2 + 1 as a backstop.** Let the widget attempt delivery so the happy path is instant and free, and run a sweeper that periodically re-scans for burns with no matching mint and submits them. Because delivery is permissionless and attestations never expire, the backstop can be simple and can run on a cron — it never races the widget destructively, it just delivers whatever is outstanding. That gets the launch-blocking property (nothing stays undelivered) without making the first version of the relayer load-bearing.
+
+**Minimum to launch:** the backstop sweeper for the onramp direction. Everything else can follow.
+
+### Monitoring
+
+- `BridgedToSolana` **without** a matching Solana mint inside ~30 min → the delivery alert. This is the one that means users are missing funds.
+- `BridgeFailed(orderId, reason)` → the burn itself was refused; funds are safe and reserved, `retryBridge` is permissionless and bubbles the reason.
+- `unbridgedTotal` → should sit near 0. Anything persistent means burns are failing.
+- `OnrampAmountAdjusted` → should never fire; means the Diamond delivered an amount other than the one placed.
 
 ## 6. Transfer speed / fees
 
-Defaults are Standard Transfer, free: `bridgeMinFinalityThreshold = 2000`, `bridgeMaxFeeBps = 0` (`maxFee = 0` is valid while the messenger's `minFee` is 0, which it is on Base Sepolia today). If ~15 min is too slow for the product, switch to Fast Transfer — `setBridgeMinFinalityThreshold(1000)` plus a non-zero `setBridgeMaxFeeBps(...)`, since Fast charges. **Product decision:** is free-and-slow acceptable, or do we pay for seconds?
+Defaults are Standard Transfer, free: `bridgeMinFinalityThreshold = 2000`, `bridgeMaxFeeBps = 0`. Circle's live fee schedule for Base → Solana confirms `minimumFee = 0` at threshold 2000, so **the defaults are valid on mainnet today** (§5) — previously this was only known for Base Sepolia. Fast Transfer costs 1.3 bps and needs `setBridgeMinFinalityThreshold(1000)` plus `setBridgeMaxFeeBps(≥ 2)`, comfortably inside the immutable `MAX_BRIDGE_MAX_FEE_BPS = 100` ceiling. **Product decision:** is ~13–19 min acceptable, or do we pay ~$0.03 on a $200 transfer for seconds?
 
 ## 7. Monitoring
 
@@ -131,7 +181,7 @@ Consequences to carry into the widget:
 ## Open decisions
 
 1. **Which network do we actually bridge on** (§1) — mainnet, a USDC-settling Sepolia Diamond, or standalone proof first.
-2. **Who delivers attestations** (§5) — Circle's forwarding service vs. our own relayer. **This is the launch blocker**: without it an onramp burns on Base and the user's USDC never appears on Solana, while `unbridgedTotal` reads 0 and the contract looks healthy.
+2. **Who delivers attestations** (§5) — **the launch blocker.** Recommendation is widget-side delivery plus a backstop sweeper; the open question is whether Circle's forwarding service covers Solana at our volume, which would remove the work entirely.
 3. **Fast vs Standard transfers** (§6).
 4. **Who owns the Solana ATA creation UX** (§4) — widget vs. Showdown's own app.
 5. **Who holds the mainnet `owner` key** — decided: a **Showdown multisig**. `owner` is immutable with no transfer and no renounce, so the deploy must be sent _from_ that multisig. See the audit's deploy gates.
