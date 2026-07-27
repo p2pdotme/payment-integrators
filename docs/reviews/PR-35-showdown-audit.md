@@ -34,7 +34,7 @@ coordinated `simple-kyc` work on both live tenants.
 
 ## Findings
 
-Severity is relative to a mainnet launch. **F1–F5 are fixed on this branch**; D1–D8 are deploy gates
+Severity is relative to a mainnet launch. **F1–F5 are fixed on this branch**; F6–F10 are accepted/documented; D1–D8 are deploy gates
 that correct code cannot save you from.
 
 ### F1 — HIGH (governance): every limit was owner-raisable without bound → **FIXED**
@@ -119,22 +119,28 @@ still come solely from the KYC tier and the region ceiling. It applies at both t
 from a sanctioned wallet is ever a requirement, that is a different and much larger design decision —
 raise it before assuming this covers it.
 
-### F6 — INFO: `onOrderCancel` is dead code on the live protocol (no fix — documented)
+### F6 — INFO: a block does not stop an order already placed (no fix — deliberate)
 
-Confirmed in the Investabl audit against the Base-mainnet Diamond: selector `0x7ff83a04` is absent
-from **all 21 facets**; the hook exists only on the unmerged `feat/integrator-on-order-cancel`.
-So `dailyTxCountLimit` bounds **placements** per day — a cancelled or expired order keeps its slot.
-Strictly safe (a slot can never be freed early ⇒ the cap cannot be exceeded); the cost is UX, and it
-bites harder at 5/day than it did at 10. Compounded by the short-TTL order expiry that has stranded
-orders before. Documented in the contract NatSpec and `showdown.md`; **surface remaining-count in the
-widget.**
+`setUserBlocked` gates _placement_ (`userBuyUsdcToSolana`, `userInitiateOfframp`, `validateOrder`).
+It does not gate `deliverOfframpUpi` or `onOrderComplete`, so an order placed before the block runs to
+completion.
 
-### F7 — INFO: the per-tx cap bounds the SELL _principal_, not principal + fee (no fix)
+That is the right trade in both directions. Blocking `deliverOfframpUpi` would leave a placed SELL
+unfunded, holding merchant capacity until it expires — the stranded-order failure that has bitten the
+INR and BRL relayers before. Blocking `onOrderComplete` would strand USDC the Diamond has already
+delivered, recoverable only through the 7-day rescue. **Operationally: a block takes effect from the
+next placement, not retroactively.** If an in-flight order must be stopped, that is a Diamond-side
+cancellation, not an integrator lever.
 
-`userInitiateOfframp` checks `amount`, but `deliverOfframpUpi` pulls the authoritative
-`actualUsdtAmount` (= principal + the Diamond's fee) from the proxy. So the value actually leaving a
-user can exceed their tier cap by the fee. Immaterial in size; noted so the cap is not described as a
-strict bound on value moved.
+### F7 — INFO: zeroing a higher tier's cell can invert the tiers (no fix — operator footgun)
+
+`effectiveLimit` reads `tierCap[userTier[user]][region]` — the user's _own_ tier, not the best cell
+available to them. So `setTierCap(TIER_KYC, REGION_INDIA, 0)` blocks passport-verified users from INR
+orders while liveness-only users keep their $20. Upgrading your KYC would then _reduce_ your access.
+
+Left as-is on purpose: making the lookup take the max across tiers at or below the user's would break
+the per-lane kill switch, which is the more valuable property. Noted so the inversion isn't a surprise
+if a lane is ever switched off — if you mean to stop everyone in a region, zero **both** cells.
 
 ### F8 — INFO: `userRescueStuckBridge` is the one path USDC reaches a user EOA (no fix — re-confirm)
 
@@ -144,6 +150,23 @@ fiat→spendable-USDC route that skips consumer-side fraud checks. The bound has
 **$200 per order** with the new matrix. The trade (bounded exposure vs. permanent loss of funds the
 user already paid fiat for) still looks right, but it is a design decision worth re-confirming at the
 new number rather than inheriting.
+
+### F9 — INFO: `onOrderCancel` is dead code on the live protocol (no fix — documented)
+
+Confirmed in the Investabl audit against the Base-mainnet Diamond: selector `0x7ff83a04` is absent
+from **all 21 facets**; the hook exists only on the unmerged `feat/integrator-on-order-cancel`.
+So `dailyTxCountLimit` bounds **placements** per day — a cancelled or expired order keeps its slot.
+Strictly safe (a slot can never be freed early ⇒ the cap cannot be exceeded); the cost is UX, and it
+bites harder at 5/day than it did at 10. Compounded by the short-TTL order expiry that has stranded
+orders before. Documented in the contract NatSpec and `showdown.md`; **surface remaining-count in the
+widget.**
+
+### F10 — INFO: the per-tx cap bounds the SELL _principal_, not principal + fee (no fix)
+
+`userInitiateOfframp` checks `amount`, but `deliverOfframpUpi` pulls the authoritative
+`actualUsdtAmount` (= principal + the Diamond's fee) from the proxy. So the value actually leaving a
+user can exceed their tier cap by the fee. Immaterial in size; noted so the cap is not described as a
+strict bound on value moved.
 
 ---
 
