@@ -10,9 +10,18 @@ import { ethers } from "hardhat";
  *     USDC here for burning without needing the flag)
  *   → set the simple-kyc attestor signers (liveness + KYC services)
  *
- * Tiers are enforced on-chain: liveness = $20/tx, passport+liveness = $50/tx.
- * The contract clamps whatever limit the simple-kyc service signs down to these
- * ceilings, so the tiers hold even if an attestor key is compromised.
+ * Limits are enforced on-chain as a (tier x region) matrix, where region is
+ * derived from the order's fiat currency — INR is India, everything else Abroad:
+ *
+ *     liveness           $20 India / $50  Abroad
+ *     passport+liveness  $100 India / $200 Abroad
+ *     5 orders/day per user, budgeted separately for onramp and offramp
+ *
+ * Each of those five numbers is ALSO an immutable MAX_* constant in the
+ * bytecode. The constructor and the owner's setters can only ever go at or
+ * below them, so the policy holds against a compromised attestor key AND a
+ * compromised owner key. Pass lower values here to launch tighter than policy;
+ * the owner can lower further later, never raise.
  *
  * ── CCTP / token caveat on Base Sepolia ────────────────────────────────────
  * CCTP burns only Circle-issued USDC. The Base Sepolia Diamond settles in a
@@ -31,8 +40,9 @@ import { ethers } from "hardhat";
  *   DIAMOND_ADDRESS=0x... USDC_ADDRESS=0x... \
  *   LIVENESS_ATTESTOR=0x... KYC_ATTESTOR=0x... \
  *   [TOKEN_MESSENGER=0x8FE6...] [MESSAGE_TRANSMITTER=0xE737...] \
- *   [SOLANA_DOMAIN=5] [DAILY_TX_COUNT_LIMIT=10] \
- *   [LIVENESS_TX_CAP=20000000] [KYC_TX_CAP=50000000] [SKIP_REGISTER=false] \
+ *   [SOLANA_DOMAIN=5] [DAILY_TX_COUNT_LIMIT=5] \
+ *   [LIVENESS_CAP_INDIA=20000000] [LIVENESS_CAP_ABROAD=50000000] \
+ *   [KYC_CAP_INDIA=100000000] [KYC_CAP_ABROAD=200000000] [SKIP_REGISTER=false] \
  *   npx hardhat run scripts/local/deploy-showdown.ts --network baseSepolia
  */
 
@@ -44,9 +54,11 @@ const MESSAGE_TRANSMITTER =
 const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
 const USDC_ADDRESS = process.env.USDC_ADDRESS || "";
 const SOLANA_DOMAIN = Number(process.env.SOLANA_DOMAIN || 5);
-const DAILY_TX_COUNT_LIMIT = process.env.DAILY_TX_COUNT_LIMIT || "10";
-const LIVENESS_TX_CAP = process.env.LIVENESS_TX_CAP || "20000000"; // $20
-const KYC_TX_CAP = process.env.KYC_TX_CAP || "50000000"; // $50
+const DAILY_TX_COUNT_LIMIT = process.env.DAILY_TX_COUNT_LIMIT || "5";
+const LIVENESS_CAP_INDIA = process.env.LIVENESS_CAP_INDIA || "20000000"; // $20
+const LIVENESS_CAP_ABROAD = process.env.LIVENESS_CAP_ABROAD || "50000000"; // $50
+const KYC_CAP_INDIA = process.env.KYC_CAP_INDIA || "100000000"; // $100
+const KYC_CAP_ABROAD = process.env.KYC_CAP_ABROAD || "200000000"; // $200
 const LIVENESS_ATTESTOR = process.env.LIVENESS_ATTESTOR || "";
 const KYC_ATTESTOR = process.env.KYC_ATTESTOR || "";
 const SKIP_REGISTER = process.env.SKIP_REGISTER === "true";
@@ -73,7 +85,32 @@ async function main() {
   console.log("TokenMessengerV2:    ", TOKEN_MESSENGER);
   console.log("MessageTransmitterV2:", MESSAGE_TRANSMITTER);
   console.log("Solana domain:       ", SOLANA_DOMAIN);
-  console.log(`Tiers: liveness=$${f(BigInt(LIVENESS_TX_CAP))} kyc=$${f(BigInt(KYC_TX_CAP))}`);
+  console.log(
+    `Caps: liveness $${f(BigInt(LIVENESS_CAP_INDIA))}/$${f(BigInt(LIVENESS_CAP_ABROAD))} ` +
+      `kyc $${f(BigInt(KYC_CAP_INDIA))}/$${f(BigInt(KYC_CAP_ABROAD))} (India/Abroad), ` +
+      `${DAILY_TX_COUNT_LIMIT}/day per direction`
+  );
+
+  // ── Mainnet guards ───────────────────────────────────────────────────────
+  // The CCTP V2 defaults above are the TESTNET addresses (identical across every
+  // supported EVM testnet). Base mainnet uses different ones, and a wrong
+  // messenger silently produces burns that can never be minted.
+  const chainId = Number((await ethers.provider.getNetwork()).chainId);
+  const isMainnet = chainId === 8453;
+  if (isMainnet) {
+    if (!process.env.TOKEN_MESSENGER || !process.env.MESSAGE_TRANSMITTER) {
+      throw new Error(
+        "Base mainnet: TOKEN_MESSENGER and MESSAGE_TRANSMITTER must be set explicitly " +
+          "to Circle's Base MAINNET CCTP V2 addresses. The script defaults are testnet-only."
+      );
+    }
+    if (process.env.DEPLOY_OWNER && me.toLowerCase() !== process.env.DEPLOY_OWNER.toLowerCase()) {
+      throw new Error(
+        `owner is immutable and is set to the deployer (${me}), but DEPLOY_OWNER is ` +
+          `${process.env.DEPLOY_OWNER}. Deploy FROM the intended owner — it cannot be transferred.`
+      );
+    }
+  }
 
   // Report up front whether the settlement token is actually CCTP-burnable —
   // it decides whether the bridge leg can run at all on this network.
@@ -83,6 +120,13 @@ async function main() {
     MINTER_ABI,
     deployer
   ).burnLimitsPerMessage(USDC_ADDRESS);
+  if (burnLimit === 0n && isMainnet) {
+    throw new Error(
+      `${USDC_ADDRESS} is NOT CCTP-burnable (burnLimitsPerMessage = 0). On mainnet that ` +
+        `means every onramp would complete and then fail to reach Solana. Check that USDC_ADDRESS ` +
+        `is canonical Circle USDC and that TOKEN_MESSENGER is the Base mainnet TokenMessengerV2.`
+    );
+  }
   if (burnLimit === 0n) {
     console.log(
       `\n⚠️  ${USDC_ADDRESS} is NOT a CCTP-burnable token (burnLimitsPerMessage = 0).\n` +
@@ -105,8 +149,10 @@ async function main() {
     BigInt(DAILY_TX_COUNT_LIMIT),
     LIVENESS_ATTESTOR,
     KYC_ATTESTOR,
-    BigInt(LIVENESS_TX_CAP),
-    BigInt(KYC_TX_CAP)
+    BigInt(LIVENESS_CAP_INDIA),
+    BigInt(LIVENESS_CAP_ABROAD),
+    BigInt(KYC_CAP_INDIA),
+    BigInt(KYC_CAP_ABROAD)
   );
   await integrator.deploymentTransaction()?.wait(2);
   const integratorAddr = await integrator.getAddress();
@@ -150,7 +196,7 @@ async function main() {
   console.log(`VITE_USDC_ADDRESS=${USDC_ADDRESS}`);
   console.log("\n--- verify ---");
   console.log(
-    `npx hardhat verify --network baseSepolia ${integratorAddr} ${DIAMOND_ADDRESS} ${USDC_ADDRESS} ${TOKEN_MESSENGER} ${MESSAGE_TRANSMITTER} ${SOLANA_DOMAIN} ${DAILY_TX_COUNT_LIMIT} ${LIVENESS_ATTESTOR} ${KYC_ATTESTOR} ${LIVENESS_TX_CAP} ${KYC_TX_CAP}`
+    `npx hardhat verify --network ${isMainnet ? "base" : "baseSepolia"} ${integratorAddr} ${DIAMOND_ADDRESS} ${USDC_ADDRESS} ${TOKEN_MESSENGER} ${MESSAGE_TRANSMITTER} ${SOLANA_DOMAIN} ${DAILY_TX_COUNT_LIMIT} ${LIVENESS_ATTESTOR} ${KYC_ATTESTOR} ${LIVENESS_CAP_INDIA} ${LIVENESS_CAP_ABROAD} ${KYC_CAP_INDIA} ${KYC_CAP_ABROAD}`
   );
 }
 

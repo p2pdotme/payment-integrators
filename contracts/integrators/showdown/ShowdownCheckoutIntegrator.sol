@@ -29,17 +29,43 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *              Diamond funded from that proxy balance, and receive fiat.
  *
  *         Both directions are gated by tiered simple-kyc attestations, since
- *         both convert between fiat and USDC the user actually controls:
+ *         both convert between fiat and USDC the user actually controls. The
+ *         per-tx cap is a function of the KYC tier AND the settlement region:
  *
- *           - No attestation        -> blocked entirely.
- *           - Liveness              -> per-tx cap = `tierCap[TIER_LIVENESS]` ($20).
- *           - Passport + liveness   -> per-tx cap = `tierCap[TIER_KYC]`      ($50).
+ *           | tier                  | India (INR) | Abroad |
+ *           |-----------------------|-------------|--------|
+ *           | 0 — none              |     blocked | blocked|
+ *           | 1 — liveness          |         $20 |    $50 |
+ *           | 2 — passport+liveness |        $100 |   $200 |
  *
- *         The effective cap is `min(attested limit, tierCap[tier])`: the
+ *         The effective cap is `min(attested limit, tierCap[tier][region])`: the
  *         simple-kyc service signs a dollar limit into the attestation, and this
- *         contract additionally clamps it to an on-chain per-tier ceiling. The
- *         $20 / $50 tiers are therefore enforced by the contract itself and a
- *         compromised attestor key cannot authorize more than the tier allows.
+ *         contract additionally clamps it to an on-chain per-(tier, region)
+ *         ceiling. A compromised attestor key therefore cannot authorize more
+ *         than the tier allows.
+ *
+ *         Those four numbers, plus the 5-orders-per-day count, are also fixed in
+ *         the bytecode as `MAX_*` constants. `setTierCap` /
+ *         `setDailyTxCountLimit` can only ever move a limit DOWN from its
+ *         ceiling — so the policy holds against a malicious or compromised
+ *         owner, not merely against a bad attestor. This matters because a
+ *         whitelisted integrator bypasses the protocol's own RP / daily /
+ *         monthly / yearly volume limits and is trusted to enforce its own in
+ *         `validateOrder` (see `IB2BGateway`).
+ *
+ *         REGION IS DERIVED FROM THE ORDER'S FIAT CURRENCY, not from the user's
+ *         location: `INR` settles on an Indian rail and takes the India column;
+ *         every other currency takes the Abroad column. The user picks the
+ *         currency, so the real constraint is which fiat rail they can actually
+ *         settle on — this is a payment-rail gate, not a nationality gate. If a
+ *         nationality gate is ever needed it belongs in the attestation.
+ *
+ *         The owner can additionally `setUserBlocked` a wallet, which zeroes its
+ *         effective limit in both directions. That is a binary gate only —
+ *         limits themselves come solely from the KYC tier and the region
+ *         ceiling, never from a per-user owner setting. A blocked user can still
+ *         reach `userBridgeBackToSolana` and `userRescueStuckBridge`, so a block
+ *         never traps funds the user already paid for.
  *
  * @dev SINGLE-TOKEN MODEL. `usdc` is simultaneously (a) the token the Diamond
  *      settles in and (b) the token CCTP burns. These coincide on Base mainnet,
@@ -73,8 +99,13 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     error InvalidAddress();
     error InvalidAmount();
     error InvalidTier();
+    error InvalidRegion();
     error OrderAlreadyFulfilled();
     error OrderAlreadyCancelled();
+    error Reentrancy();
+
+    /// @notice A limit was set above its immutable `MAX_*` policy ceiling.
+    error CapExceedsCeiling();
 
     // KYC / attestation
     error AttestorNotSet();
@@ -83,6 +114,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     error InvalidSignature();
     error NotKycVerified();
     error KycLimitExceeded();
+    error UserIsBlocked();
 
     // Bridge
     error InvalidSolanaRecipient();
@@ -92,6 +124,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     error RescueTooEarly();
     error NotOrderOwner();
     error WithdrawExceedsSurplus();
+    error UnexpectedRecipient();
 
     // Offramp
     error OfframpDisabled();
@@ -104,8 +137,10 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     event LivenessAttestorUpdated(address indexed attestor);
     event KycAttestorUpdated(address indexed attestor);
-    event TierCapUpdated(uint8 indexed tier, uint256 cap);
+    /// @param region 0 = India (INR), 1 = Abroad (every other currency).
+    event TierCapUpdated(uint8 indexed tier, uint8 indexed region, uint256 cap);
     event DailyTxCountLimitUpdated(uint256 count);
+    event UserBlockedUpdated(address indexed user, bool isBlocked);
     event OfframpEnabledUpdated(bool enabled);
     event OfframpRelayerUpdated(address indexed relayer);
     event BridgeMaxFeeBpsUpdated(uint256 bps);
@@ -131,6 +166,10 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         bytes32 solanaRecipient
     );
     event OnrampOrderFulfilled(uint256 indexed orderId, address indexed user, uint256 amount);
+    /// @notice The Diamond delivered an amount other than the one placed. The
+    ///         session is re-pinned to what actually arrived — see
+    ///         `onOrderComplete`. Should never fire; alert if it does.
+    event OnrampAmountAdjusted(uint256 indexed orderId, uint256 placed, uint256 delivered);
     event BridgedToSolana(
         uint256 indexed orderId,
         address indexed user,
@@ -157,11 +196,43 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     event OfframpUpiDelivered(uint256 indexed orderId, uint256 usdcPulled);
     event OfframpReconciled(uint256 indexed orderId, uint8 status);
 
-    // ─── Tier constants ───────────────────────────────────────────────
+    // ─── Tier / region constants ──────────────────────────────────────
 
     uint8 public constant TIER_NONE = 0;
     uint8 public constant TIER_LIVENESS = 1;
     uint8 public constant TIER_KYC = 2;
+
+    /// @notice Settlement region, derived from the order's fiat currency.
+    uint8 public constant REGION_INDIA = 0;
+    uint8 public constant REGION_ABROAD = 1;
+
+    /// @notice The fiat currency that settles on an Indian rail. Any other
+    ///         currency is treated as Abroad. `bytes32("INR")` is the same
+    ///         right-padded encoding the Diamond and the widget use.
+    bytes32 public constant INDIA_CURRENCY = bytes32("INR");
+
+    // ─── Immutable policy ceilings ────────────────────────────────────
+    //
+    // Fixed in the bytecode, so they are auditable without reading storage and
+    // cannot be moved by anyone — owner included. `setTierCap` and
+    // `setDailyTxCountLimit` may only ever set a value at or below these.
+
+    /// @notice Liveness tier, India (INR) — $20 per tx.
+    uint256 public constant MAX_TIER_CAP_LIVENESS_INDIA = 20e6;
+    /// @notice Liveness tier, abroad — $50 per tx.
+    uint256 public constant MAX_TIER_CAP_LIVENESS_ABROAD = 50e6;
+    /// @notice Passport + liveness tier, India (INR) — $100 per tx.
+    uint256 public constant MAX_TIER_CAP_KYC_INDIA = 100e6;
+    /// @notice Passport + liveness tier, abroad — $200 per tx.
+    uint256 public constant MAX_TIER_CAP_KYC_ABROAD = 200e6;
+    /// @notice Max orders per user per UTC day, applied to each direction
+    ///         independently (see `dailyTxCountLimit`).
+    uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5;
+    /// @notice Ceiling on the CCTP attestation fee the owner may agree to pay,
+    ///         as bps of the burn. Circle's Fast Transfer fee has run ~1-14 bps;
+    ///         1% is ample headroom. A burn that fails on fee grounds is
+    ///         fail-closed and retryable, never a loss.
+    uint256 public constant MAX_BRIDGE_MAX_FEE_BPS = 100;
 
     /// @notice How long an onramp's USDC must sit unbridged before the buyer
     ///         may pull it back to their own wallet. Only reachable when CCTP
@@ -211,13 +282,34 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     // ─── Configurable limits ──────────────────────────────────────────
 
-    /// @notice On-chain per-tx ceiling per KYC tier (micro-USDC, 6dp):
-    ///         tierCap[1] = $20 (liveness), tierCap[2] = $50 (passport+liveness).
-    ///         A tier whose cap is 0 is effectively disabled.
-    mapping(uint8 => uint256) public tierCap;
-    /// @notice Max number of onramp BUY orders a user can place per day.
-    ///         0 = no daily count limit.
+    /// @notice On-chain per-tx ceiling, keyed `tierCap[tier][region]`
+    ///         (micro-USDC, 6dp). Set at deploy, owner-lowerable, and hard
+    ///         bounded by the matching `MAX_TIER_CAP_*` constant. A cell set to
+    ///         0 disables that (tier, region) without touching any attestation
+    ///         — the kill switch for one lane.
+    mapping(uint8 => mapping(uint8 => uint256)) public tierCap;
+
+    /// @notice Max orders a user may place per UTC day, applied SEPARATELY to
+    ///         each direction: `dailyTxCountLimit` onramp BUYs and, independently,
+    ///         `dailyTxCountLimit` offramp SELLs. Must be 1..`MAX_DAILY_TX_COUNT_LIMIT`;
+    ///         0 (previously "unlimited") is rejected.
+    /// @dev    In practice this bounds PLACEMENTS per day, not settled orders:
+    ///         the live Diamond never calls `onOrderCancel` (the selector is
+    ///         absent from every mainnet facet), so a cancelled or expired order
+    ///         keeps its slot. Safe direction — a slot can never be freed early,
+    ///         so the cap cannot be exceeded — but a user whose orders keep
+    ///         failing is locked out until the next UTC day (00:00 UTC =
+    ///         05:30 IST).
     uint256 public dailyTxCountLimit;
+
+    /// @notice Wallets the owner has blocked. A binary gate: it zeroes the
+    ///         effective limit in both directions and nothing else. Limits are
+    ///         never set per-user — they come solely from the KYC tier and the
+    ///         region ceiling.
+    /// @dev    Deliberately does NOT gate `userBridgeBackToSolana` or
+    ///         `userRescueStuckBridge`: those move only the user's own funds
+    ///         back out, so a block never strands money.
+    mapping(address => bool) public blocked;
 
     // ─── Offramp config ───────────────────────────────────────────────
 
@@ -243,7 +335,8 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     // ─── Per-user entitlement ─────────────────────────────────────────
 
     /// @notice Per-tx USDC ceiling attested by the simple-kyc service. The
-    ///         effective cap is this clamped by `tierCap[userTier[user]]`.
+    ///         effective cap is this clamped by
+    ///         `tierCap[userTier[user]][regionFor(currency)]`.
     mapping(address => uint256) public grantedLimit;
     /// @notice Highest KYC tier the user has claimed (see TIER_* constants).
     mapping(address => uint8) public userTier;
@@ -254,7 +347,12 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     // ─── Accounting ───────────────────────────────────────────────────
 
+    /// @notice user => UTC day => onramp BUY orders placed that day.
     mapping(address => mapping(uint256 => uint256)) public userDailyCount;
+    /// @notice user => UTC day => offramp SELL orders placed that day. Counted
+    ///         separately from the onramp so each direction gets its own
+    ///         `dailyTxCountLimit` budget.
+    mapping(address => mapping(uint256 => uint256)) public userDailyOfframpCount;
 
     /// @notice proxy address => the user it belongs to. Lets `validateOrder`
     ///         tell an offramp SELL (placed with `order.user` = the seller's
@@ -295,6 +393,20 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     // ─── Modifiers ────────────────────────────────────────────────────
 
+    /// @dev Transient storage (EIP-1153), matching `UserProxy`. Auto-clears at
+    ///      end-of-tx. Guards the user-facing value-moving entrypoints only —
+    ///      NOT `validateOrder` (the Diamond calls it back inside
+    ///      `userBuyUsdcToSolana` / `userInitiateOfframp`) and NOT
+    ///      `onOrderComplete` / `selfBridge` (which self-call by design).
+    bool private transient _entered;
+
+    modifier nonReentrant() {
+        if (_entered) revert Reentrancy();
+        _entered = true;
+        _;
+        _entered = false;
+    }
+
     modifier onlyDiamond() {
         if (msg.sender != diamond) revert OnlyDiamond();
         _;
@@ -315,11 +427,18 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      * @param _tokenMessenger     CCTP V2 TokenMessengerV2.
      * @param _messageTransmitter CCTP V2 MessageTransmitterV2.
      * @param _solanaDomain       CCTP domain of the user-facing chain (Solana = 5).
-     * @param _dailyTxCountLimit  Max onramp BUYs per user per day (0 = none).
+     * @param _dailyTxCountLimit  Orders per user per UTC day, applied to each
+     *                            direction independently. 1..5; 0 is rejected.
      * @param _livenessAttestor   Liveness service signer (may be 0, set later).
      * @param _kycAttestor        KYC service signer (may be 0, set later).
-     * @param _livenessTxCap      Per-tx cap for the liveness tier ($20 = 20e6).
-     * @param _kycTxCap           Per-tx cap for the KYC tier ($50 = 50e6).
+     * @param _livenessCapIndia   Liveness cap for INR orders   (<= $20).
+     * @param _livenessCapAbroad  Liveness cap for other fiat   (<= $50).
+     * @param _kycCapIndia        Passport cap for INR orders   (<= $100).
+     * @param _kycCapAbroad       Passport cap for other fiat   (<= $200).
+     *
+     * @dev Every cap is checked against its immutable `MAX_TIER_CAP_*` ceiling,
+     *      so a deploy cannot start above policy any more than a setter can move
+     *      it there later.
      */
     constructor(
         address _diamond,
@@ -330,8 +449,10 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         uint256 _dailyTxCountLimit,
         address _livenessAttestor,
         address _kycAttestor,
-        uint256 _livenessTxCap,
-        uint256 _kycTxCap
+        uint256 _livenessCapIndia,
+        uint256 _livenessCapAbroad,
+        uint256 _kycCapIndia,
+        uint256 _kycCapAbroad
     ) {
         if (
             _diamond == address(0) ||
@@ -346,14 +467,14 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         tokenMessenger = ITokenMessengerV2(_tokenMessenger);
         messageTransmitter = IMessageTransmitterV2(_messageTransmitter);
         solanaDomain = _solanaDomain;
-        dailyTxCountLimit = _dailyTxCountLimit;
         livenessAttestor = _livenessAttestor;
         kycAttestor = _kycAttestor;
 
-        tierCap[TIER_LIVENESS] = _livenessTxCap;
-        tierCap[TIER_KYC] = _kycTxCap;
-        emit TierCapUpdated(TIER_LIVENESS, _livenessTxCap);
-        emit TierCapUpdated(TIER_KYC, _kycTxCap);
+        _setDailyTxCountLimit(_dailyTxCountLimit);
+        _setTierCap(TIER_LIVENESS, REGION_INDIA, _livenessCapIndia);
+        _setTierCap(TIER_LIVENESS, REGION_ABROAD, _livenessCapAbroad);
+        _setTierCap(TIER_KYC, REGION_INDIA, _kycCapIndia);
+        _setTierCap(TIER_KYC, REGION_ABROAD, _kycCapAbroad);
 
         offrampEnabled = true;
         // Standard Transfer, no attestation fee — see `bridgeMaxFeeBps`.
@@ -374,15 +495,51 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         emit KycAttestorUpdated(attestor);
     }
 
-    /// @notice Adjust the on-chain per-tx ceiling for a KYC tier. Setting a cap
-    ///         to 0 disables that tier without touching anyone's attestation.
-    function setTierCap(uint8 tier, uint256 cap) external onlyOwner {
-        if (tier != TIER_LIVENESS && tier != TIER_KYC) revert InvalidTier();
-        tierCap[tier] = cap;
-        emit TierCapUpdated(tier, cap);
+    /**
+     * @notice Lower the per-tx cap for one (tier, region) cell. Setting a cap to
+     *         0 disables that lane without touching anyone's attestation.
+     * @dev    Can only ever set a value AT OR BELOW the matching immutable
+     *         `MAX_TIER_CAP_*` ceiling — the owner may tighten policy, never
+     *         loosen it past what the bytecode commits to.
+     */
+    function setTierCap(uint8 tier, uint8 region, uint256 cap) external onlyOwner {
+        _setTierCap(tier, region, cap);
     }
 
+    /// @notice Set the per-direction daily order count. 1..`MAX_DAILY_TX_COUNT_LIMIT`.
+    /// @dev    0 is rejected: it used to mean "unlimited", which would be a way
+    ///         around the ceiling. Use `setTierCap(tier, region, 0)` to stop a lane.
     function setDailyTxCountLimit(uint256 count) external onlyOwner {
+        _setDailyTxCountLimit(count);
+    }
+
+    /**
+     * @notice Block or unblock a wallet. A blocked wallet's effective limit is 0
+     *         in both directions, so it can neither onramp nor offramp.
+     *
+     * @dev    Binary only — this never sets a per-user limit. Limits come solely
+     *         from the KYC tier and the region ceiling. It also does not gate
+     *         `userBridgeBackToSolana` or `userRescueStuckBridge`, so a blocked
+     *         user can always get their own already-paid-for funds back out; a
+     *         block stops new conversions, it does not seize anything.
+     */
+    function setUserBlocked(address user, bool isBlocked) external onlyOwner {
+        if (user == address(0)) revert InvalidAddress();
+        blocked[user] = isBlocked;
+        emit UserBlockedUpdated(user, isBlocked);
+    }
+
+    function _setTierCap(uint8 tier, uint8 region, uint256 cap) internal {
+        if (tier != TIER_LIVENESS && tier != TIER_KYC) revert InvalidTier();
+        if (region != REGION_INDIA && region != REGION_ABROAD) revert InvalidRegion();
+        if (cap > maxTierCap(tier, region)) revert CapExceedsCeiling();
+        tierCap[tier][region] = cap;
+        emit TierCapUpdated(tier, region, cap);
+    }
+
+    function _setDailyTxCountLimit(uint256 count) internal {
+        if (count == 0) revert InvalidAmount();
+        if (count > MAX_DAILY_TX_COUNT_LIMIT) revert CapExceedsCeiling();
         dailyTxCountLimit = count;
         emit DailyTxCountLimitUpdated(count);
     }
@@ -397,8 +554,11 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         emit OfframpRelayerUpdated(relayer);
     }
 
+    /// @dev Bounded by `MAX_BRIDGE_MAX_FEE_BPS` so a misconfigured or
+    ///      compromised owner cannot hand an arbitrary share of every burn to
+    ///      the attestation service.
     function setBridgeMaxFeeBps(uint256 bps) external onlyOwner {
-        if (bps > 10_000) revert InvalidAmount();
+        if (bps > MAX_BRIDGE_MAX_FEE_BPS) revert CapExceedsCeiling();
         bridgeMaxFeeBps = bps;
         emit BridgeMaxFeeBpsUpdated(bps);
     }
@@ -417,7 +577,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      *      buyer). The owner therefore never has custody of a user's in-flight
      *      onramp.
      */
-    function withdrawUsdc(address to, uint256 amount) external onlyOwner {
+    function withdrawUsdc(address to, uint256 amount) external onlyOwner nonReentrant {
         if (to == address(0)) revert InvalidAddress();
         uint256 bal = usdc.balanceOf(address(this));
         uint256 reserved = unbridgedTotal;
@@ -432,7 +592,8 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      * @notice Verify and record a liveness-tier attestation for `msg.sender`.
      * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
      * @param limit     Attested per-tx USDC ceiling (micro-USDC, 6dp). The
-     *                  effective cap is `min(limit, tierCap[TIER_LIVENESS])`.
+     *                  effective cap is `min(limit, tierCap[TIER_LIVENESS][region])`
+     *                  — $20 for INR orders, $50 for anything else.
      * @param expiry    Unix seconds; the attestation must be claimed before this.
      * @param signature 65-byte secp256k1 signature (r ‖ s ‖ v) from the service.
      */
@@ -503,18 +664,48 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     // ─── Views ────────────────────────────────────────────────────────
 
+    /// @notice The settlement region an order in `currency` falls under.
+    ///         `INR` is India; every other currency is Abroad.
+    function regionFor(bytes32 currency) public pure returns (uint8) {
+        return currency == INDIA_CURRENCY ? REGION_INDIA : REGION_ABROAD;
+    }
+
+    /// @notice The immutable policy ceiling for one (tier, region) cell — the
+    ///         most `setTierCap` can ever be set to.
+    function maxTierCap(uint8 tier, uint8 region) public pure returns (uint256) {
+        if (tier == TIER_LIVENESS) {
+            return
+                region == REGION_INDIA ? MAX_TIER_CAP_LIVENESS_INDIA : MAX_TIER_CAP_LIVENESS_ABROAD;
+        }
+        if (tier == TIER_KYC) {
+            return region == REGION_INDIA ? MAX_TIER_CAP_KYC_INDIA : MAX_TIER_CAP_KYC_ABROAD;
+        }
+        return 0;
+    }
+
     /**
-     * @notice The effective per-tx USDC ceiling for `user`, applied to BOTH the
-     *         onramp and the offramp: the limit their attestation carries,
-     *         clamped by this contract's ceiling for the tier they reached.
-     *         0 means "cannot transact".
+     * @notice The effective per-tx USDC ceiling for `user` settling in
+     *         `currency`, applied to BOTH the onramp and the offramp: the limit
+     *         their attestation carries, clamped by this contract's ceiling for
+     *         the tier they reached and the region the currency settles in.
+     *         0 means "cannot transact" — unverified, blocked, or a lane the
+     *         owner has switched off.
      */
-    function effectiveLimit(address user) public view returns (uint256) {
+    function effectiveLimit(address user, bytes32 currency) public view returns (uint256) {
+        if (blocked[user]) return 0;
         uint8 tier = userTier[user];
         if (tier == TIER_NONE) return 0;
         uint256 lim = grantedLimit[user];
-        uint256 cap = tierCap[tier];
+        uint256 cap = tierCap[tier][regionFor(currency)];
         return lim < cap ? lim : cap;
+    }
+
+    /// @notice Both region limits for `user` in one call, for the UI: what they
+    ///         may send settling in INR vs in any other currency.
+    function effectiveLimits(address user) external view returns (uint256 india, uint256 abroad) {
+        india = effectiveLimit(user, INDIA_CURRENCY);
+        // Any non-INR sentinel resolves to the Abroad column.
+        abroad = effectiveLimit(user, bytes32(0));
     }
 
     /// @notice Predicts the deterministic proxy address for `user`. This is the
@@ -542,11 +733,20 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         return usdc.balanceOf(proxyAddress(user));
     }
 
+    /// @notice Onramp BUY placements left for `user` today (UTC).
     function getRemainingDailyCount(address user) external view returns (uint256) {
-        if (dailyTxCountLimit == 0) return type(uint256).max;
-        uint256 count = userDailyCount[user][block.timestamp / 1 days];
-        if (count >= dailyTxCountLimit) return 0;
-        return dailyTxCountLimit - count;
+        return _remaining(userDailyCount[user][block.timestamp / 1 days]);
+    }
+
+    /// @notice Offramp SELL placements left for `user` today (UTC). Budgeted
+    ///         separately from the onramp.
+    function getRemainingOfframpDailyCount(address user) external view returns (uint256) {
+        return _remaining(userDailyOfframpCount[user][block.timestamp / 1 days]);
+    }
+
+    function _remaining(uint256 used) private view returns (uint256) {
+        uint256 limit = dailyTxCountLimit;
+        return used >= limit ? 0 : limit - used;
     }
 
     function getSession(uint256 orderId) external view returns (Session memory) {
@@ -580,13 +780,15 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         string calldata pubKey,
         uint256 preferredPaymentChannelConfigId,
         uint256 fiatAmountLimit
-    ) external returns (uint256 orderId) {
+    ) external nonReentrant returns (uint256 orderId) {
         if (amount == 0) revert InvalidAmount();
         if (solanaRecipient == bytes32(0)) revert InvalidSolanaRecipient();
 
         // Friendly pre-checks; validateOrder re-enforces these authoritatively
         // when the Diamond calls back, and reserves the daily-count slot there.
-        uint256 lim = effectiveLimit(msg.sender);
+        // `currency` picks the region column: INR -> India, anything else -> Abroad.
+        if (blocked[msg.sender]) revert UserIsBlocked();
+        uint256 lim = effectiveLimit(msg.sender, currency);
         if (lim == 0) revert NotKycVerified();
         if (amount > lim) revert KycLimitExceeded();
 
@@ -655,30 +857,42 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      *
      * @dev An offramp SELL is placed with `order.user` = the seller's own proxy,
      *      so `proxyOwner` resolves it back to the human and their tier is
-     *      checked. A BUY arrives with the user's EOA. Only BUYs consume a
-     *      daily-count slot: SELLs get no `onOrderCancel` callback from the
-     *      gateway, so a slot reserved for one could never be released.
+     *      checked. A BUY arrives with the user's EOA. Each direction consumes a
+     *      slot from its OWN daily budget, so 5/day means 5 onramps and,
+     *      independently, 5 offramps.
+     *
+     *      Neither counter is ever released: the live Diamond does not call
+     *      `onOrderCancel` at all, and the gateway would only ever call it for a
+     *      BUY. Slots are therefore placements/day in both directions — the safe
+     *      direction, since a slot can never be freed early.
+     *
+     *      `currency` selects the region column, so the same wallet legitimately
+     *      gets a different cap for an INR order than for a foreign-currency one.
      */
     function validateOrder(
         address user,
         uint256 amount,
-        bytes32 /* currency */
+        bytes32 currency
     ) external onlyDiamond returns (bool allowed) {
+        uint256 dayIndex = block.timestamp / 1 days;
+
         address seller = proxyOwner[user];
         if (seller != address(0)) {
-            uint256 sellerLim = effectiveLimit(seller);
-            return sellerLim != 0 && amount <= sellerLim;
+            uint256 sellerLim = effectiveLimit(seller, currency);
+            if (sellerLim == 0 || amount > sellerLim) return false;
+
+            uint256 sellCount = userDailyOfframpCount[seller][dayIndex];
+            if (sellCount + 1 > dailyTxCountLimit) return false;
+            userDailyOfframpCount[seller][dayIndex] = sellCount + 1;
+            return true;
         }
 
-        uint256 lim = effectiveLimit(user);
+        uint256 lim = effectiveLimit(user, currency);
         if (lim == 0 || amount > lim) return false;
 
-        if (dailyTxCountLimit != 0) {
-            uint256 dayIndex = block.timestamp / 1 days;
-            uint256 count = userDailyCount[user][dayIndex];
-            if (count + 1 > dailyTxCountLimit) return false;
-            userDailyCount[user][dayIndex] = count + 1;
-        }
+        uint256 count = userDailyCount[user][dayIndex];
+        if (count + 1 > dailyTxCountLimit) return false;
+        userDailyCount[user][dayIndex] = count + 1;
         return true;
     }
 
@@ -694,16 +908,43 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      *      delivered USDC with no session record. Failing closed instead leaves
      *      the order marked fulfilled-but-unbridged and recoverable via
      *      `retryBridge` or `userRescueStuckBridge`.
+     *
+     *      Two guards keep the core accounting invariant — `usdc.balanceOf(this)
+     *      >= unbridgedTotal` — true, which is what makes `withdrawUsdc`,
+     *      `retryBridge` and `userRescueStuckBridge` safe against each other.
+     *      Unbridged onramps share one pooled balance here, so reserving USDC
+     *      that never arrived would let one order's burn consume another
+     *      buyer's funds:
+     *
+     *        1. `recipientAddr` must be this contract. The onramp pins it at
+     *           placement, so this can only fail if the routing ever changes —
+     *           and then the USDC is not here, so recording it would be a lie.
+     *           Reverting is correct: the gateway swallows it and nothing is
+     *           stranded here, because nothing arrived here.
+     *        2. The session is re-pinned to the amount actually DELIVERED. Here
+     *           a revert would be wrong — the USDC did arrive, and a swallowed
+     *           revert would leave it with no session record, i.e. sweepable by
+     *           the owner as "surplus". Trusting the delivered figure keeps it
+     *           reserved and refundable. Sibling integrators (LotPot, Investabl)
+     *           revert with `AmountMismatch` instead; they can, because they do
+     *           not pool user funds.
      */
     function onOrderComplete(
         uint256 orderId,
         address /* user */,
-        uint256 /* amount */,
-        address /* recipientAddr */
+        uint256 amount,
+        address recipientAddr
     ) external onlyDiamond {
         Session storage session = sessions[orderId];
         if (session.user == address(0)) return; // unknown / non-BUY order — no-op
         if (session.fulfilled) revert OrderAlreadyFulfilled();
+        if (recipientAddr != address(this)) revert UnexpectedRecipient();
+
+        if (amount != session.amount) {
+            emit OnrampAmountAdjusted(orderId, session.amount, amount);
+            session.amount = amount;
+        }
+
         session.fulfilled = true;
         session.completedAt = uint32(block.timestamp);
         unbridgedTotal += session.amount;
@@ -720,6 +961,20 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      * @notice BUY cancellation hook — releases the daily-count slot reserved in
      *         validateOrder, keyed on the placement-day snapshot. Tolerates
      *         unknown / already-finalized / SELL orders (best-effort).
+     *
+     * @dev [live protocol] NOT CALLED TODAY. The mainnet Diamond's
+     *      `IP2PIntegrator` has only `validateOrder` + `onOrderComplete`; the
+     *      `onOrderCancel` selector `0x7ff83a04` is absent from all 21 facets
+     *      and exists only on the unmerged `feat/integrator-on-order-cancel`
+     *      branch. So this is forward-compatible dead code, and until it ships
+     *      `dailyTxCountLimit` bounds PLACEMENTS per day: a cancelled or expired
+     *      order keeps its slot. Strictly safe (a slot can never be freed early,
+     *      so the cap can't be exceeded); the cost is UX, and at 5/day it bites
+     *      sooner than it did at 10.
+     *
+     *      There is deliberately no offramp counterpart: the gateway only ever
+     *      calls this for a BUY, so an offramp slot could never be released
+     *      either way.
      */
     function onOrderCancel(uint256 orderId) external onlyDiamond {
         Session storage session = sessions[orderId];
@@ -728,12 +983,10 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         if (session.cancelled) revert OrderAlreadyCancelled();
         session.cancelled = true;
 
-        if (dailyTxCountLimit != 0) {
-            uint256 day = uint256(session.placementDay);
-            uint256 count = userDailyCount[session.user][day];
-            if (count > 0) {
-                userDailyCount[session.user][day] = count - 1;
-            }
+        uint256 day = uint256(session.placementDay);
+        uint256 count = userDailyCount[session.user][day];
+        if (count > 0) {
+            userDailyCount[session.user][day] = count - 1;
         }
     }
 
@@ -746,7 +999,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      *         only pay the gas. Reverts bubble up so the caller sees why CCTP
      *         refused.
      */
-    function retryBridge(uint256 orderId) external {
+    function retryBridge(uint256 orderId) external nonReentrant {
         Session storage session = sessions[orderId];
         if (session.user == address(0)) revert UnknownOrder();
         if (!session.fulfilled) revert OrderNotFulfilled();
@@ -804,7 +1057,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      *      for it, they are attested, and the amount is bounded by their tier
      *      cap ($20 / $50). It is unreachable while CCTP is healthy.
      */
-    function userRescueStuckBridge(uint256 orderId) external {
+    function userRescueStuckBridge(uint256 orderId) external nonReentrant {
         Session storage session = sessions[orderId];
         if (session.user == address(0)) revert UnknownOrder();
         if (session.user != msg.sender) revert NotOrderOwner();
@@ -847,7 +1100,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      *
      * @param solanaRecipient The user's USDC associated token account (ATA).
      */
-    function userBridgeBackToSolana(uint256 amount, bytes32 solanaRecipient) external {
+    function userBridgeBackToSolana(uint256 amount, bytes32 solanaRecipient) external nonReentrant {
         if (amount == 0) revert InvalidAmount();
         if (solanaRecipient == bytes32(0)) revert InvalidSolanaRecipient();
 
@@ -897,11 +1150,12 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         uint256 circleId,
         uint256 preferredPaymentChannelConfigId,
         string calldata userPubKey
-    ) external returns (uint256 orderId) {
+    ) external nonReentrant returns (uint256 orderId) {
         if (!offrampEnabled) revert OfframpDisabled();
         if (amount == 0) revert InvalidAmount();
 
-        uint256 lim = effectiveLimit(msg.sender);
+        if (blocked[msg.sender]) revert UserIsBlocked();
+        uint256 lim = effectiveLimit(msg.sender, currency);
         if (lim == 0) revert NotKycVerified();
         if (amount > lim) revert KycLimitExceeded();
 
@@ -960,7 +1214,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      *         `actualUsdtAmount` (principal + fee) from the Diamond rather than
      *         assuming the principal. Callable by the initiator or the relayer.
      */
-    function deliverOfframpUpi(uint256 orderId, string calldata encUpi) external {
+    function deliverOfframpUpi(uint256 orderId, string calldata encUpi) external nonReentrant {
         OfframpRecord memory record = offramps[orderId];
         if (!record.initialized) revert OfframpRecordNotFound();
         if (msg.sender != orderInitiator[orderId] && msg.sender != offrampRelayer) {

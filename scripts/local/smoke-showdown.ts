@@ -72,15 +72,27 @@ async function main() {
   const chainId = (await ethers.provider.getNetwork()).chainId;
   const integrator = await ethers.getContractAt("ShowdownCheckoutIntegrator", SHOWDOWN_ADDRESS);
 
+  const INR = ethers.encodeBytes32String("INR");
+  // Any non-INR currency resolves to the Abroad column.
+  const USD = ethers.encodeBytes32String("USD");
+
   console.log("signer:    ", me);
   console.log("integrator:", SHOWDOWN_ADDRESS);
   console.log("diamond:   ", await integrator.diamond());
   console.log("usdc:      ", await integrator.usdc());
   console.log("messenger: ", await integrator.tokenMessenger());
   console.log("solanaDom: ", await integrator.solanaDomain());
+  // tierCap[tier][region] — region 0 = India (INR), 1 = Abroad.
   console.log(
-    `tierCaps:   liveness=$${f(await integrator.tierCap(1))} kyc=$${f(await integrator.tierCap(2))}`
+    `tierCaps:   liveness $${f(await integrator.tierCap(1, 0))}/$${f(await integrator.tierCap(1, 1))} ` +
+      `kyc $${f(await integrator.tierCap(2, 0))}/$${f(await integrator.tierCap(2, 1))} (India/Abroad)`
   );
+  console.log(
+    `ceilings:   liveness $${f(await integrator.maxTierCap(1, 0))}/$${f(await integrator.maxTierCap(1, 1))} ` +
+      `kyc $${f(await integrator.maxTierCap(2, 0))}/$${f(await integrator.maxTierCap(2, 1))} ` +
+      `| daily ${await integrator.MAX_DAILY_TX_COUNT_LIMIT()}/direction (immutable)`
+  );
+  console.log(`dailyLimit: ${await integrator.dailyTxCountLimit()} per direction per UTC day`);
 
   async function signAttestation(
     service: "kyc" | "liveness",
@@ -126,11 +138,11 @@ async function main() {
     );
   }
   const tierNow = await integrator.userTier(me);
-  const livenessLimit = await integrator.effectiveLimit(me);
+  const livenessLimit = await integrator.effectiveLimit(me, INR);
   console.log(`  tier=${tierNow} granted=$${f(await integrator.grantedLimit(me))}`);
   if (tierNow === 1n) {
     console.log(
-      `  ${ok(livenessLimit === ethers.parseUnits("20", 6))} effectiveLimit clamped to $${f(livenessLimit)} (expect $20)`
+      `  ${ok(livenessLimit === ethers.parseUnits("20", 6))} effectiveLimit (INR) clamped to $${f(livenessLimit)} (expect $20)`
     );
   } else {
     // Re-run against a signer already upgraded to KYC — the liveness ceiling
@@ -150,10 +162,14 @@ async function main() {
       (t: bigint) => t >= 2n
     );
   }
-  const kycLimit = await integrator.effectiveLimit(me);
+  const kycLimit = await integrator.effectiveLimit(me, INR);
+  const kycLimitAbroad = await integrator.effectiveLimit(me, USD);
   console.log(`  tier=${await integrator.userTier(me)}`);
   console.log(
-    `  ${ok(kycLimit === ethers.parseUnits("50", 6))} effectiveLimit clamped to $${f(kycLimit)} (expect $50)`
+    `  ${ok(kycLimit === ethers.parseUnits("100", 6))} effectiveLimit (INR) clamped to $${f(kycLimit)} (expect $100)`
+  );
+  console.log(
+    `  ${ok(kycLimitAbroad === ethers.parseUnits("200", 6))} effectiveLimit (USD) clamped to $${f(kycLimitAbroad)} (expect $200)`
   );
 
   // 3. Views the widget depends on.
@@ -168,7 +184,6 @@ async function main() {
 
   // 4. Simulate the full onramp path without placing a live order.
   const ata = "0x" + "a7".repeat(32);
-  const INR = ethers.encodeBytes32String("INR");
   console.log("\nsimulating userBuyUsdcToSolana($1 -> Solana)…");
   try {
     const orderId = await integrator.userBuyUsdcToSolana.staticCall(

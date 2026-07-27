@@ -9,15 +9,49 @@ A two-way fiat ↔ USDC ramp for [Showdown](https://showdown.gg) whose user-faci
 
 Both directions are gated by tiered simple-kyc attestations, because both convert between fiat and USDC the user actually controls.
 
-## KYC tiers
+## Limits
 
-| Tier | Attestation | Per-tx cap |
-| --- | --- | --- |
-| 0 | none | blocked entirely |
-| 1 | liveness | **$20** (`tierCap[1]`) |
-| 2 | passport + liveness | **$50** (`tierCap[2]`) |
+The per-tx cap is a function of the KYC tier **and** the settlement region:
 
-The effective cap is `min(attested limit, tierCap[tier])`. The simple-kyc service signs a dollar limit into the attestation, and the contract clamps it to its own per-tier ceiling — so the $20/$50 tiers hold **even if an attestor key is compromised**, and the caps are auditable on-chain rather than living in service config. Tiers stack monotonically: claiming a higher tier raises the cap, claiming a lower one never lowers it. The same cap applies to onramp and offramp.
+| Tier | Attestation         | India (INR) | Abroad   |
+| ---- | ------------------- | ----------- | -------- |
+| 0    | none                | blocked     | blocked  |
+| 1    | liveness            | **$20**     | **$50**  |
+| 2    | passport + liveness | **$100**    | **$200** |
+
+Plus **5 orders per user per UTC day**, budgeted _separately_ for each direction — 5 onramps and, independently, 5 offramps.
+
+The effective cap is `min(attested limit, tierCap[tier][region])`. The simple-kyc service signs a dollar limit into the attestation, and the contract clamps it to its own per-(tier, region) ceiling. Tiers stack monotonically: claiming a higher tier raises the cap, claiming a lower one never lowers it. The same matrix applies to onramp and offramp.
+
+### The ceilings are immutable
+
+Each of those five numbers is _also_ fixed in the bytecode as a `MAX_*` constant:
+
+| Constant                       | Value   |
+| ------------------------------ | ------- |
+| `MAX_TIER_CAP_LIVENESS_INDIA`  | `20e6`  |
+| `MAX_TIER_CAP_LIVENESS_ABROAD` | `50e6`  |
+| `MAX_TIER_CAP_KYC_INDIA`       | `100e6` |
+| `MAX_TIER_CAP_KYC_ABROAD`      | `200e6` |
+| `MAX_DAILY_TX_COUNT_LIMIT`     | `5`     |
+
+`setTierCap(tier, region, cap)` and `setDailyTxCountLimit(count)` revert with `CapExceedsCeiling` above these, and so does the constructor. **The owner can tighten policy but never loosen it past what the bytecode commits to** — so the limits hold against a compromised _owner_ key, not just a compromised attestor key. That matters because a whitelisted integrator bypasses the protocol's own RP / daily / monthly / yearly volume limits and is trusted to enforce its own in `validateOrder` (see `IB2BGateway`).
+
+Setting a cell to `0` disables that (tier, region) lane without touching anyone's attestation — the per-lane kill switch. `setDailyTxCountLimit(0)` is rejected: it used to mean "unlimited", which would have been a way around the ceiling.
+
+### Region comes from the order's currency
+
+`regionFor(currency)` returns India for `INR` and Abroad for everything else. This is a **payment-rail gate, not a nationality gate**: the user chooses the currency, so the real constraint is which fiat rail they can actually settle on. `validateOrder` receives the currency from the Diamond, so the region resolves at the authoritative gate, not just at the entrypoint. If a nationality gate is ever needed it belongs in the attestation, which would mean a new EIP-712 typehash and coordinated simple-kyc work.
+
+### Blocking
+
+`setUserBlocked(user, bool)` zeroes a wallet's effective limit in both directions. It is a **binary gate only** — limits themselves come solely from the KYC tier and the region ceiling, never from a per-user owner setting.
+
+A block deliberately does **not** gate `userBridgeBackToSolana` or `userRescueStuckBridge`: those move only the user's own already-paid-for funds back out. A block stops new conversions; it never seizes or strands anything.
+
+### Daily counts are placements, not settlements
+
+The live Diamond does not call `onOrderCancel` — the selector is absent from every mainnet facet, and the hook exists only on the unmerged `feat/integrator-on-order-cancel` branch. Until that ships, a cancelled or expired order **keeps its slot**. This is the safe direction (a slot can never be freed early, so the cap can't be exceeded), but a user whose orders keep failing is locked out until the next UTC day — and 00:00 UTC is 05:30 IST, mid-morning in India. Worth surfacing in the UI at 5/day.
 
 Attestation intake (`submitLivenessAttestation` / `submitKycAttestation`) is byte-compatible with `UsdcDirectCheckoutIntegrator` — same EIP-712 typehashes, `KycVerifier` / `LivenessVerifier` domains, and per-(tenant, human) single-use nullifiers.
 
@@ -29,9 +63,14 @@ Attestation intake (`submitLivenessAttestation` / `submitKycAttestation`) is byt
 
 The integrator only ever custodies USDC in one narrow window: between an onramp's completion and its burn. That balance is tracked in `unbridgedTotal`, and `withdrawUsdc` is hard-bounded by it — **the owner cannot touch a buyer's in-flight funds**, only genuine surplus.
 
+Unbridged onramps share that one pooled balance, so the invariant `usdc.balanceOf(integrator) >= unbridgedTotal` is what keeps `withdrawUsdc`, `retryBridge` and `userRescueStuckBridge` safe against each other. Two guards in `onOrderComplete` hold it:
+
+- **`recipientAddr` must be the integrator.** The onramp pins it at placement; if a routing change ever sent the USDC elsewhere, reverting is correct — nothing arrived here, so nothing should be reserved here.
+- **The session is re-pinned to the amount actually delivered** (emitting `OnrampAmountAdjusted`). Here a revert would be _wrong_: the USDC did arrive, and the gateway swallows integrator reverts, so it would be left with no session record — i.e. sweepable by the owner as "surplus". Sibling integrators (LotPot, Investabl) revert with `AmountMismatch` instead; they can, because they don't pool user funds.
+
 ## Solana recipients are token accounts, not wallets
 
-`solanaRecipient` must be the user's USDC **associated token account (ATA)**, encoded as bytes32 — *not* their wallet address — and it must already exist on Solana. Circle's docs: *"the `mintRecipient` should be a hex encoded USDC token account address. The token account must exist at the time `receiveMessage` is called on Solana or else this instruction will revert."*
+`solanaRecipient` must be the user's USDC **associated token account (ATA)**, encoded as bytes32 — _not_ their wallet address — and it must already exist on Solana. Circle's docs: _"the `mintRecipient` should be a hex encoded USDC token account address. The token account must exist at the time `receiveMessage` is called on Solana or else this instruction will revert."_
 
 A wallet address here produces a burn on Base whose mint can never be executed on Solana. The address is pinned at order time and cannot be changed afterwards by anyone, including the owner.
 
@@ -42,15 +81,15 @@ For the offramp direction, use `offrampMintRecipient(user)` — it returns the u
 The burn runs inside `onOrderComplete` through an external self-call under `try/catch`. The gateway also try/catches the callback, so a revert here would silently strand the delivered USDC with no session record. Instead the order stays `fulfilled` but `bridged == false`, its USDC reserved in `unbridgedTotal`, and recovery is available:
 
 - **`retryBridge(orderId)`** — permissionless. The destination and amount were pinned at order time, so the caller can't redirect anything; they only pay gas. Reverts bubble so you can see why CCTP refused.
-- **`userRescueStuckBridge(orderId)`** — buyer-only, and only after `BRIDGE_RESCUE_DELAY` (7 days). Pulls the USDC to the buyer's own wallet. This is never an owner power. It hands the buyer Base-side USDC rather than the Solana USDC they ordered — a deliberate trade against permanent loss, bounded by their tier cap and unreachable while CCTP is healthy.
+- **`userRescueStuckBridge(orderId)`** — buyer-only, and only after `BRIDGE_RESCUE_DELAY` (7 days). Pulls the USDC to the buyer's own wallet. This is never an owner power. It hands the buyer Base-side USDC rather than the Solana USDC they ordered — a deliberate trade against permanent loss, bounded by their tier cap and unreachable while CCTP is healthy. Note the bound is now up to $200 per order rather than $50 — this is the one path where USDC reaches a user's EOA, so it is the one place the `UserProxy` USDC-trap is deliberately relaxed.
 - **`userBridgeBackToSolana(amount, ata)`** — returns bridged-in funds sitting on a proxy back to Solana instead of offramping them.
 
 ## Bridge configuration
 
-| Setting | Default | Notes |
-| --- | --- | --- |
-| `bridgeMinFinalityThreshold` | `2000` | Standard Transfer — finalized, free, ~13–19 min from Base. `1000` = Fast Transfer (seconds, charges a fee). |
-| `bridgeMaxFeeBps` | `0` | `maxFee = 0` is valid while the messenger's `minFee` is 0, which is the case on Base Sepolia today. Raise it if Circle starts enforcing a minimum, or when using Fast Transfers. |
+| Setting                      | Default | Notes                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bridgeMinFinalityThreshold` | `2000`  | Standard Transfer — finalized, free, ~13–19 min from Base. `1000` = Fast Transfer (seconds, charges a fee).                                                                                                                                                                                                                                                                                              |
+| `bridgeMaxFeeBps`            | `0`     | `maxFee = 0` is valid while the messenger's `minFee` is 0, which is the case on Base Sepolia today. Raise it if Circle starts enforcing a minimum, or when using Fast Transfers. Bounded by `MAX_BRIDGE_MAX_FEE_BPS = 100` (1%) — Circle's Fast Transfer fee has run ~1–14 bps, so that is ample headroom while ruling out an owner routing an arbitrary share of every burn to the attestation service. |
 
 Both are owner-settable, and a burn that fails on fee grounds lands in the retry path rather than losing funds.
 
@@ -68,12 +107,12 @@ Register with **`usdcThroughIntegrator = false`**. The onramp pins `recipientAdd
 
 ## Reference
 
-| | |
-| --- | --- |
-| CCTP domain — Base | `6` |
-| CCTP domain — Solana | `5` |
-| TokenMessengerV2 (all EVM testnets) | `0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA` |
+|                                         |                                              |
+| --------------------------------------- | -------------------------------------------- |
+| CCTP domain — Base                      | `6`                                          |
+| CCTP domain — Solana                    | `5`                                          |
+| TokenMessengerV2 (all EVM testnets)     | `0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA` |
 | MessageTransmitterV2 (all EVM testnets) | `0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275` |
-| Circle USDC, Base Sepolia | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
+| Circle USDC, Base Sepolia               | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
 
 Domain IDs are identical on mainnet and testnet.

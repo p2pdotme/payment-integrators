@@ -6,21 +6,23 @@ See [`showdown.md`](./showdown.md) for the contract design itself.
 
 ## Where we are
 
-`ShowdownCheckoutIntegrator` is built, unit-tested (54 tests), deployed and whitelisted on Base Sepolia.
+`ShowdownCheckoutIntegrator` is built, unit-tested (81 tests), deployed and whitelisted on Base Sepolia.
 
-| | |
-| --- | --- |
-| Integrator | `0x450642C7A1D21567814a0e262fF996aC63c0DB25` |
-| proxyImpl | `0xD6E7158270F622Af2ea9Ac6ECbcFD85EC2c71589` |
-| Diamond | `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9` |
-| Registration | `isActive = true`, `usdcThroughIntegrator = false` |
-| Bytecode hash | `0xaa1bcc0265991096f3387a5a92141064dfc07a0ce40934564f4364bc403c73e1` |
-| Deployer / owner | `0x9DE9772AfCdf3AFa03CC689fE7AFA5b631088aB9` |
+> ⚠️ **The deployed Sepolia build is stale.** The pre-prod audit ([`docs/reviews/PR-35-showdown-audit.md`](../reviews/PR-35-showdown-audit.md)) changed the limit model and the completion accounting, so the bytecode differs from `0x450642C7…`. That address still enforces the old flat $20/$50 with owner-raisable caps. **Re-deploy and re-whitelist before any further testing.**
+
+|                  |                                                                      |
+| ---------------- | -------------------------------------------------------------------- |
+| Integrator       | `0x450642C7A1D21567814a0e262fF996aC63c0DB25`                         |
+| proxyImpl        | `0xD6E7158270F622Af2ea9Ac6ECbcFD85EC2c71589`                         |
+| Diamond          | `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9`                         |
+| Registration     | `isActive = true`, `usdcThroughIntegrator = false`                   |
+| Bytecode hash    | `0xaa1bcc0265991096f3387a5a92141064dfc07a0ce40934564f4364bc403c73e1` |
+| Deployer / owner | `0x9DE9772AfCdf3AFa03CC689fE7AFA5b631088aB9`                         |
 
 Verified live on Base Sepolia (`scripts/local/smoke-showdown.ts`), not just in unit tests:
 
 - The EIP-712 attestation domain binds to this contract + chain; a signed liveness/KYC attestation moves the tier.
-- The on-chain tier ceilings hold: an attestor signing a `$1000` limit yields `grantedLimit = $1000` but `effectiveLimit = $20` (liveness) / `$50` (KYC).
+- The on-chain tier ceilings hold: an attestor signing a `$1000` limit yields `grantedLimit = $1000` but `effectiveLimit` stays at the tier ceiling. _(Run against the old flat caps; re-run after the re-deploy to confirm the region matrix live.)_
 - The full onramp path clears — proxy CREATE2 deploy → B2B gateway proxy-auth → `validateOrder` → `placeB2BOrder`. Simulated via `staticCall`, so no live order was placed and no merchant capacity was held.
 - `$51` and zero-Solana-recipient orders are refused with `KycLimitExceeded` / `InvalidSolanaRecipient`.
 
@@ -51,7 +53,9 @@ Both attestors are currently set to the **deployer key** so the demo can sign at
 1. Register the integrator address as the tenant `contract_address` in **both** the liveness and the KYC simple-kyc services, so they sign attestations bound to it.
 2. Rotate the signers: `setLivenessAttestor(<liveness GET /v1/attestor>)`, `setKycAttestor(<kyc GET /v1/attestor>)`. Both are owner-settable, no redeploy.
 
-The services can sign whatever dollar limit they like — the contract clamps to `tierCap[1] = $20` / `tierCap[2] = $50`, so the tiers hold even if a signer key leaks. Adjust with `setTierCap(tier, cap)`; setting a cap to `0` disables that tier without touching anyone's attestation.
+The services can sign whatever dollar limit they like — the contract clamps to `tierCap[tier][region]`, so the tiers hold even if a signer key leaks. Adjust with `setTierCap(tier, region, cap)`, which can only ever move a cap _down_ from its immutable `MAX_*` ceiling; setting a cell to `0` disables that lane without touching anyone's attestation.
+
+**Attestor values must come from the service's own `/v1/attestor` endpoint, never from a partner- or teammate-relayed value.** Both Showdown attestors were wrong once on Sepolia for exactly that reason (fixed 2026-07-25). `scripts/local/set-showdown-attestors.ts` fetches the signer from the service rather than taking it as an argument, which is the point of the script.
 
 Attestation intake is byte-compatible with `UsdcDirectCheckoutIntegrator` (same typehashes, `KycVerifier` / `LivenessVerifier` domains, single-use per-(tenant, human) nullifiers), so any existing simple-kyc wiring carries over.
 
@@ -106,9 +110,28 @@ Defaults are Standard Transfer, free: `bridgeMinFinalityThreshold = 2000`, `brid
 - The Solana destination is **pinned at order time** and cannot be redirected by anyone, including the owner — which is why `retryBridge` is safe to leave permissionless.
 - Owner powers are: attestor rotation, tier caps, daily count, offramp kill switch + relayer, bridge fee/finality, and surplus sweep. No upgradeability — the integrator is immutable by repo policy.
 
+## 9. Limits (settled 2026-07-27)
+
+Enforced as a (tier × region) matrix, region derived from the order's fiat currency (`INR` → India, everything else → Abroad):
+
+| Tier                | India | Abroad |
+| ------------------- | ----- | ------ |
+| liveness            | $20   | $50    |
+| passport + liveness | $100  | $200   |
+
+Plus 5 orders/day per user, budgeted separately for onramp and offramp. Every one of those five numbers is an immutable `MAX_*` constant in the bytecode; the owner may lower a cap but can never raise one past policy. See [`showdown.md`](./showdown.md#limits).
+
+Consequences to carry into the widget:
+
+- **Quote the region-correct cap.** `effectiveLimits(user)` returns `(india, abroad)` in one call; `effectiveLimit(user, currency)` is the exact figure for a given order. The old one-argument `effectiveLimit(user)` is **gone** — an ABI break.
+- **`tierCap` is now `tierCap(tier, region)`.** Same for the smoke and attestor scripts, already updated.
+- **Surface the daily budget.** `getRemainingDailyCount(user)` and `getRemainingOfframpDailyCount(user)`. At 5/day, and with cancels not releasing slots (§below), a user can hit the wall in an afternoon.
+- **Blocked users.** `blocked(user)` is a binary owner gate; the entrypoints revert `UserIsBlocked`. Show it distinctly from "not verified" — the fix is different.
+
 ## Open decisions
 
 1. **Which network do we actually bridge on** (§1) — mainnet, a USDC-settling Sepolia Diamond, or standalone proof first.
-2. **Who delivers attestations** (§5) — Circle's forwarding service vs. our own relayer.
+2. **Who delivers attestations** (§5) — Circle's forwarding service vs. our own relayer. **This is the launch blocker**: without it an onramp burns on Base and the user's USDC never appears on Solana, while `unbridgedTotal` reads 0 and the contract looks healthy.
 3. **Fast vs Standard transfers** (§6).
 4. **Who owns the Solana ATA creation UX** (§4) — widget vs. Showdown's own app.
+5. **Who holds the mainnet `owner` key** — decided: a **Showdown multisig**. `owner` is immutable with no transfer and no renounce, so the deploy must be sent _from_ that multisig. See the audit's deploy gates.
