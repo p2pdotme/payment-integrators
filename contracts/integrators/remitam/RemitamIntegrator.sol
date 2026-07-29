@@ -69,6 +69,10 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     ///         recognize a SELL placed with order.user = the wallet's proxy.
     mapping(address => address) public proxyOwner;
 
+    // ─── Daily accounting (wallet => day => consumed) ─────────────────
+    mapping(address => mapping(uint256 => uint256)) public dailyVolume;
+    mapping(address => mapping(uint256 => uint256)) public dailyCount;
+
     // ─── Modifiers ────────────────────────────────────────────────────
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
@@ -133,14 +137,49 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         emit LimitsUpdated(txLimit_, dailyVolumeLimit_, dailyCountLimit_);
     }
 
+    // ─── Helpers ──────────────────────────────────────────────────────
+
+    function _day() internal view returns (uint256) {
+        return block.timestamp / 1 days;
+    }
+
+    /// @dev Resolves the accountable wallet: `user` directly (BUY legs place
+    ///      with order.user = server wallet) or the owner of the proxy (SELL
+    ///      legs place with order.user = the wallet's UserProxy).
+    function _resolveWallet(address user) internal view returns (address wallet) {
+        if (whitelisted[user]) return user;
+        wallet = proxyOwner[user];
+        if (wallet == address(0) || !whitelisted[wallet]) revert NotWhitelisted();
+    }
+
     // ─── IP2PIntegrator (filled in over Tasks 3-4) ────────────────────
 
     function validateOrder(
-        address /*user*/,
-        uint256 /*amount*/,
+        address user,
+        uint256 amount,
         bytes32 /*currency*/
     ) external onlyDiamond returns (bool allowed) {
+        address wallet = _resolveWallet(user);
+        if (amount > txLimit) revert TxLimitExceeded();
+
+        uint256 day = _day();
+        uint256 newVolume = dailyVolume[wallet][day] + amount;
+        if (newVolume > dailyVolumeLimit) revert DailyVolumeExceeded();
+        uint256 newCount = dailyCount[wallet][day] + 1;
+        if (newCount > dailyCountLimit) revert DailyCountExceeded();
+
+        dailyVolume[wallet][day] = newVolume;
+        dailyCount[wallet][day] = newCount;
         return true;
+    }
+
+    /// @dev Floor-guarded reversal of a validateOrder debit — used on
+    ///      cancellation so a cancelled leg frees the wallet's daily budget.
+    function _releaseDebit(address wallet, uint256 day, uint256 amount) internal {
+        uint256 vol = dailyVolume[wallet][day];
+        dailyVolume[wallet][day] = vol > amount ? vol - amount : 0;
+        uint256 cnt = dailyCount[wallet][day];
+        if (cnt > 0) dailyCount[wallet][day] = cnt - 1;
     }
 
     function onOrderComplete(

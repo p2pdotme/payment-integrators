@@ -22,6 +22,13 @@ describe("RemitamIntegrator", function () {
   const VOL_CEIL = USDC(5000);
   const COUNT_CEIL = 10n;
 
+  async function diamondSigner(): Promise<SignerWithAddress> {
+    const addr = await diamond.getAddress();
+    await ethers.provider.send("hardhat_impersonateAccount", [addr]);
+    await ethers.provider.send("hardhat_setBalance", [addr, "0x1000000000000000000"]);
+    return await ethers.getSigner(addr);
+  }
+
   beforeEach(async function () {
     [owner, walletA, walletB, attacker] = await ethers.getSigners();
 
@@ -114,6 +121,74 @@ describe("RemitamIntegrator", function () {
       const p2 = await integrator.proxyAddress(walletA.address);
       expect(p1).to.equal(p2);
       expect(p1).to.not.equal(await integrator.proxyAddress(walletB.address));
+    });
+  });
+
+  describe("validateOrder", function () {
+    let dia: SignerWithAddress;
+    beforeEach(async function () {
+      dia = await diamondSigner();
+      await integrator.addAccount(walletA.address);
+    });
+
+    it("only the diamond can call it", async function () {
+      await expect(
+        integrator.connect(attacker).validateOrder(walletA.address, USDC(1), INR)
+      ).to.be.revertedWithCustomError(integrator, "OnlyDiamond");
+    });
+
+    it("rejects non-whitelisted users", async function () {
+      await expect(
+        integrator.connect(dia).validateOrder(attacker.address, USDC(1), INR)
+      ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
+    });
+
+    it("accepts a whitelisted wallet and debits daily accounting", async function () {
+      await integrator.connect(dia).validateOrder.staticCall(walletA.address, USDC(100), INR);
+      await integrator.connect(dia).validateOrder(walletA.address, USDC(100), INR);
+      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
+      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(USDC(100));
+      expect(await integrator.dailyCount(walletA.address, day)).to.equal(1n);
+    });
+
+    it("enforces the per-tx limit", async function () {
+      await expect(
+        integrator.connect(dia).validateOrder(walletA.address, TX_CEIL + 1n, INR)
+      ).to.be.revertedWithCustomError(integrator, "TxLimitExceeded");
+    });
+
+    it("enforces the daily volume limit across orders", async function () {
+      // 5 x 1000 = the 5000 ceiling; a 6th tx of 1 must fail.
+      for (let i = 0; i < 5; i++) {
+        await integrator.connect(dia).validateOrder(walletA.address, USDC(1000), INR);
+      }
+      await expect(
+        integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR)
+      ).to.be.revertedWithCustomError(integrator, "DailyVolumeExceeded");
+    });
+
+    it("enforces the daily count limit", async function () {
+      await integrator.setLimits(USDC(1), VOL_CEIL, 2);
+      await integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR);
+      await integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR);
+      await expect(
+        integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR)
+      ).to.be.revertedWithCustomError(integrator, "DailyCountExceeded");
+    });
+
+    it("day rollover resets the buckets", async function () {
+      await integrator.setLimits(USDC(1000), USDC(1000), 1);
+      await integrator.connect(dia).validateOrder(walletA.address, USDC(1000), INR);
+      await ethers.provider.send("evm_increaseTime", [DAY]);
+      await ethers.provider.send("evm_mine", []);
+      await integrator.connect(dia).validateOrder(walletA.address, USDC(1000), INR); // fresh day: ok
+    });
+
+    it("removing an account blocks further orders", async function () {
+      await integrator.removeAccount(walletA.address);
+      await expect(
+        integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR)
+      ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
     });
   });
 });
