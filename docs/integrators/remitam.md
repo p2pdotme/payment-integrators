@@ -15,18 +15,18 @@ amount; `MAX_CONCURRENT_SELLS = 8` bounds that fan-out per wallet.
 
 No upstream protocol beyond the P2P Diamond.
 
-| | Base Mainnet | Base Sepolia |
-|---|---|---|
-| P2P Diamond | `<TBD>` | `<TBD>` |
-| USDC | `<TBD>` | `<TBD>` |
-| Integrator | `<TBD after deploy>` | `<TBD after deploy>` |
+|             | Base Mainnet         | Base Sepolia         |
+| ----------- | -------------------- | -------------------- |
+| P2P Diamond | `<TBD>`              | `<TBD>`              |
+| USDC        | `<TBD>`              | `<TBD>`              |
+| Integrator  | `<TBD after deploy>` | `<TBD after deploy>` |
 
 ## Contract surface
 
 Whitelist admin (owner-only):
 
 - `addAccount(address account)` — whitelist a server wallet. Reverts `InvalidAddress` on the zero address.
-- `removeAccount(address account)` — de-whitelist a server wallet (no-op if it was never whitelisted).
+- `removeAccount(address account)` — de-whitelist a server wallet (no-op if it was never whitelisted). **This blocks new placements only** (`userPlaceBuyOrder` / `userStartSell`, both gated on `whitelisted[msg.sender]`). It does not touch in-flight legs: a removed wallet's existing `SellLeg`s are untouched, and `deliverPayout` (wallet-or-owner) / `reconcile` (permissionless) place no whitelist check on the leg's `user`, so a removed wallet can still deliver and reconcile its own in-flight legs to completion. This is an orderly-wind-down design, not an oversight — it lets ops pull a compromised or offboarded wallet from _new_ volume immediately while letting already-placed remittances settle cleanly instead of getting stuck mid-flight.
 
 Limits admin (owner-only):
 
@@ -36,8 +36,8 @@ Order flow (whitelisted server wallets):
 
 - `userPlaceBuyOrder(amount, currency, pubKey, circleId, preferredPaymentChannelConfigId, fiatAmountLimit) → orderId` — place a BUY leg (fiat → USDC). Deploys the wallet's `UserProxy` on first use. USDC settles straight to `msg.sender` (`recipientAddr` pinned to the caller).
 - `userStartSell(principal, currency, userPubKey, circleId, preferredPaymentChannelConfigId, fiatAmountLimit) → orderId` — phase 1 of a SELL leg: places the order (`order.user` = the wallet's proxy) so the Diamond matches a merchant. No USDC moves yet. Reverts `TooManyActiveSells` past `MAX_CONCURRENT_SELLS`.
-- `deliverPayout(orderId, string encPayout)` — phase 2 of a SELL leg: reads the Diamond's computed fee, requires the wallet's proxy to already hold `principal + fee`, then calls `setSellOrderUpi` to deliver the encrypted payout handle and trigger the Diamond's USDC pull. Callable by the leg's wallet or the owner (keeper). Reverts `FeeNotReady` / `ProxyUnderfunded` / `SellLegNotFound` / `NotAuthorized`.
-- `reconcile(orderId)` — permissionless settlement of a terminal (COMPLETED or CANCELLED) SELL leg: frees the wallet's concurrency slot, releases the daily-limit debit on cancellation, and sweeps any USDC left on the proxy back to the wallet. Reverts `SellLegNotFound` / `NotTerminal` / `AlreadyReconciled`.
+- `deliverPayout(orderId, string encPayout)` — phase 2 of a SELL leg: reads the Diamond's computed fee, pulls the shortfall (`principal + fee` less whatever already sits on the proxy) from the wallet **just-in-time, in this same transaction**, then calls `setSellOrderUpi` to deliver the encrypted payout handle and trigger the Diamond's USDC pull. The wallet only needs a standing `approve(integrator, ...)` — no pre-transfer to the proxy. Callable by the leg's wallet or the owner (keeper). Reverts `FeeNotReady` / `InsufficientFunding` (the wallet's balance or allowance can't cover the shortfall) / `SellLegNotFound` / `NotAuthorized`.
+- `reconcile(orderId)` — permissionless settlement of a terminal (COMPLETED or CANCELLED) SELL leg: frees the wallet's concurrency slot, releases the daily-limit debit on cancellation, and sweeps any USDC left on the proxy back to the wallet. On a CANCELLED leg that shows a raised or settled dispute, reverts `DisputedOrder` instead — a dispute means fiat may have been delivered despite the on-chain CANCELLED status, so that leg is left for manual/ops resolution rather than auto-released. Reverts `SellLegNotFound` / `NotTerminal` / `AlreadyReconciled` / `DisputedOrder`.
 
 Diamond callbacks (`onlyDiamond`):
 
@@ -56,12 +56,12 @@ The owner may lower the corresponding adjustable limit at any time via
 `setLimits`, but any value above its ceiling reverts `LimitAboveCeiling` — so a
 compromised owner key can never authorize more exposure than P2P approved.
 
-| | Ceiling (immutable) | Adjustable | Enforced in |
-|---|---|---|---|
-| Per-transaction | `txLimitCeiling` | `txLimit` | `validateOrder` |
-| Daily volume (per wallet, UTC day) | `dailyVolumeCeiling` | `dailyVolumeLimit` | `validateOrder` |
-| Daily order count (per wallet, UTC day) | `dailyCountCeiling` | `dailyCountLimit` | `validateOrder` |
-| Concurrent SELL legs (per wallet) | `MAX_CONCURRENT_SELLS = 8` | not adjustable | `userStartSell` |
+|                                         | Ceiling (immutable)        | Adjustable         | Enforced in     |
+| --------------------------------------- | -------------------------- | ------------------ | --------------- |
+| Per-transaction                         | `txLimitCeiling`           | `txLimit`          | `validateOrder` |
+| Daily volume (per wallet, UTC day)      | `dailyVolumeCeiling`       | `dailyVolumeLimit` | `validateOrder` |
+| Daily order count (per wallet, UTC day) | `dailyCountCeiling`        | `dailyCountLimit`  | `validateOrder` |
+| Concurrent SELL legs (per wallet)       | `MAX_CONCURRENT_SELLS = 8` | not adjustable     | `userStartSell` |
 
 Both BUY and SELL legs debit the same per-wallet daily volume/count buckets at
 `validateOrder` time (a SELL resolves `order.user` — the wallet's proxy — back
@@ -69,27 +69,46 @@ to the owning wallet via `proxyOwner`). A cancelled BUY (`onOrderCancel`) or a
 CANCELLED SELL (`reconcile`) releases its debit; a COMPLETED SELL keeps it,
 since it consumed real merchant capacity.
 
+**SELL fees are pulled on top of the principal, not out of it.** `validateOrder`
+debits `dailyVolumeLimit` against the SELL _principal_ only (the fee isn't
+known until the Diamond accepts the order), but `deliverPayout` pulls
+`principal + fee` in USDC. So the actual daily USDC outflow for a wallet can
+exceed `dailyVolumeLimit` by the sum of that day's per-leg fees. Size
+`dailyVolumeLimit` (and any downstream treasury/liquidity ceilings) with that
+headroom in mind rather than treating it as a hard outflow cap.
+
 ## Funding model
 
 BUY legs need no pre-funding: the Diamond assigns a merchant and settles USDC
-straight to the calling wallet. SELL legs are funded **just-in-time**:
+straight to the calling wallet. SELL legs are funded **just-in-time, inside
+`deliverPayout` itself**:
 
 1. `userStartSell` places the order with no USDC movement.
-2. Once the Diamond accepts and computes its fee, the server wallet transfers
-   `actualUsdtAmount` (principal + fee, read from
-   `getAdditionalOrderDetails`) of USDC to its own proxy — a plain ERC-20
-   transfer, immediately before calling `deliverPayout`.
-3. `deliverPayout` requires the proxy already hold that exact amount, then
-   pulls it via `setSellOrderUpi`.
+2. Once the Diamond accepts and computes its fee, the backend calls
+   `deliverPayout(orderId, encPayout)` directly — no pre-transfer step.
+   `deliverPayout` reads `actualUsdtAmount` (principal + fee) from
+   `getAdditionalOrderDetails`, computes the shortfall against whatever USDC
+   already sits on the wallet's proxy (e.g. an unswept refund from a prior
+   cancelled leg counts toward funding), and pulls exactly that shortfall from
+   the wallet via `safeTransferFrom` in the same transaction — then calls
+   `setSellOrderUpi` to complete the pull into the Diamond.
+3. The only prerequisite is a standing `usdc.approve(integrator, amount)`
+   from the wallet, done once (off the critical path), for at least the
+   largest single leg the wallet expects to deliver — not before every leg.
 
-**Fund-and-deliver one leg at a time, and reconcile cancelled legs before
-funding the next.** All of a wallet's SELL legs share a single proxy, and
-`reconcile`'s sweep takes the *whole* USDC balance sitting on that proxy —
-funding for a sibling leg would be swept up in a sibling leg's reconciliation.
-This is not a loss (the swept funds return to the same wallet), but it breaks
-the 1:1 funding-to-leg accounting the keeper depends on, so the backend must
-serialize funding per wallet: fund leg N, deliver leg N, and — if leg N was
-cancelled — reconcile it before funding leg N+1.
+**No pre-transfer, no serialization constraint.** Earlier revisions required
+the wallet to transfer `principal + fee` to its proxy before calling
+`deliverPayout`, and `reconcile` swept the _whole_ proxy balance on
+settlement — since all of a wallet's SELL legs share one proxy, a
+permissionless `reconcile` on a cancelled leg A could front-run and sweep
+funding parked on the proxy for a not-yet-delivered leg B, forcing the
+backend to fund-and-deliver strictly one leg at a time
+(precedent: the M-1 fix in `MerchantTerminalIntegrator.sol` rejects the same
+whole-balance-absorption pattern). Pulling funds JIT inside `deliverPayout`
+removes the parking window entirely: nothing is ever held on the proxy
+awaiting a delivery, so `reconcile`'s whole-balance sweep is safe — only
+refunds and dust ever land there — and multiple in-flight legs for the same
+wallet can be delivered and reconciled in any order, concurrently.
 
 ## Registration flags
 
