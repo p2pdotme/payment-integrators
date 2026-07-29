@@ -196,7 +196,17 @@ async function main() {
   );
 
   // ── Mainnet guard: owner is immutable, so it must be right at deploy time. ─
-  if (isMainnet && process.env.DEPLOY_OWNER) {
+  // DEPLOY_OWNER is MANDATORY on mainnet: `owner` becomes this signer forever
+  // (no transfer, no renounce), so a deploy from the wrong key is a full
+  // redeploy + re-whitelist. Refuse to guess rather than warn-and-proceed.
+  if (isMainnet) {
+    if (!process.env.DEPLOY_OWNER) {
+      throw new Error(
+        "DEPLOY_OWNER is required on mainnet. `owner` is immutable — it becomes the deploy signer " +
+          "forever, with no transfer and no renounce. Set DEPLOY_OWNER to the intended Showdown " +
+          "multisig and deploy FROM it."
+      );
+    }
     if (me.toLowerCase() !== process.env.DEPLOY_OWNER.toLowerCase()) {
       throw new Error(
         `owner is immutable and is set to the deployer (${me}), but DEPLOY_OWNER is ` +
@@ -204,11 +214,21 @@ async function main() {
       );
     }
     console.log("Owner check:          ✅ signer matches DEPLOY_OWNER");
-  } else if (isMainnet) {
-    console.log(
-      "\n⚠️  DEPLOY_OWNER not set. `owner` is immutable — it becomes this signer forever,\n" +
-        "   with no transfer and no renounce. Set DEPLOY_OWNER to assert the intended multisig."
-    );
+
+    // solanaDomain is also immutable. It is env-overridable (some testnets differ)
+    // but the ALLOW_ADDRESS_OVERRIDE gate covers only the four CCTP addresses, so
+    // a stray SOLANA_DOMAIN in a shared .env would bake a wrong destination in
+    // silently: the route preflight below only checks *routability*, not that the
+    // domain is Solana, so e.g. SOLANA_DOMAIN=0 (Ethereum) passes and every onramp
+    // then burns to an EVM chain with the 32-byte ATA truncated — unrecoverable.
+    // Require the canonical Solana domain unless an override is deliberate.
+    if (SOLANA_DOMAIN !== 5 && process.env.ALLOW_ADDRESS_OVERRIDE !== "true") {
+      throw new Error(
+        `SOLANA_DOMAIN is ${SOLANA_DOMAIN}, not 5 (Solana). It is baked into an immutable and a wrong ` +
+          `value silently loses every onramp's funds. Pass ALLOW_ADDRESS_OVERRIDE=true only if you ` +
+          `genuinely intend a non-Solana destination.`
+      );
+    }
   }
 
   // Whether the settlement token is actually CCTP-burnable decides whether the

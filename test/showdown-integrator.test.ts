@@ -645,6 +645,30 @@ describe("ShowdownCheckoutIntegrator", function () {
       expect(await integrator.unbridgedTotal()).to.equal(0);
       expect((await integrator.getSession(orderId)).fulfilled).to.equal(false);
     });
+
+    it("refuses to complete an order that was cancelled", async function () {
+      // Defense-in-depth for when onOrderCancel ships on the live Diamond:
+      // cancel frees the daily slot, so completing afterwards would settle one
+      // order over the cap and leave a cancelled-and-fulfilled session.
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userBuyUsdcToSolana(USDC(50), INR, SOLANA_ATA, 1, "", 0, 0);
+      await mockDiamond.simulateOrderCancelled(orderId);
+
+      await mockUsdc.mint(integratorAddr, USDC(50));
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          integratorAddr,
+          orderId,
+          user.address,
+          USDC(50),
+          integratorAddr
+        )
+      ).to.be.revertedWithCustomError(integrator, "OrderAlreadyCancelled");
+
+      const session = await integrator.getSession(orderId);
+      expect(session.fulfilled).to.equal(false);
+      expect(await integrator.unbridgedTotal()).to.equal(0);
+    });
   });
 
   // ─── Onramp: fiat -> USDC on Solana ─────────────────────────────────

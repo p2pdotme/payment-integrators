@@ -938,6 +938,13 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         Session storage session = sessions[orderId];
         if (session.user == address(0)) return; // unknown / non-BUY order — no-op
         if (session.fulfilled) revert OrderAlreadyFulfilled();
+        // A cancelled order must never complete: onOrderCancel frees the
+        // daily-count slot, so completing afterwards would settle one order over
+        // the cap and leave a cancelled-and-fulfilled session. Unreachable while
+        // onOrderCancel is absent from the live Diamond, but a one-line guard for
+        // when feat/integrator-on-order-cancel ships. The gateway try/catches
+        // this hook, so the revert is swallowed and nothing is stranded.
+        if (session.cancelled) revert OrderAlreadyCancelled();
         if (recipientAddr != address(this)) revert UnexpectedRecipient();
 
         if (amount != session.amount) {
@@ -1021,6 +1028,18 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         bytes32 recipient = session.solanaRecipient;
         uint256 maxFee = _maxFeeFor(amount);
 
+        // Checks-effects-interactions: mark bridged and release the reservation
+        // BEFORE the external burn. The automatic path (onOrderComplete ->
+        // this.selfBridge -> _bridge) is not nonReentrant, so with a burn token
+        // that had a transfer hook a reentrant retryBridge(orderId) could
+        // otherwise re-enter here while session.bridged was still false and burn
+        // a second time out of the pooled balance. Canonical Circle USDC has no
+        // such hook (enforced at deploy), so this is defense-in-depth; a failed
+        // burn still reverts the whole subcall and rolls these writes back,
+        // leaving the order fulfilled-but-unbridged and retryable.
+        session.bridged = true;
+        unbridgedTotal -= amount;
+
         usdc.forceApprove(address(tokenMessenger), amount);
         tokenMessenger.depositForBurn(
             amount,
@@ -1033,8 +1052,6 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         );
         usdc.forceApprove(address(tokenMessenger), 0);
 
-        session.bridged = true;
-        unbridgedTotal -= amount;
         emit BridgedToSolana(orderId, session.user, amount, recipient, maxFee);
     }
 
@@ -1054,8 +1071,9 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      * @dev Buyer-only and delay-gated — never an owner power. This does hand the
      *      buyer Base-side USDC rather than the Solana USDC they ordered, which
      *      is a deliberate trade against permanent loss: they already paid fiat
-     *      for it, they are attested, and the amount is bounded by their tier
-     *      cap ($20 / $50). It is unreachable while CCTP is healthy.
+     *      for it, they are attested, and the amount is bounded by their per-tx
+     *      tier cap (up to $200 under the current matrix). It is unreachable
+     *      while CCTP is healthy.
      */
     function userRescueStuckBridge(uint256 orderId) external nonReentrant {
         Session storage session = sessions[orderId];
