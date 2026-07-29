@@ -256,4 +256,54 @@ describe("RemitamIntegrator", function () {
       expect(await usdc.balanceOf(walletA.address)).to.equal(USDC(500));
     });
   });
+
+  describe("sell leg placement", function () {
+    beforeEach(async function () {
+      await integrator.addAccount(walletA.address);
+    });
+
+    it("places a sell with order.user = the wallet's proxy", async function () {
+      await expect(
+        integrator.connect(walletA).userStartSell(USDC(300), INR, PK, CIRCLE, 0, 0)
+      ).to.emit(integrator, "SellPlaced");
+      const orderId = (await diamond.getNextOrderId()) - 1n;
+
+      const order = await diamond.getSellOrder(orderId);
+      expect(order.user).to.equal(await integrator.proxyAddress(walletA.address));
+      expect(order.amount).to.equal(USDC(300));
+
+      const leg = await integrator.sellLegs(orderId);
+      expect(leg.user).to.equal(walletA.address);
+      expect(leg.initialized).to.equal(true);
+      expect(await integrator.activeSellCount(walletA.address)).to.equal(1n);
+    });
+
+    it("supports concurrent sell legs (the split case: 300 + 200)", async function () {
+      await integrator.connect(walletA).userStartSell(USDC(300), INR, PK, CIRCLE, 0, 0);
+      await integrator.connect(walletA).userStartSell(USDC(200), INR, PK, CIRCLE, 0, 0);
+      expect(await integrator.activeSellCount(walletA.address)).to.equal(2n);
+    });
+
+    it("caps concurrent sells at MAX_CONCURRENT_SELLS", async function () {
+      const max = await integrator.MAX_CONCURRENT_SELLS();
+      for (let i = 0n; i < max; i++) {
+        await integrator.connect(walletA).userStartSell(USDC(1), INR, PK, CIRCLE, 0, 0);
+      }
+      await expect(
+        integrator.connect(walletA).userStartSell(USDC(1), INR, PK, CIRCLE, 0, 0)
+      ).to.be.revertedWithCustomError(integrator, "TooManyActiveSells");
+    });
+
+    it("non-whitelisted wallet cannot start a sell", async function () {
+      await expect(
+        integrator.connect(attacker).userStartSell(USDC(1), INR, PK, CIRCLE, 0, 0)
+      ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
+    });
+
+    it("sell placement debits the wallet's daily buckets via the proxy resolution", async function () {
+      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
+      await integrator.connect(walletA).userStartSell(USDC(250), INR, PK, CIRCLE, 0, 0);
+      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(USDC(250));
+    });
+  });
 });

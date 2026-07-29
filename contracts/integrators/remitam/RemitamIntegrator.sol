@@ -36,6 +36,7 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     error TxLimitExceeded();
     error DailyVolumeExceeded();
     error DailyCountExceeded();
+    error TooManyActiveSells();
 
     // ─── Events ───────────────────────────────────────────────────────
     event AccountAdded(address indexed account);
@@ -46,6 +47,12 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         uint256 indexed orderId,
         address indexed wallet,
         uint256 amount,
+        bytes32 currency
+    );
+    event SellPlaced(
+        uint256 indexed orderId,
+        address indexed wallet,
+        uint256 principal,
         bytes32 currency
     );
     event LegCompleted(uint256 indexed orderId, address indexed wallet, uint256 amount);
@@ -89,6 +96,23 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         bool active;
     }
     mapping(uint256 => BuySession) public buySessions;
+
+    // ─── Sell legs ─────────────────────────────────────────────────────
+    /// @notice Bounded fan-out per wallet: several concurrent SELL legs are the
+    ///         mechanism for splitting one remittance across merchants, but an
+    ///         unbounded count would let accounting arrays/gas grow unchecked.
+    uint256 public constant MAX_CONCURRENT_SELLS = 8;
+
+    struct SellLeg {
+        address user; // whitelisted server wallet
+        uint256 principal; // USDC 1e6 (fee excluded; fee read at deliver time)
+        uint256 day; // day of the validateOrder debit
+        uint8 lastStatus; // Diamond status recorded by reconcile
+        bool initialized;
+        bool settled; // terminal status reached and accounted
+    }
+    mapping(uint256 => SellLeg) public sellLegs;
+    mapping(address => uint256) public activeSellCount;
 
     // ─── Modifiers ────────────────────────────────────────────────────
     modifier onlyOwner() {
@@ -197,6 +221,52 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
             active: true
         });
         emit BuyPlaced(orderId, msg.sender, amount, currency);
+    }
+
+    // ─── Sell leg ──────────────────────────────────────────────────────
+
+    /// @notice Phase 1 of a SELL leg: place the order so the Diamond matches a
+    ///         merchant. No USDC moves yet — funding happens at deliverPayout.
+    ///         order.user is the wallet's UserProxy: the Diamond pulls USDC
+    ///         from order.user during setSellOrderUpi, and on cancellation the
+    ///         refund lands back on the proxy where reconcile can recover it.
+    function userStartSell(
+        uint256 principal,
+        bytes32 currency,
+        string calldata userPubKey,
+        uint256 circleId,
+        uint256 preferredPaymentChannelConfigId,
+        uint256 fiatAmountLimit
+    ) external nonReentrant returns (uint256 orderId) {
+        if (!whitelisted[msg.sender]) revert NotWhitelisted();
+        if (activeSellCount[msg.sender] >= MAX_CONCURRENT_SELLS) revert TooManyActiveSells();
+        address proxy = _ensureProxy(msg.sender);
+
+        bytes memory placeData = abi.encodeCall(
+            IB2BGateway.placeB2BSellOrder,
+            (
+                proxy,
+                principal,
+                currency,
+                userPubKey,
+                circleId,
+                preferredPaymentChannelConfigId,
+                fiatAmountLimit
+            )
+        );
+        bytes memory result = UserProxy(proxy).execute(diamond, placeData, address(usdc), 0);
+        orderId = abi.decode(result, (uint256));
+
+        sellLegs[orderId] = SellLeg({
+            user: msg.sender,
+            principal: principal,
+            day: _day(),
+            lastStatus: 0,
+            initialized: true,
+            settled: false
+        });
+        activeSellCount[msg.sender] += 1;
+        emit SellPlaced(orderId, msg.sender, principal, currency);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────
