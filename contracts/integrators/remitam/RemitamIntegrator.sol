@@ -40,9 +40,21 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     error SellLegNotFound();
     error NotAuthorized();
     error FeeNotReady();
-    error ProxyUnderfunded();
+    /// @notice deliverPayout could not pull the shortfall (principal + fee
+    ///         less whatever already sits on the proxy) from the wallet:
+    ///         insufficient USDC balance or insufficient allowance granted to
+    ///         this integrator. Formerly named ProxyUnderfunded back when the
+    ///         wallet had to pre-fund the proxy directly; renamed because
+    ///         funding is now pulled just-in-time from the wallet itself.
+    error InsufficientFunding();
     error AlreadyReconciled();
     error NotTerminal();
+    /// @notice reconcile refuses to release the debit / sweep a CANCELLED
+    ///         leg that shows a raised or settled dispute — a dispute means
+    ///         fiat may have been delivered despite the on-chain CANCELLED
+    ///         status, so automatic recovery would be unsafe. Left for
+    ///         manual/ops resolution.
+    error DisputedOrder();
 
     // ─── Events ───────────────────────────────────────────────────────
     event AccountAdded(address indexed account);
@@ -234,10 +246,12 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     // ─── Sell leg ──────────────────────────────────────────────────────
 
     /// @notice Phase 1 of a SELL leg: place the order so the Diamond matches a
-    ///         merchant. No USDC moves yet — funding happens at deliverPayout.
-    ///         order.user is the wallet's UserProxy: the Diamond pulls USDC
-    ///         from order.user during setSellOrderUpi, and on cancellation the
-    ///         refund lands back on the proxy where reconcile can recover it.
+    ///         merchant. No USDC moves yet — deliverPayout pulls the needed
+    ///         amount from the wallet just-in-time, in the same tx it delivers
+    ///         the payout. order.user is the wallet's UserProxy: the Diamond
+    ///         pulls USDC from order.user during setSellOrderUpi, and on
+    ///         cancellation the refund lands back on the proxy where
+    ///         reconcile can recover it.
     function userStartSell(
         uint256 principal,
         bytes32 currency,
@@ -280,8 +294,15 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     /// @notice Phase 2 of a SELL leg: deliver the ECIES-encrypted payout
     ///         handle (CBU/PIX/Nequi... encrypted to the merchant's pubkey,
     ///         never plaintext, never in events) and trigger the Diamond's
-    ///         USDC pull. The wallet must have funded its proxy with
-    ///         principal + fee beforehand (plain ERC-20 transfer).
+    ///         USDC pull. Funding is pulled just-in-time in this same
+    ///         transaction: the wallet only needs to have approved THIS
+    ///         INTEGRATOR (once, off the critical path) for at least
+    ///         principal + fee — no pre-transfer to the proxy, and therefore
+    ///         no cross-leg funding-order dependency (see M-1 precedent in
+    ///         MerchantTerminalIntegrator: whole-balance absorption on a
+    ///         shared proxy is unsafe when funds can be parked there ahead of
+    ///         use; pulling exactly the shortfall JIT removes the parking
+    ///         window entirely).
     /// @dev    The live Diamond wraps its pull in try/catch and AUTO-CANCELS
     ///         on failure instead of reverting, so success here is not proof
     ///         of delivery — we read the status back and emit it for the
@@ -299,7 +320,18 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         if (needed == 0) revert FeeNotReady();
 
         address proxy = proxyAddress(leg.user);
-        if (usdc.balanceOf(proxy) < needed) revert ProxyUnderfunded();
+        // Whatever already sits on the proxy (e.g. an unswept cancel refund
+        // from a prior leg, or Diamond under-pull dust) counts toward
+        // funding — only the shortfall is pulled from the wallet.
+        uint256 existing = usdc.balanceOf(proxy);
+        if (existing < needed) {
+            uint256 shortfall = needed - existing;
+            if (
+                usdc.balanceOf(leg.user) < shortfall ||
+                usdc.allowance(leg.user, address(this)) < shortfall
+            ) revert InsufficientFunding();
+            usdc.safeTransferFrom(leg.user, proxy, shortfall);
+        }
 
         bytes memory data = abi.encodeCall(IOrderFlow.setSellOrderUpi, (orderId, encPayout, 0));
         UserProxy(proxy).execute(diamond, data, address(usdc), needed);
@@ -315,18 +347,25 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     ///         USDC sitting on the proxy (a cancellation refund, or Diamond
     ///         under-pull dust) back to the wallet. On CANCELLED it also
     ///         releases the validateOrder daily debit.
-    /// @dev    All of a wallet's legs share one proxy, so the sweep can pick
-    ///         up funding parked for a sibling leg. Not a loss (funds return
-    ///         to the same wallet), but the backend must fund-and-deliver one
-    ///         leg at a time and reconcile cancelled legs before funding the
-    ///         next.
+    /// @dev    deliverPayout funds JIT (see its natspec), so nothing is ever
+    ///         parked on the proxy awaiting delivery — only refunds/dust live
+    ///         there — which makes sweeping the whole proxy balance safe even
+    ///         though all of a wallet's legs share one proxy.
+    /// @dev    Mirrors MerchantTerminalIntegrator's dispute guard: a CANCELLED
+    ///         order that shows a raised or settled dispute may have had
+    ///         fiat delivered despite the on-chain status, so we refuse to
+    ///         auto-release the debit / sweep and leave it for manual/ops
+    ///         resolution instead.
     function reconcile(uint256 orderId) external nonReentrant {
         SellLeg storage leg = sellLegs[orderId];
         if (!leg.initialized) revert SellLegNotFound();
         if (leg.settled) revert AlreadyReconciled();
 
-        uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
+        IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
+        uint8 status = order.status;
         if (status != 3 && status != 4) revert NotTerminal();
+        if (status == 4 && (order.disputeInfo.status != 0 || order.disputeInfo.raisedBy != 0))
+            revert DisputedOrder();
 
         leg.settled = true;
         leg.lastStatus = status;

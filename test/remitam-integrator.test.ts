@@ -404,34 +404,47 @@ describe("RemitamIntegrator", function () {
       await usdc.mint(walletA.address, USDC(1000));
     });
 
-    it("happy path: pulls principal + fee from the funded proxy, order goes PAID", async function () {
-      await usdc.connect(walletA).transfer(proxy, USDC(302));
+    it("happy path: pulls the shortfall JIT from the wallet's approved balance, order goes PAID", async function () {
+      await usdc.connect(walletA).approve(await integrator.getAddress(), USDC(302));
+      const walletBefore = await usdc.balanceOf(walletA.address);
+
       await expect(integrator.connect(walletA).deliverPayout(orderId, ENC)).to.emit(
         integrator,
         "PayoutDelivered"
       );
       const order = await diamond.getSellOrder(orderId);
       expect(order.status).to.equal(2); // PAID
-      expect(await usdc.balanceOf(proxy)).to.equal(0n); // exact pull
+      expect(await usdc.balanceOf(proxy)).to.equal(0n); // exact pull, nothing left parked
+      expect(await usdc.balanceOf(walletA.address)).to.equal(walletBefore - USDC(302));
     });
 
     it("reverts FeeNotReady while the Diamond has not computed the fee", async function () {
       await diamond.setAdditionalOrderDetailsFeeUnready(true);
-      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await usdc.connect(walletA).approve(await integrator.getAddress(), USDC(302));
       await expect(
         integrator.connect(walletA).deliverPayout(orderId, ENC)
       ).to.be.revertedWithCustomError(integrator, "FeeNotReady");
     });
 
-    it("reverts ProxyUnderfunded when the proxy holds less than principal + fee", async function () {
-      await usdc.connect(walletA).transfer(proxy, USDC(300)); // missing the fee
+    it("reverts InsufficientFunding when the wallet's USDC balance is too low", async function () {
+      // walletA only ever received 1000 in beforeEach; drain it below the 302 needed.
+      const bal = await usdc.balanceOf(walletA.address);
+      await usdc.connect(walletA).transfer(owner.address, bal - USDC(100)); // leaves 100 < 302
+      await usdc.connect(walletA).approve(await integrator.getAddress(), USDC(302));
       await expect(
         integrator.connect(walletA).deliverPayout(orderId, ENC)
-      ).to.be.revertedWithCustomError(integrator, "ProxyUnderfunded");
+      ).to.be.revertedWithCustomError(integrator, "InsufficientFunding");
+    });
+
+    it("reverts InsufficientFunding when the wallet has balance but insufficient allowance", async function () {
+      await usdc.connect(walletA).approve(await integrator.getAddress(), USDC(300)); // short by the fee
+      await expect(
+        integrator.connect(walletA).deliverPayout(orderId, ENC)
+      ).to.be.revertedWithCustomError(integrator, "InsufficientFunding");
     });
 
     it("only the leg's wallet or the owner can deliver", async function () {
-      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await usdc.connect(walletA).approve(await integrator.getAddress(), USDC(302));
       await expect(
         integrator.connect(attacker).deliverPayout(orderId, ENC)
       ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
@@ -440,7 +453,7 @@ describe("RemitamIntegrator", function () {
 
     it("surfaces the Diamond's silent auto-cancel in the emitted status", async function () {
       await diamond.setForceSellUpiAutoCancel(true);
-      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await usdc.connect(walletA).approve(await integrator.getAddress(), USDC(302));
       const tx = await integrator.connect(walletA).deliverPayout(orderId, ENC);
       const rc = await tx.wait();
       const ev = rc!.logs
@@ -459,6 +472,55 @@ describe("RemitamIntegrator", function () {
       await expect(
         integrator.connect(walletA).deliverPayout(999999, ENC)
       ).to.be.revertedWithCustomError(integrator, "SellLegNotFound");
+    });
+
+    it("an unswept refund on the proxy reduces the shortfall pulled from the wallet", async function () {
+      // Deliver this leg (needed = 302) fully, then have it cancelled-after-PAID
+      // so the mock refunds 302 back onto the proxy — and deliberately do NOT
+      // reconcile, leaving it there as unswept dust.
+      await usdc.connect(walletA).approve(await integrator.getAddress(), USDC(1000));
+      await integrator.connect(walletA).deliverPayout(orderId, ENC);
+      await diamond.cancelSellOrder(orderId); // refunds 302 to the proxy
+      expect(await usdc.balanceOf(proxy)).to.equal(USDC(302));
+
+      // Start a second leg needing 202 (principal 200 + fee 2). The 302
+      // already sitting on the proxy fully covers it, so no wallet pull.
+      await integrator.connect(walletA).userStartSell(USDC(200), INR, PK, CIRCLE, 0, 0);
+      const orderId2 = (await diamond.getNextOrderId()) - 1n;
+      await diamond.acceptSellOrder(orderId2, PK);
+
+      const walletBefore = await usdc.balanceOf(walletA.address);
+      await integrator.connect(walletA).deliverPayout(orderId2, ENC);
+      expect(await usdc.balanceOf(walletA.address)).to.equal(walletBefore); // no pull needed
+      expect(await usdc.balanceOf(proxy)).to.equal(USDC(100)); // 302 - 202 leftover dust
+    });
+
+    it("attack is gone: leg A cancelled and reconciled AFTER leg B was already delivered and paid", async function () {
+      // Start a second leg B (200 + fee 2 = 202) alongside leg A (300 + fee 2 = 302).
+      await integrator.connect(walletA).userStartSell(USDC(200), INR, PK, CIRCLE, 0, 0);
+      const orderIdB = (await diamond.getNextOrderId()) - 1n;
+      await diamond.acceptSellOrder(orderIdB, PK);
+
+      await usdc.connect(walletA).approve(await integrator.getAddress(), USDC(1000));
+
+      // Deliver B fully — funded and pulled entirely JIT, nothing parked on
+      // the proxy for A to ever front-run.
+      await integrator.connect(walletA).deliverPayout(orderIdB, ENC);
+      const orderB = await diamond.getSellOrder(orderIdB);
+      expect(orderB.status).to.equal(2); // PAID
+      expect(await usdc.balanceOf(proxy)).to.equal(0n);
+
+      // Now cancel leg A (still ACCEPTED, never delivered) and reconcile it —
+      // under the old whole-balance-sweep design a permissionless reconcile
+      // on A, timed after B's funding landed on the shared proxy, could have
+      // swept B's parked funds. Here there is nothing to sweep and B is
+      // untouched: its PAID status and pulled funds are unaffected.
+      await diamond.cancelSellOrder(orderId);
+      await integrator.reconcile(orderId);
+
+      const orderBAfter = await diamond.getSellOrder(orderIdB);
+      expect(orderBAfter.status).to.equal(2); // still PAID, undisturbed
+      expect(await usdc.balanceOf(proxy)).to.equal(0n);
     });
   });
 
@@ -505,6 +567,40 @@ describe("RemitamIntegrator", function () {
       expect(await usdc.balanceOf(proxy)).to.equal(0n);
       expect(await integrator.activeSellCount(walletA.address)).to.equal(0n);
       expect(await integrator.dailyVolume(walletA.address, day)).to.equal(0n); // released
+    });
+
+    it("reverts DisputedOrder on a CANCELLED leg with a raised dispute, leaving it unsettled", async function () {
+      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await integrator.connect(walletA).deliverPayout(orderId, ENC);
+      await diamond.cancelSellOrder(orderId); // refunds 302 to the proxy
+
+      await diamond.setSellDispute(orderId, /* raisedBy */ 1, /* status */ 0);
+      await expect(integrator.reconcile(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "DisputedOrder"
+      );
+      // Nothing was mutated: leg still unsettled, slot still held, funds untouched.
+      const leg = await integrator.sellLegs(orderId);
+      expect(leg.settled).to.equal(false);
+      expect(await integrator.activeSellCount(walletA.address)).to.equal(1n);
+      expect(await usdc.balanceOf(proxy)).to.equal(USDC(302));
+    });
+
+    it("reverts DisputedOrder on a CANCELLED leg with a settled dispute (status != 0)", async function () {
+      await diamond.cancelSellOrder(orderId); // still ACCEPTED pre-delivery
+      await diamond.setSellDispute(orderId, /* raisedBy */ 0, /* status */ 2);
+      await expect(integrator.reconcile(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "DisputedOrder"
+      );
+    });
+
+    it("COMPLETED legs are unaffected by the dispute guard (only checked on CANCELLED)", async function () {
+      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await integrator.connect(walletA).deliverPayout(orderId, ENC);
+      await diamond.completeSellOrder(orderId);
+      await diamond.setSellDispute(orderId, 1, 1); // even a raised+settled dispute
+      await expect(integrator.reconcile(orderId)).to.emit(integrator, "SellReconciled");
     });
 
     it("cancelled-before-funding leg: nothing to sweep, slot freed", async function () {
