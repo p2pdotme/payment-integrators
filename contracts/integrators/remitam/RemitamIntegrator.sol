@@ -37,6 +37,10 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     error DailyVolumeExceeded();
     error DailyCountExceeded();
     error TooManyActiveSells();
+    error SellLegNotFound();
+    error NotAuthorized();
+    error FeeNotReady();
+    error ProxyUnderfunded();
 
     // ─── Events ───────────────────────────────────────────────────────
     event AccountAdded(address indexed account);
@@ -57,6 +61,7 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     );
     event LegCompleted(uint256 indexed orderId, address indexed wallet, uint256 amount);
     event LegCancelled(uint256 indexed orderId, address indexed wallet);
+    event PayoutDelivered(uint256 indexed orderId, uint8 statusAfter);
 
     // ─── Immutables ───────────────────────────────────────────────────
     address public immutable diamond;
@@ -267,6 +272,37 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         });
         activeSellCount[msg.sender] += 1;
         emit SellPlaced(orderId, msg.sender, principal, currency);
+    }
+
+    /// @notice Phase 2 of a SELL leg: deliver the ECIES-encrypted payout
+    ///         handle (CBU/PIX/Nequi... encrypted to the merchant's pubkey,
+    ///         never plaintext, never in events) and trigger the Diamond's
+    ///         USDC pull. The wallet must have funded its proxy with
+    ///         principal + fee beforehand (plain ERC-20 transfer).
+    /// @dev    The live Diamond wraps its pull in try/catch and AUTO-CANCELS
+    ///         on failure instead of reverting, so success here is not proof
+    ///         of delivery — we read the status back and emit it for the
+    ///         keeper.
+    function deliverPayout(uint256 orderId, string calldata encPayout) external nonReentrant {
+        SellLeg storage leg = sellLegs[orderId];
+        if (!leg.initialized) revert SellLegNotFound();
+        if (msg.sender != leg.user && msg.sender != owner) revert NotAuthorized();
+
+        // actualUsdtAmount = principal + fee. Zero means the Diamond has not
+        // computed the fee yet — funding principal-only would make the pull
+        // fail and silently cancel the order, so refuse and let the keeper
+        // retry.
+        uint256 needed = IOrderFlow(diamond).getAdditionalOrderDetails(orderId).actualUsdtAmount;
+        if (needed == 0) revert FeeNotReady();
+
+        address proxy = proxyAddress(leg.user);
+        if (usdc.balanceOf(proxy) < needed) revert ProxyUnderfunded();
+
+        bytes memory data = abi.encodeCall(IOrderFlow.setSellOrderUpi, (orderId, encPayout, 0));
+        UserProxy(proxy).execute(diamond, data, address(usdc), needed);
+
+        uint8 statusAfter = IOrderFlow(diamond).getOrdersById(orderId).status;
+        emit PayoutDelivered(orderId, statusAfter);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────

@@ -306,4 +306,77 @@ describe("RemitamIntegrator", function () {
       expect(await integrator.dailyVolume(walletA.address, day)).to.equal(USDC(250));
     });
   });
+
+  describe("deliverPayout", function () {
+    let orderId: bigint;
+    let proxy: string;
+    const ENC = "0x" + "cd".repeat(48); // opaque encrypted payout blob
+
+    beforeEach(async function () {
+      await integrator.addAccount(walletA.address);
+      await integrator.connect(walletA).userStartSell(USDC(300), INR, PK, CIRCLE, 0, 0);
+      orderId = (await diamond.getNextOrderId()) - 1n;
+      proxy = await integrator.proxyAddress(walletA.address);
+      await diamond.acceptSellOrder(orderId, PK);
+      await diamond.setSellFee(USDC(2)); // actualUsdtAmount = 302
+      await usdc.mint(walletA.address, USDC(1000));
+    });
+
+    it("happy path: pulls principal + fee from the funded proxy, order goes PAID", async function () {
+      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await expect(integrator.connect(walletA).deliverPayout(orderId, ENC)).to.emit(
+        integrator,
+        "PayoutDelivered"
+      );
+      const order = await diamond.getSellOrder(orderId);
+      expect(order.status).to.equal(2); // PAID
+      expect(await usdc.balanceOf(proxy)).to.equal(0n); // exact pull
+    });
+
+    it("reverts FeeNotReady while the Diamond has not computed the fee", async function () {
+      await diamond.setAdditionalOrderDetailsFeeUnready(true);
+      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await expect(
+        integrator.connect(walletA).deliverPayout(orderId, ENC)
+      ).to.be.revertedWithCustomError(integrator, "FeeNotReady");
+    });
+
+    it("reverts ProxyUnderfunded when the proxy holds less than principal + fee", async function () {
+      await usdc.connect(walletA).transfer(proxy, USDC(300)); // missing the fee
+      await expect(
+        integrator.connect(walletA).deliverPayout(orderId, ENC)
+      ).to.be.revertedWithCustomError(integrator, "ProxyUnderfunded");
+    });
+
+    it("only the leg's wallet or the owner can deliver", async function () {
+      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await expect(
+        integrator.connect(attacker).deliverPayout(orderId, ENC)
+      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await integrator.connect(owner).deliverPayout(orderId, ENC); // keeper path ok
+    });
+
+    it("surfaces the Diamond's silent auto-cancel in the emitted status", async function () {
+      await diamond.setForceSellUpiAutoCancel(true);
+      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      const tx = await integrator.connect(walletA).deliverPayout(orderId, ENC);
+      const rc = await tx.wait();
+      const ev = rc!.logs
+        .map((l: any) => {
+          try {
+            return integrator.interface.parseLog(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((p: any) => p?.name === "PayoutDelivered");
+      expect(ev!.args[1]).to.equal(4); // CANCELLED — keeper must reconcile
+    });
+
+    it("unknown orderId reverts SellLegNotFound", async function () {
+      await expect(
+        integrator.connect(walletA).deliverPayout(999999, ENC)
+      ).to.be.revertedWithCustomError(integrator, "SellLegNotFound");
+    });
+  });
 });
