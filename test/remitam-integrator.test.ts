@@ -77,6 +77,21 @@ describe("RemitamIntegrator", function () {
         "InvalidAddress"
       );
     });
+
+    it("non-owner cannot remove accounts", async function () {
+      await integrator.addAccount(walletA.address);
+      await expect(
+        integrator.connect(attacker).removeAccount(walletA.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    it("removeAccount of a never-added account is a no-op (stays false)", async function () {
+      expect(await integrator.whitelisted(walletA.address)).to.equal(false);
+      await expect(integrator.removeAccount(walletA.address))
+        .to.emit(integrator, "AccountRemoved")
+        .withArgs(walletA.address);
+      expect(await integrator.whitelisted(walletA.address)).to.equal(false);
+    });
   });
 
   describe("limits admin", function () {
@@ -121,6 +136,34 @@ describe("RemitamIntegrator", function () {
       const p2 = await integrator.proxyAddress(walletA.address);
       expect(p1).to.equal(p2);
       expect(p1).to.not.equal(await integrator.proxyAddress(walletB.address));
+    });
+  });
+
+  describe("constructor", function () {
+    it("rejects a zero diamond address", async function () {
+      const Integrator = await ethers.getContractFactory("RemitamIntegrator");
+      await expect(
+        Integrator.deploy(
+          ethers.ZeroAddress,
+          await usdc.getAddress(),
+          TX_CEIL,
+          VOL_CEIL,
+          COUNT_CEIL
+        )
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    });
+
+    it("rejects a zero usdc address", async function () {
+      const Integrator = await ethers.getContractFactory("RemitamIntegrator");
+      await expect(
+        Integrator.deploy(
+          await diamond.getAddress(),
+          ethers.ZeroAddress,
+          TX_CEIL,
+          VOL_CEIL,
+          COUNT_CEIL
+        )
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
   });
 
@@ -190,6 +233,18 @@ describe("RemitamIntegrator", function () {
         integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR)
       ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
     });
+
+    it("rejects a proxy whose owning wallet was later removed (proxyOwner resolves non-zero)", async function () {
+      // Create the proxy (and proxyOwner mapping) via a SELL placement, then
+      // remove the wallet: _resolveWallet must fall through past the
+      // wallet == address(0) short-circuit into the whitelisted check.
+      await integrator.connect(walletA).userStartSell(USDC(1), INR, PK, CIRCLE, 0, 0);
+      const proxy = await integrator.proxyAddress(walletA.address);
+      await integrator.removeAccount(walletA.address);
+      await expect(
+        integrator.connect(dia).validateOrder(proxy, USDC(1), INR)
+      ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
+    });
   });
 
   describe("buy leg", function () {
@@ -243,6 +298,33 @@ describe("RemitamIntegrator", function () {
     it("onOrderCancel tolerates unknown orderIds (no revert, no state change)", async function () {
       const dia = await diamondSigner();
       await integrator.connect(dia).onOrderCancel(999999); // must not revert
+    });
+
+    it("onOrderCancel and onOrderComplete are diamond-only", async function () {
+      await expect(integrator.connect(attacker).onOrderCancel(1)).to.be.revertedWithCustomError(
+        integrator,
+        "OnlyDiamond"
+      );
+      await expect(
+        integrator.connect(attacker).onOrderComplete(1, walletA.address, USDC(1), attacker.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyDiamond");
+    });
+
+    it("onOrderComplete tolerates unknown / already-settled orderIds (no revert)", async function () {
+      const dia = await diamondSigner();
+      // Never-placed orderId.
+      await integrator
+        .connect(dia)
+        .onOrderComplete(999999, walletA.address, USDC(1), walletA.address);
+
+      // A real order that already completed once.
+      await integrator.connect(walletA).userPlaceBuyOrder(USDC(300), INR, PK, CIRCLE, 0, 0);
+      const orderId = (await diamond.getNextOrderId()) - 1n;
+      await diamond.simulateOrderComplete(orderId);
+      // Second callback for the same (now-inactive) session must be a no-op.
+      await integrator
+        .connect(dia)
+        .onOrderComplete(orderId, walletA.address, USDC(300), walletA.address);
     });
 
     it("splitting: two buy legs 300 + 200 both settle to the wallet", async function () {
@@ -429,6 +511,13 @@ describe("RemitamIntegrator", function () {
       await diamond.cancelSellOrder(orderId);
       await integrator.reconcile(orderId);
       expect(await integrator.activeSellCount(walletA.address)).to.equal(0n);
+    });
+
+    it("unknown orderId reverts SellLegNotFound", async function () {
+      await expect(integrator.reconcile(999999)).to.be.revertedWithCustomError(
+        integrator,
+        "SellLegNotFound"
+      );
     });
 
     it("rejects non-terminal status and double reconciliation", async function () {
