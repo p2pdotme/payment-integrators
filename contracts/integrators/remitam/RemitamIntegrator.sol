@@ -41,6 +41,8 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     error NotAuthorized();
     error FeeNotReady();
     error ProxyUnderfunded();
+    error AlreadyReconciled();
+    error NotTerminal();
 
     // ─── Events ───────────────────────────────────────────────────────
     event AccountAdded(address indexed account);
@@ -62,6 +64,7 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     event LegCompleted(uint256 indexed orderId, address indexed wallet, uint256 amount);
     event LegCancelled(uint256 indexed orderId, address indexed wallet);
     event PayoutDelivered(uint256 indexed orderId, uint8 statusAfter);
+    event SellReconciled(uint256 indexed orderId, uint8 status, uint256 swept);
 
     // ─── Immutables ───────────────────────────────────────────────────
     address public immutable diamond;
@@ -303,6 +306,47 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
 
         uint8 statusAfter = IOrderFlow(diamond).getOrdersById(orderId).status;
         emit PayoutDelivered(orderId, statusAfter);
+    }
+
+    /// @notice Permissionless settlement of a SELL leg. Reads the
+    ///         authoritative status from the Diamond (never caller-supplied —
+    ///         trusting a caller status is a griefing surface). On a terminal
+    ///         status it frees the wallet's concurrency slot and sweeps any
+    ///         USDC sitting on the proxy (a cancellation refund, or Diamond
+    ///         under-pull dust) back to the wallet. On CANCELLED it also
+    ///         releases the validateOrder daily debit.
+    /// @dev    All of a wallet's legs share one proxy, so the sweep can pick
+    ///         up funding parked for a sibling leg. Not a loss (funds return
+    ///         to the same wallet), but the backend must fund-and-deliver one
+    ///         leg at a time and reconcile cancelled legs before funding the
+    ///         next.
+    function reconcile(uint256 orderId) external nonReentrant {
+        SellLeg storage leg = sellLegs[orderId];
+        if (!leg.initialized) revert SellLegNotFound();
+        if (leg.settled) revert AlreadyReconciled();
+
+        uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
+        if (status != 3 && status != 4) revert NotTerminal();
+
+        leg.settled = true;
+        leg.lastStatus = status;
+        if (activeSellCount[leg.user] > 0) activeSellCount[leg.user] -= 1;
+
+        if (status == 4) {
+            // The leg never consumed merchant capacity — free the daily budget.
+            _releaseDebit(leg.user, leg.day, leg.principal);
+        }
+
+        // Recover whatever USDC sits on the proxy. sweepERC20 blocks USDC by
+        // design; transferERC20ToIntegrator is the integrator-only primitive.
+        address proxy = proxyAddress(leg.user);
+        uint256 swept = usdc.balanceOf(proxy);
+        if (swept > 0) {
+            UserProxy(proxy).transferERC20ToIntegrator(address(usdc), swept);
+            usdc.safeTransfer(leg.user, swept);
+        }
+
+        emit SellReconciled(orderId, status, swept);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────

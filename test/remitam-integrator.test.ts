@@ -379,4 +379,92 @@ describe("RemitamIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "SellLegNotFound");
     });
   });
+
+  describe("reconcile", function () {
+    let orderId: bigint;
+    let proxy: string;
+    const ENC = "0x" + "cd".repeat(48);
+
+    beforeEach(async function () {
+      await integrator.addAccount(walletA.address);
+      await integrator.connect(walletA).userStartSell(USDC(300), INR, PK, CIRCLE, 0, 0);
+      orderId = (await diamond.getNextOrderId()) - 1n;
+      proxy = await integrator.proxyAddress(walletA.address);
+      await diamond.acceptSellOrder(orderId, PK);
+      await diamond.setSellFee(USDC(2));
+      await usdc.mint(walletA.address, USDC(1000));
+    });
+
+    it("completed leg: settles, frees the concurrency slot, keeps the daily debit", async function () {
+      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
+      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await integrator.connect(walletA).deliverPayout(orderId, ENC);
+      await diamond.completeSellOrder(orderId);
+
+      await expect(integrator.connect(attacker).reconcile(orderId)) // permissionless
+        .to.emit(integrator, "SellReconciled");
+      expect(await integrator.activeSellCount(walletA.address)).to.equal(0n);
+      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(USDC(300)); // consumed capacity stays
+      const leg = await integrator.sellLegs(orderId);
+      expect(leg.settled).to.equal(true);
+      expect(leg.lastStatus).to.equal(3);
+    });
+
+    it("cancelled-after-PAID leg: refund swept from proxy back to the wallet, debit released", async function () {
+      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
+      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await integrator.connect(walletA).deliverPayout(orderId, ENC);
+      const balBefore = await usdc.balanceOf(walletA.address);
+
+      await diamond.cancelSellOrder(orderId); // mock refunds 302 to order.user = proxy
+      await integrator.reconcile(orderId);
+
+      expect(await usdc.balanceOf(walletA.address)).to.equal(balBefore + USDC(302));
+      expect(await usdc.balanceOf(proxy)).to.equal(0n);
+      expect(await integrator.activeSellCount(walletA.address)).to.equal(0n);
+      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(0n); // released
+    });
+
+    it("cancelled-before-funding leg: nothing to sweep, slot freed", async function () {
+      await diamond.cancelSellOrder(orderId);
+      await integrator.reconcile(orderId);
+      expect(await integrator.activeSellCount(walletA.address)).to.equal(0n);
+    });
+
+    it("rejects non-terminal status and double reconciliation", async function () {
+      await expect(integrator.reconcile(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "NotTerminal"
+      ); // still ACCEPTED
+      await diamond.cancelSellOrder(orderId);
+      await integrator.reconcile(orderId);
+      await expect(integrator.reconcile(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "AlreadyReconciled"
+      );
+    });
+
+    it("full split scenario: 300 + 200 legs, one completes, one cancels and refunds", async function () {
+      // Second leg.
+      await integrator.connect(walletA).userStartSell(USDC(200), INR, PK, CIRCLE, 0, 0);
+      const orderId2 = (await diamond.getNextOrderId()) - 1n;
+      await diamond.acceptSellOrder(orderId2, PK);
+
+      // Leg 1 completes.
+      await usdc.connect(walletA).transfer(proxy, USDC(302));
+      await integrator.connect(walletA).deliverPayout(orderId, ENC);
+      await diamond.completeSellOrder(orderId);
+      await integrator.reconcile(orderId);
+
+      // Leg 2 funded, then cancelled by the protocol.
+      await usdc.connect(walletA).transfer(proxy, USDC(202));
+      await integrator.connect(walletA).deliverPayout(orderId2, ENC);
+      const balBefore = await usdc.balanceOf(walletA.address);
+      await diamond.cancelSellOrder(orderId2);
+      await integrator.reconcile(orderId2);
+
+      expect(await usdc.balanceOf(walletA.address)).to.equal(balBefore + USDC(202));
+      expect(await integrator.activeSellCount(walletA.address)).to.equal(0n);
+    });
+  });
 });
