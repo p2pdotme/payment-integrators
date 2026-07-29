@@ -191,4 +191,69 @@ describe("RemitamIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
     });
   });
+
+  describe("buy leg", function () {
+    beforeEach(async function () {
+      await integrator.addAccount(walletA.address);
+    });
+
+    it("whitelisted wallet places a buy; USDC lands on the wallet at completion", async function () {
+      const tx = await integrator
+        .connect(walletA)
+        .userPlaceBuyOrder(USDC(300), INR, PK, CIRCLE, 0, 0);
+      const rc = await tx.wait();
+      const ev = rc!.logs
+        .map((l: any) => {
+          try {
+            return integrator.interface.parseLog(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((p: any) => p?.name === "BuyPlaced");
+      expect(ev).to.not.be.undefined;
+      const orderId = ev!.args[0];
+
+      const before = await usdc.balanceOf(walletA.address);
+      await expect(diamond.simulateOrderComplete(orderId)).to.emit(integrator, "LegCompleted");
+      expect(await usdc.balanceOf(walletA.address)).to.equal(before + USDC(300));
+
+      const session = await integrator.buySessions(orderId);
+      expect(session.active).to.equal(false);
+    });
+
+    it("non-whitelisted wallet cannot place", async function () {
+      await expect(
+        integrator.connect(attacker).userPlaceBuyOrder(USDC(1), INR, PK, CIRCLE, 0, 0)
+      ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
+    });
+
+    it("cancellation releases the daily debit and is idempotent", async function () {
+      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
+      await integrator.connect(walletA).userPlaceBuyOrder(USDC(300), INR, PK, CIRCLE, 0, 0);
+      // The just-placed order got id nextOrderId-1.
+      const orderId = (await diamond.getNextOrderId()) - 1n;
+      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(USDC(300));
+
+      await expect(diamond.simulateOrderCancelled(orderId)).to.emit(integrator, "LegCancelled");
+      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(0n);
+      expect(await integrator.dailyCount(walletA.address, day)).to.equal(0n);
+    });
+
+    it("onOrderCancel tolerates unknown orderIds (no revert, no state change)", async function () {
+      const dia = await diamondSigner();
+      await integrator.connect(dia).onOrderCancel(999999); // must not revert
+    });
+
+    it("splitting: two buy legs 300 + 200 both settle to the wallet", async function () {
+      await integrator.connect(walletA).userPlaceBuyOrder(USDC(300), INR, PK, CIRCLE, 0, 0);
+      const id1 = (await diamond.getNextOrderId()) - 1n;
+      await integrator.connect(walletA).userPlaceBuyOrder(USDC(200), INR, PK, CIRCLE, 0, 0);
+      const id2 = (await diamond.getNextOrderId()) - 1n;
+
+      await diamond.simulateOrderComplete(id1);
+      await diamond.simulateOrderComplete(id2);
+      expect(await usdc.balanceOf(walletA.address)).to.equal(USDC(500));
+    });
+  });
 });

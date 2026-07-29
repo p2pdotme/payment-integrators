@@ -42,6 +42,14 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     event AccountRemoved(address indexed account);
     event LimitsUpdated(uint256 txLimit, uint256 dailyVolumeLimit, uint256 dailyCountLimit);
     event UserProxyDeployed(address indexed user, address proxy);
+    event BuyPlaced(
+        uint256 indexed orderId,
+        address indexed wallet,
+        uint256 amount,
+        bytes32 currency
+    );
+    event LegCompleted(uint256 indexed orderId, address indexed wallet, uint256 amount);
+    event LegCancelled(uint256 indexed orderId, address indexed wallet);
 
     // ─── Immutables ───────────────────────────────────────────────────
     address public immutable diamond;
@@ -72,6 +80,15 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     // ─── Daily accounting (wallet => day => consumed) ─────────────────
     mapping(address => mapping(uint256 => uint256)) public dailyVolume;
     mapping(address => mapping(uint256 => uint256)) public dailyCount;
+
+    // ─── Buy sessions (orderId => BuySession) ──────────────────────────
+    struct BuySession {
+        address user; // whitelisted server wallet
+        uint256 amount; // USDC 1e6
+        uint256 day; // day the validateOrder debit landed on
+        bool active;
+    }
+    mapping(uint256 => BuySession) public buySessions;
 
     // ─── Modifiers ────────────────────────────────────────────────────
     modifier onlyOwner() {
@@ -137,6 +154,51 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         emit LimitsUpdated(txLimit_, dailyVolumeLimit_, dailyCountLimit_);
     }
 
+    // ─── Buy leg ──────────────────────────────────────────────────────
+
+    /// @notice Place a BUY leg (fiat -> USDC). The Diamond assigns merchants;
+    ///         at completion USDC is transferred straight to msg.sender
+    ///         (recipientAddr; we register usdcThroughIntegrator = false).
+    function userPlaceBuyOrder(
+        uint256 amount,
+        bytes32 currency,
+        string calldata pubKey,
+        uint256 circleId,
+        uint256 preferredPaymentChannelConfigId,
+        uint256 fiatAmountLimit
+    ) external nonReentrant returns (uint256 orderId) {
+        if (!whitelisted[msg.sender]) revert NotWhitelisted();
+        address proxy = _ensureProxy(msg.sender);
+
+        bytes memory placeData = abi.encodeCall(
+            IB2BGateway.placeB2BOrder,
+            (
+                msg.sender,
+                amount,
+                currency,
+                msg.sender, // recipientAddr = the user's server wallet
+                pubKey,
+                circleId,
+                preferredPaymentChannelConfigId,
+                fiatAmountLimit
+            )
+        );
+        // usdcAllowance = 0: the Diamond pulls nothing at BUY placement.
+        bytes memory result = UserProxy(proxy).execute(diamond, placeData, address(usdc), 0);
+        orderId = abi.decode(result, (uint256));
+
+        // validateOrder already ran (synchronously, inside placeB2BOrder) and
+        // debited today's buckets; snapshot the day so a late cancel releases
+        // the right bucket.
+        buySessions[orderId] = BuySession({
+            user: msg.sender,
+            amount: amount,
+            day: _day(),
+            active: true
+        });
+        emit BuyPlaced(orderId, msg.sender, amount, currency);
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────
 
     function _day() internal view returns (uint256) {
@@ -182,14 +244,32 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         if (cnt > 0) dailyCount[wallet][day] = cnt - 1;
     }
 
+    /// @notice Diamond callback on BUY settlement. USDC was already routed to
+    ///         recipientAddr by the protocol; we only close our session.
+    ///         Tolerates unknown orderIds (SELL completions are observed via
+    ///         reconcile, not this callback).
     function onOrderComplete(
-        uint256 /*orderId*/,
+        uint256 orderId,
         address /*user*/,
         uint256 /*amount*/,
         address /*recipientAddr*/
-    ) external onlyDiamond {}
+    ) external onlyDiamond {
+        BuySession storage s = buySessions[orderId];
+        if (!s.active) return;
+        s.active = false;
+        emit LegCompleted(orderId, s.user, s.amount);
+    }
 
-    function onOrderCancel(uint256 /*orderId*/) external onlyDiamond {}
+    /// @notice Diamond callback on B2B BUY cancellation. Releases the daily
+    ///         debit consumed at validateOrder time. Best-effort: tolerates
+    ///         unknown / already-cancelled orderIds and never reverts.
+    function onOrderCancel(uint256 orderId) external onlyDiamond {
+        BuySession storage s = buySessions[orderId];
+        if (!s.active) return;
+        s.active = false;
+        _releaseDebit(s.user, s.day, s.amount);
+        emit LegCancelled(orderId, s.user);
+    }
 
     // ─── Proxy helpers (mirror contracts/templates/MyIntegrator.sol) ──
 
