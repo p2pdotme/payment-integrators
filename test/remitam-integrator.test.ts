@@ -16,12 +16,6 @@ describe("RemitamIntegrator", function () {
   const INR = ethers.encodeBytes32String("INR");
   const CIRCLE = 1;
   const PK = "04" + "ab".repeat(64); // valid-shape relay pubkey
-  const DAY = 86400;
-  // Ceilings chosen for tests: 1_000 USDC/tx, 5_000 USDC/day, 10 orders/day
-  const TX_CEIL = USDC(1000);
-  const VOL_CEIL = USDC(5000);
-  const COUNT_CEIL = 10n;
-
   async function diamondSigner(): Promise<SignerWithAddress> {
     const addr = await diamond.getAddress();
     await ethers.provider.send("hardhat_impersonateAccount", [addr]);
@@ -39,13 +33,7 @@ describe("RemitamIntegrator", function () {
     diamond = await MockDiamond.deploy(await usdc.getAddress());
 
     const Integrator = await ethers.getContractFactory("RemitamIntegrator");
-    integrator = await Integrator.deploy(
-      await diamond.getAddress(),
-      await usdc.getAddress(),
-      TX_CEIL,
-      VOL_CEIL,
-      COUNT_CEIL
-    );
+    integrator = await Integrator.deploy(await diamond.getAddress(), await usdc.getAddress());
 
     await diamond.registerIntegrator(await integrator.getAddress(), await integrator.proxyImpl());
     // Fund the mock diamond so simulateOrderComplete can pay out buys.
@@ -94,42 +82,6 @@ describe("RemitamIntegrator", function () {
     });
   });
 
-  describe("limits admin", function () {
-    it("initial limits equal ceilings", async function () {
-      expect(await integrator.txLimit()).to.equal(TX_CEIL);
-      expect(await integrator.dailyVolumeLimit()).to.equal(VOL_CEIL);
-      expect(await integrator.dailyCountLimit()).to.equal(COUNT_CEIL);
-    });
-
-    it("owner can lower and re-raise limits up to the ceiling", async function () {
-      await expect(integrator.setLimits(USDC(100), USDC(500), 3))
-        .to.emit(integrator, "LimitsUpdated")
-        .withArgs(USDC(100), USDC(500), 3);
-      expect(await integrator.txLimit()).to.equal(USDC(100));
-
-      await integrator.setLimits(TX_CEIL, VOL_CEIL, COUNT_CEIL); // back to ceiling: ok
-    });
-
-    it("cannot raise any limit above its immutable ceiling", async function () {
-      await expect(
-        integrator.setLimits(TX_CEIL + 1n, VOL_CEIL, COUNT_CEIL)
-      ).to.be.revertedWithCustomError(integrator, "LimitAboveCeiling");
-      await expect(
-        integrator.setLimits(TX_CEIL, VOL_CEIL + 1n, COUNT_CEIL)
-      ).to.be.revertedWithCustomError(integrator, "LimitAboveCeiling");
-      await expect(
-        integrator.setLimits(TX_CEIL, VOL_CEIL, COUNT_CEIL + 1n)
-      ).to.be.revertedWithCustomError(integrator, "LimitAboveCeiling");
-    });
-
-    it("non-owner cannot set limits", async function () {
-      await expect(integrator.connect(attacker).setLimits(1, 1, 1)).to.be.revertedWithCustomError(
-        integrator,
-        "OnlyOwner"
-      );
-    });
-  });
-
   describe("proxy derivation", function () {
     it("proxyAddress is deterministic and stable", async function () {
       const p1 = await integrator.proxyAddress(walletA.address);
@@ -143,26 +95,14 @@ describe("RemitamIntegrator", function () {
     it("rejects a zero diamond address", async function () {
       const Integrator = await ethers.getContractFactory("RemitamIntegrator");
       await expect(
-        Integrator.deploy(
-          ethers.ZeroAddress,
-          await usdc.getAddress(),
-          TX_CEIL,
-          VOL_CEIL,
-          COUNT_CEIL
-        )
+        Integrator.deploy(ethers.ZeroAddress, await usdc.getAddress())
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
 
     it("rejects a zero usdc address", async function () {
       const Integrator = await ethers.getContractFactory("RemitamIntegrator");
       await expect(
-        Integrator.deploy(
-          await diamond.getAddress(),
-          ethers.ZeroAddress,
-          TX_CEIL,
-          VOL_CEIL,
-          COUNT_CEIL
-        )
+        Integrator.deploy(await diamond.getAddress(), ethers.ZeroAddress)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
   });
@@ -186,45 +126,18 @@ describe("RemitamIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
     });
 
-    it("accepts a whitelisted wallet and debits daily accounting", async function () {
-      await integrator.connect(dia).validateOrder.staticCall(walletA.address, USDC(100), INR);
-      await integrator.connect(dia).validateOrder(walletA.address, USDC(100), INR);
-      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
-      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(USDC(100));
-      expect(await integrator.dailyCount(walletA.address, day)).to.equal(1n);
+    it("accepts a whitelisted wallet (limits are enforced off-chain, not here)", async function () {
+      const allowed = await integrator
+        .connect(dia)
+        .validateOrder.staticCall(walletA.address, USDC(100), INR);
+      expect(allowed).to.equal(true);
+      await expect(integrator.connect(dia).validateOrder(walletA.address, USDC(100), INR)).to.not.be
+        .reverted;
     });
 
-    it("enforces the per-tx limit", async function () {
-      await expect(
-        integrator.connect(dia).validateOrder(walletA.address, TX_CEIL + 1n, INR)
-      ).to.be.revertedWithCustomError(integrator, "TxLimitExceeded");
-    });
-
-    it("enforces the daily volume limit across orders", async function () {
-      // 5 x 1000 = the 5000 ceiling; a 6th tx of 1 must fail.
-      for (let i = 0; i < 5; i++) {
-        await integrator.connect(dia).validateOrder(walletA.address, USDC(1000), INR);
-      }
-      await expect(
-        integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR)
-      ).to.be.revertedWithCustomError(integrator, "DailyVolumeExceeded");
-    });
-
-    it("enforces the daily count limit", async function () {
-      await integrator.setLimits(USDC(1), VOL_CEIL, 2);
-      await integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR);
-      await integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR);
-      await expect(
-        integrator.connect(dia).validateOrder(walletA.address, USDC(1), INR)
-      ).to.be.revertedWithCustomError(integrator, "DailyCountExceeded");
-    });
-
-    it("day rollover resets the buckets", async function () {
-      await integrator.setLimits(USDC(1000), USDC(1000), 1);
-      await integrator.connect(dia).validateOrder(walletA.address, USDC(1000), INR);
-      await ethers.provider.send("evm_increaseTime", [DAY]);
-      await ethers.provider.send("evm_mine", []);
-      await integrator.connect(dia).validateOrder(walletA.address, USDC(1000), INR); // fresh day: ok
+    it("accepts an arbitrarily large amount for a whitelisted wallet (no on-chain cap)", async function () {
+      await expect(integrator.connect(dia).validateOrder(walletA.address, USDC(1_000_000), INR)).to
+        .not.be.reverted;
     });
 
     it("removing an account blocks further orders", async function () {
@@ -283,16 +196,19 @@ describe("RemitamIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
     });
 
-    it("cancellation releases the daily debit and is idempotent", async function () {
-      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
+    it("cancellation closes the session and is idempotent", async function () {
       await integrator.connect(walletA).userPlaceBuyOrder(USDC(300), INR, PK, CIRCLE, 0, 0);
       // The just-placed order got id nextOrderId-1.
       const orderId = (await diamond.getNextOrderId()) - 1n;
-      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(USDC(300));
 
       await expect(diamond.simulateOrderCancelled(orderId)).to.emit(integrator, "LegCancelled");
-      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(0n);
-      expect(await integrator.dailyCount(walletA.address, day)).to.equal(0n);
+      const session = await integrator.buySessions(orderId);
+      expect(session.active).to.equal(false);
+
+      // Idempotent: a second cancel callback on the same (now-inactive)
+      // session must be a no-op, not a revert or a double emit.
+      const dia = await diamondSigner();
+      await integrator.connect(dia).onOrderCancel(orderId);
     });
 
     it("onOrderCancel tolerates unknown orderIds (no revert, no state change)", async function () {
@@ -382,10 +298,11 @@ describe("RemitamIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "NotWhitelisted");
     });
 
-    it("sell placement debits the wallet's daily buckets via the proxy resolution", async function () {
-      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
-      await integrator.connect(walletA).userStartSell(USDC(250), INR, PK, CIRCLE, 0, 0);
-      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(USDC(250));
+    it("sell placement is accepted via the proxy resolution (order.user = proxy is whitelist-recognized)", async function () {
+      await expect(integrator.connect(walletA).userStartSell(USDC(250), INR, PK, CIRCLE, 0, 0)).to
+        .not.be.reverted;
+      const leg = await integrator.sellLegs((await diamond.getNextOrderId()) - 1n);
+      expect(leg.principal).to.equal(USDC(250));
     });
   });
 
@@ -539,8 +456,7 @@ describe("RemitamIntegrator", function () {
       await usdc.mint(walletA.address, USDC(1000));
     });
 
-    it("completed leg: settles, frees the concurrency slot, keeps the daily debit", async function () {
-      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
+    it("completed leg: settles and frees the concurrency slot", async function () {
       await usdc.connect(walletA).transfer(proxy, USDC(302));
       await integrator.connect(walletA).deliverPayout(orderId, ENC);
       await diamond.completeSellOrder(orderId);
@@ -548,14 +464,12 @@ describe("RemitamIntegrator", function () {
       await expect(integrator.connect(attacker).reconcile(orderId)) // permissionless
         .to.emit(integrator, "SellReconciled");
       expect(await integrator.activeSellCount(walletA.address)).to.equal(0n);
-      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(USDC(300)); // consumed capacity stays
       const leg = await integrator.sellLegs(orderId);
       expect(leg.settled).to.equal(true);
       expect(leg.lastStatus).to.equal(3);
     });
 
-    it("cancelled-after-PAID leg: refund swept from proxy back to the wallet, debit released", async function () {
-      const day = BigInt(Math.floor((await ethers.provider.getBlock("latest"))!.timestamp / DAY));
+    it("cancelled-after-PAID leg: refund swept from proxy back to the wallet", async function () {
       await usdc.connect(walletA).transfer(proxy, USDC(302));
       await integrator.connect(walletA).deliverPayout(orderId, ENC);
       const balBefore = await usdc.balanceOf(walletA.address);
@@ -566,7 +480,6 @@ describe("RemitamIntegrator", function () {
       expect(await usdc.balanceOf(walletA.address)).to.equal(balBefore + USDC(302));
       expect(await usdc.balanceOf(proxy)).to.equal(0n);
       expect(await integrator.activeSellCount(walletA.address)).to.equal(0n);
-      expect(await integrator.dailyVolume(walletA.address, day)).to.equal(0n); // released
     });
 
     it("reverts DisputedOrder on a CANCELLED leg with a raised dispute, leaving it unsettled", async function () {

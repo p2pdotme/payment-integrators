@@ -21,8 +21,11 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
  *         supports several in-flight SELL legs per wallet (bounded).
  *
  *         As a whitelisted integrator we bypass the protocol's RP/daily/
- *         monthly/yearly limits and enforce our own per-tx and daily limits
- *         here, owner-adjustable only up to immutable ceilings.
+ *         monthly/yearly limits. Per-tx and daily buy/sell limits are
+ *         enforced server-side by the Remitam backend, not on-chain: the
+ *         only on-chain gate is the owner-managed whitelist of
+ *         backend-controlled server wallets, since every order can only
+ *         ever originate from a backend-controlled key.
  */
 contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -32,10 +35,6 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     error OnlyOwner();
     error InvalidAddress();
     error NotWhitelisted();
-    error LimitAboveCeiling();
-    error TxLimitExceeded();
-    error DailyVolumeExceeded();
-    error DailyCountExceeded();
     error TooManyActiveSells();
     error SellLegNotFound();
     error NotAuthorized();
@@ -59,7 +58,6 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     // ─── Events ───────────────────────────────────────────────────────
     event AccountAdded(address indexed account);
     event AccountRemoved(address indexed account);
-    event LimitsUpdated(uint256 txLimit, uint256 dailyVolumeLimit, uint256 dailyCountLimit);
     event UserProxyDeployed(address indexed user, address proxy);
     event BuyPlaced(
         uint256 indexed orderId,
@@ -87,32 +85,16 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     /// @notice Pinned at deploy; submitted with the whitelist request.
     address public immutable proxyImpl;
 
-    /// @notice Immutable ceilings — the owner can move limits below these,
-    ///         never above. Reviewed at whitelisting time.
-    uint256 public immutable txLimitCeiling;
-    uint256 public immutable dailyVolumeCeiling;
-    uint256 public immutable dailyCountCeiling;
-
-    // ─── Adjustable limits ────────────────────────────────────────────
-    uint256 public txLimit;
-    uint256 public dailyVolumeLimit;
-    uint256 public dailyCountLimit;
-
     // ─── Whitelist ────────────────────────────────────────────────────
     mapping(address => bool) public whitelisted;
     /// @notice proxy => whitelisted wallet that owns it. Lets validateOrder
     ///         recognize a SELL placed with order.user = the wallet's proxy.
     mapping(address => address) public proxyOwner;
 
-    // ─── Daily accounting (wallet => day => consumed) ─────────────────
-    mapping(address => mapping(uint256 => uint256)) public dailyVolume;
-    mapping(address => mapping(uint256 => uint256)) public dailyCount;
-
     // ─── Buy sessions (orderId => BuySession) ──────────────────────────
     struct BuySession {
         address user; // whitelisted server wallet
         uint256 amount; // USDC 1e6
-        uint256 day; // day the validateOrder debit landed on
         bool active;
     }
     mapping(uint256 => BuySession) public buySessions;
@@ -126,7 +108,6 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     struct SellLeg {
         address user; // whitelisted server wallet
         uint256 principal; // USDC 1e6 (fee excluded; fee read at deliver time)
-        uint256 day; // day of the validateOrder debit
         uint8 lastStatus; // Diamond status recorded by reconcile
         bool initialized;
         bool settled; // terminal status reached and accounted
@@ -146,25 +127,12 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     }
 
     // ─── Constructor ──────────────────────────────────────────────────
-    constructor(
-        address _diamond,
-        address _usdc,
-        uint256 _txLimitCeiling,
-        uint256 _dailyVolumeCeiling,
-        uint256 _dailyCountCeiling
-    ) {
+    constructor(address _diamond, address _usdc) {
         if (_diamond == address(0) || _usdc == address(0)) revert InvalidAddress();
         diamond = _diamond;
         usdc = IERC20(_usdc);
         owner = msg.sender;
         proxyImpl = address(new UserProxy());
-
-        txLimitCeiling = _txLimitCeiling;
-        dailyVolumeCeiling = _dailyVolumeCeiling;
-        dailyCountCeiling = _dailyCountCeiling;
-        txLimit = _txLimitCeiling;
-        dailyVolumeLimit = _dailyVolumeCeiling;
-        dailyCountLimit = _dailyCountCeiling;
     }
 
     // ─── Whitelist admin ──────────────────────────────────────────────
@@ -178,24 +146,6 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     function removeAccount(address account) external onlyOwner {
         whitelisted[account] = false;
         emit AccountRemoved(account);
-    }
-
-    // ─── Limits admin ─────────────────────────────────────────────────
-
-    function setLimits(
-        uint256 txLimit_,
-        uint256 dailyVolumeLimit_,
-        uint256 dailyCountLimit_
-    ) external onlyOwner {
-        if (
-            txLimit_ > txLimitCeiling ||
-            dailyVolumeLimit_ > dailyVolumeCeiling ||
-            dailyCountLimit_ > dailyCountCeiling
-        ) revert LimitAboveCeiling();
-        txLimit = txLimit_;
-        dailyVolumeLimit = dailyVolumeLimit_;
-        dailyCountLimit = dailyCountLimit_;
-        emit LimitsUpdated(txLimit_, dailyVolumeLimit_, dailyCountLimit_);
     }
 
     // ─── Buy leg ──────────────────────────────────────────────────────
@@ -231,15 +181,7 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         bytes memory result = UserProxy(proxy).execute(diamond, placeData, address(usdc), 0);
         orderId = abi.decode(result, (uint256));
 
-        // validateOrder already ran (synchronously, inside placeB2BOrder) and
-        // debited today's buckets; snapshot the day so a late cancel releases
-        // the right bucket.
-        buySessions[orderId] = BuySession({
-            user: msg.sender,
-            amount: amount,
-            day: _day(),
-            active: true
-        });
+        buySessions[orderId] = BuySession({ user: msg.sender, amount: amount, active: true });
         emit BuyPlaced(orderId, msg.sender, amount, currency);
     }
 
@@ -282,7 +224,6 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         sellLegs[orderId] = SellLeg({
             user: msg.sender,
             principal: principal,
-            day: _day(),
             lastStatus: 0,
             initialized: true,
             settled: false
@@ -345,8 +286,7 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
     ///         trusting a caller status is a griefing surface). On a terminal
     ///         status it frees the wallet's concurrency slot and sweeps any
     ///         USDC sitting on the proxy (a cancellation refund, or Diamond
-    ///         under-pull dust) back to the wallet. On CANCELLED it also
-    ///         releases the validateOrder daily debit.
+    ///         under-pull dust) back to the wallet.
     /// @dev    deliverPayout funds JIT (see its natspec), so nothing is ever
     ///         parked on the proxy awaiting delivery — only refunds/dust live
     ///         there — which makes sweeping the whole proxy balance safe even
@@ -371,11 +311,6 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         leg.lastStatus = status;
         if (activeSellCount[leg.user] > 0) activeSellCount[leg.user] -= 1;
 
-        if (status == 4) {
-            // The leg never consumed merchant capacity — free the daily budget.
-            _releaseDebit(leg.user, leg.day, leg.principal);
-        }
-
         // Recover whatever USDC sits on the proxy. sweepERC20 blocks USDC by
         // design; transferERC20ToIntegrator is the integrator-only primitive.
         address proxy = proxyAddress(leg.user);
@@ -390,10 +325,6 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
 
     // ─── Helpers ──────────────────────────────────────────────────────
 
-    function _day() internal view returns (uint256) {
-        return block.timestamp / 1 days;
-    }
-
     /// @dev Resolves the accountable wallet: `user` directly (BUY legs place
     ///      with order.user = server wallet) or the owner of the proxy (SELL
     ///      legs place with order.user = the wallet's UserProxy).
@@ -403,34 +334,18 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         if (wallet == address(0) || !whitelisted[wallet]) revert NotWhitelisted();
     }
 
-    // ─── IP2PIntegrator (filled in over Tasks 3-4) ────────────────────
+    // ─── IP2PIntegrator ─────────────────────────────────────────────────
 
+    /// @notice The only on-chain gate: the resolved wallet must be
+    ///         whitelisted. All buy/sell limits are enforced server-side by
+    ///         the Remitam backend before it ever signs an order.
     function validateOrder(
         address user,
-        uint256 amount,
+        uint256 /*amount*/,
         bytes32 /*currency*/
-    ) external onlyDiamond returns (bool allowed) {
-        address wallet = _resolveWallet(user);
-        if (amount > txLimit) revert TxLimitExceeded();
-
-        uint256 day = _day();
-        uint256 newVolume = dailyVolume[wallet][day] + amount;
-        if (newVolume > dailyVolumeLimit) revert DailyVolumeExceeded();
-        uint256 newCount = dailyCount[wallet][day] + 1;
-        if (newCount > dailyCountLimit) revert DailyCountExceeded();
-
-        dailyVolume[wallet][day] = newVolume;
-        dailyCount[wallet][day] = newCount;
+    ) external view onlyDiamond returns (bool allowed) {
+        _resolveWallet(user);
         return true;
-    }
-
-    /// @dev Floor-guarded reversal of a validateOrder debit — used on
-    ///      cancellation so a cancelled leg frees the wallet's daily budget.
-    function _releaseDebit(address wallet, uint256 day, uint256 amount) internal {
-        uint256 vol = dailyVolume[wallet][day];
-        dailyVolume[wallet][day] = vol > amount ? vol - amount : 0;
-        uint256 cnt = dailyCount[wallet][day];
-        if (cnt > 0) dailyCount[wallet][day] = cnt - 1;
     }
 
     /// @notice Diamond callback on BUY settlement. USDC was already routed to
@@ -449,14 +364,13 @@ contract RemitamIntegrator is IP2PIntegrator, ReentrancyGuard {
         emit LegCompleted(orderId, s.user, s.amount);
     }
 
-    /// @notice Diamond callback on B2B BUY cancellation. Releases the daily
-    ///         debit consumed at validateOrder time. Best-effort: tolerates
-    ///         unknown / already-cancelled orderIds and never reverts.
+    /// @notice Diamond callback on B2B BUY cancellation. Best-effort:
+    ///         tolerates unknown / already-cancelled orderIds and never
+    ///         reverts.
     function onOrderCancel(uint256 orderId) external onlyDiamond {
         BuySession storage s = buySessions[orderId];
         if (!s.active) return;
         s.active = false;
-        _releaseDebit(s.user, s.day, s.amount);
         emit LegCancelled(orderId, s.user);
     }
 
