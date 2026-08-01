@@ -170,6 +170,12 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     ///         session is re-pinned to what actually arrived — see
     ///         `onOrderComplete`. Should never fire; alert if it does.
     event OnrampAmountAdjusted(uint256 indexed orderId, uint256 placed, uint256 delivered);
+
+    /// @notice A cancelled order was subsequently completed by the gateway: the
+    ///         delivered USDC was settled normally and the daily slot released
+    ///         by onOrderCancel was re-charged. Alert + audit trail — this
+    ///         sequence should be rare (admin CANCELLED -> re-open -> COMPLETE).
+    event CancelledOrderCompleted(uint256 indexed orderId, address indexed user);
     event BridgedToSolana(
         uint256 indexed orderId,
         address indexed user,
@@ -938,14 +944,22 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         Session storage session = sessions[orderId];
         if (session.user == address(0)) return; // unknown / non-BUY order — no-op
         if (session.fulfilled) revert OrderAlreadyFulfilled();
-        // A cancelled order must never complete: onOrderCancel frees the
-        // daily-count slot, so completing afterwards would settle one order over
-        // the cap and leave a cancelled-and-fulfilled session. Unreachable while
-        // onOrderCancel is absent from the live Diamond, but a one-line guard for
-        // when feat/integrator-on-order-cancel ships. The gateway try/catches
-        // this hook, so the revert is swallowed and nothing is stranded.
-        if (session.cancelled) revert OrderAlreadyCancelled();
         if (recipientAddr != address(this)) revert UnexpectedRecipient();
+
+        if (session.cancelled) {
+            // Cancel-then-complete (admin CANCELLED -> re-open -> COMPLETE once
+            // feat/integrator-on-order-cancel ships). The USDC is already here —
+            // the gateway routes funds BEFORE this hook and try/catches it, so a
+            // revert would be swallowed and strand the delivered amount with no
+            // session record (sweepable as owner "surplus"). Same asymmetry as
+            // the F2 delivery-accounting rule: never revert once the money has
+            // arrived. Settle normally, re-charge the daily slot onOrderCancel
+            // released, and leave `cancelled = true` as the honest record.
+            // Over-counting is the safe direction — it can only make the NEXT
+            // placement stricter, never looser.
+            userDailyCount[session.user][uint256(session.placementDay)] += 1;
+            emit CancelledOrderCompleted(orderId, session.user);
+        }
 
         if (amount != session.amount) {
             emit OnrampAmountAdjusted(orderId, session.amount, amount);

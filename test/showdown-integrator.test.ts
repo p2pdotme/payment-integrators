@@ -646,28 +646,120 @@ describe("ShowdownCheckoutIntegrator", function () {
       expect((await integrator.getSession(orderId)).fulfilled).to.equal(false);
     });
 
-    it("refuses to complete an order that was cancelled", async function () {
-      // Defense-in-depth for when onOrderCancel ships on the live Diamond:
-      // cancel frees the daily slot, so completing afterwards would settle one
-      // order over the cap and leave a cancelled-and-fulfilled session.
+    it("settles a cancel-then-complete and re-charges the daily slot", async function () {
+      // Forward-compat for when onOrderCancel ships on the live Diamond. The
+      // gateway routes the USDC BEFORE calling this hook and try/catches it, so
+      // a revert here would be swallowed and strand the delivered amount with
+      // no session record (sweepable as owner "surplus"). The contract must
+      // instead settle normally, re-charge the daily slot onOrderCancel
+      // released, and keep `cancelled = true` as the record.
       const orderId = await mockDiamond.nextOrderId();
       await integrator.connect(user).userBuyUsdcToSolana(USDC(50), INR, SOLANA_ATA, 1, "", 0, 0);
+      const afterPlacement = await integrator.getRemainingDailyCount(user.address);
+
+      // The mock Diamond drives onOrderCancel (the live Diamond will once
+      // feat/integrator-on-order-cancel ships): the daily slot is freed.
       await mockDiamond.simulateOrderCancelled(orderId);
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(afterPlacement + 1n);
 
-      await mockUsdc.mint(integratorAddr, USDC(50));
-      await expect(
-        mockDiamond.adminCallOnOrderComplete(
-          integratorAddr,
-          orderId,
-          user.address,
-          USDC(50),
-          integratorAddr
-        )
-      ).to.be.revertedWithCustomError(integrator, "OrderAlreadyCancelled");
+      // Gateway completes the cancelled order: USDC routed first, hook after.
+      await expect(mockDiamond.simulateOrderComplete(orderId))
+        .to.emit(integrator, "CancelledOrderCompleted")
+        .withArgs(orderId, user.address);
 
+      // Settled, bridged (money moved on to Solana), honest cancelled record.
       const session = await integrator.getSession(orderId);
-      expect(session.fulfilled).to.equal(false);
+      expect(session.fulfilled).to.equal(true);
+      expect(session.cancelled).to.equal(true);
+      expect(session.bridged).to.equal(true);
+
+      // Nothing stranded, nothing sweepable: no un-reserved balance remains.
       expect(await integrator.unbridgedTotal()).to.equal(0);
+      expect(await mockUsdc.balanceOf(integratorAddr)).to.equal(0);
+      await expect(
+        integrator.connect(owner).withdrawUsdc(owner.address, USDC(50))
+      ).to.be.revertedWithCustomError(integrator, "WithdrawExceedsSurplus");
+
+      // The daily slot is re-charged (over-counting is the safe direction).
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(afterPlacement);
+    });
+
+    it("CEI in _bridge: a reentrant burn-token cannot double-bridge", async function () {
+      // Regression pin for the checks-effects-interactions ordering in
+      // _bridge. No standard mock re-enters, so without this fixture the CEI
+      // ordering can be reverted with the suite staying green (verified by
+      // mutation review on PR #42). The malicious token re-enters
+      // retryBridge(orderId) from inside the TokenMessenger's transferFrom —
+      // i.e. mid-burn — and records whether the reentrant call succeeded.
+      const evilUsdc = await (await ethers.getContractFactory("MockReentrantUSDC")).deploy();
+      const evilUsdcAddr = await evilUsdc.getAddress();
+      const diamond2 = await (await ethers.getContractFactory("MockDiamond")).deploy(evilUsdcAddr);
+      const messenger2 = await (await ethers.getContractFactory("MockTokenMessengerV2")).deploy();
+      const transmitter2 = await (
+        await ethers.getContractFactory("MockMessageTransmitterV2")
+      ).deploy(evilUsdcAddr);
+
+      const integrator2 = await (
+        await ethers.getContractFactory("ShowdownCheckoutIntegrator")
+      ).deploy(
+        await diamond2.getAddress(),
+        evilUsdcAddr,
+        await messenger2.getAddress(),
+        await transmitter2.getAddress(),
+        SOLANA_DOMAIN,
+        DAILY_COUNT,
+        livenessAttestor.address,
+        kycAttestor.address,
+        LIVENESS_CAP_INDIA,
+        LIVENESS_CAP_ABROAD,
+        KYC_CAP_INDIA,
+        KYC_CAP_ABROAD
+      );
+      const integrator2Addr = await integrator2.getAddress();
+      await diamond2.registerIntegrator(integrator2Addr, await integrator2.proxyImpl());
+      await evilUsdc.mint(await diamond2.getAddress(), USDC(1_000_000));
+      await messenger2.setBurnLimitPerMessage(evilUsdcAddr, USDC(1_000_000));
+
+      // Attest against the second integrator (EIP-712 domain binds the address).
+      const nullifier = nullifierFor(`kyc:reentrancy:${user.address}`);
+      const expiry = await futureExpiry();
+      const sig = await kycAttestor.signTypedData(
+        {
+          name: "KycVerifier",
+          version: "1",
+          chainId,
+          verifyingContract: integrator2Addr,
+        },
+        {
+          KycAttestation: [
+            { name: "wallet", type: "address" },
+            { name: "nullifier", type: "bytes32" },
+            { name: "limit", type: "uint256" },
+            { name: "expiry", type: "uint256" },
+          ],
+        },
+        { wallet: user.address, nullifier, limit: KYC_CAP, expiry }
+      );
+      await integrator2.connect(user).submitKycAttestation(nullifier, KYC_CAP, expiry, sig);
+
+      const orderId = await diamond2.nextOrderId();
+      await integrator2.connect(user).userBuyUsdcToSolana(USDC(50), INR, SOLANA_ATA, 1, "", 0, 0);
+      await evilUsdc.armReentrancy(integrator2Addr, orderId);
+
+      // Complete: USDC routed in, hook bridges, transferFrom re-enters mid-burn.
+      await diamond2.simulateOrderComplete(orderId);
+
+      expect(await evilUsdc.reentryAttempted()).to.equal(true);
+      // With effects-before-burn the session is already bridged when the
+      // reentrant call lands, so it MUST fail (AlreadyBridged). If this reads
+      // true, the CEI ordering has been reverted and the burn ran twice.
+      expect(await evilUsdc.reentrySucceeded()).to.equal(false);
+
+      const session = await integrator2.getSession(orderId);
+      expect(session.bridged).to.equal(true);
+      // Custody invariant: nothing burned beyond the session amount.
+      expect(await evilUsdc.balanceOf(integrator2Addr)).to.equal(0);
+      expect(await integrator2.unbridgedTotal()).to.equal(0);
     });
   });
 
