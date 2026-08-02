@@ -173,9 +173,22 @@ client. We propose the blind signature and are happy to revisit.
    conditions?
 3. Enclave-side embedding, where the operator cannot read the selfie at all even
    in memory, is the stronger version of the same goal. Phase 2, or out of scope?
-4. Does the reputation layer already expose a document-based zk path (ZKPassport,
-   Anon Aadhaar)? If so we would rather build against it for tiers above $20 than
-   add a second biometric surface.
-5. If change A is refused: can our backend-signed `PurchaseAuthorization` serve as
+4. **The zk document path, and whether RP can reach an integrator at all.** We
+   checked before asking. The client plumbing exists
+   (`prepareSubmitAnonAadharProofTx`, `isAadharVerified`, `getAadhaarRp`), but
+   Aadhaar sits behind `HIDE_AADHAAR_VERIFICATION = true` in `user-app-client`,
+   and we did not find the selector on mainnet. Separately, and this matters more:
+   RP is integrator-private by design. `docs/ARCHITECTURE.md:43` puts per-user RP
+   on the integrator, `:56` calls the RP curve an integrator-private concern,
+   there is no `IReputationManager` in `contracts/interfaces/`, and no integrator
+   in this repo reads the reputation layer. So even a fully live zk document path
+   would not move an integrator's cap today. What is the roadmap for both?
+5. **Is a B2B BUY still gated Diamond-side at `buyLimit = 0` for an unreputed
+   wallet?** `LIMITS-AND-RP.md` notes the Diamond enforces protocol limits
+   independently, and our on-chain reads suggested BUY is reputation-gated. If
+   that still holds, the binding limit for an onramp is yours and no
+   integrator-side change reaches it. This blocks us whichever way the rest of the
+   proposal lands, so we would like this answer first.
+6. If change A is refused: can our backend-signed `PurchaseAuthorization` serve as
    the $20 gate instead? It is weaker on Sybil and we would rather not, but it
    collects no biometrics at all, which beats collecting them badly.

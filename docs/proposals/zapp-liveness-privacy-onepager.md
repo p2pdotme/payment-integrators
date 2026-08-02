@@ -50,10 +50,15 @@ Two changes. Neither touches a line of Solidity. Neither weakens the Sybil gate.
 
 - Do you want unlinkable mode upstream in `simple-kyc-oss`, or as a Zapp-only
   deployment flag?
-- Does the reputation layer already expose a document-based zk path (ZKPassport,
-  Anon Aadhaar)? For tiers above $20 we would rather build against that than add a
-  second biometric surface. (A zk circuit over the biometric itself does not work;
-  the technical doc §7 says why, since it is the obvious first question.)
+- **Blocking question, answer this one first:** is a B2B BUY still gated
+  Diamond-side at `buyLimit = 0` for an unreputed wallet? If so the binding limit
+  for an onramp is yours, not ours, and nothing in this proposal reaches it.
+- Roadmap for the zk document path (Aadhaar, ZKPassport) and for RP reaching
+  integrators at all? Today RP is integrator-private (`ARCHITECTURE.md:43`) and no
+  integrator reads the reputation layer, so a live zk path would not move an
+  integrator's cap. Detail in §10 of the technical doc. (A zk circuit over the
+  biometric itself does not work; §7 says why, since it is the obvious first
+  question.)
 - Enclave-side embedding (operator cannot read the selfie at all) is the stronger
   version of the same idea. Worth a phase 2, or out of scope?
 - ArcFace `buffalo_l` is licensed non-commercial-research-only and is the default
