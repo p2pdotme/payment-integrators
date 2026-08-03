@@ -19,27 +19,47 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  * @dev    Settlement routing: `userPlaceOrder` pins `recipientAddr = address(this)`,
  *         so the Diamond delivers completion USDC straight to this contract and
  *         `onOrderComplete` forwards it to the immutable `treasury`. This is the
- *         same shape ShowdownCheckoutIntegrator uses, and it means the integrator
- *         MUST be registered with **`usdcThroughIntegrator = false`** — the
- *         recipient pin already does the routing. See docs/integrators/cubeskins.md.
+ *         same shape ShowdownCheckoutIntegrator uses. Register with
+ *         **`usdcThroughIntegrator = false`**, matching every other integrator.
+ *         (For this contract the flag is in fact behaviourally inert — the
+ *         gateway sends to `recipientAddr` when false and to the integrator when
+ *         true, and the recipient pin makes those the same address. `false` is
+ *         still the correct registration; see docs/integrators/cubeskins.md.)
  *
- * @dev    Limits: per-tx ceilings are gated on a simple-kyc **liveness**
- *         attestation, not on RP.
+ * @dev    Limits: per-tx ceilings are gated on a **liveness** attestation, not
+ *         on RP.
  *
  *           - No attestation       -> cannot place an order at all.
  *           - Liveness attestation -> per-tx cap = min(attested limit,
- *                                     tierCap[TIER_LIVENESS]).
+ *                                     livenessTierCap).
  *
- *         The simple-kyc service signs a dollar limit into the attestation and
- *         this contract additionally clamps it to an on-chain per-tier ceiling,
- *         so a compromised attestor key cannot authorize more than the tier
- *         allows. Attestation verification is the on-chain twin of simple-kyc's
+ *         The liveness service signs a dollar limit into the attestation and
+ *         this contract additionally clamps it to an on-chain ceiling, so a
+ *         compromised attestor key cannot authorize more than policy allows.
+ *         Attestation verification is the on-chain twin of the service's
  *         `LivenessAttestationVerifier`: EIP-712 typehash
  *         `LivenessAttestation(address wallet,bytes32 nullifier,uint256 limit,uint256 expiry)`,
  *         domain name `LivenessVerifier`, recovered with `ecrecover`. Register
  *         this contract's address as the tenant `contract_address` with the
  *         liveness service so attestations are bound to it; the per-(tenant,
  *         human) `nullifier` is single-use for on-chain Sybil resistance.
+ *
+ * @dev    Limits are bounded by immutable policy ceilings. A whitelisted
+ *         integrator bypasses the protocol's own RP / daily / monthly / yearly
+ *         volume limits and is trusted to enforce its own in `validateOrder`,
+ *         so an owner-raisable cap would be a protocol lever, not partner
+ *         config: a compromised owner key could re-point the attestor at itself,
+ *         self-attest an arbitrary limit, lift the cap and route unbounded
+ *         fiat→USDC through P2P's LP network. `MAX_LIVENESS_TIER_CAP` and
+ *         `MAX_DAILY_TX_COUNT_LIMIT` are committed to the bytecode and enforced
+ *         in both the constructor and the setters — the owner may tighten
+ *         policy, never loosen it past what was reviewed.
+ *
+ * @dev    Neither protocol callback ever reverts. The gateway wraps both in
+ *         try/catch and finalises protocol state regardless, so a revert cannot
+ *         undo anything — it can only strand settlement USDC in an immutable
+ *         contract or silently drop a daily-count refund. Disagreements are
+ *         reported as `SettlementAnomaly` for off-chain reconciliation instead.
  */
 contract CubeSkinsIntegrator is IP2PIntegrator {
     using SafeERC20 for IERC20;
@@ -55,10 +75,11 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
     error OrderExpired();
     error OrderAlreadyPlaced();
     error OrderAlreadyFulfilled();
-    error OrderAlreadyCancelled();
     error BuyerMismatch();
-    error AmountMismatch();
-    error UnknownOrder();
+
+    /// @notice A limit was set above its immutable policy ceiling, or a daily
+    ///         count was set to 0 ("unlimited") — the hole in the ceiling.
+    error CapExceedsCeiling();
 
     // KYC / attestation
     error AttestorNotSet();
@@ -89,8 +110,9 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
     );
     event UserProxyDeployed(address indexed user, address proxy);
     event LivenessAttestorUpdated(address indexed attestor);
-    event TierCapUpdated(uint8 indexed tier, uint256 cap);
+    event LivenessTierCapUpdated(uint256 cap);
     event DailyTxCountLimitUpdated(uint256 count);
+    event UsdcSwept(address indexed to, uint256 amount);
     /// @param tier 1 = liveness
     event LivenessClaimed(
         address indexed user,
@@ -99,11 +121,52 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
         uint256 attestedLimit,
         uint256 grantedLimit
     );
+    /**
+     * @notice `onOrderComplete` settled against state that disagreed with what
+     *         the gateway reported. The USDC has already been forwarded — this
+     *         is a reconciliation signal, not a failure.
+     * @param reason    One of the `ANOMALY_*` codes.
+     * @param expected  What this contract had recorded for the order (0 if none).
+     * @param actual    What the gateway reported (or the balance actually held,
+     *                  for `ANOMALY_SHORT_BALANCE`).
+     * @param forwarded USDC actually sent to `treasury` in this call.
+     */
+    event SettlementAnomaly(
+        uint256 indexed p2pOrderId,
+        uint8 indexed reason,
+        uint256 expected,
+        uint256 actual,
+        uint256 forwarded
+    );
 
     // ─── Tier constants ───────────────────────────────────────────────
 
     uint8 public constant TIER_NONE = 0;
     uint8 public constant TIER_LIVENESS = 1;
+
+    // ─── Settlement anomaly codes ─────────────────────────────────────
+
+    /// @notice Settled an order this contract has no session for.
+    uint8 public constant ANOMALY_UNKNOWN_ORDER = 1;
+    /// @notice Settled an order already marked fulfilled.
+    uint8 public constant ANOMALY_ALREADY_FULFILLED = 2;
+    /// @notice Settled an order whose session was already cancelled.
+    uint8 public constant ANOMALY_SESSION_CANCELLED = 3;
+    /// @notice Gateway amount differed from the amount pinned at placement.
+    uint8 public constant ANOMALY_AMOUNT_MISMATCH = 4;
+    /// @notice Held less USDC than the gateway said it settled.
+    uint8 public constant ANOMALY_SHORT_BALANCE = 5;
+
+    // ─── Immutable policy ceilings ────────────────────────────────────
+
+    /// @notice Hard ceiling on the liveness per-tx cap (200 USDC, 6dp) — the
+    ///         approved CubeSkins policy figure. The owner may set any cap at
+    ///         or below this, including 0 to pause new orders, but can never
+    ///         exceed it. Raising policy requires a new deploy and a fresh
+    ///         whitelist review.
+    uint256 public constant MAX_LIVENESS_TIER_CAP = 200e6;
+    /// @notice Hard ceiling on orders per user per UTC day.
+    uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5;
 
     // ─── EIP-712 constants ────────────────────────────────────────────
 
@@ -127,7 +190,8 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
     /// @notice Admin key — the CubeSkins backend relayer. Set explicitly at
     ///         construction rather than taken from `msg.sender`, so the
     ///         deploying key and the operating key can differ (P2P may deploy
-    ///         on CubeSkins' behalf for testnet).
+    ///         on CubeSkins' behalf for testnet). Cannot be transferred or
+    ///         renounced: deploy with the key that will operate in production.
     address public immutable owner;
     address public immutable proxyImpl;
 
@@ -136,18 +200,19 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
     /// @notice secp256k1 signer of the liveness service's attestations.
     address public livenessAttestor;
 
-    // ─── Configurable limits ──────────────────────────────────────────
+    // ─── Configurable limits (bounded by the ceilings above) ──────────
 
-    /// @notice On-chain per-tx ceiling per tier (micro-USDC, 6dp).
-    ///         A tier whose cap is 0 is effectively disabled.
-    mapping(uint8 => uint256) public tierCap;
-    /// @notice Max orders per user per UTC day. 0 = no daily count limit.
+    /// @notice On-chain per-tx ceiling for the liveness tier (micro-USDC, 6dp).
+    ///         Never above `MAX_LIVENESS_TIER_CAP`. 0 pauses new orders.
+    uint256 public livenessTierCap;
+    /// @notice Max orders per user per UTC day. Always 1..`MAX_DAILY_TX_COUNT_LIMIT`
+    ///         — 0 is rejected, since "no limit" would defeat the ceiling.
     uint256 public dailyTxCountLimit;
 
     // ─── Per-user entitlement ─────────────────────────────────────────
 
-    /// @notice Per-tx USDC ceiling attested by the simple-kyc service. The
-    ///         effective cap is this clamped by `tierCap[userTier[user]]`.
+    /// @notice Per-tx USDC ceiling attested by the liveness service. The
+    ///         effective cap is this clamped by `livenessTierCap`.
     mapping(address => uint256) public grantedLimit;
     /// @notice Highest tier the user has claimed (see TIER_* constants).
     mapping(address => uint8) public userTier;
@@ -196,8 +261,8 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
      * @param _usdc              Settlement token the Diamond pays out in.
      * @param _treasury          Immutable sink for settled USDC.
      * @param _owner             Admin key (CubeSkins backend relayer).
-     * @param _livenessTierCap   Per-tx ceiling for the liveness tier (6dp).
-     * @param _dailyTxCountLimit Max orders per user per UTC day (0 = none).
+     * @param _livenessTierCap   Per-tx ceiling, 0..`MAX_LIVENESS_TIER_CAP` (6dp).
+     * @param _dailyTxCountLimit Orders per user per UTC day, 1..`MAX_DAILY_TX_COUNT_LIMIT`.
      * @param _livenessAttestor  Liveness service signer (may be 0, set later).
      */
     constructor(
@@ -217,16 +282,22 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
         ) {
             revert InvalidAddress();
         }
+        // Same bounds as the setters — a deploy cannot start outside policy.
+        if (_livenessTierCap > MAX_LIVENESS_TIER_CAP) revert CapExceedsCeiling();
+        if (_dailyTxCountLimit == 0 || _dailyTxCountLimit > MAX_DAILY_TX_COUNT_LIMIT) {
+            revert CapExceedsCeiling();
+        }
+
         diamond = _diamond;
         usdc = IERC20(_usdc);
         treasury = _treasury;
         owner = _owner;
-        tierCap[TIER_LIVENESS] = _livenessTierCap;
+        livenessTierCap = _livenessTierCap;
         dailyTxCountLimit = _dailyTxCountLimit;
         livenessAttestor = _livenessAttestor;
         proxyImpl = address(new UserProxy());
 
-        emit TierCapUpdated(TIER_LIVENESS, _livenessTierCap);
+        emit LivenessTierCapUpdated(_livenessTierCap);
         emit DailyTxCountLimitUpdated(_dailyTxCountLimit);
         emit LivenessAttestorUpdated(_livenessAttestor);
     }
@@ -282,14 +353,37 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
         emit LivenessAttestorUpdated(attestor);
     }
 
-    function setTierCap(uint8 tier, uint256 cap) external onlyOwner {
-        tierCap[tier] = cap;
-        emit TierCapUpdated(tier, cap);
+    /// @notice Set the liveness per-tx cap. Can only ever set a value at or
+    ///         below the immutable `MAX_LIVENESS_TIER_CAP` — the owner may
+    ///         tighten policy, never raise past what the bytecode commits to.
+    ///         0 is allowed and pauses new orders.
+    function setLivenessTierCap(uint256 cap) external onlyOwner {
+        if (cap > MAX_LIVENESS_TIER_CAP) revert CapExceedsCeiling();
+        livenessTierCap = cap;
+        emit LivenessTierCapUpdated(cap);
     }
 
+    /// @notice Set orders per user per UTC day. Must be 1..`MAX_DAILY_TX_COUNT_LIMIT`;
+    ///         0 is rejected because "unlimited" would defeat the ceiling.
     function setDailyTxCountLimit(uint256 count) external onlyOwner {
+        if (count == 0 || count > MAX_DAILY_TX_COUNT_LIMIT) revert CapExceedsCeiling();
         dailyTxCountLimit = count;
         emit DailyTxCountLimitUpdated(count);
+    }
+
+    /**
+     * @notice Recover USDC sitting on this contract.
+     * @dev    Settlement USDC never rests here — `onOrderComplete` forwards it
+     *         to `treasury` in the same call. Any balance is therefore money
+     *         that arrived outside the order flow (a mistaken direct transfer,
+     *         or a settlement whose callback could not be matched to a
+     *         session). Without this, such funds would be locked forever in a
+     *         contract that cannot be upgraded.
+     */
+    function sweepUsdc(address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert InvalidAddress();
+        usdc.safeTransfer(to, amount);
+        emit UsdcSwept(to, amount);
     }
 
     // ─── Attestations ─────────────────────────────────────────────────
@@ -298,7 +392,7 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
      * @notice Verify and record a liveness-tier attestation for `msg.sender`.
      * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
      * @param limit     Attested per-tx USDC ceiling (micro-USDC, 6dp). The
-     *                  effective cap is `min(limit, tierCap[TIER_LIVENESS])`.
+     *                  effective cap is `min(limit, livenessTierCap)`.
      * @param expiry    Unix seconds; the attestation must be claimed before this.
      * @param signature 65-byte secp256k1 signature (r ‖ s ‖ v) from the service.
      */
@@ -323,13 +417,7 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
         if (limit > grantedLimit[msg.sender]) grantedLimit[msg.sender] = limit;
         if (TIER_LIVENESS > userTier[msg.sender]) userTier[msg.sender] = TIER_LIVENESS;
 
-        emit LivenessClaimed(
-            msg.sender,
-            TIER_LIVENESS,
-            nullifier,
-            limit,
-            grantedLimit[msg.sender]
-        );
+        emit LivenessClaimed(msg.sender, TIER_LIVENESS, nullifier, limit, grantedLimit[msg.sender]);
     }
 
     // ─── User-facing placement ────────────────────────────────────────
@@ -393,60 +481,117 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
         // Tier gate: no liveness attestation -> effectiveLimit is 0 -> blocked.
         if (amount > effectiveLimit(user)) return false;
 
-        if (dailyTxCountLimit != 0) {
-            uint256 dayIndex = block.timestamp / 1 days;
-            uint256 count = userDailyCount[user][dayIndex];
-            if (count + 1 > dailyTxCountLimit) return false;
-            userDailyCount[user][dayIndex] = count + 1;
-        }
+        uint256 dayIndex = block.timestamp / 1 days;
+        uint256 count = userDailyCount[user][dayIndex];
+        if (count + 1 > dailyTxCountLimit) return false;
+        userDailyCount[user][dayIndex] = count + 1;
+
         return true;
     }
 
-    /// @dev Settlement USDC arrives here because `userPlaceOrder` pinned
-    ///      `recipientAddr = address(this)`. Validation is deliberately scoped
-    ///      to the session only: the session is immutable once written, whereas
-    ///      the registration is owner-mutable, and re-reading it here would let
-    ///      an admin action make a settled order permanently unfinalisable.
+    /**
+     * @dev Settlement USDC arrives here because `userPlaceOrder` pinned
+     *      `recipientAddr = address(this)`.
+     *
+     *      This function never reverts. The gateway transfers the USDC before
+     *      calling, wraps the call in try/catch, and finalises the order either
+     *      way — so a revert cannot undo the transfer, it can only leave the
+     *      USDC stranded in a contract that can never be upgraded. Funds are
+     *      therefore forwarded first and bookkeeping disagreements are reported
+     *      as `SettlementAnomaly` rather than raised.
+     *
+     *      Validation is deliberately scoped to the session: the session is
+     *      immutable once written, whereas the registration is owner-mutable,
+     *      and re-reading it here would let an admin action desynchronise a
+     *      settled order.
+     */
     function onOrderComplete(
         uint256 orderId,
         address /* user */,
         uint256 amount,
         address /* recipientAddr */
     ) external onlyDiamond {
+        // Forward whatever actually arrived, capped by the balance held so a
+        // short or duplicate delivery can never revert on an underflowing
+        // transfer.
+        uint256 balance = usdc.balanceOf(address(this));
+        uint256 forwarded = amount < balance ? amount : balance;
+        if (forwarded > 0) {
+            usdc.safeTransfer(treasury, forwarded);
+        }
+        if (forwarded < amount) {
+            emit SettlementAnomaly(orderId, ANOMALY_SHORT_BALANCE, amount, balance, forwarded);
+        }
+
         CheckoutSession storage session = sessions[orderId];
-        if (session.user == address(0)) revert UnknownOrder();
-        if (session.cancelled) revert OrderAlreadyCancelled();
-        if (session.fulfilled) revert OrderAlreadyFulfilled();
-        if (session.usdcAmount != amount) revert AmountMismatch();
+        if (session.user == address(0)) {
+            emit SettlementAnomaly(orderId, ANOMALY_UNKNOWN_ORDER, 0, amount, forwarded);
+            return;
+        }
+        if (session.fulfilled) {
+            emit SettlementAnomaly(
+                orderId,
+                ANOMALY_ALREADY_FULFILLED,
+                session.usdcAmount,
+                amount,
+                forwarded
+            );
+            return;
+        }
+        if (session.cancelled) {
+            emit SettlementAnomaly(
+                orderId,
+                ANOMALY_SESSION_CANCELLED,
+                session.usdcAmount,
+                amount,
+                forwarded
+            );
+        }
+        if (session.usdcAmount != amount) {
+            emit SettlementAnomaly(
+                orderId,
+                ANOMALY_AMOUNT_MISMATCH,
+                session.usdcAmount,
+                amount,
+                forwarded
+            );
+        }
 
         session.fulfilled = true;
         registrations[session.marketplaceOrderId].fulfilled = true;
 
-        usdc.safeTransfer(treasury, amount);
-
-        emit CheckoutFulfilled(orderId, session.user, session.marketplaceOrderId, amount);
+        // Carries what actually reached the treasury, not what the gateway
+        // claimed — the indexer marks the marketplace order paid off this, and
+        // on the happy path the two are identical anyway.
+        emit CheckoutFulfilled(orderId, session.user, session.marketplaceOrderId, forwarded);
     }
 
+    /**
+     * @dev Releases the per-user accounting consumed at placement: the daily
+     *      count slot, and the registration's `placed` flag so the buyer can
+     *      retry the same marketplace order.
+     *
+     *      Never reverts, per the interface contract ("tolerate being called
+     *      with an unknown orderId or after another cancellation"). The gateway
+     *      try/catches this, so a revert would not block cancellation — it would
+     *      silently drop the refund and surface only as a
+     *      `B2BIntegratorCallbackFailed` event.
+     */
     function onOrderCancel(uint256 orderId) external onlyDiamond {
         CheckoutSession storage session = sessions[orderId];
         if (session.user == address(0)) return;
-        if (session.fulfilled) revert OrderAlreadyFulfilled();
-        if (session.cancelled) revert OrderAlreadyCancelled();
+        if (session.fulfilled || session.cancelled) return;
         session.cancelled = true;
 
-        // Release the registration so the buyer can retry the same marketplace
-        // order, and give back the daily-count slot reserved in validateOrder.
         OrderRegistration storage reg = registrations[session.marketplaceOrderId];
         if (!reg.fulfilled) {
             reg.placed = false;
         }
 
-        if (dailyTxCountLimit != 0) {
-            uint256 day = uint256(session.placementDay);
-            uint256 count = userDailyCount[session.user][day];
-            if (count > 0) {
-                userDailyCount[session.user][day] = count - 1;
-            }
+        uint256 day = uint256(session.placementDay);
+        uint256 count = userDailyCount[session.user][day];
+        if (count > 0) {
+            userDailyCount[session.user][day] = count - 1;
         }
     }
 
@@ -454,15 +599,19 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
 
     /**
      * @notice The effective per-tx USDC ceiling for `user`: the limit their
-     *         attestation carries, clamped by this contract's ceiling for the
-     *         tier they reached. 0 means "cannot transact".
+     *         attestation carries, clamped by this contract's tier ceiling.
+     *         0 means "cannot transact". Gate the checkout UI on this.
      */
     function effectiveLimit(address user) public view returns (uint256) {
-        uint8 tier = userTier[user];
-        if (tier == TIER_NONE) return 0;
+        if (userTier[user] == TIER_NONE) return 0;
         uint256 lim = grantedLimit[user];
-        uint256 cap = tierCap[tier];
-        return lim < cap ? lim : cap;
+        return lim < livenessTierCap ? lim : livenessTierCap;
+    }
+
+    /// @notice Back-compat view for readers written against the old
+    ///         `tierCap(uint8)` mapping. Prefer `livenessTierCap`.
+    function tierCap(uint8 tier) external view returns (uint256) {
+        return tier == TIER_LIVENESS ? livenessTierCap : 0;
     }
 
     function getProductPrice(uint256 marketplaceOrderId) external view returns (uint256) {
@@ -472,7 +621,6 @@ contract CubeSkinsIntegrator is IP2PIntegrator {
     }
 
     function getRemainingDailyCount(address user) external view returns (uint256) {
-        if (dailyTxCountLimit == 0) return type(uint256).max;
         uint256 dayIndex = block.timestamp / 1 days;
         uint256 count = userDailyCount[user][dayIndex];
         if (count >= dailyTxCountLimit) return 0;

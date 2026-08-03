@@ -27,34 +27,90 @@ backend marks the marketplace order as `paid` after indexing `CheckoutFulfilled`
 
 ## Custody and settlement routing
 
-- Register with **`usdcThroughIntegrator = false`**.
+- Register with **`usdcThroughIntegrator = false`**, matching every other integrator.
 - `userPlaceOrder` pins `recipientAddr = address(this)`, so the Diamond delivers
-  completion USDC straight to the integrator. The recipient pin does the routing —
-  the flag is not needed and must not be set. This is the same shape
+  completion USDC straight to the integrator. This is the same shape
   [Showdown](./showdown.md) uses.
-- `onOrderComplete` then `safeTransfer`s the full amount to the immutable `treasury`.
+- `onOrderComplete` then `safeTransfer`s the amount to the immutable `treasury`.
 - USDC never returns to the user EOA.
 
-## Limits — liveness-gated
+> For this contract the flag is in fact behaviourally inert: the gateway sends to
+> `recipientAddr` when `false` and to the integrator when `true`, and the recipient
+> pin makes those the same address. Earlier drafts of this doc claimed `true` would
+> "double-route" — it would not. `false` is still the correct registration.
 
-Per-tx ceilings are gated on a simple-kyc **liveness** attestation, not on RP:
+## Limits — liveness-gated, bounded by immutable ceilings
+
+Per-tx ceilings are gated on a **liveness** attestation, not on RP:
 
 | Tier | Requirement | Per-tx cap |
 |---|---|---|
 | `TIER_NONE` (0) | none | **0 — cannot transact** |
-| `TIER_LIVENESS` (1) | liveness check | `min(attested limit, tierCap[1])`, deployed at **200 USDC** |
+| `TIER_LIVENESS` (1) | liveness check | `min(attested limit, livenessTierCap)`, deployed at **200 USDC** |
 
-Effective cap is `min(attested limit, tierCap[tier])`: the simple-kyc service signs
-a dollar limit into the attestation, and the contract additionally clamps it to an
-on-chain per-tier ceiling. A compromised attestor key therefore cannot authorize
-more than 200 USDC per transaction.
+Effective cap is `min(attested limit, livenessTierCap)`: the liveness service signs
+a dollar limit into the attestation, and the contract additionally clamps it on-chain.
+A compromised attestor key therefore cannot authorize more than 200 USDC per transaction.
+
+Both limits are bounded by **immutable ceilings** committed to the bytecode:
+
+| Constant | Value |
+|---|---|
+| `MAX_LIVENESS_TIER_CAP` | `200e6` (200 USDC) |
+| `MAX_DAILY_TX_COUNT_LIMIT` | `5` |
+
+`setLivenessTierCap` and `setDailyTxCountLimit` revert `CapExceedsCeiling` above
+these, and so does the constructor — the owner may tighten policy, never loosen it
+past what was reviewed. `dailyTxCountLimit = 0` ("unlimited") is rejected outright.
+This matters because a whitelisted integrator **bypasses the protocol's own RP /
+daily / monthly / yearly volume limits** and is trusted to enforce its own in
+`validateOrder`; without a ceiling, a compromised owner key could re-point the
+attestor at itself, self-attest an arbitrary limit, raise the cap and route
+unbounded fiat→USDC through P2P's LP network.
+
+`livenessTierCap = 0` is permitted and pauses new orders — a deliberate owner-side
+kill switch. The legacy `tierCap(uint8)` view is kept for existing frontends.
 
 Passport-tier KYC is deliberately **not** implemented — CubeSkins' approved policy
 is liveness-only. Adding a higher tier later means a new contract and a fresh
 whitelist request (integrators are immutable).
 
-Daily count: **5 orders / user / UTC day**, decremented on cancellation so a
-cancelled order doesn't burn a slot.
+Daily count: **5 orders / user / UTC day**, refunded on cancellation so a cancelled
+order doesn't burn a slot.
+
+> The refund rides on the `onOrderCancel` hook, which the live Diamond does **not**
+> yet call — the call site lands with contracts-v4 `603b16f`. Until that facet
+> upgrade is deployed, the daily count effectively counts *placements* and a
+> cancelled order's `placed` flag is never released, so its `marketplaceOrderId`
+> cannot be retried. Do not deploy to mainnet ahead of that upgrade.
+
+### Recovering stray USDC
+
+Settlement USDC never rests in the contract — `onOrderComplete` forwards it to
+`treasury` in the same call. `sweepUsdc(to, amount)` (`onlyOwner`) exists only for
+money that arrives outside the order flow, e.g. a mistaken direct transfer. Without
+it such funds would be locked forever, since the contract cannot be upgraded.
+
+### Settlement never reverts
+
+Neither protocol callback reverts. The gateway transfers the USDC *before* calling
+`onOrderComplete`, wraps the call in `try/catch`, and finalises the order either
+way — so a revert cannot undo the transfer, it can only strand the USDC. The hook
+therefore forwards first (capped by the balance actually held) and reports
+disagreements as `SettlementAnomaly(orderId, reason, expected, actual, forwarded)`:
+
+| Code | Reason |
+|---|---|
+| 1 | `ANOMALY_UNKNOWN_ORDER` — settled an order with no session here |
+| 2 | `ANOMALY_ALREADY_FULFILLED` — settled twice |
+| 3 | `ANOMALY_SESSION_CANCELLED` — settled after cancellation |
+| 4 | `ANOMALY_AMOUNT_MISMATCH` — gateway amount ≠ amount pinned at placement |
+| 5 | `ANOMALY_SHORT_BALANCE` — held less than the gateway said it settled |
+
+`CheckoutFulfilled` carries what actually reached the treasury, not what the gateway
+claimed. **Make the indexer idempotent on `p2pOrderId`** — a cancelled-then-replaced
+marketplace order can legitimately emit `CheckoutFulfilled` twice for the same
+`marketplaceOrderId` under different `p2pOrderId`s.
 
 ### Attestation format
 

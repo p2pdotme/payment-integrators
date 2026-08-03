@@ -14,8 +14,10 @@ describe("CubeSkinsIntegrator", function () {
   let integrator: any;
 
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
+  // The approved CubeSkins policy figures, which are also the contract's
+  // immutable ceilings — a deploy cannot start above either.
   const LIVENESS_TIER_CAP = USDC(200);
-  const DAILY_COUNT_LIMIT = 10;
+  const DAILY_COUNT_LIMIT = 5;
   const MARKETPLACE_ORDER_ID = 42;
   const BRL = ethers.encodeBytes32String("BRL");
 
@@ -64,7 +66,9 @@ describe("CubeSkinsIntegrator", function () {
   /** Claims the liveness tier for `who` at `limit`. */
   async function claimLiveness(who: SignerWithAddress, limit = LIVENESS_TIER_CAP) {
     const a = await attest(who.address, limit);
-    await integrator.connect(who).submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature);
+    await integrator
+      .connect(who)
+      .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature);
     return a;
   }
 
@@ -147,14 +151,18 @@ describe("CubeSkinsIntegrator", function () {
     it("rejects a signature from the wrong signer", async function () {
       const a = await attest(buyer.address, USDC(200), { signer: stranger });
       await expect(
-        integrator.connect(buyer).submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
+        integrator
+          .connect(buyer)
+          .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
     it("rejects an attestation bound to a different wallet", async function () {
       const a = await attest(stranger.address, USDC(200));
       await expect(
-        integrator.connect(buyer).submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
+        integrator
+          .connect(buyer)
+          .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
@@ -162,7 +170,9 @@ describe("CubeSkinsIntegrator", function () {
       const past = (await now()) - 10n;
       const a = await attest(buyer.address, USDC(200), { expiry: past });
       await expect(
-        integrator.connect(buyer).submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
+        integrator
+          .connect(buyer)
+          .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
       ).to.be.revertedWithCustomError(integrator, "AttestationExpired");
     });
 
@@ -173,7 +183,12 @@ describe("CubeSkinsIntegrator", function () {
       await expect(
         integrator
           .connect(stranger)
-          .submitLivenessAttestation(replay.nullifier, replay.limit, replay.expiry, replay.signature)
+          .submitLivenessAttestation(
+            replay.nullifier,
+            replay.limit,
+            replay.expiry,
+            replay.signature
+          )
       ).to.be.revertedWithCustomError(integrator, "NullifierAlreadySpent");
     });
 
@@ -181,7 +196,9 @@ describe("CubeSkinsIntegrator", function () {
       await integrator.connect(owner).setLivenessAttestor(ethers.ZeroAddress);
       const a = await attest(buyer.address, USDC(200));
       await expect(
-        integrator.connect(buyer).submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
+        integrator
+          .connect(buyer)
+          .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature)
       ).to.be.revertedWithCustomError(integrator, "AttestorNotSet");
     });
   });
@@ -298,7 +315,11 @@ describe("CubeSkinsIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "OnlyDiamond");
     });
 
-    it("reverts on an unknown order", async function () {
+    // The gateway transfers settlement USDC BEFORE calling this hook and
+    // try/catches the call, finalising the order either way. A revert here
+    // therefore cannot undo the transfer — it only strands the USDC in a
+    // contract that can never be upgraded. So the hook must never revert.
+    it("does not revert on an unknown order — flags it instead", async function () {
       await expect(
         mockDiamond.adminCallOnOrderComplete(
           await integrator.getAddress(),
@@ -307,10 +328,12 @@ describe("CubeSkinsIntegrator", function () {
           USDC(10),
           await integrator.getAddress()
         )
-      ).to.be.revertedWithCustomError(integrator, "UnknownOrder");
+      )
+        .to.emit(integrator, "SettlementAnomaly")
+        .withArgs(999, await integrator.ANOMALY_UNKNOWN_ORDER(), 0, USDC(10), 0);
     });
 
-    it("reverts on an amount that does not match the session", async function () {
+    it("does not revert on an amount that does not match the session", async function () {
       await registerOrder();
       await integrator.connect(buyer).userPlaceOrder(MARKETPLACE_ORDER_ID, BRL, 1, "", 0, 0);
       await expect(
@@ -321,7 +344,48 @@ describe("CubeSkinsIntegrator", function () {
           USDC(999),
           await integrator.getAddress()
         )
-      ).to.be.revertedWithCustomError(integrator, "AmountMismatch");
+      )
+        .to.emit(integrator, "SettlementAnomaly")
+        .withArgs(1, await integrator.ANOMALY_AMOUNT_MISMATCH(), USDC(10), USDC(999), 0);
+    });
+
+    it("forwards only what it actually holds, never reverting on a short balance", async function () {
+      await registerOrder();
+      await integrator.connect(buyer).userPlaceOrder(MARKETPLACE_ORDER_ID, BRL, 1, "", 0, 0);
+      // Callback claims $999 settled but no USDC was transferred in.
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          await integrator.getAddress(),
+          1,
+          buyer.address,
+          USDC(999),
+          await integrator.getAddress()
+        )
+      )
+        .to.emit(integrator, "SettlementAnomaly")
+        .withArgs(1, await integrator.ANOMALY_SHORT_BALANCE(), USDC(999), 0, 0);
+      expect(await mockUsdc.balanceOf(treasury.address)).to.equal(0);
+    });
+
+    it("does not revert or double-pay when the same order settles twice", async function () {
+      await registerOrder();
+      await integrator.connect(buyer).userPlaceOrder(MARKETPLACE_ORDER_ID, BRL, 1, "", 0, 0);
+      await mockDiamond.simulateOrderComplete(1);
+      expect(await mockUsdc.balanceOf(treasury.address)).to.equal(USDC(10));
+
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          await integrator.getAddress(),
+          1,
+          buyer.address,
+          USDC(10),
+          await integrator.getAddress()
+        )
+      )
+        .to.emit(integrator, "SettlementAnomaly")
+        .withArgs(1, await integrator.ANOMALY_ALREADY_FULFILLED(), USDC(10), USDC(10), 0);
+      // Nothing left to forward, so the treasury is not paid a second time.
+      expect(await mockUsdc.balanceOf(treasury.address)).to.equal(USDC(10));
     });
   });
 
@@ -384,6 +448,163 @@ describe("CubeSkinsIntegrator", function () {
       }
       await registerOrder(200, USDC(10));
       await expect(integrator.connect(buyer).userPlaceOrder(200, BRL, 1, "", 0, 0)).to.be.reverted;
+    });
+  });
+
+  // A whitelisted integrator bypasses the protocol's own RP / daily / monthly
+  // volume limits and is trusted to enforce its own in validateOrder. An
+  // owner-raisable cap is therefore a protocol lever, not partner config: the
+  // owner could re-point the attestor at itself, self-attest an arbitrary
+  // limit, lift the cap, and run unbounded fiat->USDC through P2P's LPs.
+  describe("immutable policy ceilings", function () {
+    it("exposes the approved policy figures as constants", async function () {
+      expect(await integrator.MAX_LIVENESS_TIER_CAP()).to.equal(USDC(200));
+      expect(await integrator.MAX_DAILY_TX_COUNT_LIMIT()).to.equal(5);
+    });
+
+    it("lets the owner lower the tier cap", async function () {
+      await integrator.connect(owner).setLivenessTierCap(USDC(50));
+      expect(await integrator.livenessTierCap()).to.equal(USDC(50));
+    });
+
+    it("refuses to raise the tier cap past the ceiling", async function () {
+      await expect(
+        integrator.connect(owner).setLivenessTierCap(USDC(201))
+      ).to.be.revertedWithCustomError(integrator, "CapExceedsCeiling");
+    });
+
+    it("refuses to raise the daily count past the ceiling", async function () {
+      await expect(integrator.connect(owner).setDailyTxCountLimit(6)).to.be.revertedWithCustomError(
+        integrator,
+        "CapExceedsCeiling"
+      );
+    });
+
+    it("rejects a zero daily count — 'unlimited' is the hole in the ceiling", async function () {
+      await expect(integrator.connect(owner).setDailyTxCountLimit(0)).to.be.revertedWithCustomError(
+        integrator,
+        "CapExceedsCeiling"
+      );
+    });
+
+    it("refuses to deploy above either ceiling", async function () {
+      const Integrator = await ethers.getContractFactory("CubeSkinsIntegrator");
+      const base = [
+        await mockDiamond.getAddress(),
+        await mockUsdc.getAddress(),
+        treasury.address,
+        owner.address,
+      ];
+      await expect(
+        Integrator.deploy(...base, USDC(201), DAILY_COUNT_LIMIT, attestor.address)
+      ).to.be.revertedWithCustomError(Integrator, "CapExceedsCeiling");
+      await expect(
+        Integrator.deploy(...base, LIVENESS_TIER_CAP, 6, attestor.address)
+      ).to.be.revertedWithCustomError(Integrator, "CapExceedsCeiling");
+      await expect(
+        Integrator.deploy(...base, LIVENESS_TIER_CAP, 0, attestor.address)
+      ).to.be.revertedWithCustomError(Integrator, "CapExceedsCeiling");
+    });
+
+    it("caps a self-attested limit even if the attestor key is compromised", async function () {
+      // Worst case: owner re-points the attestor at a key it controls and signs
+      // itself $1m. The on-chain ceiling still binds.
+      await integrator.connect(owner).setLivenessAttestor(stranger.address);
+      const a = await attest(buyer.address, USDC(1_000_000), { signer: stranger });
+      await integrator
+        .connect(buyer)
+        .submitLivenessAttestation(a.nullifier, a.limit, a.expiry, a.signature);
+      expect(await integrator.effectiveLimit(buyer.address)).to.equal(USDC(200));
+    });
+
+    it("keeps tierCap(uint8) readable for existing frontends", async function () {
+      expect(await integrator.tierCap(1)).to.equal(LIVENESS_TIER_CAP);
+      expect(await integrator.tierCap(0)).to.equal(0);
+    });
+
+    it("rejects limit changes from a non-owner", async function () {
+      await expect(
+        integrator.connect(stranger).setLivenessTierCap(USDC(1))
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      await expect(
+        integrator.connect(stranger).setDailyTxCountLimit(1)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+  });
+
+  describe("sweepUsdc", function () {
+    it("recovers USDC that arrived outside the order flow", async function () {
+      // Settlement USDC never rests here; anything held is money that would
+      // otherwise be locked forever in a contract that cannot be upgraded.
+      await mockUsdc.mint(await integrator.getAddress(), USDC(75));
+      await integrator.connect(owner).sweepUsdc(treasury.address, USDC(75));
+      expect(await mockUsdc.balanceOf(treasury.address)).to.equal(USDC(75));
+    });
+
+    it("emits UsdcSwept", async function () {
+      await mockUsdc.mint(await integrator.getAddress(), USDC(5));
+      await expect(integrator.connect(owner).sweepUsdc(treasury.address, USDC(5)))
+        .to.emit(integrator, "UsdcSwept")
+        .withArgs(treasury.address, USDC(5));
+    });
+
+    it("rejects a non-owner", async function () {
+      await mockUsdc.mint(await integrator.getAddress(), USDC(5));
+      await expect(
+        integrator.connect(stranger).sweepUsdc(stranger.address, USDC(5))
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    it("rejects the zero address", async function () {
+      await expect(
+        integrator.connect(owner).sweepUsdc(ethers.ZeroAddress, 0)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    });
+  });
+
+  describe("onOrderCancel never reverts", function () {
+    // The gateway try/catches this hook, so a revert would not block
+    // cancellation — it would silently drop the daily-count refund and the
+    // `placed` release, surfacing only as B2BIntegratorCallbackFailed.
+    beforeEach(async function () {
+      await claimLiveness(buyer);
+    });
+
+    it("tolerates an unknown order id", async function () {
+      await expect(mockDiamond.adminCallOnOrderCancel(await integrator.getAddress(), 4242)).to.not
+        .be.reverted;
+    });
+
+    it("tolerates being called twice for the same order", async function () {
+      await registerOrder();
+      await integrator.connect(buyer).userPlaceOrder(MARKETPLACE_ORDER_ID, BRL, 1, "", 0, 0);
+      await mockDiamond.simulateOrderCancelled(1);
+      await expect(mockDiamond.adminCallOnOrderCancel(await integrator.getAddress(), 1)).to.not.be
+        .reverted;
+    });
+
+    it("tolerates a cancel arriving after settlement", async function () {
+      await registerOrder();
+      await integrator.connect(buyer).userPlaceOrder(MARKETPLACE_ORDER_ID, BRL, 1, "", 0, 0);
+      await mockDiamond.simulateOrderComplete(1);
+      await expect(mockDiamond.adminCallOnOrderCancel(await integrator.getAddress(), 1)).to.not.be
+        .reverted;
+      // The settled registration stays fulfilled — a late cancel cannot reopen it.
+      const reg = await integrator.registrations(MARKETPLACE_ORDER_ID);
+      expect(reg.fulfilled).to.equal(true);
+    });
+
+    it("refunds the daily slot so failed matches do not lock the buyer out", async function () {
+      await integrator.connect(owner).setDailyTxCountLimit(1);
+      await registerOrder(301, USDC(10));
+      await integrator.connect(buyer).userPlaceOrder(301, BRL, 1, "", 0, 0);
+      expect(await integrator.getRemainingDailyCount(buyer.address)).to.equal(0);
+
+      await mockDiamond.simulateOrderCancelled(1);
+      expect(await integrator.getRemainingDailyCount(buyer.address)).to.equal(1);
+
+      await registerOrder(302, USDC(10));
+      await integrator.connect(buyer).userPlaceOrder(302, BRL, 1, "", 0, 0);
     });
   });
 });
