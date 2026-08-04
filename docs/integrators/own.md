@@ -193,13 +193,29 @@ session.settled: true
 The buyer received the full amount in their own wallet; the integrator and the
 user's proxy both held nothing. That assertion is the point of the test.
 
-> **Short order TTL.** Orders on this deployment expire quickly, measured from
-> *placement*, not acceptance. Any delay between placing and calling
-> `paidBuyOrder` — even re-reading the order record, which lags on this RPC —
-> burns the window and reverts `OrderExpired()` (`0xc56873ba`). The E2E script
-> therefore places and pays in one tight loop. Orders **585** and **586** were
-> lost to this before the loop was tightened and are still holding merchant
-> capacity; clear them with demo-merchant-bot `cancel-hanging-orders`.
+### Order TTL — measured
+
+A buy order is payable for **~5 minutes from PLACEMENT**, not from merchant
+acceptance. Measured 2026-08-04 with `scripts/local/measure-order-ttl.ts`, which
+probes `paidBuyOrder` via free `eth_call`:
+
+```
+t+283s  ACCEPTED  paidBuyOrder → OK
+t+310s  ACCEPTED  paidBuyOrder → EXPIRED
+```
+
+Past that, `paidBuyOrder` reverts `OrderExpired()` (`0xc56873ba`). Two
+consequences:
+
+- **Scripts** must place and pay in one tight loop — even re-reading the order
+  record (which lags on this RPC) can burn the window. Orders **585** and **586**
+  were lost this way and are still holding merchant capacity; clear them with
+  demo-merchant-bot `cancel-hanging-orders`.
+- **Real users** get ~5 minutes to open their banking app, pay, and confirm.
+  That is tight but workable, so no protocol change is needed — but a client
+  MUST show the deadline and MUST NOT send `paidBuyOrder` on the user's behalf.
+  That call is the buyer's attestation that the money moved; sending it
+  automatically to beat the clock fabricates a payment claim.
 
 ---
 
