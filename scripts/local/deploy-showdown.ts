@@ -196,18 +196,48 @@ async function main() {
   );
 
   // ── Mainnet guard: owner is immutable, so it must be right at deploy time. ─
-  if (isMainnet && process.env.DEPLOY_OWNER) {
-    if (me.toLowerCase() !== process.env.DEPLOY_OWNER.toLowerCase()) {
+  // DEPLOY_OWNER is MANDATORY on mainnet: `owner` becomes this signer forever
+  // (no transfer, no renounce), so a deploy from the wrong key is a full
+  // redeploy + re-whitelist. Refuse to guess rather than warn-and-proceed.
+  if (isMainnet) {
+    if (!process.env.DEPLOY_OWNER) {
+      throw new Error(
+        "DEPLOY_OWNER is required on mainnet. `owner` is immutable — it becomes the deploy signer " +
+          "forever, with no transfer and no renounce. Set DEPLOY_OWNER to the intended Showdown " +
+          "multisig and deploy FROM it."
+      );
+    }
+    // Under DRY_RUN nothing can deploy, so a read-only mainnet preflight must
+    // not require the real owner key in hand — skip the signer-identity
+    // assertion (the DEPLOY_OWNER presence check above still applies).
+    if (!DRY_RUN && me.toLowerCase() !== process.env.DEPLOY_OWNER.toLowerCase()) {
       throw new Error(
         `owner is immutable and is set to the deployer (${me}), but DEPLOY_OWNER is ` +
           `${process.env.DEPLOY_OWNER}. Deploy FROM the intended owner — it cannot be transferred.`
       );
     }
-    console.log("Owner check:          ✅ signer matches DEPLOY_OWNER");
-  } else if (isMainnet) {
     console.log(
-      "\n⚠️  DEPLOY_OWNER not set. `owner` is immutable — it becomes this signer forever,\n" +
-        "   with no transfer and no renounce. Set DEPLOY_OWNER to assert the intended multisig."
+      DRY_RUN
+        ? "Owner check:          ✅ DEPLOY_OWNER set (signer identity skipped under DRY_RUN)"
+        : "Owner check:          ✅ signer matches DEPLOY_OWNER"
+    );
+  }
+
+  // solanaDomain is immutable and CCTP domain IDs are network-agnostic — Solana
+  // is 5 on devnet exactly as on mainnet — so this guard applies on EVERY
+  // network, testnets included (where we actually iterate). A stray
+  // SOLANA_DOMAIN in a shared .env would bake a wrong destination in silently:
+  // the route preflight below only checks *routability*, not that the domain is
+  // Solana, so e.g. SOLANA_DOMAIN=0 (Ethereum) passes and every onramp then
+  // burns to an EVM chain with the 32-byte ATA truncated — unrecoverable.
+  // Deliberate overrides use ALLOW_DOMAIN_OVERRIDE — its own flag, NOT
+  // ALLOW_ADDRESS_OVERRIDE, so overriding a CCTP address never silently
+  // disables the domain check too.
+  if (SOLANA_DOMAIN !== 5 && process.env.ALLOW_DOMAIN_OVERRIDE !== "true") {
+    throw new Error(
+      `SOLANA_DOMAIN is ${SOLANA_DOMAIN}, not 5 (Solana). It is baked into an immutable and a wrong ` +
+        `value silently loses every onramp's funds. Pass ALLOW_DOMAIN_OVERRIDE=true only if you ` +
+        `genuinely intend a non-Solana destination.`
     );
   }
 
