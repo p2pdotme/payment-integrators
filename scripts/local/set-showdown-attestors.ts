@@ -13,12 +13,17 @@
  *
  * Env:
  *   SHOWDOWN_ADDRESS    required — the integrator
- *   BASE_SEPOLIA_RPC    RPC (falls back to https://sepolia.base.org)
+ *   BASE_RPC            RPC (preferred); BASE_SEPOLIA_RPC / default sepolia only
+ *                       as a testnet fallback — a mainnet run MUST pass BASE_RPC
+ *                       + EXPECTED_CHAIN_ID or it silently hits Base Sepolia.
+ *   EXPECTED_CHAIN_ID   optional but STRONGLY advised — asserts the network so a
+ *                       rotation can't land on the wrong chain (8453 = mainnet).
  *   MNEMONIC_KEY / DEPLOYER_PRIVATE_KEY   owner key
  *   LIVENESS_API        default https://liveness-api.p2p.cool
- *   KYC_API             optional — the passport/tier-2 backend. Omitted =>
- *                       kycAttestor is left alone.
- *   DRY_RUN=1           read + diff only, send nothing
+ *   KYC_API             the passport/tier-2 backend. If omitted, kycAttestor is
+ *                       left as-is AND the final safety check FAILS (a tier-2
+ *                       lane self-attestable by the deploy key is not shippable).
+ *   DRY_RUN=1           read + diff only, send nothing (safety check warns only)
  */
 import { ethers } from "ethers";
 import dotenv from "dotenv";
@@ -26,7 +31,8 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const SHOWDOWN_ADDRESS = process.env.SHOWDOWN_ADDRESS || "";
-const RPC = process.env.BASE_SEPOLIA_RPC || "https://sepolia.base.org";
+const RPC = process.env.BASE_RPC || process.env.BASE_SEPOLIA_RPC || "https://sepolia.base.org";
+const EXPECTED_CHAIN_ID = process.env.EXPECTED_CHAIN_ID || "";
 const LIVENESS_API = process.env.LIVENESS_API || "https://liveness-api.p2p.cool";
 const KYC_API = process.env.KYC_API || "";
 const DRY_RUN = process.env.DRY_RUN === "1";
@@ -78,6 +84,13 @@ async function main() {
   console.log("owner:     ", owner);
   if (owner.toLowerCase() !== me.toLowerCase()) {
     throw new Error("signer is not owner — setters are onlyOwner, tx would revert");
+  }
+  // Refuse to rotate on the wrong network: the RPC default is Base Sepolia, so a
+  // mainnet rotation without EXPECTED_CHAIN_ID could silently hit testnet. (#52)
+  if (EXPECTED_CHAIN_ID && chainId.toString() !== EXPECTED_CHAIN_ID) {
+    throw new Error(
+      `chainId ${chainId} != EXPECTED_CHAIN_ID ${EXPECTED_CHAIN_ID} — refusing to rotate on the wrong network`
+    );
   }
 
   // The service signs EIP-712 over (domain, verifyingContract = integrator,
@@ -140,6 +153,32 @@ async function main() {
       throw new Error(`${t.read}() still ${confirmed} after ${t.set} — investigate`);
     }
     console.log(`  ✓ ${t.read}() == ${confirmed}`);
+  }
+
+  // Final safety gate (#52): NEITHER lane may be unset (fails closed) or still
+  // the deploy key (self-attestable). This is what makes leaving KYC_API unset —
+  // the default — a hard error instead of a green run that ships a tier-2 lane
+  // the deployer can forge $100/$200 attestations into.
+  console.log("\n── attestor safety check ─────────────────");
+  const finalLiveness: string = await integrator.livenessAttestor();
+  const finalKyc: string = await integrator.kycAttestor();
+  for (const [name, addr, api] of [
+    ["livenessAttestor", finalLiveness, "LIVENESS_API"],
+    ["kycAttestor", finalKyc, "KYC_API"],
+  ] as const) {
+    const reason =
+      addr === ethers.ZeroAddress
+        ? "unset (0) — that tier fails closed"
+        : addr.toLowerCase() === me.toLowerCase()
+          ? `still the deploy key ${me} — that tier is SELF-ATTESTABLE`
+          : "";
+    if (reason) {
+      const msg = `${name} ${reason}; set ${api} and re-run`;
+      if (DRY_RUN) console.log(`  ! ${msg}`);
+      else throw new Error(msg);
+    } else {
+      console.log(`  ✓ ${name} = ${addr} (non-deployer service signer)`);
+    }
   }
 }
 
