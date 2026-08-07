@@ -19,9 +19,12 @@ import { ethers } from "hardhat";
  *
  * Each of those five numbers is ALSO an immutable MAX_* constant in the
  * bytecode. The constructor and the owner's setters can only ever go at or
- * below them, so the policy holds against a compromised attestor key AND a
- * compromised owner key. Pass lower values here to launch tighter than policy;
- * the owner can lower further later, never raise.
+ * below the CEILING, so the policy holds against a compromised attestor key AND
+ * a compromised owner key. Pass lower values here to launch tighter than policy.
+ * NB (#54): the setters compare only against the immutable ceiling, NOT the
+ * current value — so an owner who launches tight can still move a cap back UP to
+ * the ceiling later (and un-zero a killed lane). The guarantee is "never above
+ * MAX_*", not "monotonically down". Un-raisable policy is the ceiling itself.
  *
  * ── CCTP / token caveat on Base Sepolia ────────────────────────────────────
  * CCTP burns only Circle-issued USDC. The Base Sepolia Diamond settles in a

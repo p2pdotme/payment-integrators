@@ -76,7 +76,7 @@ The offramp maps cleanly onto the existing `<Cashout>` host-callback shape; the 
 
 Note the Diamond's fee comes off the same proxy balance, so the proxy needs **principal + fee** by delivery time, not just principal. `userInitiateOfframp` only checks the principal; `deliverOfframpUpi` reads the authoritative `actualUsdtAmount` and will revert with `InsufficientBridgedFunds` if the proxy is short. Worth surfacing headroom in the UI.
 
-**KYC gate UI.** `submitLivenessAttestation` / `submitKycAttestation`, and read `effectiveLimit(user)` / `userTier(user)` to drive the cap shown and the upsell from $20 → $50.
+**KYC gate UI.** `submitLivenessAttestation` / `submitKycAttestation`, and read `effectiveLimit(address,bytes32 currency)` (or `effectiveLimits(address) → (india, abroad)`) / `userTier(user)` to drive the cap shown. The one-arg `effectiveLimit(user)` no longer exists — ABI break (see the widget note below). The passport upsell is region-dependent: liveness→passport is $20→$100 (INR) or $50→$200 (abroad), NOT a flat $20→$50 (that difference is India-vs-Abroad within the SAME liveness tier). (#54)
 
 **Escape hatch.** `userBridgeBackToSolana(amount, ata)` returns bridged-in funds to Solana instead of offramping — worth exposing for users who change their mind or whose tier doesn't cover the amount.
 
@@ -84,7 +84,7 @@ Note the Diamond's fee comes off the same proxy balance, so the proxy needs **pr
 
 **CCTP does not auto-deliver.** `depositForBurn` burns the USDC and emits a message; that is _all_ it does. It authorizes a mint — it does not perform one. The mint only happens when someone calls `receiveMessage(message, attestation)` on the **destination** chain. Nothing in the contract, on either side, does this. Without a service that does, an onramp burns on Base and **the user's USDC never appears on Solana**, while `unbridgedTotal` reads 0 and the integrator looks perfectly healthy.
 
-**Sizing the risk correctly:** this is an _availability_ problem, not a _safety_ one. Showdown burns with `destinationCaller = bytes32(0)`, so delivery is permissionless, and Circle's attestations do not expire — anyone can submit a stale message months later and the mint still lands, to the recipient encoded in the message and nobody else. So funds are never lost. But an onramp that doesn't deliver is a user who paid fiat and has nothing, which is a support incident on day one.
+**Sizing the risk correctly:** this is an _availability_ problem, not a _safety_ one. Showdown burns with `destinationCaller = bytes32(0)`, so delivery is permissionless, and Circle's attestations of a **finalized (Standard) transfer do not expire** (`expirationBlock == 0`, accepted at any block) — anyone can submit a stale message months later and the mint still lands, to the recipient encoded in the message and nobody else. So funds are never lost. ⚠️ (#54) This holds only for Standard, which is what ships (`bridgeMinFinalityThreshold = 2000`). A **Fast** (unfinalized) message carries a real 24h `expirationBlock` and needs `POST /v2/reattest/{nonce}` — so if the bridge is ever switched to Fast, the "never expires" premise the cron sweeper relies on is false. But an onramp that doesn't deliver is a user who paid fiat and has nothing, which is a support incident on day one.
 
 ### The three steps, per transfer
 

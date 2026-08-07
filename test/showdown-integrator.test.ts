@@ -192,7 +192,8 @@ describe("ShowdownCheckoutIntegrator", function () {
       // A compromised / misconfigured attestor signs $1000 for the liveness
       // tier; the contract's own $20 ceiling still wins.
       await verify(user, "liveness", USDC(1000));
-      expect(await integrator.grantedLimit(user.address)).to.equal(USDC(1000));
+      // grantedLimit is now keyed per tier (#45).
+      expect(await integrator.grantedLimit(user.address, TIER.LIVENESS)).to.equal(USDC(1000));
       expect(await integrator.effectiveLimit(user.address, INR)).to.equal(LIVENESS_CAP);
 
       await expect(
@@ -1211,6 +1212,143 @@ describe("ShowdownCheckoutIntegrator", function () {
       await expect(integrator.reconcile(orderId)).to.be.revertedWithCustomError(
         integrator,
         "OfframpAlreadyReconciled"
+      );
+    });
+  });
+
+  // ─── Pre-deploy hardening (#44/#45/#51/#53/#55/#47) ─────────────────
+  describe("pre-deploy hardening", function () {
+    it("#45: a lower KYC sub-cap binds even after a higher liveness attestation", async function () {
+      // Risk-flagged user: liveness attests a huge limit (clamped to $20 by the
+      // tier ceiling), then KYC deliberately signs a $5 per-user sub-cap.
+      await verify(user, "liveness", USDC(10_000), "live-hi");
+      expect(await integrator.effectiveLimit(user.address, INR)).to.equal(USDC(20));
+      await verify(user, "kyc", USDC(5), "kyc-lo");
+      // Before the fix this read min(10000, tierCap[2]=100) = $100. Now the
+      // tier-2 clamp uses tier 2's OWN attested $5.
+      expect(await integrator.userTier(user.address)).to.equal(TIER.KYC);
+      expect(await integrator.effectiveLimit(user.address, INR)).to.equal(USDC(5));
+    });
+
+    it("#45: a same-tier re-attestation downgrade reduces the effective cap", async function () {
+      await verify(user, "kyc", USDC(100), "kyc-1");
+      expect(await integrator.effectiveLimit(user.address, INR)).to.equal(USDC(100));
+      await verify(user, "kyc", USDC(5), "kyc-2"); // fresh nullifier, risk downgrade
+      expect(await integrator.effectiveLimit(user.address, INR)).to.equal(USDC(5));
+    });
+
+    it("#53: a seller blocked after placement cannot be delivered", async function () {
+      await verify(user, "kyc", KYC_CAP);
+      await bridgeIn(user, USDC(50));
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(20), INR, 0, 1, 0, "pub");
+      await mockDiamond.acceptSellOrder(orderId, "m");
+      await integrator.connect(owner).setUserBlocked(user.address, true);
+      await expect(
+        integrator.connect(user).deliverOfframpUpi(orderId, "enc")
+      ).to.be.revertedWithCustomError(integrator, "UserIsBlocked");
+    });
+
+    it("#51/#44: escrow blocks over-committing multiple SELLs against one balance", async function () {
+      await verify(user, "kyc", KYC_CAP);
+      await bridgeIn(user, USDC(100));
+      await integrator.connect(user).userInitiateOfframp(USDC(60), INR, 0, 1, 0, "pub");
+      expect(await integrator.pendingOfframpTotal(user.address)).to.equal(USDC(60));
+      // A second $60 needs $120 of headroom against the $100 balance.
+      await expect(
+        integrator.connect(user).userInitiateOfframp(USDC(60), INR, 0, 1, 0, "pub")
+      ).to.be.revertedWithCustomError(integrator, "InsufficientBridgedFunds");
+    });
+
+    it("#44 (known/deferred): a full-balance SELL still strands at delivery once a fee applies", async function () {
+      // Documents the half of #44 NOT fixed here: the escrow prevents
+      // over-commit, but a single full-balance SELL is still undeliverable when
+      // the Diamond charges a fee on top (needed = principal + fee > balance).
+      // The fee-headroom fix is deferred pending p2p's max-SELL-fee bound.
+      await verify(user, "kyc", KYC_CAP);
+      await mockDiamond.setSellFeeBps(100); // 1%
+      await bridgeIn(user, USDC(50));
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(50), INR, 0, 1, 0, "pub");
+      await mockDiamond.acceptSellOrder(orderId, "m");
+      await expect(
+        integrator.connect(user).deliverOfframpUpi(orderId, "enc")
+      ).to.be.revertedWithCustomError(integrator, "InsufficientBridgedFunds");
+    });
+
+    it("#51: releases the daily SELL slot when a never-accepted order is cancelled", async function () {
+      await verify(user, "kyc", KYC_CAP);
+      await bridgeIn(user, USDC(50));
+      const before = await integrator.getRemainingOfframpDailyCount(user.address);
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(20), INR, 0, 1, 0, "pub");
+      expect(await integrator.getRemainingOfframpDailyCount(user.address)).to.equal(before - 1n);
+      await mockDiamond.cancelSellOrder(orderId); // never accepted
+      await integrator.reconcile(orderId);
+      expect(await integrator.getRemainingOfframpDailyCount(user.address)).to.equal(before);
+      expect(await integrator.pendingOfframpTotal(user.address)).to.equal(0);
+    });
+
+    it("#51: keeps the slot for a merchant-accepted order that cancels", async function () {
+      await verify(user, "kyc", KYC_CAP);
+      await bridgeIn(user, USDC(50));
+      const before = await integrator.getRemainingOfframpDailyCount(user.address);
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(20), INR, 0, 1, 0, "pub");
+      await mockDiamond.acceptSellOrder(orderId, "m"); // accepted → slot not refundable
+      await mockDiamond.cancelSellOrder(orderId);
+      await integrator.reconcile(orderId);
+      expect(await integrator.getRemainingOfframpDailyCount(user.address)).to.equal(before - 1n);
+    });
+
+    it("#55: onOrderCancel tolerates a repeat call without double-freeing the slot", async function () {
+      await verify(user, "kyc", KYC_CAP);
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userBuyUsdcToSolana(USDC(20), INR, SOLANA_ATA, 1, "", 0, 0);
+      const afterPlace = await integrator.getRemainingDailyCount(user.address);
+      const diamondAddr = await mockDiamond.getAddress();
+      await ethers.provider.send("hardhat_setBalance", [diamondAddr, "0xde0b6b3a7640000"]);
+      const asDiamond = integrator.connect(await ethers.getImpersonatedSigner(diamondAddr));
+      await asDiamond.onOrderCancel(orderId);
+      const afterCancel = await integrator.getRemainingDailyCount(user.address);
+      expect(afterCancel).to.equal(afterPlace + 1n); // freed exactly one
+      await asDiamond.onOrderCancel(orderId); // repeat must not revert or double-free
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(afterCancel);
+    });
+
+    it("#47: rejects a malleated (high-s) attestation signature", async function () {
+      const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+      const nullifier = nullifierFor("malleate");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(
+        "liveness",
+        livenessAttestor,
+        user.address,
+        nullifier,
+        USDC(20),
+        expiry
+      );
+      const parsed = ethers.Signature.from(sig);
+      const s2 = ethers.toBeHex(N - BigInt(parsed.s), 32);
+      const v2 = ethers.toBeHex(parsed.v === 27 ? 28 : 27, 1);
+      const malleated = ethers.concat([parsed.r, s2, v2]);
+      await expect(
+        integrator.connect(user).submitLivenessAttestation(nullifier, USDC(20), expiry, malleated)
+      ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
+    });
+
+    it("#47: userRescueStuckBridge succeeds at exactly completedAt + BRIDGE_RESCUE_DELAY", async function () {
+      await verify(user, "kyc", KYC_CAP);
+      await tokenMessenger.setBurnLimitPerMessage(usdcAddr, 0); // force fail-closed
+      const orderId = await buyAndComplete(user, USDC(50));
+      const completedAt = Number((await integrator.getSession(orderId)).completedAt);
+      const RESCUE = 7 * 24 * 3600;
+      await ethers.provider.send("evm_setNextBlockTimestamp", [completedAt + RESCUE]);
+      // `<` boundary: at exactly the deadline it must SUCCEED — the `<=` mutation
+      // reverts here, so this kills it.
+      await expect(integrator.connect(user).userRescueStuckBridge(orderId)).to.emit(
+        integrator,
+        "BridgeRescued"
       );
     });
   });

@@ -1,5 +1,16 @@
 # PR #35 — Showdown CCTP Checkout Integrator — pre-prod launch audit
 
+> ⚠️ **STALE — do not use as the go/no-go source (#54).** This doc was cut before
+> the later commits and now describes a contract that has since changed:
+> D1/D3 predate the deploy-script preset lock + `DRY_RUN` carve-out; the test
+> count is 81 (head is higher); F4 overclaims reentrancy coverage that `8cbc368`'s
+> `MockReentrantUSDC` only later added; and no finding covers `onOrderComplete`'s
+> settle-and-re-charge behaviour or the #44/#45/#51/#53/#55 fixes. The authoritative
+> current state is the open PR(s) + `~/Downloads/showdown-prod-readiness.md`. A full
+> re-cut (or moving this into the PR body) is tracked in #54; the load-bearing wrong
+> claims elsewhere (deploy-script "never raise", the widget ABI, attestation expiry,
+> Fast-Transfer two-setter) are corrected in this same change.
+
 **Scope:** `contracts/integrators/showdown/ShowdownCheckoutIntegrator.sol` (branch
 `feat/showdown-cctp-integrator`), plus its deploy / smoke / attestor scripts, tests and docs.
 **Goal of this pass (per request):** confirm the contract is launch-ready for a Base **mainnet**
