@@ -488,7 +488,13 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
             _diamond == address(0) ||
             _usdc == address(0) ||
             _tokenMessenger == address(0) ||
-            _messageTransmitter == address(0)
+            _messageTransmitter == address(0) ||
+            // Attestors are immutable in practice too: a deploy that zeroes them
+            // ships a contract where no one can ever verify (both entrypoints
+            // revert `AttestorNotSet`), and `owner` cannot be transferred, so the
+            // only remedy is a redeploy + re-whitelist. Refuse at construction.
+            _livenessAttestor == address(0) ||
+            _kycAttestor == address(0)
         ) revert InvalidAddress();
 
         diamond = _diamond;
@@ -515,12 +521,19 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     // ─── Admin ────────────────────────────────────────────────────────
 
+    /// @dev Zero is rejected rather than treated as "disable this tier". Zeroing
+    ///      an attestor fails closed (`AttestorNotSet`), so it would brick the
+    ///      tier silently and irreversibly for anyone mid-verification; the
+    ///      supported way to close a lane is `setTierCap(tier, region, 0)`, which
+    ///      leaves attestations verifiable. Same reasoning in the constructor.
     function setLivenessAttestor(address attestor) external onlyOwner {
+        if (attestor == address(0)) revert InvalidAddress();
         livenessAttestor = attestor;
         emit LivenessAttestorUpdated(attestor);
     }
 
     function setKycAttestor(address attestor) external onlyOwner {
+        if (attestor == address(0)) revert InvalidAddress();
         kycAttestor = attestor;
         emit KycAttestorUpdated(attestor);
     }

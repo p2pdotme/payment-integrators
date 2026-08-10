@@ -1218,6 +1218,65 @@ describe("ShowdownCheckoutIntegrator", function () {
 
   // ─── Pre-deploy hardening (#44/#45/#51/#53/#55/#47) ─────────────────
   describe("pre-deploy hardening", function () {
+    // A zero attestor fails closed (`AttestorNotSet`), so it never opens a hole —
+    // but `owner` is immutable, so a deploy or a fat-fingered rotation that zeroes
+    // one strands every user mid-verification with no remedy but a redeploy and a
+    // re-whitelist. Reject it at both entry points instead.
+    it("rejects a zero liveness attestor in the constructor", async function () {
+      const Factory = await ethers.getContractFactory("ShowdownCheckoutIntegrator");
+      await expect(
+        Factory.deploy(
+          mockDiamond.target,
+          usdcAddr,
+          tokenMessenger.target,
+          messageTransmitter.target,
+          SOLANA_DOMAIN,
+          DAILY_COUNT,
+          ethers.ZeroAddress,
+          kycAttestor.address,
+          LIVENESS_CAP_INDIA,
+          LIVENESS_CAP_ABROAD,
+          KYC_CAP_INDIA,
+          KYC_CAP_ABROAD
+        )
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    });
+
+    it("rejects a zero KYC attestor in the constructor", async function () {
+      const Factory = await ethers.getContractFactory("ShowdownCheckoutIntegrator");
+      await expect(
+        Factory.deploy(
+          mockDiamond.target,
+          usdcAddr,
+          tokenMessenger.target,
+          messageTransmitter.target,
+          SOLANA_DOMAIN,
+          DAILY_COUNT,
+          livenessAttestor.address,
+          ethers.ZeroAddress,
+          LIVENESS_CAP_INDIA,
+          LIVENESS_CAP_ABROAD,
+          KYC_CAP_INDIA,
+          KYC_CAP_ABROAD
+        )
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    });
+
+    it("rejects zeroing either attestor via the setters", async function () {
+      await expect(
+        integrator.connect(owner).setLivenessAttestor(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(
+        integrator.connect(owner).setKycAttestor(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      // A real rotation still works — the check must not block attestor rotation,
+      // which is the documented remedy for a leaked signing key.
+      await expect(integrator.connect(owner).setLivenessAttestor(stranger.address))
+        .to.emit(integrator, "LivenessAttestorUpdated")
+        .withArgs(stranger.address);
+      expect(await integrator.livenessAttestor()).to.equal(stranger.address);
+    });
+
     it("#45: a lower KYC sub-cap binds even after a higher liveness attestation", async function () {
       // Risk-flagged user: liveness attests a huge limit (clamped to $20 by the
       // tier ceiling), then KYC deliberately signs a $5 per-user sub-cap.

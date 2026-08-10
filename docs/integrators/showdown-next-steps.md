@@ -175,7 +175,7 @@ Consequences to carry into the widget:
 
 - **Quote the region-correct cap.** `effectiveLimits(user)` returns `(india, abroad)` in one call; `effectiveLimit(user, currency)` is the exact figure for a given order. The old one-argument `effectiveLimit(user)` is **gone** — an ABI break.
 - **`tierCap` is now `tierCap(tier, region)`.** Same for the smoke and attestor scripts, already updated.
-- **Surface the daily budget.** `getRemainingDailyCount(user)` and `getRemainingOfframpDailyCount(user)`. At 5/day, and with cancels not releasing slots (§below), a user can hit the wall in an afternoon.
+- **Surface the daily budget.** `getRemainingDailyCount(user)` and `getRemainingOfframpDailyCount(user)`. At 5/day a user can hit the wall in an afternoon — and until the cancel callback is switched on for this integrator (see the audit's F9: `contracts-v4` #362 is live but **opt-in, default off**), a cancelled or expired BUY keeps its slot until UTC midnight. The SELL side always relies on `reconcile` regardless.
 - **Blocked users.** `blocked(user)` is a binary owner gate; the entrypoints revert `UserIsBlocked`. Show it distinctly from "not verified" — the fix is different.
 
 ## Open decisions
@@ -184,4 +184,4 @@ Consequences to carry into the widget:
 2. **Who delivers attestations** (§5) — **the launch blocker.** Recommendation is widget-side delivery plus a backstop sweeper; the open question is whether Circle's forwarding service covers Solana at our volume, which would remove the work entirely.
 3. **Fast vs Standard transfers** (§6).
 4. **Who owns the Solana ATA creation UX** (§4) — widget vs. Showdown's own app.
-5. **Who holds the mainnet `owner` key** — decided: a **Showdown multisig**. `owner` is immutable with no transfer and no renounce, so the deploy must be sent _from_ that multisig. See the audit's deploy gates.
+5. **Who holds the mainnet `owner` key** — **decided 2026-08-10: a Showdown-held EOA, deployed from that key.** `owner` is immutable with no transfer and no renounce, so whoever sends the deploy transaction is owner forever; `deploy-showdown.ts` enforces `signer == DEPLOY_OWNER` on mainnet. This supersedes the earlier "Showdown multisig" note, which the contract cannot express: a Safe is a contract and cannot be a deploy signer, so a multisig owner would need an `_owner` constructor param (readiness P5 option 2) — deliberately not taken. Exposure is bounded by the immutable ceilings ($200/tx × 5/day per wallet, `withdrawUsdc` surplus-only), which is what makes an EOA acceptable here. The trade-off to accept knowingly: that one key also holds attestor rotation, tier caps, the offramp kill switch and `offrampRelayer`, so key custody is the whole control.

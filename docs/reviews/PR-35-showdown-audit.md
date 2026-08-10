@@ -162,15 +162,30 @@ fiat→spendable-USDC route that skips consumer-side fraud checks. The bound has
 user already paid fiat for) still looks right, but it is a design decision worth re-confirming at the
 new number rather than inheriting.
 
-### F9 — INFO: `onOrderCancel` is dead code on the live protocol (no fix — documented)
+### F9 — RESOLVED upstream 2026-08-10: `onOrderCancel` is live, but Showdown must opt in
 
-Confirmed in the Investabl audit against the Base-mainnet Diamond: selector `0x7ff83a04` is absent
-from **all 21 facets**; the hook exists only on the unmerged `feat/integrator-on-order-cancel`.
-So `dailyTxCountLimit` bounds **placements** per day — a cancelled or expired order keeps its slot.
-Strictly safe (a slot can never be freed early ⇒ the cap cannot be exceeded); the cost is UX, and it
-bites harder at 5/day than it did at 10. Compounded by the short-TTL order expiry that has stranded
-orders before. Documented in the contract NatSpec and `showdown.md`; **surface remaining-count in the
-widget.**
+**Superseded.** This finding recorded that selector `0x7ff83a04` was absent from all 21 mainnet
+facets, so `dailyTxCountLimit` bounded **placements** per day. That was true until 2026-08-05.
+
+`contracts-v4` **#362** ("opt-in `IP2PIntegrator.onOrderCancel` on B2B BUY cancellation + bounded
+callbacks", merge `962911e`) is now **merged and deployed** to the mainnet Diamond. Verified
+2026-08-10: `setIntegratorCancelCallback(address,bool)` (`0x42de055b`) is present in live facet
+`0x06909D396f04579fcEc20af17eAC6Efe56Bb939E`, and `getIntegratorConfig` now returns five fields
+including `cancelCallbackEnabled`.
+
+Three things follow for Showdown:
+
+1. **It is opt-in and defaults to off.** Enabling is a separate super-admin
+   `setIntegratorCancelCallback(showdown, true)` call **after** registration — see the deploy gates.
+   Until that call, `dailyTxCountLimit` still bounds placements per day exactly as described above.
+2. **It is BUY-only.** `onB2BOrderCancelled` is gated on `orderType == BUY`, so the offramp/SELL side
+   still relies on `reconcile` to release its own daily slot.
+3. **The gas cap is real.** #362 bounds the cancel callback at 250k gas because it runs inside the
+   permissionless `autoCancelExpiredOrders` keeper. Showdown's `onOrderCancel` measures **27,860**
+   gas (24,416 on a repeat call), comfortably inside, and #362 names Showdown as qualifying on all
+   three of its enable gates.
+
+Still **surface remaining-count in the widget** either way.
 
 ### F10 — INFO: the per-tx cap bounds the SELL _principal_, not principal + fee (no fix)
 
@@ -211,6 +226,15 @@ strict bound on value moved.
   arrives** — while `unbridgedTotal` reads 0 and the contract looks perfectly healthy. Note this is
   _worse_ than the fail-closed case: there is no on-chain recovery once the burn lands. It stays
   permissionless and therefore recoverable by anyone, forever — but someone has to do it.
+- **D9 — Enable the cancel callback after registration.** `setIntegratorCancelCallback(showdown, true)`,
+  super-admin, on the Diamond. New since `contracts-v4` #362 (2026-08-05) and **defaults to off**, so
+  skipping it silently leaves `dailyTxCountLimit` bounding placements/day rather than orders/day. See
+  F9. Do it after `registerIntegrator`, not before — the setter reverts `ZeroAddress` for an
+  unregistered integrator.
+- **D10 — Read `getIntegratorConfig` with the 5-field ABI.** #362 added `cancelCallbackEnabled` as the
+  third field. A stale 4-field ABI does not revert; it reads `proxyImpl` as `address(0)`, which is
+  exactly the value D5 depends on. Fixed in `deploy-showdown.ts`; confirm any other tool you register
+  with was updated too.
 - **D8 — No genuine on-chain attestation has ever happened.** "Wired end-to-end" on Sepolia meant
   CORS/proxy 200s. The first real `submitLivenessAttestation` from a live face capture is the actual
   proof, and it has not been produced.

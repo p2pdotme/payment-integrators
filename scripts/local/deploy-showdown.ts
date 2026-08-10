@@ -123,7 +123,13 @@ const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 
 const REGISTER_ABI = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, uint256 activeOrderCount, address proxyImpl))",
+  // 5 fields, not 4: contracts-v4 #362 (merged + deployed to Base mainnet
+  // 2026-08-05) added `cancelCallbackEnabled`. A stale 4-field ABI does NOT
+  // revert — it silently reads `proxyImpl` off `activeOrderCount`, i.e. always
+  // address(0), which both kills the re-register guard below and prints a bogus
+  // proxyImpl in the registration log (the value WHITELISTING.md treats as the
+  // security gate).
+  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, bool cancelCallbackEnabled, uint256 activeOrderCount, address proxyImpl))",
 ];
 const MINTER_ABI = ["function burnLimitsPerMessage(address) view returns (uint256)"];
 const TM_ABI = ["function localMinter() view returns (address)"];
