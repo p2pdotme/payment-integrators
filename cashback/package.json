@@ -1,0 +1,30 @@
+{
+  "name": "@p2pdotme/cashback",
+  "version": "0.1.0",
+  "description": "Config-driven cashback service for the P2P protocol. One registry contract + one watcher; no integrator contract is modified.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:gas": "REPORT_GAS=true hardhat test",
+    "coverage": "hardhat coverage",
+    "clean": "hardhat clean",
+    "lint": "solhint 'contracts/**/*.sol'",
+    "format": "prettier --write 'contracts/**/*.sol' '{test,scripts}/**/*.ts'",
+    "format:check": "prettier --check 'contracts/**/*.sol' '{test,scripts}/**/*.ts'"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "dotenv": "^17.4.2",
+    "hardhat": "^2.22.14",
+    "prettier": "^3.3.3",
+    "prettier-plugin-solidity": "^1.4.1",
+    "solhint": "^5.0.3",
+    "solidity-coverage": "^0.8.17",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.1"
+  }
+}
