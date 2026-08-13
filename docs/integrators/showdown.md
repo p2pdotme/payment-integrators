@@ -4,7 +4,9 @@ A two-way fiat ↔ USDC ramp for [Showdown](https://showdown.gg) whose user-faci
 
 ## What it does
 
-- **Onramp (fiat → USDC on Solana).** The user pays local fiat on the P2P network. The Diamond delivers the purchased USDC to the integrator, which immediately burns it via CCTP and authorizes an equivalent mint to the user's Solana USDC account. The final product the user holds is native USDC on Solana — no wrapped asset, no third-party bridge.
+- **Onramp (fiat → USDC on Solana).** The user pays local fiat on the P2P network. The Diamond delivers the purchased USDC to the integrator, which immediately burns it via CCTP and authorizes a mint to the user's Solana USDC account. The final product the user holds is native USDC on Solana — no wrapped asset, no third-party bridge.
+
+  > **The mint is `amount − fee`, not `amount`.** Circle deducts its attestation fee from the burned amount, so the recipient receives less than was burned whenever a fee applies. On the shipped defaults this is a distinction without a difference — `bridgeMinFinalityThreshold = 2000` (Standard) costs **0 bps** on Base → Solana, verified against Circle's live fee API, so the mint equals the burn exactly. It stops being free the moment anyone calls `setBridgeMinFinalityThreshold(1000)` (Fast, 1.3 bps) and raises `bridgeMaxFeeBps` to match. The widget must quote the **net** amount rather than the order amount if Fast is ever enabled.
 - **Offramp (USDC on Solana → fiat).** The user burns USDC on Solana with CCTP, naming their Base-side `UserProxy` as the `mintRecipient`. Once it lands there, they place a SELL on the Diamond funded from that proxy balance and receive fiat.
 
 Both directions are gated by tiered simple-kyc attestations, because both convert between fiat and USDC the user actually controls.
