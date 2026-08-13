@@ -49,12 +49,71 @@ Own's perps-margin bridge already uses. Verified live (Aug 2026):
 | Route | Base `8453` USDC `0x8335…2913` → Robinhood `4663` USDG `0x5fc5…d168` |
 | Both legs | `supportsBridging: true` on Relay's `/chains` feed |
 | Live quote | 100 USDC in → **99.947424 USDG** out, ETA ~2s, impact −0.07% |
-| Steps | `approve`, `deposit` — two wallet confirmations |
+| Steps | one signature — see below |
 | Recipient | a parameter — set to the user's own address |
 
 > Relay does **not** list Base Sepolia (84532) or Robinhood testnet (46630), so
 > the bridge leg cannot run on testnet. This is expected, and it is why the
-> Sepolia E2E asserts only the settlement leg.
+> Sepolia E2E asserts only the settlement leg. Relay's *testnet* API carries
+> only two chains, and Base Sepolia lists neither USDC nor a Robinhood
+> destination — so there is nothing to configure here, and the bridge and its
+> gas top-up are mainnet-only tests.
+
+### The bridge leg costs the user no gas
+
+Base USDC implements EIP-3009, so the quote is requested with `usePermit: true`
+and comes back as a **single EIP-712 signature** instead of an `approve` +
+`deposit` pair. `fees.gas.amountUsd` is literally `0`. Verified live on the
+mainnet route 2026-08-13; the fee cost of asking is +$0.002 on $100.
+
+This matters more than it looks. The user reaching this step has just bought
+their first stablecoin and holds no ETH, so every transaction turned into a
+signature is one fewer reason for them to be stuck. The transaction path is
+still implemented and still correct — a wallet that refuses the message type
+falls back to it — but the common case now needs nothing but a signature.
+
+> Relay reads that signature off the **query string** of
+> `POST /execute/permits`, not the body. Posting it in the body returns `200`
+> with nothing queued, so the bridge sits in "tracking" forever and never
+> fills. It can also return follow-up steps, so treat the quote's steps as a
+> queue rather than a fixed list.
+
+### Robinhood Chain: gas, and the token that isn't there
+
+Relay lists exactly **one** ERC-20 on chain 4663: **USDG** (`0x5fc5…d168`).
+There is **no USDT on Robinhood Chain**, and Own's app is USDG-denominated
+throughout — worth stating plainly, because "USDT on Robinhood" is a natural
+thing to ask for and there is no route that delivers it.
+
+Chain 4663 is an **Arbitrum Orbit** chain settling to Ethereum L1. Native gas
+is **ETH** at ~0.047 gwei, and because Orbit folds the L1 posting cost into
+`gasUsed`, `gasUsed × gasPrice` is the whole bill — there is no separate L1 fee
+to add. A real 261,464-gas transaction there cost 0.0000123 ETH, about
+**$0.023**.
+
+So USDG arriving in a wallet with no ETH is unspendable. The ramp reads the
+buyer's balance on 4663 and, when it is under five transactions' worth, offers
+a top-up as a visible line item on the bridge they are already making —
+pre-ticked only when they are short, and always declinable:
+
+| top-up | ETH delivered | ≈ platform txs | Relay fee | user receives (on $100) |
+|---|---|---|---|---|
+| none | – | – | $0.050 | 99.823 USDG |
+| $0.10 | 0.0000530 | ~4 | $0.179 | 99.694 USDG |
+| **$0.25** (default) | 0.0001325 | **~11** | $0.329 | 99.494 USDG |
+| $2.00 | 0.0010605 | ~86 | $2.079 | 97.793 USDG |
+
+Overhead is roughly $0.03–0.08 flat on top of the amount delivered.
+
+> `topupGasAmount` is denominated in **origin currency base units** — 6dp USDC,
+> so `"250000"` is $0.25 — **not** destination wei. This is undocumented and it
+> fails misleadingly: a wei-scaled number reads as an enormous dollar figure and
+> Relay rejects the whole quote with `AMOUNT_TOO_LOW`, which looks like the
+> user's amount is the problem.
+>
+> Omitting it entirely while `topupGas` is true takes Relay's default of
+> **$2.00** — about 86 transactions, and 2% of a $100 order. Always send an
+> explicit figure.
 
 ---
 
@@ -268,6 +327,44 @@ Useful views: `effectiveLimits(user)` returns both region caps in one call;
 `domainSeparator()` lets the service and the frontend assert they are signing
 for this exact deployment.
 
+### The buyer has no gas — steps 3, 4 and the mark-paid
+
+Steps 3 and 4 above, plus `paidBuyOrder`, are three transactions from the
+buyer's own wallet. The buyer is on this screen because they are acquiring
+their first stablecoin, so their Base ETH balance is zero. Measured:
+
+| call | gas | note |
+|---|---|---|
+| `submitPassportAttestation` | 99,644 | once per wallet |
+| `buyUsdc` | 1,107,487 / 987,781 | first call also deploys the `UserProxy` |
+| `paidBuyOrder` | ~150,000 | per order |
+
+At Base's prevailing 0.005 gwei that is **about 1.5 cents in total**. It was
+never a cost problem — it is a chicken-and-egg problem, because the on-ramp is
+the thing that would have given them the gas.
+
+`paidBuyOrder` is why this cannot simply be relayed away. `OrderFlowHelper`
+accepts it only from `_order.user` or a protocol admin, and it is the buyer's
+own attestation that they moved fiat — sending it for them would fabricate a
+payment claim, which §5 already warns against. ERC-2771 on this contract would
+cover the other two calls and not this one, at the price of a new contract, a
+re-audit and a re-whitelist; 4337/7702 would cover all three, but the app
+connects external wallets, so there is no embedded signing stack to drive an
+authorization and moving to smart accounts would change every user's address.
+
+So the gap is closed by **dripping gas to the buyer's own address**:
+`services/gas-faucet`. It funds a wallet only against a passport attestation
+re-verified against this contract's exact EIP-712 message — including the
+low-`s` rejection, since accepting a signature this contract would refuse means
+funding a wallet whose submit then reverts — or against `verified(wallet)` once
+that is true on chain. Spend is capped per wallet, per **nullifier** (so one
+human spreading across many wallets shares one budget) and globally.
+
+The client must **fail open**. A faucet that is down, slow or dry leaves buyers
+who already hold gas completely unaffected, and buyers who don't get their
+wallet's own insufficient-funds error rather than a guess at one. It is a
+convenience, never a dependency.
+
 ### Passport is not liveness — three places integrations get this wrong
 
 The passport and liveness services are separate deployments with near-identical
@@ -314,6 +411,11 @@ key-holding proxy exposes only the two widget endpoints, so that lookup goes to
 - [x] Rotate `attestor` off the deployer placeholder (`setAttestor`) — done on
       Base Sepolia 2026-08-06, see §5. **Still required on any new deployment**:
       the deploy script falls back to the deployer on testnet by design.
+      Re-verified on chain 2026-08-13: `attestor()` returns `0xA0bE0151…`,
+      byte-identical to `passport-api.p2p.cool/v1/attestor`. One consequence
+      worth knowing before reaching for it — `scripts/local/e2e-own-sepolia.ts`
+      can no longer mint its own attestations and refuses loudly, by design.
+      Sepolia end-to-end now runs through the real passport flow in own-app.
 - [x] Create the Own tenant on the service (`own-passport`, `limit_usdc: 200` —
       see §5 for why 200 and not 100), and add the app's origins to the proxy's
       `ALLOWED_ORIGINS` **and** the tenant's own `redirect_uris` / `web_origins`.
@@ -329,3 +431,17 @@ key-holding proxy exposes only the two widget endpoints, so that lookup goes to
       replayed against the mainnet contract — a separate tenant is mandatory, not
       housekeeping.
 - [ ] Confirm the mainnet `circleId` for each fiat currency Own will offer.
+- [ ] Deploy `services/gas-faucet` and point `NEXT_PUBLIC_P2P_GAS_FAUCET` at it.
+      Needs a hot key with a small ETH float on Base, a **persistent volume**
+      for `FAUCET_DB_PATH` (every daily cap is a sum over that ledger, so
+      ephemeral disk resets the caps on each deploy), one replica (single key,
+      single nonce), and the mainnet integrator plus its attestor in
+      `FAUCET_INTEGRATORS`. Read that attestor from `/v1/attestor` like any
+      other — a wrong value here rejects every cold-start request and is
+      indistinguishable from the faucet being down.
+      Not a launch blocker: without it the ramp works for anyone already
+      holding gas.
+- [ ] Test the bridge and its gas top-up on **mainnet**. Neither can run on
+      testnet (§1), so they are the one part of the flow that reaches
+      production unexercised. A $5 bridge with a $0.25 top-up costs about
+      $0.33 all-in — cheap enough that there is no excuse for skipping it.
