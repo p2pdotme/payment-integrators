@@ -74,7 +74,11 @@ The offramp maps cleanly onto the existing `<Cashout>` host-callback shape; the 
 3. Deliver the attested message on Base (see §5) — `receiveFromSolana(message, attestation)` is a convenience passthrough on the integrator, or call MessageTransmitterV2 directly; it's permissionless either way.
 4. Poll `bridgedBalance(user)` until it reflects, then `userInitiateOfframp(...)`.
 
-Note the Diamond's fee comes off the same proxy balance, so the proxy needs **principal + fee** by delivery time, not just principal. `userInitiateOfframp` only checks the principal; `deliverOfframpUpi` reads the authoritative `actualUsdtAmount` and will revert with `InsufficientBridgedFunds` if the proxy is short. Worth surfacing headroom in the UI.
+Note the Diamond's fee comes off the same proxy balance, so the proxy needs **principal + fee** by delivery time, not just principal. `userInitiateOfframp` only checks the principal; `deliverOfframpUpi` reads the authoritative `actualUsdtAmount` and will revert with `InsufficientBridgedFunds` if the proxy is short.
+
+> **Decided 2026-08-13 (#44): this is handled in the widget, not the contract.** Before the user confirms a cash-out the widget must quote **the exact fiat they will receive, net of fees**, and only proceed on that confirmation. The corollary is a constraint, not just a display: the widget must also **cap the maximum cash-out at balance − fee headroom**, or a user who taps "max" still places an order that cannot be delivered. No `MAX_SELL_FEE_BPS` bound was added to the contract, so a caller that bypasses the widget and calls `userInitiateOfframp` directly can still strand — recoverable via `reconcile`, never a loss of funds.
+
+**Delivery is initiator-only.** `deliverOfframpUpi` can be called only by the address that placed the order. There is no relayer path (#53.2), because `encUpi` *is* the payout destination and is encrypted to the merchant — who is unknown until after the accept — so no one can pre-authorise a delivery on the user's behalf without also being able to redirect the money. The user's client encrypts `encUpi` locally and submits it.
 
 **KYC gate UI.** `submitLivenessAttestation` / `submitKycAttestation`, and read `effectiveLimit(address,bytes32 currency)` (or `effectiveLimits(address) → (india, abroad)`) / `userTier(user)` to drive the cap shown. The one-arg `effectiveLimit(user)` no longer exists — ABI break (see the widget note below). The passport upsell is region-dependent: liveness→passport is $20→$100 (INR) or $50→$200 (abroad), NOT a flat $20→$50 (that difference is India-vs-Abroad within the SAME liveness tier). (#54)
 
@@ -158,7 +162,7 @@ Defaults are Standard Transfer, free: `bridgeMinFinalityThreshold = 2000`, `brid
 - The owner **cannot touch in-flight funds**: `withdrawUsdc` is hard-bounded by `unbridgedTotal` and can only sweep genuine surplus.
 - The stuck-bridge escape is **buyer-only, after 7 days** (`userRescueStuckBridge`) — never an owner power. It returns Base-side USDC rather than the Solana USDC ordered: a deliberate trade against permanent loss, bounded by the tier cap, unreachable while CCTP is healthy.
 - The Solana destination is **pinned at order time** and cannot be redirected by anyone, including the owner — which is why `retryBridge` is safe to leave permissionless.
-- Owner powers are: attestor rotation, tier caps, daily count, offramp kill switch + relayer, bridge fee/finality, and surplus sweep. No upgradeability — the integrator is immutable by repo policy.
+- Owner powers are: attestor rotation, tier caps, daily count, the offramp kill switch, bridge fee/finality, and surplus sweep. **Not** offramp delivery — there is no `offrampRelayer` (#53.2, decided 2026-08-13), so the owner can never name who delivers a user's payout. No upgradeability — the integrator is immutable by repo policy.
 
 ## 9. Limits (settled 2026-07-27)
 

@@ -196,6 +196,48 @@ strict bound on value moved.
 
 ---
 
+## The three PR #58 design calls — settled 2026-08-13
+
+PR #58 fixed what it could and deliberately left three questions to p2p, all of them
+bytecode-gating because the integrator is immutable. All three are now decided.
+
+### #51.1 — `userCancelOfframp`: **not adding it**
+
+A user-facing SELL cancel is not shipping. A cancel that could still land after the merchant has
+sent the rupees is a merchant-funded double-spend, and it could not be verified against
+`MockDiamond.cancelSellOrder`, which is permissive. Users who change their mind wait for expiry;
+`reconcile` then releases the escrow and — for an order no merchant ever accepted — refunds the
+daily slot. That path is already implemented and tested. Cost is UX on a mistyped amount, not funds.
+
+### #53.2 — `offrampRelayer`: **removed entirely**
+
+The state variable, the `setOfframpRelayer` setter and the `OfframpRelayerUpdated` event are gone;
+`deliverOfframpUpi` is now initiator-only. This was not merely a dormant power: `encUpi` **is** the
+fiat payout target, `placeB2BSellOrder` leaves `order.encUpi` empty, and the Diamond's substitution
+guard accepts any string into an empty slot — so a set relayer could redirect any seller's payout to
+itself, with the order still moving to PAID and every health metric reading clean.
+
+Binding it to a user EIP-712 signature over `keccak256(encUpi)` was considered and **rejected as
+illusory**: `encUpi` is encrypted to the *matched merchant*, who is unknown until after the accept,
+so the user cannot pre-sign the destination at placement. By the time they can sign it they are
+online and can simply deliver it themselves. Since Showdown's client encrypts `encUpi` locally, the
+relayer bought no capability the user lacked — only a way to lose money. Removing it also shrinks
+the owner's authority: the owner can no longer name who delivers a payout.
+
+### #44 — fee headroom: **widget-side, no contract bound**
+
+No `MAX_SELL_FEE_BPS` was added. The Diamond's fee is charged on top of principal and is unknown
+until delivery, so a full-balance SELL can still be undeliverable. This is handled in the product:
+the widget quotes the exact net fiat before the user confirms, and **caps the maximum cash-out at
+balance − fee headroom** so an undeliverable order cannot be placed through the UI.
+
+Residual, accepted knowingly: a caller that bypasses the widget and hits `userInitiateOfframp`
+directly can still strand. Funds are never lost — the USDC stays on the user's own proxy, `reconcile`
+releases the escrow and refunds the slot, and `userBridgeBackToSolana` remains open. The contract-side
+bound stays available until the deploy transaction and not after.
+
+---
+
 ## Deploy gates (correct code, wrong config still bricks or weakens it)
 
 - **D1 — CCTP addresses in the deploy script are TESTNET-ONLY.** `0x8FE6B999…` / `0xE737e5cE…` are

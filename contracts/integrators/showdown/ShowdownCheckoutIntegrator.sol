@@ -142,7 +142,6 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     event DailyTxCountLimitUpdated(uint256 count);
     event UserBlockedUpdated(address indexed user, bool isBlocked);
     event OfframpEnabledUpdated(bool enabled);
-    event OfframpRelayerUpdated(address indexed relayer);
     event BridgeMaxFeeBpsUpdated(uint256 bps);
     event BridgeFinalityThresholdUpdated(uint32 threshold);
     event UsdcWithdrawn(address indexed to, uint256 amount);
@@ -321,21 +320,22 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     /// @notice Master switch for the offramp flow. Defaults ON at deploy.
     bool public offrampEnabled;
-    /// @notice Optional relayer permitted to deliver UPI on a user's behalf
-    ///         (in addition to the order's initiator). 0 = user-only.
-    /// @dev    ⚠️ A set relayer CHOOSES the fiat payout destination, not merely
-    ///         relays it: `encUpi` IS the payout target, `placeB2BSellOrder`
-    ///         leaves `order.encUpi` empty, and the Diamond's substitution guard
-    ///         accepts any string into an empty slot — so a relayer can direct
-    ///         ANY seller's payout (first writer wins; the order moves to PAID).
-    ///         Defaults to 0 (constructor never sets it) so the power does not
-    ///         exist until an owner explicitly opts in. RECOMMENDATION: leave it
-    ///         0 — the initiator can always self-deliver. If a no-Base-identity
-    ///         UX ever needs it, require the user to sign keccak256(encUpi)
-    ///         (EIP-712, same stack) so the relayer relays rather than chooses.
-    ///         See #53. (Removing the relayer path outright is a design call for
-    ///         p2p; left in place with this warning + the default-0 guard.)
-    address public offrampRelayer;
+    // NOTE (#53.2, decided 2026-08-13): there is deliberately NO `offrampRelayer`.
+    // An earlier revision let an owner-set relayer call `deliverOfframpUpi` for
+    // someone else's order. That is not a relay — `encUpi` IS the fiat payout
+    // target, `placeB2BSellOrder` leaves `order.encUpi` empty, and the Diamond's
+    // substitution guard accepts any string into an empty slot, so a relayer
+    // could redirect ANY seller's payout to itself (first writer wins; the order
+    // then moves to PAID and every health metric still reads clean).
+    //
+    // Binding it with a user EIP-712 signature over keccak256(encUpi) was
+    // considered and rejected as illusory: `encUpi` is encrypted to the MATCHED
+    // MERCHANT, who is unknown until after the accept, so the user cannot
+    // pre-sign the destination at placement. By the time they can sign it they
+    // are online and can simply call `deliverOfframpUpi` themselves.
+    //
+    // Showdown's client encrypts `encUpi` locally, so a relayer buys no
+    // capability the user does not already have. Delivery is initiator-only.
 
     // ─── Bridge config ────────────────────────────────────────────────
 
@@ -590,11 +590,6 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     function setOfframpEnabled(bool flag) external onlyOwner {
         offrampEnabled = flag;
         emit OfframpEnabledUpdated(flag);
-    }
-
-    function setOfframpRelayer(address relayer) external onlyOwner {
-        offrampRelayer = relayer;
-        emit OfframpRelayerUpdated(relayer);
     }
 
     /// @dev Bounded by `MAX_BRIDGE_MAX_FEE_BPS` so a misconfigured or
@@ -1312,9 +1307,8 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     function deliverOfframpUpi(uint256 orderId, string calldata encUpi) external nonReentrant {
         OfframpRecord memory record = offramps[orderId];
         if (!record.initialized) revert OfframpRecordNotFound();
-        if (msg.sender != orderInitiator[orderId] && msg.sender != offrampRelayer) {
-            revert OfframpNotAuthorized();
-        }
+        // Initiator-only by design (#53.2) — see the note by `offrampEnabled`.
+        if (msg.sender != orderInitiator[orderId]) revert OfframpNotAuthorized();
         // Honour a block placed AFTER the order was placed. blocked[] exists
         // precisely to stop a payout (fraud report / sanctions), so unlike the
         // offrampEnabled kill switch — which we deliberately let in-flight orders

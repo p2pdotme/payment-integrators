@@ -1179,7 +1179,10 @@ describe("ShowdownCheckoutIntegrator", function () {
       expect(await asDiamond.validateOrder.staticCall(user2.address, USDC(1), INR)).to.equal(false);
     });
 
-    it("restricts UPI delivery to the initiator or the relayer", async function () {
+    // #53.2: delivery is initiator-only. `encUpi` IS the fiat payout target, so
+    // any third party permitted to supply it could redirect the seller's cash to
+    // itself. There is no relayer to opt into — not even the owner.
+    it("restricts UPI delivery to the initiator, with no relayer escape", async function () {
       await bridgeIn(user, USDC(50));
       const orderId = await mockDiamond.nextOrderId();
       await integrator.connect(user).userInitiateOfframp(USDC(50), INR, 0, 1, 0, "pub");
@@ -1189,8 +1192,14 @@ describe("ShowdownCheckoutIntegrator", function () {
         integrator.connect(stranger).deliverOfframpUpi(orderId, "enc-upi")
       ).to.be.revertedWithCustomError(integrator, "OfframpNotAuthorized");
 
-      await integrator.connect(owner).setOfframpRelayer(stranger.address);
-      await expect(integrator.connect(stranger).deliverOfframpUpi(orderId, "enc-upi")).to.emit(
+      // The owner cannot delegate the power either — the setter does not exist.
+      expect((integrator as any).setOfframpRelayer).to.equal(undefined);
+      await expect(
+        integrator.connect(owner).deliverOfframpUpi(orderId, "enc-upi")
+      ).to.be.revertedWithCustomError(integrator, "OfframpNotAuthorized");
+
+      // The initiator can always self-deliver.
+      await expect(integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi")).to.emit(
         integrator,
         "OfframpUpiDelivered"
       );
