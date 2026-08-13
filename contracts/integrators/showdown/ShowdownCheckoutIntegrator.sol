@@ -997,8 +997,28 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         }
 
         if (amount != session.amount) {
-            emit OnrampAmountAdjusted(orderId, session.amount, amount);
-            session.amount = amount;
+            // Re-pin to what the Diamond says it delivered — but never above what
+            // actually arrived. `unbridgedTotal` is a claim on a POOLED balance,
+            // so reserving more than is backed would let this order's burn spend
+            // another buyer's USDC and break `balanceOf(this) >= unbridgedTotal`.
+            //
+            // Clamp rather than revert: the gateway routes funds BEFORE this hook
+            // and swallows a revert, so reverting would strand the delivered USDC
+            // with no session record (sweepable as owner "surplus") — the same
+            // asymmetry the cancel-then-complete branch above turns on.
+            //
+            // Deliberately NOT re-checked against the tier cap. Clamping an
+            // over-delivery down to the cap would leave the excess unreserved and
+            // owner-sweepable, converting an AML limit breach into a user fund
+            // loss. The cap is enforced at placement, where it belongs.
+            //
+            // Unreachable on today's gateway (it passes exactly the amount it
+            // transferred, verified against contracts-v4). This is defence in
+            // depth: the integrator is immutable and the Diamond is not.
+            uint256 backed = usdc.balanceOf(address(this)) - unbridgedTotal;
+            uint256 pinned = amount > backed ? backed : amount;
+            emit OnrampAmountAdjusted(orderId, session.amount, pinned);
+            session.amount = pinned;
         }
 
         session.fulfilled = true;

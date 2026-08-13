@@ -609,6 +609,55 @@ describe("ShowdownCheckoutIntegrator", function () {
       expect(await mockUsdc.balanceOf(integratorAddr)).to.equal(0);
     });
 
+    // gitchadd on #35: the re-pin accepted whatever the Diamond reported, in
+    // either direction. Over-reporting would reserve USDC that never arrived,
+    // against a POOLED balance — so one order's burn could spend another
+    // buyer's funds. Unreachable on today's gateway (it passes exactly what it
+    // transferred); pinned here because the integrator is immutable.
+    it("clamps an over-reported delivery so one order cannot reserve another buyer's USDC", async function () {
+      await tokenMessenger.setBurnLimitPerMessage(usdcAddr, 0); // burns fail → funds stay pooled
+      await verify(user2, "kyc", KYC_CAP, "kyc-u2");
+
+      // Buyer A: $50 delivered honestly, sitting unbridged in the pool.
+      const idA = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userBuyUsdcToSolana(USDC(50), INR, SOLANA_ATA, 1, "", 0, 0);
+      await mockUsdc.mint(integratorAddr, USDC(50));
+      await mockDiamond.adminCallOnOrderComplete(
+        integratorAddr,
+        idA,
+        user.address,
+        USDC(50),
+        integratorAddr
+      );
+      expect(await integrator.unbridgedTotal()).to.equal(USDC(50));
+
+      // Buyer B: the Diamond delivers $50 but REPORTS $80.
+      const idB = await mockDiamond.nextOrderId();
+      await integrator.connect(user2).userBuyUsdcToSolana(USDC(50), INR, SOLANA_ATA, 1, "", 0, 0);
+      await mockUsdc.mint(integratorAddr, USDC(50));
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          integratorAddr,
+          idB,
+          user2.address,
+          USDC(80),
+          integratorAddr
+        )
+      )
+        .to.emit(integrator, "OnrampAmountAdjusted")
+        .withArgs(idB, USDC(50), USDC(50)); // clamped to what arrived, not $80
+
+      // Unclamped this reads $130 against a $100 balance — buyer A's reserve
+      // part-funding buyer B's burn.
+      expect(await integrator.unbridgedTotal()).to.equal(USDC(100));
+      expect(await mockUsdc.balanceOf(integratorAddr)).to.equal(USDC(100));
+      expect((await integrator.getSession(idB)).amount).to.equal(USDC(50));
+      // Nothing is surplus, so buyer A's reserve stays un-sweepable.
+      await expect(
+        integrator.connect(owner).withdrawUsdc(owner.address, 1)
+      ).to.be.revertedWithCustomError(integrator, "WithdrawExceedsSurplus");
+    });
+
     it("keeps unbridgedTotal within the balance when a short delivery cannot bridge", async function () {
       await tokenMessenger.setBurnLimitPerMessage(usdcAddr, 0);
       const orderId = await mockDiamond.nextOrderId();
