@@ -1,4 +1,5 @@
 import { ethers } from "hardhat";
+import { getIntegratorConfig } from "../lib/diamond";
 
 /**
  * Whitelist PikerOnrampIntegrator on the Base Sepolia test Diamond via
@@ -11,7 +12,6 @@ import { ethers } from "hardhat";
  */
 const ABI = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, bool cancelCallbackEnabled, uint256 activeOrderCount, address proxyImpl))",
 ];
 const EXPECTED_SUPERADMIN = "0x9DE9772AfCdf3AFa03CC689fE7AFA5b631088aB9";
 
@@ -41,7 +41,7 @@ async function main() {
   if (bal === 0n) throw new Error("signer has no ETH for gas — aborting");
 
   const c = new ethers.Contract(DIAMOND, ABI, admin);
-  const before = await c.getIntegratorConfig(INTEGRATOR);
+  const before = await getIntegratorConfig(ethers.provider, DIAMOND, INTEGRATOR);
   console.log("before:", {
     isActive: before.isActive,
     usdcThroughIntegrator: before.usdcThroughIntegrator,
@@ -68,7 +68,7 @@ async function main() {
   const r = await tx.wait();
   console.log("mined in block:", r?.blockNumber);
 
-  const after = await c.getIntegratorConfig(INTEGRATOR);
+  const after = await getIntegratorConfig(ethers.provider, DIAMOND, INTEGRATOR);
   console.log("after:", {
     isActive: after.isActive,
     usdcThroughIntegrator: after.usdcThroughIntegrator,

@@ -76,7 +76,7 @@ async function main() {
 
   // Current registration state on the Diamond.
   const dAbi = [
-    "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, bool cancelCallbackEnabled, uint256 activeOrderCount, address proxyImpl))",
+    "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, uint256 activeOrderCount, address proxyImpl))",
   ];
   try {
     const d = new ethers.Contract(DIAMOND, dAbi, provider);
