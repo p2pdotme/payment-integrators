@@ -149,6 +149,19 @@ async function main() {
   );
 
   const head0 = await provider.getBlockNumber();
+
+  // RE-AUDIT (high). Falling back to the CURRENT head when the state file is
+  // missing or corrupt silently skips every order placed while the watcher
+  // was down — the on-chain `orderPaid` marker prevents double payment, but
+  // nothing recovers an order we never looked at. Require START_BLOCK so a
+  // cold start has an explicit, auditable floor.
+  if (!fs.existsSync(STATE_FILE) && !START_BLOCK) {
+    throw new Error(
+      `No state file at ${STATE_FILE} and START_BLOCK is unset. Set START_BLOCK ` +
+        `to the registry's deploy block (or an earlier known-good block) so a ` +
+        `cold start cannot silently skip orders placed while the watcher was down.`
+    );
+  }
   const state = readState(START_BLOCK || head0);
   console.log(
     `            · resuming at block ${state.lastProcessedBlock} ` +
@@ -188,7 +201,20 @@ async function main() {
 
       // ── 2. RE-CHECK: has anything pending completed since last poll? ──
       const now = Date.now();
-      const keys = Object.keys(state.pending).slice(0, RECHECK_PER_POLL);
+
+      // Re-check OLDEST-FIRST, not in key order.
+      //
+      // RE-AUDIT (high). This used to be `Object.keys(pending).slice(0, N)`.
+      // JavaScript enumerates integer-like keys in ascending NUMERIC order,
+      // not insertion order — so once the pending set exceeded N, the same
+      // N lowest orderIds were re-checked every poll forever and newer
+      // orders were never examined until they aged out. That is F2's
+      // failure mode returning by a different route: cashback silently
+      // unpaid, dashboards healthy. Sorting by `firstSeen` makes progress
+      // monotonic regardless of set size.
+      const keys = Object.keys(state.pending)
+        .sort((a, b) => state.pending[a].firstSeen - state.pending[b].firstSeen)
+        .slice(0, RECHECK_PER_POLL);
       const ready: { orderId: bigint; integrator: string; user: string; orderAmount: bigint }[] =
         [];
 

@@ -1826,3 +1826,230 @@ describe("CashbackRegistry — budgets, decimals, labels", function () {
     expect((await reg.campaignsPaged(99, 10)).length).to.equal(0); // past the end
   });
 });
+
+// ─── Re-audit regressions ────────────────────────────────────────────
+// Bugs introduced BY the PR #62 fixes, found in a second adversarial pass.
+// The critical one fired in normal operation with no attacker involved.
+
+describe("CashbackRegistry — re-audit regressions", function () {
+  let admin: SignerWithAddress;
+  let alice: SignerWithAddress;
+  let keeper: SignerWithAddress;
+  let buyer: SignerWithAddress;
+
+  let orders: any;
+  let reg: any;
+  let intg: string;
+
+  const U6 = (n: number | string) => ethers.parseUnits(n.toString(), 6);
+  const NB = {
+    maxRewardPerOrder: 0,
+    dailyBudget: 0,
+    totalBudget: 0,
+    dailyPerUser: 0,
+    startTime: 0,
+    endTime: 0,
+  };
+
+  async function campaign(token: any, opts: any = {}) {
+    const tx = await reg
+      .connect(alice)
+      .createCampaign(
+        intg,
+        opts.orderType ?? BUY,
+        opts.currency ?? INR,
+        await token.getAddress(),
+        opts.bps ?? 100,
+        opts.flat ?? 0n,
+        alice.address,
+        opts.budget ?? NB
+      );
+    const rc = await tx.wait();
+    const id = rc.logs
+      .map((l: any) => {
+        try {
+          return reg.interface.parseLog(l);
+        } catch {
+          return null;
+        }
+      })
+      .find((e: any) => e && e.name === "CampaignCreated").args.campaignId;
+    if (opts.activate !== false) await reg.connect(alice).activate(id);
+    return id;
+  }
+
+  beforeEach(async function () {
+    [admin, alice, keeper, buyer] = await ethers.getSigners();
+    intg = ethers.Wallet.createRandom().address;
+
+    orders = await (await ethers.getContractFactory("MockOrderSource")).deploy();
+    reg = await (
+      await ethers.getContractFactory("CashbackRegistry")
+    ).deploy(await orders.getAddress());
+
+    await reg.setAccruer(keeper.address, true);
+    await reg.setIntegratorOwner(intg, alice.address);
+  });
+
+  // CRITICAL — a USDT-style token moved the funds but read as a failure, so
+  // orderPaid was rolled back and the budget counters never incremented.
+  // A retrying watcher then drained the wallet one transfer at a time.
+  it("a no-return (USDT-style) token pays exactly once and is accounted for", async function () {
+    const usdt = await (await ethers.getContractFactory("MockNoReturnToken")).deploy();
+    await usdt.mint(alice.address, U6(1_000_000));
+    await usdt.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    const id = await campaign(usdt, { bps: 100, budget: { ...NB, totalBudget: U6(5) } });
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+
+    const funderStart = await usdt.balanceOf(alice.address);
+
+    // The watcher retries an order it believes unpaid. Ten attempts.
+    for (let i = 0; i < 10; i++) {
+      await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+    }
+
+    // 1% of 1000 = 10, clamped by the 5-token lifetime budget. Paid ONCE,
+    // not once per retry — that is the whole point of the regression.
+    expect(await usdt.balanceOf(buyer.address)).to.equal(U6(5));
+    expect(funderStart - (await usdt.balanceOf(alice.address))).to.equal(U6(5));
+
+    // And every guard held.
+    expect(await reg.orderPaid(1)).to.equal(true);
+    expect((await reg.stats(id)).totalPaid).to.equal(U6(5));
+    expect((await reg.stats(id)).orderCount).to.equal(1);
+  });
+
+  it("a token that returns false still fails and stays retryable", async function () {
+    const bad = await (await ethers.getContractFactory("MockBadToken")).deploy(1); // RETURN_FALSE
+    await bad.mint(alice.address, U6(1000));
+    await bad.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign(bad, { bps: 100 });
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+
+    await expect(reg.connect(keeper).pay(1, intg, buyer.address, U6(1000))).to.emit(
+      reg,
+      "PayFailed"
+    );
+    expect(await reg.orderPaid(1)).to.equal(false);
+  });
+
+  // HIGH — startTime was only DEFAULTED to now, not floored, so passing a
+  // past value harvested the integrator's whole order history.
+  it("startTime is floored at creation time, not merely defaulted", async function () {
+    const usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    await usdc.mint(alice.address, U6(1_000_000));
+    await usdc.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    // An order placed long before any campaign exists.
+    const past = (await ethers.provider.getBlock("latest"))!.timestamp - 90 * 24 * 3600;
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, past);
+
+    // Owner tries to backdate the campaign to sweep history.
+    const id = await campaign(usdc, { bps: 500, budget: { ...NB, startTime: 1 } });
+
+    const c = await reg.getCampaign(id);
+    expect(c.startTime).to.be.greaterThan(past); // floored to ~now
+
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(0);
+  });
+
+  // MEDIUM — setBudget validated endTime against the calldata start, so the
+  // "leave unchanged" sentinel (0) let an endTime slip below the real start
+  // and silently brick a live campaign.
+  it("setBudget validates endTime against the effective start", async function () {
+    const usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    await usdc.mint(alice.address, U6(1000));
+    await usdc.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    const id = await campaign(usdc, { bps: 100 });
+
+    // startTime 0 means "leave it"; endTime 1 is far below the real start.
+    await expect(
+      reg.connect(alice).setBudget(id, { ...NB, startTime: 0, endTime: 1 })
+    ).to.be.revertedWithCustomError(reg, "InvalidWindow");
+
+    // The campaign is still payable.
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(10));
+  });
+
+  // MEDIUM — quote() advertised rewards that pay() would not pay.
+  it("quote agrees with pay once the budget is exhausted", async function () {
+    const usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    await usdc.mint(alice.address, U6(1_000_000));
+    await usdc.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign(usdc, { bps: 500, budget: { ...NB, totalBudget: U6(10) } });
+
+    await orders.setOrderFull(1, buyer.address, U6(200), COMPLETED, 0, intg, 0);
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(200)); // spends the lot
+
+    const [, quoted] = await reg.quote(intg, BUY, INR, U6(200));
+    expect(quoted).to.equal(0); // no longer advertises a reward it cannot pay
+  });
+
+  it("quote reports zero once the funder revokes authorisation", async function () {
+    const usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    const [, , , , carol] = await ethers.getSigners();
+    await usdc.mint(carol.address, U6(1000));
+    await usdc.connect(carol).approve(await reg.getAddress(), ethers.MaxUint256);
+    await reg.connect(carol).authorizeCampaignFunder(alice.address, await usdc.getAddress(), true);
+
+    const tx = await reg
+      .connect(alice)
+      .createCampaign(intg, BUY, INR, await usdc.getAddress(), 100, 0, carol.address, NB);
+    const rc = await tx.wait();
+    const id = rc.logs
+      .map((l: any) => {
+        try {
+          return reg.interface.parseLog(l);
+        } catch {
+          return null;
+        }
+      })
+      .find((e: any) => e && e.name === "CampaignCreated").args.campaignId;
+    await reg.connect(alice).activate(id);
+
+    const [, before] = await reg.quote(intg, BUY, INR, U6(1000));
+    expect(before).to.equal(U6(10));
+
+    await reg.connect(carol).authorizeCampaignFunder(alice.address, await usdc.getAddress(), false);
+
+    const [, after] = await reg.quote(intg, BUY, INR, U6(1000));
+    expect(after).to.equal(0);
+  });
+
+  it("quote reports zero when the funding wallet cannot pay", async function () {
+    const usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    await usdc.mint(alice.address, U6(1000));
+    await usdc.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign(usdc, { bps: 100 });
+
+    await usdc.connect(alice).approve(await reg.getAddress(), 0); // revoke
+    const [, quoted] = await reg.quote(intg, BUY, INR, U6(1000));
+    expect(quoted).to.equal(0);
+  });
+
+  it("quoteForUser accounts for the per-user daily allowance", async function () {
+    const usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    await usdc.mint(alice.address, U6(1_000_000));
+    await usdc.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign(usdc, { bps: 500, budget: { ...NB, dailyPerUser: U6(1) } });
+
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+
+    const [, forUser] = await reg.quoteForUser(intg, buyer.address, BUY, INR, U6(1000));
+    expect(forUser).to.equal(0); // this user is capped out for today
+
+    // A different user still has their full allowance.
+    const [, forOther] = await reg.quoteForUser(intg, admin.address, BUY, INR, U6(1000));
+    expect(forOther).to.equal(U6(1));
+  });
+});

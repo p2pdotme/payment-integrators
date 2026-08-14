@@ -455,9 +455,15 @@ contract CashbackRegistry is ICashbackRegistry {
             dailyBudget: budget.dailyBudget,
             totalBudget: budget.totalBudget,
             dailyPerUser: budget.dailyPerUser,
-            // Default the start to now: a campaign must never be able to pay
-            // for orders placed before it existed, even if the caller passes 0.
-            startTime: budget.startTime == 0 ? uint64(block.timestamp) : budget.startTime,
+            // RE-AUDIT (high). The start is FLOORED at now, not merely
+            // defaulted. Defaulting only when the caller passed 0 left the
+            // whole point of F7 bypassable by passing `startTime: 1`: the
+            // owner could stand up a campaign today and immediately harvest
+            // the integrator's entire order history. A campaign may be
+            // scheduled to start later, never earlier.
+            startTime: budget.startTime > uint64(block.timestamp)
+                ? budget.startTime
+                : uint64(block.timestamp),
             endTime: budget.endTime,
             status: Status.INACTIVE,
             owner: owner
@@ -489,11 +495,18 @@ contract CashbackRegistry is ICashbackRegistry {
     ) external onlyCampaignOwner(campaignId) {
         Campaign storage c = _campaigns[campaignId];
         if (c.status == Status.ENDED) revert CampaignEnded();
-        if (budget.endTime != 0 && budget.endTime <= budget.startTime) revert InvalidWindow();
         // The start may move forward but never backward — otherwise a
         // campaign could be widened to swallow history it was never
         // eligible for, which is the F7 hole by another route.
         if (budget.startTime != 0 && budget.startTime < c.startTime) revert InvalidWindow();
+
+        // RE-AUDIT (medium). Validate the end against the EFFECTIVE start.
+        // Comparing against `budget.startTime` meant that passing 0 (the
+        // "leave the start unchanged" sentinel) compared against 0, so any
+        // positive endTime passed — including one below the real start,
+        // which leaves the campaign permanently unpayable with no error.
+        uint64 effectiveStart = budget.startTime != 0 ? budget.startTime : c.startTime;
+        if (budget.endTime != 0 && budget.endTime <= effectiveStart) revert InvalidWindow();
 
         c.maxRewardPerOrder = budget.maxRewardPerOrder;
         c.dailyBudget = budget.dailyBudget;
@@ -641,38 +654,16 @@ contract CashbackRegistry is ICashbackRegistry {
         address funder = c.fundingWallet;
         if (funder != c.owner && !fundingAuthorized[funder][c.owner][c.rewardToken]) return 0;
 
-        // AUDIT F9. `orderAmount` is USDC (6dp) but the reward is paid in the
-        // reward token's own units. Without rescaling, 1% of a $1,000 order
-        // in an 18-decimal token pays 0.00000000001 tokens. `scaleNum/Den`
-        // are derived from the token's decimals at creation.
-        reward = c.flatAmount > 0
-            ? c.flatAmount
-            : (orderAmount * c.bps * c.scaleNum) / (BPS_DENOMINATOR * c.scaleDen);
-        if (c.maxRewardPerOrder != 0 && reward > c.maxRewardPerOrder) {
-            reward = c.maxRewardPerOrder;
-        }
+        // Reward and budget clamps go through the same helpers `quote` uses,
+        // so the preview and the payout can never disagree.
+        reward = _grossReward(c, orderAmount);
         if (reward == 0) return 0;
 
-        // AUDIT F6. Budgets are enforced on-chain rather than left to
-        // "keep the allowance small". Clamp rather than reject, so a partly
-        // affordable reward still pays what the budget allows.
         Stats storage st = stats[campaignId];
-        if (c.totalBudget != 0) {
-            uint256 leftTotal = c.totalBudget > st.totalPaid ? c.totalBudget - st.totalPaid : 0;
-            if (reward > leftTotal) reward = leftTotal;
-        }
-        uint256 today = block.timestamp / 1 days;
-        if (c.dailyBudget != 0) {
-            uint256 spentToday = campaignDaySpend[campaignId][today];
-            uint256 leftToday = c.dailyBudget > spentToday ? c.dailyBudget - spentToday : 0;
-            if (reward > leftToday) reward = leftToday;
-        }
-        if (c.dailyPerUser != 0) {
-            uint256 userToday = userDaySpend[campaignId][v.user][today];
-            uint256 leftUser = c.dailyPerUser > userToday ? c.dailyPerUser - userToday : 0;
-            if (reward > leftUser) reward = leftUser;
-        }
+        reward = _applyBudgets(campaignId, c, reward, v.user);
         if (reward == 0) return 0;
+
+        uint256 today = block.timestamp / 1 days;
 
         // Mark before the transfer so a reentrant token cannot collect twice.
         // Rolled back below if the transfer fails, leaving it retryable.
@@ -683,10 +674,24 @@ contract CashbackRegistry is ICashbackRegistry {
         (bool callOk, bytes memory ret) = c.rewardToken.call{ gas: TOKEN_CALL_GAS }(
             abi.encodeCall(IERC20.transferFrom, (funder, v.user, reward))
         );
-        // Treat "returned false" and "returned nothing" as failure too: the
-        // first is the classic silent-failure ERC-20, the second means we
-        // cannot prove the tokens moved.
-        bool transferred = callOk && ret.length == 32 && abi.decode(ret, (bool));
+        // Success is judged by the SafeERC20 rule, NOT by "did it return 32
+        // bytes of true".
+        //
+        // RE-AUDIT (critical). This previously required `ret.length == 32`,
+        // which made a USDT-style token — one that moves the tokens and
+        // returns NOTHING — read as a failure. The rollback below then
+        // cleared `orderPaid` and skipped the budget counters, while the
+        // tokens had already left the funding wallet. A watcher retrying
+        // the unpaid order drained the wallet one transfer at a time, with
+        // every guard bypassed: no replay protection, no budget accounting.
+        // It fired automatically in normal operation — no attacker needed.
+        //
+        // So: a call that reverted is a failure; a call that returned data
+        // decoding to `false` is a failure; a call that returned NOTHING is
+        // a success, because a non-compliant token that did not revert has
+        // moved the tokens.
+        bool transferred = callOk &&
+            (ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool))));
         if (!transferred) {
             orderPaid[orderId] = false;
             emit PayFailed(campaignId, orderId, v.user, reward);
@@ -801,14 +806,58 @@ contract CashbackRegistry is ICashbackRegistry {
     ) external view returns (bytes32 campaignId, uint256 reward) {
         campaignId = _resolve(integrator, orderType, currency);
         if (campaignId == bytes32(0)) return (bytes32(0), 0);
+
         Campaign storage c = _campaigns[campaignId];
         if (c.status != Status.ACTIVE) return (campaignId, 0);
-        reward = c.flatAmount > 0
-            ? c.flatAmount
-            : (orderAmount * c.bps * c.scaleNum) / (BPS_DENOMINATOR * c.scaleDen);
-        if (c.maxRewardPerOrder != 0 && reward > c.maxRewardPerOrder) {
-            reward = c.maxRewardPerOrder;
+
+        // RE-AUDIT (medium). `quote` must model what `pay` would ACTUALLY
+        // transfer, not just the headline rate. It previously replicated
+        // neither the budget clamps nor the funding-authorisation check, so
+        // a dashboard kept advertising a reward after the budget was spent
+        // or the funder had revoked — promising users cashback the contract
+        // would not pay.
+        address funder = c.fundingWallet;
+        if (funder != c.owner && !fundingAuthorized[funder][c.owner][c.rewardToken]) {
+            return (campaignId, 0);
         }
+
+        reward = _grossReward(c, orderAmount);
+        reward = _applyBudgets(campaignId, c, reward, address(0));
+        if (reward == 0) return (campaignId, 0);
+
+        // Cap by what the funding wallet can actually pay right now, so an
+        // underfunded campaign reads as 0 rather than as its nominal rate.
+        uint256 spendable = _spendable(c);
+        if (reward > spendable) reward = spendable;
+    }
+
+    /// @notice What `pay` would transfer for a specific user, accounting for
+    ///         their own daily allowance too. Preferred by dashboards that
+    ///         know the recipient.
+    function quoteForUser(
+        address integrator,
+        address user,
+        bytes32 orderType,
+        bytes32 currency,
+        uint256 orderAmount
+    ) external view returns (bytes32 campaignId, uint256 reward) {
+        campaignId = _resolve(integrator, orderType, currency);
+        if (campaignId == bytes32(0)) return (bytes32(0), 0);
+
+        Campaign storage c = _campaigns[campaignId];
+        if (c.status != Status.ACTIVE) return (campaignId, 0);
+
+        address funder = c.fundingWallet;
+        if (funder != c.owner && !fundingAuthorized[funder][c.owner][c.rewardToken]) {
+            return (campaignId, 0);
+        }
+
+        reward = _grossReward(c, orderAmount);
+        reward = _applyBudgets(campaignId, c, reward, user);
+        if (reward == 0) return (campaignId, 0);
+
+        uint256 spendable = _spendable(c);
+        if (reward > spendable) reward = spendable;
     }
 
     /// @notice The lookup key for a triple, so operators can inspect
@@ -942,6 +991,56 @@ contract CashbackRegistry is ICashbackRegistry {
         if (orderType == 1) return ORDER_TYPE_SELL;
         if (orderType == 2) return ORDER_TYPE_PAY;
         return ANY;
+    }
+
+    /// @dev The headline reward before any budget clamp. Shared by `pay`
+    ///      and `quote` so the two can never drift apart.
+    function _grossReward(
+        Campaign storage c,
+        uint256 orderAmount
+    ) internal view returns (uint256 reward) {
+        reward = c.flatAmount > 0
+            ? c.flatAmount
+            : (orderAmount * c.bps * c.scaleNum) / (BPS_DENOMINATOR * c.scaleDen);
+        if (c.maxRewardPerOrder != 0 && reward > c.maxRewardPerOrder) {
+            reward = c.maxRewardPerOrder;
+        }
+    }
+
+    /// @dev Clamps a reward against the lifetime, daily and per-user budgets.
+    ///      Pass `user = address(0)` to skip the per-user leg (the generic
+    ///      `quote`, which does not know the recipient).
+    function _applyBudgets(
+        bytes32 campaignId,
+        Campaign storage c,
+        uint256 reward,
+        address user
+    ) internal view returns (uint256) {
+        if (c.totalBudget != 0) {
+            uint256 paid = stats[campaignId].totalPaid;
+            uint256 leftTotal = c.totalBudget > paid ? c.totalBudget - paid : 0;
+            if (reward > leftTotal) reward = leftTotal;
+        }
+        uint256 today = block.timestamp / 1 days;
+        if (c.dailyBudget != 0) {
+            uint256 spentToday = campaignDaySpend[campaignId][today];
+            uint256 leftToday = c.dailyBudget > spentToday ? c.dailyBudget - spentToday : 0;
+            if (reward > leftToday) reward = leftToday;
+        }
+        if (user != address(0) && c.dailyPerUser != 0) {
+            uint256 userToday = userDaySpend[campaignId][user][today];
+            uint256 leftUser = c.dailyPerUser > userToday ? c.dailyPerUser - userToday : 0;
+            if (reward > leftUser) reward = leftUser;
+        }
+        return reward;
+    }
+
+    /// @dev What the funding wallet can actually pay right now: the lesser of
+    ///      its balance and the allowance it granted this registry.
+    function _spendable(Campaign storage c) internal view returns (uint256) {
+        uint256 balance = IERC20(c.rewardToken).balanceOf(c.fundingWallet);
+        uint256 allowed = IERC20(c.rewardToken).allowance(c.fundingWallet, address(this));
+        return balance < allowed ? balance : allowed;
     }
 
     /// @dev Converts a 6-decimal USDC order amount into the reward token's
