@@ -2053,3 +2053,136 @@ describe("CashbackRegistry — re-audit regressions", function () {
     expect(forOther).to.equal(U6(1));
   });
 });
+
+// ─── Third-pass audit regressions ────────────────────────────────────
+// Two blind spots the third audit found: a token that reports success but
+// delivers nothing, and one that delivers less than requested.
+
+describe("CashbackRegistry — third-pass regressions", function () {
+  let alice: SignerWithAddress;
+  let keeper: SignerWithAddress;
+  let buyer: SignerWithAddress;
+
+  let orders: any;
+  let reg: any;
+  let intg: string;
+
+  const U6 = (n: number | string) => ethers.parseUnits(n.toString(), 6);
+  const NB = {
+    maxRewardPerOrder: 0,
+    dailyBudget: 0,
+    totalBudget: 0,
+    dailyPerUser: 0,
+    startTime: 0,
+    endTime: 0,
+  };
+
+  async function campaign(token: any, opts: any = {}) {
+    const tx = await reg
+      .connect(alice)
+      .createCampaign(
+        intg,
+        BUY,
+        INR,
+        await token.getAddress(),
+        opts.bps ?? 100,
+        0n,
+        alice.address,
+        opts.budget ?? NB
+      );
+    const rc = await tx.wait();
+    const id = rc.logs
+      .map((l: any) => {
+        try {
+          return reg.interface.parseLog(l);
+        } catch {
+          return null;
+        }
+      })
+      .find((e: any) => e && e.name === "CampaignCreated").args.campaignId;
+    await reg.connect(alice).activate(id);
+    return id;
+  }
+
+  beforeEach(async function () {
+    [, alice, keeper, buyer] = await ethers.getSigners();
+    intg = ethers.Wallet.createRandom().address;
+
+    orders = await (await ethers.getContractFactory("MockOrderSource")).deploy();
+    reg = await (
+      await ethers.getContractFactory("CashbackRegistry")
+    ).deploy(await orders.getAddress());
+
+    await reg.setAccruer(keeper.address, true);
+    await reg.setIntegratorOwner(intg, alice.address);
+  });
+
+  // A campaign must not be creatable against a codeless address: a
+  // low-level call there succeeds with empty returndata, which the
+  // SafeERC20 rule reads as a successful transfer.
+  it("rejects a reward token with no code", async function () {
+    const eoa = ethers.Wallet.createRandom().address;
+    await expect(
+      reg.connect(alice).createCampaign(intg, BUY, INR, eoa, 100, 0n, alice.address, NB)
+    ).to.be.revertedWithCustomError(reg, "InvalidAddress");
+  });
+
+  // A token that reports success but delivers nothing must not burn the
+  // order's one payout slot — otherwise no later honest campaign could
+  // ever pay that order.
+  it("a no-op token does not mark the order paid or inflate totals", async function () {
+    const noop = await (await ethers.getContractFactory("MockNoOpToken")).deploy();
+    await noop.mint(alice.address, U6(1000));
+    await noop.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    const id = await campaign(noop, { bps: 100 });
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+
+    await expect(reg.connect(keeper).pay(1, intg, buyer.address, U6(1000))).to.emit(
+      reg,
+      "PayFailed"
+    );
+
+    expect(await reg.orderPaid(1)).to.equal(false); // slot NOT burned
+    expect((await reg.stats(id)).totalPaid).to.equal(0);
+    expect((await reg.stats(id)).orderCount).to.equal(0);
+  });
+
+  // Budgets must track tokens DELIVERED, not requested — otherwise a
+  // fee-on-transfer token exhausts a campaign at twice the real spend.
+  it("a fee-on-transfer token accounts the delivered amount", async function () {
+    const fee = await (await ethers.getContractFactory("MockFeeToken")).deploy(5000); // 50%
+    await fee.mint(alice.address, U6(1_000_000));
+    await fee.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    const id = await campaign(fee, { bps: 100 });
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+
+    // 1% of 1000 = 10 requested; 50% fee means 5 delivered.
+    expect(await fee.balanceOf(buyer.address)).to.equal(U6(5));
+    // The counters must record 5, not 10.
+    expect((await reg.stats(id)).totalPaid).to.equal(U6(5));
+  });
+
+  it("a fee-on-transfer token does not exhaust the budget early", async function () {
+    const fee = await (await ethers.getContractFactory("MockFeeToken")).deploy(5000);
+    await fee.mint(alice.address, U6(1_000_000));
+    await fee.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    // Budget of 10, 1% of 1000 = 10 requested per order, 50% fee.
+    //   order 1: requests 10, delivers 5, budget credited 5  (5 left)
+    //   order 2: clamped to the remaining 5, delivers 2.5, credited 2.5
+    // Total delivered 7.5. Crediting the REQUESTED amount would have
+    // recorded 10 on order 1 and stopped everything after one order.
+    await campaign(fee, { bps: 100, budget: { ...NB, totalBudget: U6(10) } });
+
+    for (const i of [1, 2]) {
+      await orders.setOrderFull(i, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+      await reg.connect(keeper).pay(i, intg, buyer.address, U6(1000));
+    }
+
+    // Both orders paid — the budget was not exhausted by the first alone.
+    expect(await fee.balanceOf(buyer.address)).to.equal(U6("7.5"));
+  });
+});

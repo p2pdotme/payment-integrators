@@ -96,12 +96,16 @@ type Pending = {
   user: string;
   amount: string; // bigint as decimal string
   firstSeen: number; // ms epoch, for the TTL
+  lastChecked?: number; // ms epoch, drives the round-robin rotation
 };
 
 type State = {
   lastProcessedBlock: number;
   pending: Record<string, Pending>; // orderId -> details
 };
+
+/** Thrown when the state file exists but cannot be parsed. */
+class CorruptStateError extends Error {}
 
 function readState(fallbackBlock: number): State {
   try {
@@ -111,7 +115,19 @@ function readState(fallbackBlock: number): State {
         typeof raw.lastProcessedBlock === "number" ? raw.lastProcessedBlock : fallbackBlock,
       pending: raw.pending && typeof raw.pending === "object" ? raw.pending : {},
     };
-  } catch {
+  } catch (err) {
+    // THIRD-PASS AUDIT (medium). A file that EXISTS but does not parse must
+    // not silently fall back to the head — that is the same silent-skip the
+    // cold-start guard was added to prevent, reached by the exact scenario
+    // its own comment names ("missing or corrupt").
+    if (fs.existsSync(STATE_FILE)) {
+      throw new CorruptStateError(
+        `State file ${STATE_FILE} exists but could not be parsed: ${(err as Error).message}. ` +
+          `Refusing to resume from the chain head, which would silently skip every order ` +
+          `placed while the watcher was down. Restore it from backup, or delete it and set ` +
+          `START_BLOCK explicitly.`
+      );
+    }
     return { lastProcessedBlock: fallbackBlock, pending: {} };
   }
 }
@@ -189,6 +205,7 @@ async function main() {
               user,
               amount: amount.toString(),
               firstSeen: Date.now(),
+              lastChecked: 0, // never checked — front of the rotation
             };
           }
         }
@@ -202,24 +219,37 @@ async function main() {
       // ── 2. RE-CHECK: has anything pending completed since last poll? ──
       const now = Date.now();
 
-      // Re-check OLDEST-FIRST, not in key order.
+      // Re-check on a ROTATING CURSOR, oldest-unchecked first.
       //
-      // RE-AUDIT (high). This used to be `Object.keys(pending).slice(0, N)`.
-      // JavaScript enumerates integer-like keys in ascending NUMERIC order,
-      // not insertion order — so once the pending set exceeded N, the same
-      // N lowest orderIds were re-checked every poll forever and newer
-      // orders were never examined until they aged out. That is F2's
-      // failure mode returning by a different route: cashback silently
-      // unpaid, dashboards healthy. Sorting by `firstSeen` makes progress
-      // monotonic regardless of set size.
+      // THIRD-PASS AUDIT (high). Two earlier versions both starved:
+      //   1. `Object.keys(pending).slice(0, N)` — JS enumerates integer-like
+      //      keys in ascending NUMERIC order, so the N lowest orderIds were
+      //      re-checked forever.
+      //   2. Sorting by `firstSeen` — no better. That sort is STATIC, and an
+      //      order only leaves the set when it completes, cancels, or ages
+      //      out. Orders parked in PLACED/ACCEPTED (abandoned orders, which
+      //      are routine) sit at the head of the sort permanently. Once more
+      //      than N of them accumulate, nothing newer is ever examined until
+      //      it ages out at 14 days — unpaid. An attacker could trigger it
+      //      deliberately by placing ~N orders and abandoning them, disabling
+      //      cashback for every integrator at once.
+      //
+      // Sorting by `lastChecked` instead makes the head of the list the
+      // least-recently-visited entry, so a stuck order is examined once and
+      // then moves to the back. Every entry is visited in bounded time
+      // regardless of how many are stuck.
       const keys = Object.keys(state.pending)
-        .sort((a, b) => state.pending[a].firstSeen - state.pending[b].firstSeen)
+        .sort((a, b) => (state.pending[a].lastChecked ?? 0) - (state.pending[b].lastChecked ?? 0))
         .slice(0, RECHECK_PER_POLL);
       const ready: { orderId: bigint; integrator: string; user: string; orderAmount: bigint }[] =
         [];
 
       for (const key of keys) {
         const p = state.pending[key];
+        // Stamp BEFORE any early `continue`, so an order that stays pending
+        // still moves to the back of the rotation rather than being
+        // re-examined immediately.
+        p.lastChecked = now;
 
         // Age out anything past the dispute window so the set stays bounded.
         if (now - p.firstSeen > PENDING_TTL_MS) {

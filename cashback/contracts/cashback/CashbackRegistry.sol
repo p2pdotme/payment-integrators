@@ -419,6 +419,16 @@ contract CashbackRegistry is ICashbackRegistry {
         if (owner == address(0)) revert IntegratorUnclaimed();
         if (msg.sender != owner) revert OnlyIntegratorOwner();
         if (rewardToken == address(0) || fundingWallet == address(0)) revert InvalidAddress();
+        // THIRD-PASS AUDIT. An explicit code check, not an incidental one.
+        // Empty returndata counts as success (the SafeERC20 rule, needed for
+        // USDT-style tokens), and a low-level call to a CODELESS address also
+        // returns success with empty returndata — so without this a campaign
+        // pointed at an EOA would mark orders paid and emit `Paid` while no
+        // tokens moved. It happened to be unreachable because `_decimalScale`
+        // does a `try ... returns` whose extcodesize check reverts outside
+        // the catchable region, but relying on that is relying on a compiler
+        // detail, not on an invariant.
+        if (rewardToken.code.length == 0) revert InvalidAddress();
         _validateRate(bps, flatAmount);
         _requireFundingControl(fundingWallet, rewardToken);
 
@@ -669,6 +679,9 @@ contract CashbackRegistry is ICashbackRegistry {
         // Rolled back below if the transfer fails, leaving it retryable.
         orderPaid[orderId] = true;
 
+        // Snapshot for the delivered-amount measurement below.
+        uint256 balanceBefore = IERC20(c.rewardToken).balanceOf(v.user);
+
         // AUDIT F5. Gas-capped so a hostile reward token cannot burn the
         // batch's remaining gas and starve every other row.
         (bool callOk, bytes memory ret) = c.rewardToken.call{ gas: TOKEN_CALL_GAS }(
@@ -698,12 +711,31 @@ contract CashbackRegistry is ICashbackRegistry {
             return 0;
         }
 
-        st.totalPaid += reward;
-        st.orderCount += 1;
-        campaignDaySpend[campaignId][today] += reward;
-        userDaySpend[campaignId][v.user][today] += reward;
+        // THIRD-PASS AUDIT. Account what was DELIVERED, not what was asked
+        // for. With a fee-on-transfer or rebasing token the two differ, and
+        // crediting the requested amount exhausted budgets at up to 2x the
+        // tokens users actually received — a campaign stopping while its
+        // wallet still held funds, and `dailyPerUser` locking someone out
+        // early. Measuring the recipient's balance delta is the only figure
+        // that is true for every token.
+        uint256 delivered = IERC20(c.rewardToken).balanceOf(v.user) - balanceBefore;
+        if (delivered == 0) {
+            // Nothing arrived despite a "successful" call — a no-op token.
+            // Roll back rather than burn this order's one payout slot
+            // forever on a payment the user never received.
+            orderPaid[orderId] = false;
+            emit PayFailed(campaignId, orderId, v.user, reward);
+            return 0;
+        }
+        if (delivered > reward) delivered = reward; // never credit more than intended
 
-        emit Paid(campaignId, orderId, v.user, c.rewardToken, reward);
+        st.totalPaid += delivered;
+        st.orderCount += 1;
+        campaignDaySpend[campaignId][today] += delivered;
+        userDaySpend[campaignId][v.user][today] += delivered;
+
+        emit Paid(campaignId, orderId, v.user, c.rewardToken, delivered);
+        return delivered;
     }
 
     /**
