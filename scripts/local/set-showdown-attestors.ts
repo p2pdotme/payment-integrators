@@ -14,10 +14,11 @@
  * Env:
  *   SHOWDOWN_ADDRESS    required — the integrator
  *   BASE_RPC            RPC (preferred); BASE_SEPOLIA_RPC / default sepolia only
- *                       as a testnet fallback — a mainnet run MUST pass BASE_RPC
- *                       + EXPECTED_CHAIN_ID or it silently hits Base Sepolia.
- *   EXPECTED_CHAIN_ID   optional but STRONGLY advised — asserts the network so a
- *                       rotation can't land on the wrong chain (8453 = mainnet).
+ *                       as a testnet fallback. Because that fallback exists, a
+ *                       mainnet run MUST pass BASE_RPC — see EXPECTED_CHAIN_ID.
+ *   EXPECTED_CHAIN_ID   REQUIRED — asserts the network before any rotation, so a
+ *                       forgotten BASE_RPC cannot silently rotate testnet and
+ *                       report success. 8453 = Base mainnet, 84532 = Sepolia.
  *   MNEMONIC_KEY / DEPLOYER_PRIVATE_KEY   owner key
  *   LIVENESS_API        default https://liveness-api.p2p.cool
  *   KYC_API             the passport/tier-2 backend. If omitted, kycAttestor is
@@ -77,20 +78,34 @@ async function main() {
   const { chainId } = await provider.getNetwork();
   const integrator = new ethers.Contract(SHOWDOWN_ADDRESS, ABI, signer);
 
-  const owner: string = await integrator.owner();
   console.log("integrator:", SHOWDOWN_ADDRESS);
   console.log("chainId:   ", chainId.toString());
   console.log("signer:    ", me);
-  console.log("owner:     ", owner);
-  if (owner.toLowerCase() !== me.toLowerCase()) {
-    throw new Error("signer is not owner — setters are onlyOwner, tx would revert");
+
+  // Network first, BEFORE any contract read. EXPECTED_CHAIN_ID is MANDATORY, not
+  // advisory: `RPC` falls back to Base Sepolia, so an operator setting up prod
+  // attestors who forgets `BASE_RPC` would otherwise rotate testnet and see a
+  // fully green run — the failure mode this script exists to prevent, one layer
+  // out. Ordering matters too: reading `owner()` on the wrong chain hits a
+  // different (or absent) contract, so the owner check below would fail first
+  // with a misleading "signer is not owner" instead of naming the real problem.
+  if (!EXPECTED_CHAIN_ID) {
+    throw new Error(
+      "EXPECTED_CHAIN_ID is required (8453 = Base mainnet, 84532 = Base Sepolia). " +
+        `This run would have rotated on chainId ${chainId} via ${RPC}. Set it explicitly ` +
+        "so a missing BASE_RPC cannot silently point a prod rotation at testnet."
+    );
   }
-  // Refuse to rotate on the wrong network: the RPC default is Base Sepolia, so a
-  // mainnet rotation without EXPECTED_CHAIN_ID could silently hit testnet. (#52)
-  if (EXPECTED_CHAIN_ID && chainId.toString() !== EXPECTED_CHAIN_ID) {
+  if (chainId.toString() !== EXPECTED_CHAIN_ID) {
     throw new Error(
       `chainId ${chainId} != EXPECTED_CHAIN_ID ${EXPECTED_CHAIN_ID} — refusing to rotate on the wrong network`
     );
+  }
+
+  const owner: string = await integrator.owner();
+  console.log("owner:     ", owner);
+  if (owner.toLowerCase() !== me.toLowerCase()) {
+    throw new Error("signer is not owner — setters are onlyOwner, tx would revert");
   }
 
   // The service signs EIP-712 over (domain, verifyingContract = integrator,
