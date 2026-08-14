@@ -72,10 +72,29 @@ const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 
 const REGISTER_ABI = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-  // NOTE the tuple wrapper and `activeOrderCount` — decoding this as a flat
-  // 3-field return silently reads activeOrderCount as `proxyImpl` (i.e. 0) and
-  // makes a perfectly good registration look failed.
-  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, uint256 activeOrderCount, address proxyImpl))",
+  /*
+   * This struct has grown twice, and BOTH times the new field landed in the
+   * middle rather than at the end — so every stale copy of this ABI decodes
+   * `proxyImpl` off the wrong word and gets 0. ethers does not complain: a
+   * short tuple spec against a longer return silently drops the trailing
+   * words.
+   *
+   * The damage is specific and nasty. `registerIntegrator` has already been
+   * mined by the time the post-check runs, so the mis-read turns a perfectly
+   * good registration into `registered proxyImpl does not match the deployed
+   * one` — and an operator who reruns finds the "already locked" guard reading
+   * 0 too, so it does not fire. Verified against Base mainnet 2026-08-14.
+   *
+   * Deployed layout (contracts-v4 #362, the onOrderCancel opt-in):
+   *   w0 isActive · w1 usdcThroughIntegrator · w2 cancelCallbackEnabled
+   *   w3 activeOrderCount · w4 proxyImpl
+   *
+   * Before trusting this on a new deployment, count the words:
+   *   cast call $DIAMOND "getIntegratorConfig(address)" $INTEGRATOR
+   * Five 32-byte words is the shape below. Anything else means the struct has
+   * moved again — fix it here BEFORE deploying, not after.
+   */
+  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, bool cancelCallbackEnabled, uint256 activeOrderCount, address proxyImpl))",
 ];
 
 const ERC20_ABI = [
