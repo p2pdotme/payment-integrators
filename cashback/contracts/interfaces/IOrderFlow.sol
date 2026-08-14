@@ -100,4 +100,12 @@ interface IOrderFlow {
     ///         offramp record into a wrong terminal state by passing the
     ///         wrong status.
     function getOrdersById(uint256 orderId) external view returns (OrderView memory);
+
+    /// @notice The integrator that placed `orderId`, or address(0) for an
+    ///         organic (non-B2B) order. Live on the Base mainnet Diamond and
+    ///         Base Sepolia (selector 0xc0bc0d14). This is the authoritative
+    ///         order -> integrator binding: without it, a caller reporting an
+    ///         order could name ANY integrator and bill that campaign's
+    ///         funding wallet for an order it had nothing to do with.
+    function getOrderIntegrator(uint256 orderId) external view returns (address);
 }

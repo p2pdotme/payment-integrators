@@ -79,7 +79,15 @@ describe("CashbackRegistry", function () {
         await token.getAddress(),
         opts.bps ?? 0,
         opts.flat ?? 0n,
-        (opts.as ?? funder).address
+        (opts.as ?? funder).address,
+        {
+          maxRewardPerOrder: 0,
+          dailyBudget: 0,
+          totalBudget: 0,
+          dailyPerUser: 0,
+          startTime: 0,
+          endTime: 0,
+        }
       );
     const receipt = await tx.wait();
     const ev = receipt.logs
@@ -97,8 +105,10 @@ describe("CashbackRegistry", function () {
   }
 
   // Helper: record a COMPLETED order on the mock Diamond.
-  async function completedOrder(orderId: number, who: string, amount: bigint) {
-    await orders.setOrder(orderId, who, amount, COMPLETED);
+  async function completedOrder(orderId: number, who: string, amount: bigint, intg?: string) {
+    // Orders are now bound to the integrator that placed them (audit F1),
+    // and carry a placement time (F7).
+    await orders.setOrderFull(orderId, who, amount, COMPLETED, 0, intg ?? integrator, 0);
   }
 
   // ─── Creating campaigns ────────────────────────────────────────────
@@ -109,7 +119,14 @@ describe("CashbackRegistry", function () {
       await expect(
         registry
           .connect(funder)
-          .createCampaign(unclaimed, BUY, INR, await token.getAddress(), 100, 0, funder.address)
+          .createCampaign(unclaimed, BUY, INR, await token.getAddress(), 100, 0, funder.address, {
+            maxRewardPerOrder: 0,
+            dailyBudget: 0,
+            totalBudget: 0,
+            dailyPerUser: 0,
+            startTime: 0,
+            endTime: 0,
+          })
       ).to.be.revertedWithCustomError(registry, "IntegratorUnclaimed");
     });
 
@@ -117,7 +134,14 @@ describe("CashbackRegistry", function () {
       await expect(
         registry
           .connect(funder)
-          .createCampaign(integrator, BUY, INR, ethers.ZeroAddress, 100, 0, funder.address)
+          .createCampaign(integrator, BUY, INR, ethers.ZeroAddress, 100, 0, funder.address, {
+            maxRewardPerOrder: 0,
+            dailyBudget: 0,
+            totalBudget: 0,
+            dailyPerUser: 0,
+            startTime: 0,
+            endTime: 0,
+          })
       ).to.be.revertedWithCustomError(registry, "InvalidAddress");
 
       await expect(
@@ -130,7 +154,15 @@ describe("CashbackRegistry", function () {
             await token.getAddress(),
             100,
             0,
-            ethers.ZeroAddress
+            ethers.ZeroAddress,
+            {
+              maxRewardPerOrder: 0,
+              dailyBudget: 0,
+              totalBudget: 0,
+              dailyPerUser: 0,
+              startTime: 0,
+              endTime: 0,
+            }
           )
       ).to.be.revertedWithCustomError(registry, "InvalidAddress");
     });
@@ -146,7 +178,15 @@ describe("CashbackRegistry", function () {
             await token.getAddress(),
             100,
             USDC(1),
-            funder.address
+            funder.address,
+            {
+              maxRewardPerOrder: 0,
+              dailyBudget: 0,
+              totalBudget: 0,
+              dailyPerUser: 0,
+              startTime: 0,
+              endTime: 0,
+            }
           )
       ).to.be.revertedWithCustomError(registry, "InvalidRate");
     });
@@ -155,7 +195,14 @@ describe("CashbackRegistry", function () {
       await expect(
         registry
           .connect(funder)
-          .createCampaign(integrator, BUY, INR, await token.getAddress(), 0, 0, funder.address)
+          .createCampaign(integrator, BUY, INR, await token.getAddress(), 0, 0, funder.address, {
+            maxRewardPerOrder: 0,
+            dailyBudget: 0,
+            totalBudget: 0,
+            dailyPerUser: 0,
+            startTime: 0,
+            endTime: 0,
+          })
       ).to.be.revertedWithCustomError(registry, "InvalidRate");
     });
 
@@ -171,7 +218,15 @@ describe("CashbackRegistry", function () {
             await token.getAddress(),
             max + 1n,
             0,
-            funder.address
+            funder.address,
+            {
+              maxRewardPerOrder: 0,
+              dailyBudget: 0,
+              totalBudget: 0,
+              dailyPerUser: 0,
+              startTime: 0,
+              endTime: 0,
+            }
           )
       ).to.be.revertedWithCustomError(registry, "InvalidRate");
     });
@@ -181,7 +236,7 @@ describe("CashbackRegistry", function () {
       expect((await registry.getCampaign(id)).status).to.equal(Status.INACTIVE);
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
 
       expect(await token.balanceOf(user.address)).to.equal(0);
       expect(await registry.orderPaid(1)).to.equal(false);
@@ -191,7 +246,23 @@ describe("CashbackRegistry", function () {
       await expect(
         registry
           .connect(stranger)
-          .createCampaign(integrator, BUY, INR, await token.getAddress(), 100, 0, stranger.address)
+          .createCampaign(
+            integrator,
+            BUY,
+            INR,
+            await token.getAddress(),
+            100,
+            0,
+            stranger.address,
+            {
+              maxRewardPerOrder: 0,
+              dailyBudget: 0,
+              totalBudget: 0,
+              dailyPerUser: 0,
+              startTime: 0,
+              endTime: 0,
+            }
+          )
       ).to.be.revertedWithCustomError(registry, "OnlyIntegratorOwner");
     });
   });
@@ -246,7 +317,7 @@ describe("CashbackRegistry", function () {
       await registry.connect(funder).pause(id);
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
 
@@ -254,13 +325,13 @@ describe("CashbackRegistry", function () {
       const id = await makeCampaign({ bps: 100 });
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(1)); // 1%
 
       await registry.connect(funder).setRate(id, 200, 0); // bump to 2%
 
       await completedOrder(2, user.address, USDC(100));
-      await registry.connect(watcher).pay(2, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(2, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(3)); // 1 + 2
     });
 
@@ -296,7 +367,7 @@ describe("CashbackRegistry", function () {
       await makeCampaign({ orderType: BUY, currency: INR, bps: 500 }); // 5% INR
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(5)); // exact INR row
     });
 
@@ -304,7 +375,7 @@ describe("CashbackRegistry", function () {
       await makeCampaign({ orderType: BUY, currency: ANY, bps: 100 });
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, BRL, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(1));
     });
 
@@ -312,7 +383,7 @@ describe("CashbackRegistry", function () {
       await makeCampaign({ orderType: ANY, currency: ANY, bps: 100 });
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, SELL, BRL, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(1));
     });
 
@@ -321,9 +392,8 @@ describe("CashbackRegistry", function () {
       const strangerIntegrator = ethers.Wallet.createRandom().address;
 
       await completedOrder(1, user.address, USDC(100));
-      await expect(
-        registry.connect(watcher).pay(1, strangerIntegrator, user.address, BUY, INR, USDC(100))
-      ).to.not.be.reverted;
+      await expect(registry.connect(watcher).pay(1, strangerIntegrator, user.address, USDC(100))).to
+        .not.be.reverted;
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
   });
@@ -334,7 +404,7 @@ describe("CashbackRegistry", function () {
     it("pays a percentage of the order", async function () {
       await makeCampaign({ bps: 100 }); // 1%
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(1));
     });
 
@@ -342,11 +412,11 @@ describe("CashbackRegistry", function () {
       await makeCampaign({ flat: USDC(5) });
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(5));
 
       await completedOrder(2, other.address, USDC(10_000));
-      await registry.connect(watcher).pay(2, integrator, other.address, BUY, INR, USDC(10_000));
+      await registry.connect(watcher).pay(2, integrator, other.address, USDC(10_000));
       expect(await token.balanceOf(other.address)).to.equal(USDC(5));
     });
 
@@ -354,7 +424,7 @@ describe("CashbackRegistry", function () {
       await makeCampaign({ bps: 250 }); // 2.5%
       // 1 micro-USDC * 250 / 10000 = 0.025 → floors to 0 → nothing paid
       await completedOrder(1, user.address, 1n);
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, 1n);
+      await registry.connect(watcher).pay(1, integrator, user.address, 1n);
       expect(await token.balanceOf(user.address)).to.equal(0);
       expect(await registry.orderPaid(1)).to.equal(false);
     });
@@ -376,30 +446,30 @@ describe("CashbackRegistry", function () {
 
     it("pays each order only once", async function () {
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(1));
     });
 
     it("pays nothing for an order that is not COMPLETED", async function () {
-      await orders.setOrder(1, user.address, USDC(100), PLACED);
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await orders.setOrderFull(1, user.address, USDC(100), PLACED, 0, integrator, 0);
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(0);
 
-      await orders.setOrder(2, user.address, USDC(100), CANCELLED);
-      await registry.connect(watcher).pay(2, integrator, user.address, BUY, INR, USDC(100));
+      await orders.setOrderFull(2, user.address, USDC(100), CANCELLED, 0, integrator, 0);
+      await registry.connect(watcher).pay(2, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
 
     it("pays nothing for an order that does not exist", async function () {
-      await registry.connect(watcher).pay(99, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(99, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
 
     it("rejects a mismatched user — a lying watcher cannot redirect funds", async function () {
       await completedOrder(1, user.address, USDC(100));
       // Watcher claims the reward belongs to `other`.
-      await registry.connect(watcher).pay(1, integrator, other.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, other.address, USDC(100));
       expect(await token.balanceOf(other.address)).to.equal(0);
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
@@ -407,22 +477,22 @@ describe("CashbackRegistry", function () {
     it("rejects a mismatched amount — a lying watcher cannot inflate rewards", async function () {
       await completedOrder(1, user.address, USDC(100));
       // Watcher claims the order was for 1,000,000 rather than 100.
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(1_000_000));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(1_000_000));
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
 
     it("fails closed when the Diamond is unreachable", async function () {
       await completedOrder(1, user.address, USDC(100));
       await orders.setReverting(true);
-      await expect(registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100)))
-        .to.not.be.reverted;
+      await expect(registry.connect(watcher).pay(1, integrator, user.address, USDC(100))).to.not.be
+        .reverted;
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
 
     it("rejects a caller that is not an allowlisted watcher", async function () {
       await completedOrder(1, user.address, USDC(100));
       await expect(
-        registry.connect(stranger).pay(1, integrator, user.address, BUY, INR, USDC(100))
+        registry.connect(stranger).pay(1, integrator, user.address, USDC(100))
       ).to.be.revertedWithCustomError(registry, "OnlyAccruer");
     });
 
@@ -430,7 +500,7 @@ describe("CashbackRegistry", function () {
       await registry.setAccruer(watcher.address, false);
       await completedOrder(1, user.address, USDC(100));
       await expect(
-        registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100))
+        registry.connect(watcher).pay(1, integrator, user.address, USDC(100))
       ).to.be.revertedWithCustomError(registry, "OnlyAccruer");
     });
   });
@@ -446,9 +516,10 @@ describe("CashbackRegistry", function () {
       await token.connect(funder).transfer(stranger.address, bal);
 
       await completedOrder(1, user.address, USDC(100));
-      await expect(
-        registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100))
-      ).to.emit(registry, "PayFailed");
+      await expect(registry.connect(watcher).pay(1, integrator, user.address, USDC(100))).to.emit(
+        registry,
+        "PayFailed"
+      );
 
       // Crucially: the order stays unpaid, so it can be retried.
       expect(await registry.orderPaid(1)).to.equal(false);
@@ -462,14 +533,15 @@ describe("CashbackRegistry", function () {
       await token.connect(funder).transfer(stranger.address, bal);
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await registry.orderPaid(1)).to.equal(false);
 
       // Top up, retry.
       await token.mint(funder.address, USDC(100));
-      await expect(
-        registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100))
-      ).to.emit(registry, "Paid");
+      await expect(registry.connect(watcher).pay(1, integrator, user.address, USDC(100))).to.emit(
+        registry,
+        "Paid"
+      );
       expect(await token.balanceOf(user.address)).to.equal(USDC(1));
     });
 
@@ -478,9 +550,10 @@ describe("CashbackRegistry", function () {
       await token.connect(funder).approve(await registry.getAddress(), 0);
 
       await completedOrder(1, user.address, USDC(100));
-      await expect(
-        registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100))
-      ).to.emit(registry, "PayFailed");
+      await expect(registry.connect(watcher).pay(1, integrator, user.address, USDC(100))).to.emit(
+        registry,
+        "PayFailed"
+      );
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
 
@@ -490,7 +563,14 @@ describe("CashbackRegistry", function () {
 
       const tx = await registry
         .connect(funder)
-        .createCampaign(integrator, BUY, INR, await bad.getAddress(), 100, 0, funder.address);
+        .createCampaign(integrator, BUY, INR, await bad.getAddress(), 100, 0, funder.address, {
+          maxRewardPerOrder: 0,
+          dailyBudget: 0,
+          totalBudget: 0,
+          dailyPerUser: 0,
+          startTime: 0,
+          endTime: 0,
+        });
       const receipt = await tx.wait();
       const id = receipt.logs
         .map((l: any) => {
@@ -504,9 +584,10 @@ describe("CashbackRegistry", function () {
       await registry.connect(funder).activate(id);
 
       await completedOrder(1, user.address, USDC(100));
-      await expect(
-        registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100))
-      ).to.emit(registry, "PayFailed");
+      await expect(registry.connect(watcher).pay(1, integrator, user.address, USDC(100))).to.emit(
+        registry,
+        "PayFailed"
+      );
       expect(await registry.orderPaid(1)).to.equal(false);
     });
 
@@ -516,7 +597,14 @@ describe("CashbackRegistry", function () {
 
       const tx = await registry
         .connect(funder)
-        .createCampaign(integrator, BUY, INR, await bad.getAddress(), 100, 0, funder.address);
+        .createCampaign(integrator, BUY, INR, await bad.getAddress(), 100, 0, funder.address, {
+          maxRewardPerOrder: 0,
+          dailyBudget: 0,
+          totalBudget: 0,
+          dailyPerUser: 0,
+          startTime: 0,
+          endTime: 0,
+        });
       const receipt = await tx.wait();
       const id = receipt.logs
         .map((l: any) => {
@@ -530,9 +618,10 @@ describe("CashbackRegistry", function () {
       await registry.connect(funder).activate(id);
 
       await completedOrder(1, user.address, USDC(100));
-      await expect(
-        registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100))
-      ).to.emit(registry, "PayFailed");
+      await expect(registry.connect(watcher).pay(1, integrator, user.address, USDC(100))).to.emit(
+        registry,
+        "PayFailed"
+      );
       // The order must NOT be marked paid when no tokens actually moved.
       expect(await registry.orderPaid(1)).to.equal(false);
     });
@@ -667,7 +756,7 @@ describe("CashbackRegistry", function () {
       await registry.connect(funder).setRate(id, 0, USDC(7));
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(7));
     });
 
@@ -692,7 +781,7 @@ describe("CashbackRegistry", function () {
     it("pays nothing when the reported integrator is the zero address", async function () {
       await makeCampaign({ bps: 100 });
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, ethers.ZeroAddress, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, ethers.ZeroAddress, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
   });
@@ -708,9 +797,7 @@ describe("CashbackRegistry", function () {
       await makeCampaign({ orderType: BUY, currency: INR, bps: 100 });
 
       await completedOrder(77, merchant.address, USDC(1000));
-      await expect(
-        registry.connect(watcher).pay(77, integrator, merchant.address, BUY, INR, USDC(1000))
-      )
+      await expect(registry.connect(watcher).pay(77, integrator, merchant.address, USDC(1000)))
         .to.emit(registry, "Paid")
         .withArgs(
           await registry.activeFor(await registry.lookupKey(integrator, BUY, INR)),
@@ -728,11 +815,20 @@ describe("CashbackRegistry", function () {
       await makeCampaign({ orderType: BUY, currency: BRL, bps: 300 }); // 3%
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(1));
 
-      await completedOrder(2, other.address, USDC(100));
-      await registry.connect(watcher).pay(2, integrator, other.address, BUY, BRL, USDC(100));
+      await orders.setOrderWithCurrency(
+        2,
+        other.address,
+        USDC(100),
+        COMPLETED,
+        0,
+        BRL,
+        integrator,
+        0
+      );
+      await registry.connect(watcher).pay(2, integrator, other.address, USDC(100));
       expect(await token.balanceOf(other.address)).to.equal(USDC(3));
     });
   });
@@ -815,8 +911,8 @@ describe("CashbackRegistry", function () {
       const otherBefore = await token.balanceOf(other.address);
 
       // An order on integrator B must debit `other`, never `funder`.
-      await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integratorB, user.address, BUY, INR, USDC(100));
+      await completedOrder(1, user.address, USDC(100), integratorB);
+      await registry.connect(watcher).pay(1, integratorB, user.address, USDC(100));
 
       expect(await token.balanceOf(funder.address)).to.equal(funderBefore);
       expect(await token.balanceOf(other.address)).to.equal(otherBefore - USDC(1));
@@ -831,12 +927,12 @@ describe("CashbackRegistry", function () {
       await makeCampaign({ bps: 100 });
       await makeCampaign({ integratorAddr: integratorB, bps: 100, as: other });
 
-      await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integratorB, user.address, BUY, INR, USDC(100));
+      await completedOrder(1, user.address, USDC(100), integratorB);
+      await registry.connect(watcher).pay(1, integratorB, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(0); // theirs fails
 
       await completedOrder(2, user.address, USDC(100));
-      await registry.connect(watcher).pay(2, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(2, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(USDC(1)); // ours still pays
     });
 
@@ -848,7 +944,14 @@ describe("CashbackRegistry", function () {
       await expect(
         registry
           .connect(stranger)
-          .createCampaign(integratorB, BUY, INR, await token.getAddress(), 100, 0, funder.address)
+          .createCampaign(integratorB, BUY, INR, await token.getAddress(), 100, 0, funder.address, {
+            maxRewardPerOrder: 0,
+            dailyBudget: 0,
+            totalBudget: 0,
+            dailyPerUser: 0,
+            startTime: 0,
+            endTime: 0,
+          })
       ).to.be.revertedWithCustomError(registry, "FundingWalletNotAuthorized");
     });
 
@@ -864,7 +967,23 @@ describe("CashbackRegistry", function () {
       await expect(
         registry
           .connect(funder)
-          .createCampaign(integrator, BUY, INR, await token.getAddress(), 100, 0, treasury.address)
+          .createCampaign(
+            integrator,
+            BUY,
+            INR,
+            await token.getAddress(),
+            100,
+            0,
+            treasury.address,
+            {
+              maxRewardPerOrder: 0,
+              dailyBudget: 0,
+              totalBudget: 0,
+              dailyPerUser: 0,
+              startTime: 0,
+              endTime: 0,
+            }
+          )
       ).to.be.revertedWithCustomError(registry, "FundingWalletNotAuthorized");
     });
 
@@ -873,12 +992,30 @@ describe("CashbackRegistry", function () {
       await token.mint(treasury.address, USDC(1000));
       await token.connect(treasury).approve(await registry.getAddress(), ethers.MaxUint256);
       // Only the wallet itself can grant this.
-      await registry.connect(treasury).authorizeCampaignFunder(funder.address, true);
+      await registry
+        .connect(treasury)
+        .authorizeCampaignFunder(funder.address, await token.getAddress(), true);
 
       await expect(
         registry
           .connect(funder)
-          .createCampaign(integrator, BUY, INR, await token.getAddress(), 100, 0, treasury.address)
+          .createCampaign(
+            integrator,
+            BUY,
+            INR,
+            await token.getAddress(),
+            100,
+            0,
+            treasury.address,
+            {
+              maxRewardPerOrder: 0,
+              dailyBudget: 0,
+              totalBudget: 0,
+              dailyPerUser: 0,
+              startTime: 0,
+              endTime: 0,
+            }
+          )
       ).to.not.be.reverted;
     });
 
@@ -887,12 +1024,14 @@ describe("CashbackRegistry", function () {
 
       await token.mint(other.address, USDC(1000));
       await token.connect(other).approve(await registry.getAddress(), ethers.MaxUint256);
-      await registry.connect(other).authorizeCampaignFunder(funder.address, true);
+      await registry
+        .connect(other)
+        .authorizeCampaignFunder(funder.address, await token.getAddress(), true);
       await registry.connect(funder).setCampaignFundingWallet(id, other.address);
 
       const otherBefore = await token.balanceOf(other.address);
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
 
       expect(await token.balanceOf(other.address)).to.equal(otherBefore - USDC(1));
     });
@@ -907,7 +1046,7 @@ describe("CashbackRegistry", function () {
       expect((await registry.getCampaign(id)).status).to.equal(Status.PAUSED);
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       expect(await token.balanceOf(user.address)).to.equal(0);
     });
 
@@ -926,7 +1065,7 @@ describe("CashbackRegistry", function () {
     it("an admin CANNOT change a rate — stopping is not spending", async function () {
       const id = await makeCampaign({ bps: 100 });
       // `deployer` is a registry admin but not the integrator owner.
-      await expect(registry.connect(deployer).setRate(id, 2000, 0)).to.be.revertedWithCustomError(
+      await expect(registry.connect(deployer).setRate(id, 500, 0)).to.be.revertedWithCustomError(
         registry,
         "OnlyIntegratorOwner"
       );
@@ -947,9 +1086,9 @@ describe("CashbackRegistry", function () {
       const id = await makeCampaign({ bps: 100 });
 
       await completedOrder(1, user.address, USDC(100));
-      await registry.connect(watcher).pay(1, integrator, user.address, BUY, INR, USDC(100));
+      await registry.connect(watcher).pay(1, integrator, user.address, USDC(100));
       await completedOrder(2, other.address, USDC(300));
-      await registry.connect(watcher).pay(2, integrator, other.address, BUY, INR, USDC(300));
+      await registry.connect(watcher).pay(2, integrator, other.address, USDC(300));
 
       const s = await registry.stats(id);
       expect(s.totalPaid).to.equal(USDC(4)); // 1 + 3
@@ -1030,7 +1169,14 @@ describe("CashbackRegistry — audit regressions", function () {
   ) {
     const tx = await reg
       .connect(as)
-      .createCampaign(intg, orderType, currency, await token2.getAddress(), bps, flat, funder);
+      .createCampaign(intg, orderType, currency, await token2.getAddress(), bps, flat, funder, {
+        maxRewardPerOrder: 0,
+        dailyBudget: 0,
+        totalBudget: 0,
+        dailyPerUser: 0,
+        startTime: 0,
+        endTime: 0,
+      });
     return idOf(await tx.wait());
   }
 
@@ -1063,8 +1209,8 @@ describe("CashbackRegistry — audit regressions", function () {
     ).to.be.revertedWithCustomError(reg, "CampaignRetired");
 
     const before = await token2.balanceOf(alice.address);
-    await orders2.setOrder(1, user2.address, U6(100), 3);
-    await reg.connect(watcher2).pay(1, intg, user2.address, BUY, INR, U6(100));
+    await orders2.setOrderFull(1, user2.address, U6(100), 3, 0, intg, 0);
+    await reg.connect(watcher2).pay(1, intg, user2.address, U6(100));
 
     expect(await token2.balanceOf(user2.address)).to.equal(0);
     expect(await token2.balanceOf(alice.address)).to.equal(before);
@@ -1100,19 +1246,23 @@ describe("CashbackRegistry — audit regressions", function () {
   it("an authorised wallet may fund, and revoking stops payouts live", async function () {
     await token2.mint(carol.address, U6(1000));
     await token2.connect(carol).approve(await reg.getAddress(), ethers.MaxUint256);
-    await reg.connect(carol).authorizeCampaignFunder(alice.address, true);
+    await reg
+      .connect(carol)
+      .authorizeCampaignFunder(alice.address, await token2.getAddress(), true);
 
     const id = await newCampaign(alice, carol.address, 100);
     await reg.connect(alice).activate(id);
 
-    await orders2.setOrder(1, user2.address, U6(100), 3);
-    await reg.connect(watcher2).pay(1, intg, user2.address, BUY, INR, U6(100));
+    await orders2.setOrderFull(1, user2.address, U6(100), 3, 0, intg, 0);
+    await reg.connect(watcher2).pay(1, intg, user2.address, U6(100));
     expect(await token2.balanceOf(user2.address)).to.equal(U6(1));
 
-    await reg.connect(carol).authorizeCampaignFunder(alice.address, false);
+    await reg
+      .connect(carol)
+      .authorizeCampaignFunder(alice.address, await token2.getAddress(), false);
 
-    await orders2.setOrder(2, user2.address, U6(100), 3);
-    await reg.connect(watcher2).pay(2, intg, user2.address, BUY, INR, U6(100));
+    await orders2.setOrderFull(2, user2.address, U6(100), 3, 0, intg, 0);
+    await reg.connect(watcher2).pay(2, intg, user2.address, U6(100));
     expect(await token2.balanceOf(user2.address)).to.equal(U6(1)); // unchanged
   });
 
@@ -1124,14 +1274,14 @@ describe("CashbackRegistry — audit regressions", function () {
     const wide = await newCampaign(alice, alice.address, 100, 0n, ANY, ANY);
     await reg.connect(alice).activate(wide);
 
-    await orders2.setOrder(1, user2.address, U6(100), 3);
-    await reg.connect(watcher2).pay(1, intg, user2.address, BUY, INR, U6(100));
+    await orders2.setOrderFull(1, user2.address, U6(100), 3, 0, intg, 0);
+    await reg.connect(watcher2).pay(1, intg, user2.address, U6(100));
     expect(await token2.balanceOf(user2.address)).to.equal(U6(5)); // narrow wins
 
     await reg.connect(admin).emergencyStop(narrow, true);
 
-    await orders2.setOrder(2, user2.address, U6(100), 3);
-    await reg.connect(watcher2).pay(2, intg, user2.address, BUY, INR, U6(100));
+    await orders2.setOrderFull(2, user2.address, U6(100), 3, 0, intg, 0);
+    await reg.connect(watcher2).pay(2, intg, user2.address, U6(100));
     expect(await token2.balanceOf(user2.address)).to.equal(U6(6)); // fell through: 5 + 1
   });
 
@@ -1155,11 +1305,524 @@ describe("CashbackRegistry — audit regressions", function () {
       reg,
       "OnlyIntegratorOwner"
     );
-    await expect(reg.connect(admin).setRate(id, 2000, 0)).to.be.revertedWithCustomError(
+    await expect(reg.connect(admin).setRate(id, 500, 0)).to.be.revertedWithCustomError(
       reg,
       "OnlyIntegratorOwner"
     );
 
     await expect(reg.connect(admin).emergencyStop(id, false)).to.not.be.reverted;
+  });
+});
+
+// ─── PR #62 review findings (Aash) ───────────────────────────────────
+// One regression per finding, encoding the reviewer's proof-of-concepts —
+// so a regression reintroduces a named, reproduced exploit rather than an
+// abstract coverage gap.
+
+describe("CashbackRegistry — PR #62 review regressions", function () {
+  let admin: SignerWithAddress;
+  let alice: SignerWithAddress; // owns integrator A
+  let bob: SignerWithAddress; // owns integrator B
+  let carol: SignerWithAddress; // uninvolved treasury
+  let keeper: SignerWithAddress; // the accruer / watcher key
+  let buyer: SignerWithAddress;
+
+  let usdc: any;
+  let orders: any;
+  let reg: any;
+  let intgA: string;
+  let intgB: string;
+
+  const U6 = (n: number | string) => ethers.parseUnits(n.toString(), 6);
+  const NB = {
+    maxRewardPerOrder: 0,
+    dailyBudget: 0,
+    totalBudget: 0,
+    dailyPerUser: 0,
+    startTime: 0,
+    endTime: 0,
+  };
+
+  function idOf(rc: any) {
+    return rc.logs
+      .map((l: any) => {
+        try {
+          return reg.interface.parseLog(l);
+        } catch {
+          return null;
+        }
+      })
+      .find((e: any) => e && e.name === "CampaignCreated").args.campaignId;
+  }
+
+  async function campaign(
+    as: SignerWithAddress,
+    intg: string,
+    opts: {
+      token?: any;
+      bps?: number;
+      flat?: bigint;
+      currency?: string;
+      orderType?: string;
+      funder?: string;
+      budget?: any;
+      activate?: boolean;
+    } = {}
+  ) {
+    const tok = opts.token ?? usdc;
+    const tx = await reg
+      .connect(as)
+      .createCampaign(
+        intg,
+        opts.orderType ?? BUY,
+        opts.currency ?? INR,
+        await tok.getAddress(),
+        opts.bps ?? 0,
+        opts.flat ?? 0n,
+        opts.funder ?? as.address,
+        opts.budget ?? NB
+      );
+    const id = idOf(await tx.wait());
+    if (opts.activate !== false) await reg.connect(as).activate(id);
+    return id;
+  }
+
+  beforeEach(async function () {
+    [admin, alice, bob, carol, keeper, buyer] = await ethers.getSigners();
+    intgA = ethers.Wallet.createRandom().address;
+    intgB = ethers.Wallet.createRandom().address;
+
+    usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    orders = await (await ethers.getContractFactory("MockOrderSource")).deploy();
+    reg = await (
+      await ethers.getContractFactory("CashbackRegistry")
+    ).deploy(await orders.getAddress());
+
+    await reg.setAccruer(keeper.address, true);
+    await reg.setIntegratorOwner(intgA, alice.address);
+    await reg.setIntegratorOwner(intgB, bob.address);
+
+    for (const who of [alice, bob, carol]) {
+      await usdc.mint(who.address, U6(1_000_000));
+      await usdc.connect(who).approve(await reg.getAddress(), ethers.MaxUint256);
+    }
+  });
+
+  // F1 (HIGH) — the accruer key must not choose WHICH tenant pays.
+  it("F1: an order can only bill the integrator that actually placed it", async function () {
+    await campaign(alice, intgA, { bps: 100 }); // Alice: 1%
+    await campaign(bob, intgB, { bps: 500 }); // Bob: 5%
+
+    // A real order placed through Alice's integrator.
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intgA, 0);
+
+    const bobBefore = await usdc.balanceOf(bob.address);
+
+    // The keeper reports it against BOB's richer campaign.
+    await reg.connect(keeper).pay(1, intgB, buyer.address, U6(1000));
+
+    expect(await usdc.balanceOf(bob.address)).to.equal(bobBefore);
+    expect(await usdc.balanceOf(buyer.address)).to.equal(0);
+    expect(await reg.orderPaid(1)).to.equal(false);
+  });
+
+  it("F1: an organic order with no integrator pays nothing", async function () {
+    await campaign(alice, intgA, { bps: 100 });
+    await orders.setOrderFull(2, buyer.address, U6(1000), COMPLETED, 0, ethers.ZeroAddress, 0);
+
+    await reg.connect(keeper).pay(2, intgA, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(0);
+  });
+
+  // F3 (MEDIUM-HIGH) — the keeper must not choose WHICH campaign pays.
+  it("F3: order type and currency come from the record, not the report", async function () {
+    await campaign(alice, intgA, { bps: 100, currency: INR }); // 1% INR
+    await campaign(alice, intgA, { bps: 500, currency: ANY }); // 5% anything else
+
+    await orders.setOrderWithCurrency(1, buyer.address, U6(1000), COMPLETED, 0, INR, intgA, 0);
+
+    // The INR row must win: the currency is read from the record.
+    await reg.connect(keeper).pay(1, intgA, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(10)); // 1%, not 5%
+  });
+
+  // F4 (MEDIUM) — funding authorisation is scoped to a token.
+  it("F4: authorising a spender for one token does not authorise another", async function () {
+    const points = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    await points.mint(carol.address, U6(1000));
+    await points.connect(carol).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    // Carol sponsors Alice for the POINTS token only.
+    await reg
+      .connect(carol)
+      .authorizeCampaignFunder(alice.address, await points.getAddress(), true);
+
+    // Succeeds: Carol explicitly authorised Alice for THIS token.
+    const sponsored = await campaign(alice, intgA, {
+      token: points,
+      bps: 100,
+      funder: carol.address,
+    });
+    expect((await reg.getCampaign(sponsored)).fundingWallet).to.equal(carol.address);
+
+    await expect(
+      reg
+        .connect(alice)
+        .createCampaign(intgA, BUY, BRL, await usdc.getAddress(), 100, 0, carol.address, NB)
+    ).to.be.revertedWithCustomError(reg, "FundingWalletNotAuthorized");
+  });
+
+  // F5 (MEDIUM) — one hostile reward token must not starve the batch.
+  it("F5: a gas-bomb reward token cannot take down the whole batch", async function () {
+    const bomb = await (await ethers.getContractFactory("MockGasBomb")).deploy();
+    await bomb.mint(bob.address, U6(1_000_000));
+    await bomb.connect(bob).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign(alice, intgA, { bps: 100 }); // honest
+    await campaign(bob, intgB, { token: bomb, bps: 100 }); // hostile
+
+    const reports: any[] = [
+      { orderId: 1, integrator: intgB, user: buyer.address, orderAmount: U6(100) },
+    ];
+    await orders.setOrderFull(1, buyer.address, U6(100), COMPLETED, 0, intgB, 0);
+    for (let i = 2; i <= 10; i++) {
+      await orders.setOrderFull(i, buyer.address, U6(100), COMPLETED, 0, intgA, 0);
+      reports.push({ orderId: i, integrator: intgA, user: buyer.address, orderAmount: U6(100) });
+    }
+
+    await reg.connect(keeper).payBatch(reports);
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(9)); // 9 honest rows paid
+  });
+
+  // F6 (MEDIUM) — budgets are enforced on-chain, not by allowance discipline.
+  it("F6: MAX_BPS is programme-shaped and MAX_FLAT_AMOUNT bounds a 6dp token", async function () {
+    expect(await reg.MAX_BPS()).to.equal(500); // 5%, not 20%
+    await expect(campaign(alice, intgA, { bps: 501 })).to.be.revertedWithCustomError(
+      reg,
+      "InvalidRate"
+    );
+
+    const maxFlat = await reg.MAX_FLAT_AMOUNT();
+    await expect(campaign(alice, intgA, { flat: maxFlat + 1n })).to.be.revertedWithCustomError(
+      reg,
+      "InvalidRate"
+    );
+  });
+
+  it("F6: per-order, per-day and lifetime budgets all clamp", async function () {
+    const id = await campaign(alice, intgA, {
+      bps: 500,
+      budget: { ...NB, maxRewardPerOrder: U6(2), dailyBudget: U6(3), totalBudget: U6(3) },
+    });
+
+    // 5% of 1000 = 50, clamped to maxRewardPerOrder = 2.
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intgA, 0);
+    await reg.connect(keeper).pay(1, intgA, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(2));
+
+    // Only 1 left in the daily / total budget.
+    await orders.setOrderFull(2, buyer.address, U6(1000), COMPLETED, 0, intgA, 0);
+    await reg.connect(keeper).pay(2, intgA, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(3));
+
+    // Exhausted.
+    await orders.setOrderFull(3, buyer.address, U6(1000), COMPLETED, 0, intgA, 0);
+    await reg.connect(keeper).pay(3, intgA, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(3));
+    expect((await reg.stats(id)).totalPaid).to.equal(U6(3));
+  });
+
+  it("F6: a per-user daily cap bounds one address farming", async function () {
+    await campaign(alice, intgA, { bps: 500, budget: { ...NB, dailyPerUser: U6(1) } });
+
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intgA, 0);
+    await reg.connect(keeper).pay(1, intgA, buyer.address, U6(1000));
+    await orders.setOrderFull(2, buyer.address, U6(1000), COMPLETED, 0, intgA, 0);
+    await reg.connect(keeper).pay(2, intgA, buyer.address, U6(1000));
+
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(1)); // capped
+  });
+
+  // F7 (MEDIUM) — campaigns are not retroactive.
+  it("F7: a campaign cannot pay orders placed before it started", async function () {
+    const past = (await ethers.provider.getBlock("latest"))!.timestamp - 30 * 24 * 3600;
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intgA, past);
+
+    await campaign(alice, intgA, { bps: 500 });
+
+    await reg.connect(keeper).pay(1, intgA, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(0);
+  });
+
+  it("F7: an order placed after endTime is not eligible", async function () {
+    const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+    await campaign(alice, intgA, {
+      bps: 500,
+      budget: { ...NB, startTime: now - 100, endTime: now + 1 },
+    });
+
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intgA, now + 5000);
+    await reg.connect(keeper).pay(1, intgA, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(0);
+  });
+
+  // F8 (MEDIUM) — SELL rewards land on a proxy, so block them for now.
+  it("F8: SELL and PAY campaigns are rejected at creation", async function () {
+    await expect(
+      campaign(alice, intgA, { bps: 100, orderType: SELL })
+    ).to.be.revertedWithCustomError(reg, "UnsupportedOrderType");
+
+    const PAY = ethers.encodeBytes32String("PAY");
+    await expect(
+      campaign(alice, intgA, { bps: 100, orderType: PAY })
+    ).to.be.revertedWithCustomError(reg, "UnsupportedOrderType");
+  });
+
+  // F9 (LOW) — reward scaling across token decimals.
+  it("F9: an 18-decimal reward token pays a sensible amount", async function () {
+    const t18 = await (await ethers.getContractFactory("MockToken18")).deploy();
+    await t18.mint(alice.address, ethers.parseUnits("1000000", 18));
+    await t18.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign(alice, intgA, { token: t18, bps: 100 }); // 1%
+
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intgA, 0);
+    await reg.connect(keeper).pay(1, intgA, buyer.address, U6(1000));
+
+    // 1% of a $1,000 order = 10 tokens, at 18 decimals.
+    expect(await t18.balanceOf(buyer.address)).to.equal(ethers.parseUnits("10", 18));
+  });
+
+  // F10 (LOW) — a retired campaign must be closeable.
+  it("F10: the recorded owner can end a retired campaign", async function () {
+    const id = await campaign(alice, intgA, { bps: 100 });
+
+    await reg.setIntegratorOwner(intgA, bob.address); // handover retires it
+
+    await expect(reg.connect(bob).pause(id)).to.be.revertedWithCustomError(reg, "CampaignRetired");
+    // The recorded owner can close it, so they know to revoke their approval.
+    await expect(reg.connect(alice).end(id)).to.not.be.reverted;
+    expect((await reg.getCampaign(id)).status).to.equal(Status.ENDED);
+  });
+
+  // F11 (LOW) — admin surface sharp edges.
+  it("F11: the last admin cannot remove themselves", async function () {
+    await expect(reg.setAdmin(admin.address, false)).to.be.revertedWithCustomError(
+      reg,
+      "LastAdmin"
+    );
+
+    await reg.setAdmin(alice.address, true);
+    await expect(reg.setAdmin(admin.address, false)).to.not.be.reverted;
+  });
+
+  it("F11: an integrator can be un-assigned, retiring its campaigns", async function () {
+    await campaign(alice, intgA, { bps: 100 });
+    await reg.unassignIntegrator(intgA);
+
+    expect(await reg.integratorOwner(intgA)).to.equal(ethers.ZeroAddress);
+
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intgA, 0);
+    await reg.connect(keeper).pay(1, intgA, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(0);
+
+    await expect(campaign(alice, intgA, { bps: 100 })).to.be.revertedWithCustomError(
+      reg,
+      "IntegratorUnclaimed"
+    );
+  });
+});
+
+// ─── Coverage: budget retuning, decimals, order-type labels ──────────
+
+describe("CashbackRegistry — budgets, decimals, labels", function () {
+  let admin: SignerWithAddress;
+  let alice: SignerWithAddress;
+  let keeper: SignerWithAddress;
+  let buyer: SignerWithAddress;
+
+  let usdc: any;
+  let orders: any;
+  let reg: any;
+  let intg: string;
+
+  const U6 = (n: number | string) => ethers.parseUnits(n.toString(), 6);
+  const NB = {
+    maxRewardPerOrder: 0,
+    dailyBudget: 0,
+    totalBudget: 0,
+    dailyPerUser: 0,
+    startTime: 0,
+    endTime: 0,
+  };
+
+  async function campaign(opts: any = {}) {
+    const tok = opts.token ?? usdc;
+    const tx = await reg
+      .connect(alice)
+      .createCampaign(
+        intg,
+        opts.orderType ?? BUY,
+        opts.currency ?? INR,
+        await tok.getAddress(),
+        opts.bps ?? 100,
+        opts.flat ?? 0n,
+        alice.address,
+        opts.budget ?? NB
+      );
+    const rc = await tx.wait();
+    const id = rc.logs
+      .map((l: any) => {
+        try {
+          return reg.interface.parseLog(l);
+        } catch {
+          return null;
+        }
+      })
+      .find((e: any) => e && e.name === "CampaignCreated").args.campaignId;
+    if (opts.activate !== false) await reg.connect(alice).activate(id);
+    return id;
+  }
+
+  beforeEach(async function () {
+    [admin, alice, keeper, buyer] = await ethers.getSigners();
+    intg = ethers.Wallet.createRandom().address;
+
+    usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    orders = await (await ethers.getContractFactory("MockOrderSource")).deploy();
+    reg = await (
+      await ethers.getContractFactory("CashbackRegistry")
+    ).deploy(await orders.getAddress());
+
+    await reg.setAccruer(keeper.address, true);
+    await reg.setIntegratorOwner(intg, alice.address);
+    await usdc.mint(alice.address, U6(1_000_000));
+    await usdc.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+  });
+
+  it("setBudget retunes the dials mid-flight", async function () {
+    const id = await campaign({ bps: 500 });
+
+    await expect(reg.connect(alice).setBudget(id, { ...NB, maxRewardPerOrder: U6(1) })).to.emit(
+      reg,
+      "CampaignBudgetChanged"
+    );
+
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(1)); // clamped by the new cap
+  });
+
+  it("setBudget refuses to move the start backwards", async function () {
+    const id = await campaign({ bps: 100 });
+    const c = await reg.getCampaign(id);
+
+    // Moving the start earlier would let the campaign swallow history it was
+    // never eligible for — the F7 hole by another route.
+    await expect(
+      reg.connect(alice).setBudget(id, { ...NB, startTime: Number(c.startTime) - 1 })
+    ).to.be.revertedWithCustomError(reg, "InvalidWindow");
+  });
+
+  it("setBudget rejects an end before the start, and an ended campaign", async function () {
+    const id = await campaign({ bps: 100 });
+    const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+
+    await expect(
+      reg.connect(alice).setBudget(id, { ...NB, startTime: now, endTime: now - 1 })
+    ).to.be.revertedWithCustomError(reg, "InvalidWindow");
+
+    await reg.connect(alice).end(id);
+    await expect(reg.connect(alice).setBudget(id, NB)).to.be.revertedWithCustomError(
+      reg,
+      "CampaignEnded"
+    );
+  });
+
+  it("createCampaign rejects an end before the start", async function () {
+    const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+    await expect(
+      campaign({ budget: { ...NB, startTime: now, endTime: now - 1 } })
+    ).to.be.revertedWithCustomError(reg, "InvalidWindow");
+  });
+
+  it("a sub-6-decimal reward token scales down correctly", async function () {
+    const t2 = await (await ethers.getContractFactory("MockToken2")).deploy();
+    await t2.mint(alice.address, ethers.parseUnits("1000000", 2));
+    await t2.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign({ token: t2, bps: 100 }); // 1%
+
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+
+    // 1% of $1,000 = 10 tokens, at 2 decimals.
+    expect(await t2.balanceOf(buyer.address)).to.equal(ethers.parseUnits("10", 2));
+  });
+
+  it("a token with no decimals() is treated as 6dp", async function () {
+    const nodec = await (await ethers.getContractFactory("MockNoDecimals")).deploy();
+    await nodec.mint(alice.address, U6(1000));
+    await nodec.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign({ token: nodec, bps: 100 });
+
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intg, 0);
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+    expect(await nodec.balanceOf(buyer.address)).to.equal(U6(10));
+  });
+
+  it("a PAY order resolves only against a wildcard row", async function () {
+    // orderType 2 = PAY on the record. A BUY-keyed campaign must not match.
+    await campaign({ bps: 500, orderType: BUY, currency: INR });
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 2, intg, 0);
+
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(0);
+  });
+
+  it("an unrecognised order type maps to the ANY wildcard, never to BUY", async function () {
+    await campaign({ bps: 500, orderType: BUY, currency: INR });
+    // orderType 7 is not a Diamond enum value.
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 7, intg, 0);
+
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(0);
+  });
+
+  it("an order with no placement time is rejected", async function () {
+    await campaign({ bps: 100 });
+    // A record that decodes but carries no placedTimestamp cannot be checked
+    // against the campaign window, so it must fail closed.
+    await orders.setOrderWithCurrency(1, buyer.address, U6(1000), COMPLETED, 0, INR, intg, 1);
+    await reg.connect(keeper).setAccruer;
+
+    const c = await reg.getCampaign(await reg.activeFor(await reg.lookupKey(intg, BUY, INR)));
+    expect(c.startTime).to.be.greaterThan(1);
+
+    await reg.connect(keeper).pay(1, intg, buyer.address, U6(1000));
+    expect(await usdc.balanceOf(buyer.address)).to.equal(0);
+  });
+
+  it("campaignView reports spendable capacity", async function () {
+    const id = await campaign({ bps: 100 });
+    const [, , spendable] = await reg.campaignView(id);
+    expect(spendable).to.be.greaterThan(0);
+
+    // Revoking the approval drops spendable to zero — the health signal a
+    // dashboard needs, since the campaign still reads ACTIVE.
+    await usdc.connect(alice).approve(await reg.getAddress(), 0);
+    const [, , after] = await reg.campaignView(id);
+    expect(after).to.equal(0);
+  });
+
+  it("campaignsPaged pages and clamps", async function () {
+    await campaign({ bps: 100, currency: INR });
+    await campaign({ bps: 100, currency: BRL, activate: false });
+
+    expect(await reg.campaignCount()).to.equal(2);
+    expect((await reg.campaignsPaged(0, 1)).length).to.equal(1);
+    expect((await reg.campaignsPaged(1, 50)).length).to.equal(1); // clamped
+    expect((await reg.campaignsPaged(99, 10)).length).to.equal(0); // past the end
   });
 });

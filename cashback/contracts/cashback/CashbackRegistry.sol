@@ -2,6 +2,12 @@
 pragma solidity ^0.8.28;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/// @dev Minimal `decimals()` view. Not every ERC-20 implements it, so calls
+///      are wrapped in try/catch at the call site.
+interface IERC20Metadata {
+    function decimals() external view returns (uint8);
+}
 import { ICashbackRegistry } from "../interfaces/ICashbackRegistry.sol";
 import { IOrderFlow } from "../interfaces/IOrderFlow.sol";
 
@@ -69,6 +75,9 @@ contract CashbackRegistry is ICashbackRegistry {
     error IntegratorUnclaimed();
     error FundingWalletNotAuthorized();
     error CampaignRetired();
+    error UnsupportedOrderType();
+    error InvalidWindow();
+    error LastAdmin();
 
     // ─── Constants ────────────────────────────────────────────────────
 
@@ -76,21 +85,45 @@ contract CashbackRegistry is ICashbackRegistry {
     ///         cover every order type or every currency for an integrator.
     bytes32 public constant ANY = bytes32(0);
 
-    /// @notice Hard ceiling on any campaign rate (2000 bps = 20%). There is
-    ///         no setter — a compromised key, at any level, cannot configure
-    ///         an unbounded payout.
-    uint16 public constant MAX_BPS = 2000;
+    /// @notice Canonical order-type labels, derived from the Diamond's own
+    ///         uint8 enum (0=BUY, 1=SELL, 2=PAY) rather than trusted from a
+    ///         report. Campaigns are keyed on these.
+    bytes32 public constant ORDER_TYPE_BUY = bytes32("BUY");
+    bytes32 public constant ORDER_TYPE_SELL = bytes32("SELL");
+    bytes32 public constant ORDER_TYPE_PAY = bytes32("PAY");
 
-    /// @notice Ceiling on a flat per-order reward. Without this the
-    ///         "no unbounded payout" guarantee covered only the percentage
-    ///         path. 1e24 is generous for any 6- or 18-decimal reward token
-    ///         while still bounding a single order's blast radius.
-    uint256 public constant MAX_FLAT_AMOUNT = 1e24;
+    /// @notice Hard ceiling on any campaign rate. AUDIT F6: lowered from 20%
+    ///         to 5% — 20% is not a cashback rate, it is a drain budget, and
+    ///         a ceiling only helps if it is programme-shaped.
+    uint16 public constant MAX_BPS = 500;
+
+    /// @notice Ceiling on a flat per-order reward, in the reward token's own
+    ///         units. AUDIT F6: 1e24 was meaningless for a 6-decimal token
+    ///         (10^18 USDC). 1e21 is 1e15 USDC at 6dp and 1,000 tokens at
+    ///         18dp — bounded in both worlds, and campaigns can set a much
+    ///         tighter `maxRewardPerOrder` on top.
+    uint256 public constant MAX_FLAT_AMOUNT = 1e21;
+
+    /// @notice Gas forwarded to a reward token's `transferFrom`. AUDIT F5:
+    ///         without a cap, the 63/64 rule lets a token that burns all
+    ///         forwarded gas take down the whole batch, so one tenant's
+    ///         hostile token starves every honest row. Generous for any
+    ///         reasonable ERC-20, fatal to a gas bomb.
+    uint256 public constant TOKEN_CALL_GAS = 150_000;
 
     uint256 private constant BPS_DENOMINATOR = 10_000;
 
     /// @dev Diamond order status (OrderProcessorStorage.OrderStatus).
     uint8 private constant STATUS_COMPLETED = 3;
+
+    /// @dev What `_verifyOrder` proved from the Diamond's own record. Every
+    ///      field here is authoritative; nothing in it comes from the report.
+    struct VerifiedOrder {
+        address user;
+        bytes32 orderType;
+        bytes32 currency;
+        uint256 placedAt;
+    }
 
     // ─── Immutables ───────────────────────────────────────────────────
 
@@ -104,6 +137,9 @@ contract CashbackRegistry is ICashbackRegistry {
     ///         rate, or redirect anyone's funds — see `emergencyStop` for the
     ///         one power they hold over a live campaign.
     mapping(address => bool) public admin;
+
+    /// @notice How many admins exist. Guards against removing the last one.
+    uint256 public adminCount;
 
     /// @notice Addresses permitted to report orders (the watcher service).
     mapping(address => bool) public accruer;
@@ -120,11 +156,15 @@ contract CashbackRegistry is ICashbackRegistry {
     ///         of a campaign funded by the outgoing owner's wallet.
     mapping(address => uint256) public integratorEpoch;
 
-    /// @notice fundingWallet => spender => may that spender attach this
-    ///         wallet to a campaign. Only the wallet itself can grant this,
-    ///         and it is re-checked on every payout, so revoking it stops
-    ///         the campaign immediately.
-    mapping(address => mapping(address => bool)) public fundingAuthorized;
+    /// @notice fundingWallet => spender => token => may that spender attach
+    ///         this wallet to a campaign paying THAT token. Only the wallet
+    ///         itself can grant it, and it is re-checked on every payout.
+    ///
+    ///         AUDIT F4: this was previously an unscoped blanket grant, so a
+    ///         treasury that authorised a partner for a points-token campaign
+    ///         had also authorised them to create a USDC campaign funded by
+    ///         the same wallet.
+    mapping(address => mapping(address => mapping(address => bool))) public fundingAuthorized;
 
     /// @dev owner => integrator => already recorded in `_integratorsByOwner`.
     ///      Keeps that enumeration free of duplicates across handovers.
@@ -144,6 +184,13 @@ contract CashbackRegistry is ICashbackRegistry {
 
     /// @notice orderId => already paid. One reward per order, ever.
     mapping(uint256 => bool) public orderPaid;
+
+    /// @notice campaign => UTC day => reward units spent that day.
+    mapping(bytes32 => mapping(uint256 => uint256)) public campaignDaySpend;
+
+    /// @notice campaign => recipient => UTC day => reward units they earned.
+    ///         Bounds how much any single address can farm in a day.
+    mapping(bytes32 => mapping(address => mapping(uint256 => uint256))) public userDaySpend;
 
     // ─── Enumeration (dashboards) ─────────────────────────────────────
     // Campaign ids are content-addressed, so without these a UI could only
@@ -201,6 +248,7 @@ contract CashbackRegistry is ICashbackRegistry {
         if (_diamond == address(0)) revert InvalidAddress();
         diamond = _diamond;
         admin[msg.sender] = true;
+        adminCount = 1;
         emit AdminSet(msg.sender, true);
     }
 
@@ -208,6 +256,21 @@ contract CashbackRegistry is ICashbackRegistry {
 
     function setAdmin(address who, bool allowed) external onlyAdmin {
         if (who == address(0)) revert InvalidAddress();
+        if (admin[who] == allowed) return;
+
+        // AUDIT F11: never let the registry reach zero admins. Campaigns
+        // would keep paying with nobody able to rotate the accruer or
+        // emergency-stop anything again.
+        if (!allowed) {
+            if (adminCount == 1) revert LastAdmin();
+            unchecked {
+                --adminCount;
+            }
+        } else {
+            unchecked {
+                ++adminCount;
+            }
+        }
         admin[who] = allowed;
         emit AdminSet(who, allowed);
     }
@@ -276,6 +339,24 @@ contract CashbackRegistry is ICashbackRegistry {
      *         wallet, or spend an owner's tokens differently. Stopping is a
      *         safety power; spending is not.
      */
+    /// @notice Un-assign an integrator, retiring its campaigns.
+    ///
+    ///         AUDIT F11: `setIntegratorOwner` rejects address(0), so without
+    ///         this an integrator could only ever be handed on, never
+    ///         withdrawn. Bumps the epoch so the outgoing owner's campaigns
+    ///         stop paying immediately and their funding wallet is safe.
+    function unassignIntegrator(address integrator) external onlyAdmin {
+        address previous = integratorOwner[integrator];
+        if (previous == address(0)) revert IntegratorUnclaimed();
+
+        delete integratorOwner[integrator];
+        unchecked {
+            ++integratorEpoch[integrator];
+        }
+        emit IntegratorEpochBumped(integrator, integratorEpoch[integrator]);
+        emit IntegratorOwnerSet(integrator, previous, address(0));
+    }
+
     function emergencyStop(bytes32 campaignId, bool permanent) external onlyAdmin {
         Campaign storage c = _campaigns[campaignId];
         if (c.integrator == address(0)) revert UnknownCampaign();
@@ -300,10 +381,10 @@ contract CashbackRegistry is ICashbackRegistry {
      *         allowance, and without affecting any other campaign that
      *         happens to share the same token approval.
      */
-    function authorizeCampaignFunder(address spender, bool allowed) external {
-        if (spender == address(0)) revert InvalidAddress();
-        fundingAuthorized[msg.sender][spender] = allowed;
-        emit FundingAuthorizationSet(msg.sender, spender, allowed);
+    function authorizeCampaignFunder(address spender, address token, bool allowed) external {
+        if (spender == address(0) || token == address(0)) revert InvalidAddress();
+        fundingAuthorized[msg.sender][spender][token] = allowed;
+        emit FundingAuthorizationSet(msg.sender, spender, token, allowed);
     }
 
     // ─── Campaign management (integrator owners) ──────────────────────
@@ -331,14 +412,29 @@ contract CashbackRegistry is ICashbackRegistry {
         address rewardToken,
         uint16 bps,
         uint256 flatAmount,
-        address fundingWallet
+        address fundingWallet,
+        Budget calldata budget
     ) external returns (bytes32 campaignId) {
         address owner = integratorOwner[integrator];
         if (owner == address(0)) revert IntegratorUnclaimed();
         if (msg.sender != owner) revert OnlyIntegratorOwner();
         if (rewardToken == address(0) || fundingWallet == address(0)) revert InvalidAddress();
         _validateRate(bps, flatAmount);
-        _requireFundingControl(fundingWallet);
+        _requireFundingControl(fundingWallet, rewardToken);
+
+        // AUDIT F8. On SELL/offramp flows `order.user` is a UserProxy, not a
+        // person: for some integrators the seller's own proxy (where a USDC
+        // reward is permanently trapped by UserProxy's sweep block), for
+        // others the integrator's shared system proxy (where every seller's
+        // reward piles up unattributable). Until there is a delivery story,
+        // only BUY and explicit wildcards are allowed.
+        if (orderType == ORDER_TYPE_SELL || orderType == ORDER_TYPE_PAY) {
+            revert UnsupportedOrderType();
+        }
+
+        if (budget.endTime != 0 && budget.endTime <= budget.startTime) revert InvalidWindow();
+
+        (uint256 scaleNum, uint256 scaleDen) = _decimalScale(rewardToken);
 
         campaignId = keccak256(
             abi.encode(integrator, orderType, currency, rewardToken, _campaignNonce++)
@@ -353,6 +449,16 @@ contract CashbackRegistry is ICashbackRegistry {
             bps: bps,
             flatAmount: flatAmount,
             fundingWallet: fundingWallet,
+            scaleNum: scaleNum,
+            scaleDen: scaleDen,
+            maxRewardPerOrder: budget.maxRewardPerOrder,
+            dailyBudget: budget.dailyBudget,
+            totalBudget: budget.totalBudget,
+            dailyPerUser: budget.dailyPerUser,
+            // Default the start to now: a campaign must never be able to pay
+            // for orders placed before it existed, even if the caller passes 0.
+            startTime: budget.startTime == 0 ? uint64(block.timestamp) : budget.startTime,
+            endTime: budget.endTime,
             status: Status.INACTIVE,
             owner: owner
         });
@@ -372,6 +478,31 @@ contract CashbackRegistry is ICashbackRegistry {
             flatAmount,
             fundingWallet
         );
+    }
+
+    /// @notice Retune a campaign's budget dials or validity window.
+    ///         Cannot resurrect an ended campaign or widen it backwards past
+    ///         its original start.
+    function setBudget(
+        bytes32 campaignId,
+        Budget calldata budget
+    ) external onlyCampaignOwner(campaignId) {
+        Campaign storage c = _campaigns[campaignId];
+        if (c.status == Status.ENDED) revert CampaignEnded();
+        if (budget.endTime != 0 && budget.endTime <= budget.startTime) revert InvalidWindow();
+        // The start may move forward but never backward — otherwise a
+        // campaign could be widened to swallow history it was never
+        // eligible for, which is the F7 hole by another route.
+        if (budget.startTime != 0 && budget.startTime < c.startTime) revert InvalidWindow();
+
+        c.maxRewardPerOrder = budget.maxRewardPerOrder;
+        c.dailyBudget = budget.dailyBudget;
+        c.totalBudget = budget.totalBudget;
+        c.dailyPerUser = budget.dailyPerUser;
+        if (budget.startTime != 0) c.startTime = budget.startTime;
+        c.endTime = budget.endTime;
+
+        emit CampaignBudgetChanged(campaignId);
     }
 
     /// @notice Start (or resume) a campaign, claiming the lookup slot for its
@@ -407,8 +538,22 @@ contract CashbackRegistry is ICashbackRegistry {
     }
 
     /// @notice Close a campaign permanently. Terminal.
-    function end(bytes32 campaignId) external onlyCampaignOwner(campaignId) {
+    ///
+    ///         AUDIT F10: a RETIRED campaign (one whose integrator changed
+    ///         hands) is deliberately excluded from `onlyCampaignOwner`, so
+    ///         it used to be closeable by nobody — it sat reading ACTIVE
+    ///         forever while its owner's stale token approval lingered. The
+    ///         address recorded as its creator can always close it, which
+    ///         is exactly who needs to know to revoke that approval.
+    function end(bytes32 campaignId) external {
         Campaign storage c = _campaigns[campaignId];
+        if (c.integrator == address(0)) revert UnknownCampaign();
+
+        bool isCurrentOwner = msg.sender == integratorOwner[c.integrator] &&
+            c.epoch == integratorEpoch[c.integrator];
+        bool isRecordedOwner = msg.sender == c.owner;
+        if (!isCurrentOwner && !isRecordedOwner) revert OnlyIntegratorOwner();
+
         if (c.status == Status.ENDED) revert InvalidStatus();
         Status previous = c.status;
         _releaseSlot(campaignId, c);
@@ -440,7 +585,7 @@ contract CashbackRegistry is ICashbackRegistry {
         if (fundingWallet == address(0)) revert InvalidAddress();
         Campaign storage c = _campaigns[campaignId];
         if (c.status == Status.ENDED) revert CampaignEnded();
-        _requireFundingControl(fundingWallet);
+        _requireFundingControl(fundingWallet, c.rewardToken);
 
         address previous = c.fundingWallet;
         c.fundingWallet = fundingWallet;
@@ -465,72 +610,95 @@ contract CashbackRegistry is ICashbackRegistry {
         uint256 orderId,
         address integrator,
         address user,
-        bytes32 orderType,
-        bytes32 currency,
         uint256 orderAmount
     ) public onlyAccruer returns (uint256 reward) {
         if (orderPaid[orderId]) return 0;
 
-        // TRUST BOUNDARY. Re-read the order from the Diamond and confirm it
-        // matches the report. `verifiedUser` is the Diamond's record of who
-        // the order belongs to — the reward goes there, never to the address
-        // the watcher supplied. `orderAmount` is USDC (6dp), so percentage
-        // rewards are a share of USDC bought, not of local fiat paid.
-        (bool ok, address verifiedUser) = _verifyOrder(orderId, integrator, user, orderAmount);
+        // TRUST BOUNDARY. Everything used below comes from the Diamond's own
+        // record: the recipient, the order type, the currency, and the
+        // placement time. The report only says WHICH order to look at.
+        (bool ok, VerifiedOrder memory v) = _verifyOrder(orderId, integrator, user, orderAmount);
         if (!ok) return 0;
 
-        bytes32 campaignId = _resolve(integrator, orderType, currency);
+        bytes32 campaignId = _resolve(integrator, v.orderType, v.currency);
         if (campaignId == bytes32(0)) return 0;
 
         Campaign storage c = _campaigns[campaignId];
         if (c.status != Status.ACTIVE) return 0;
 
         // A campaign created before the integrator changed hands is retired:
-        // its funding wallet belongs to the previous owner and must not be
-        // spent by the new one.
+        // its funding wallet belongs to the previous owner.
         if (c.epoch != integratorEpoch[c.integrator]) return 0;
 
-        // Funding authorisation is LIVE, not a one-time assertion. A wallet
-        // that revoked its authorisation stops paying immediately, even
-        // though the ERC-20 allowance may still be in place for other
-        // campaigns.
-        address funder = c.fundingWallet;
-        if (funder != c.owner && !fundingAuthorized[funder][c.owner]) return 0;
+        // AUDIT F7. Only orders placed inside the campaign's own window are
+        // eligible, so activating a campaign cannot retroactively pay months
+        // of history and `setRate` cannot re-price orders already placed.
+        if (v.placedAt < c.startTime) return 0;
+        if (c.endTime != 0 && v.placedAt > c.endTime) return 0;
 
-        reward = c.flatAmount > 0 ? c.flatAmount : (orderAmount * c.bps) / BPS_DENOMINATOR;
+        // Funding authorisation is LIVE, not a one-time assertion, and is
+        // scoped to this campaign's reward token (AUDIT F4).
+        address funder = c.fundingWallet;
+        if (funder != c.owner && !fundingAuthorized[funder][c.owner][c.rewardToken]) return 0;
+
+        // AUDIT F9. `orderAmount` is USDC (6dp) but the reward is paid in the
+        // reward token's own units. Without rescaling, 1% of a $1,000 order
+        // in an 18-decimal token pays 0.00000000001 tokens. `scaleNum/Den`
+        // are derived from the token's decimals at creation.
+        reward = c.flatAmount > 0
+            ? c.flatAmount
+            : (orderAmount * c.bps * c.scaleNum) / (BPS_DENOMINATOR * c.scaleDen);
+        if (c.maxRewardPerOrder != 0 && reward > c.maxRewardPerOrder) {
+            reward = c.maxRewardPerOrder;
+        }
         if (reward == 0) return 0;
 
-        // Mark before the transfer so a reentrant token cannot re-enter and
-        // collect twice for this order. Rolled back below if the transfer
-        // fails, leaving the order retryable.
+        // AUDIT F6. Budgets are enforced on-chain rather than left to
+        // "keep the allowance small". Clamp rather than reject, so a partly
+        // affordable reward still pays what the budget allows.
+        Stats storage st = stats[campaignId];
+        if (c.totalBudget != 0) {
+            uint256 leftTotal = c.totalBudget > st.totalPaid ? c.totalBudget - st.totalPaid : 0;
+            if (reward > leftTotal) reward = leftTotal;
+        }
+        uint256 today = block.timestamp / 1 days;
+        if (c.dailyBudget != 0) {
+            uint256 spentToday = campaignDaySpend[campaignId][today];
+            uint256 leftToday = c.dailyBudget > spentToday ? c.dailyBudget - spentToday : 0;
+            if (reward > leftToday) reward = leftToday;
+        }
+        if (c.dailyPerUser != 0) {
+            uint256 userToday = userDaySpend[campaignId][v.user][today];
+            uint256 leftUser = c.dailyPerUser > userToday ? c.dailyPerUser - userToday : 0;
+            if (reward > leftUser) reward = leftUser;
+        }
+        if (reward == 0) return 0;
+
+        // Mark before the transfer so a reentrant token cannot collect twice.
+        // Rolled back below if the transfer fails, leaving it retryable.
         orderPaid[orderId] = true;
 
-        // Pull from THIS campaign's funding wallet — never a shared pool, so
-        // one owner's campaign can never spend another's tokens. Wrapped so
-        // an empty wallet, a revoked approval, or a hostile token degrades to
-        // a logged skip rather than reverting the caller's whole batch.
-        try IERC20(c.rewardToken).transferFrom(c.fundingWallet, verifiedUser, reward) returns (
-            bool success
-        ) {
-            // Tokens that signal failure with a false return rather than a
-            // revert must be treated as failures too — otherwise the order
-            // would be marked paid while no tokens moved.
-            if (!success) {
-                orderPaid[orderId] = false;
-                emit PayFailed(campaignId, orderId, verifiedUser, reward);
-                return 0;
-            }
-        } catch {
+        // AUDIT F5. Gas-capped so a hostile reward token cannot burn the
+        // batch's remaining gas and starve every other row.
+        (bool callOk, bytes memory ret) = c.rewardToken.call{ gas: TOKEN_CALL_GAS }(
+            abi.encodeCall(IERC20.transferFrom, (funder, v.user, reward))
+        );
+        // Treat "returned false" and "returned nothing" as failure too: the
+        // first is the classic silent-failure ERC-20, the second means we
+        // cannot prove the tokens moved.
+        bool transferred = callOk && ret.length == 32 && abi.decode(ret, (bool));
+        if (!transferred) {
             orderPaid[orderId] = false;
-            emit PayFailed(campaignId, orderId, verifiedUser, reward);
+            emit PayFailed(campaignId, orderId, v.user, reward);
             return 0;
         }
 
-        Stats storage s = stats[campaignId];
-        s.totalPaid += reward;
-        s.orderCount += 1;
+        st.totalPaid += reward;
+        st.orderCount += 1;
+        campaignDaySpend[campaignId][today] += reward;
+        userDaySpend[campaignId][v.user][today] += reward;
 
-        emit Paid(campaignId, orderId, verifiedUser, c.rewardToken, reward);
+        emit Paid(campaignId, orderId, v.user, c.rewardToken, reward);
     }
 
     /**
@@ -544,7 +712,7 @@ contract CashbackRegistry is ICashbackRegistry {
             OrderReport calldata r = reports[i];
             // External self-call so each row gets its own revert boundary
             // (see the note on `onlyAccruer`).
-            try this.pay(r.orderId, r.integrator, r.user, r.orderType, r.currency, r.orderAmount) {
+            try this.pay(r.orderId, r.integrator, r.user, r.orderAmount) {
                 // Outcome is emitted by pay() as Paid / PayFailed.
             } catch {
                 // Row failed hard (unexpected); skip it and continue.
@@ -635,7 +803,12 @@ contract CashbackRegistry is ICashbackRegistry {
         if (campaignId == bytes32(0)) return (bytes32(0), 0);
         Campaign storage c = _campaigns[campaignId];
         if (c.status != Status.ACTIVE) return (campaignId, 0);
-        reward = c.flatAmount > 0 ? c.flatAmount : (orderAmount * c.bps) / BPS_DENOMINATOR;
+        reward = c.flatAmount > 0
+            ? c.flatAmount
+            : (orderAmount * c.bps * c.scaleNum) / (BPS_DENOMINATOR * c.scaleDen);
+        if (c.maxRewardPerOrder != 0 && reward > c.maxRewardPerOrder) {
+            reward = c.maxRewardPerOrder;
+        }
     }
 
     /// @notice The lookup key for a triple, so operators can inspect
@@ -715,23 +888,75 @@ contract CashbackRegistry is ICashbackRegistry {
         address integrator,
         address reportedUser,
         uint256 reportedAmount
-    ) internal view returns (bool ok, address verifiedUser) {
-        // `integrator` is not on the Diamond's order record; it comes from
-        // the B2BOrderPlaced event the watcher read. It only selects which
-        // campaign applies — it cannot redirect funds, because the recipient
-        // is taken from the verified order below.
-        if (integrator == address(0)) return (false, address(0));
+    ) internal view returns (bool ok, VerifiedOrder memory v) {
+        if (integrator == address(0)) return (false, v);
+
+        // AUDIT F1 (HIGH). Bind the order to the integrator being billed.
+        // Previously `integrator` was taken from the report and only checked
+        // non-zero, so whoever held the accruer key could point ANY completed
+        // order — including organic ones that never touched an integrator —
+        // at ANY campaign and drain that tenant's funding wallet. The
+        // Diamond is the authority on which integrator placed an order.
+        try IOrderFlow(diamond).getOrderIntegrator(orderId) returns (address bound) {
+            if (bound == address(0) || bound != integrator) return (false, v);
+        } catch {
+            return (false, v);
+        }
 
         try IOrderFlow(diamond).getOrdersById(orderId) returns (IOrderFlow.OrderView memory order) {
-            if (order.id != orderId) return (false, address(0));
-            if (order.status != STATUS_COMPLETED) return (false, address(0));
-            if (order.user == address(0)) return (false, address(0));
-            if (order.user != reportedUser) return (false, address(0));
-            if (order.amount != reportedAmount) return (false, address(0));
-            return (true, order.user);
+            if (order.id != orderId) return (false, v);
+            if (order.status != STATUS_COMPLETED) return (false, v);
+            if (order.user == address(0)) return (false, v);
+            if (order.user != reportedUser) return (false, v);
+            if (order.amount != reportedAmount) return (false, v);
+
+            // AUDIT F7 (MEDIUM). Campaigns are not retroactive: an order is
+            // only eligible for a campaign that was already running when the
+            // order was placed. Without this, activating a campaign today
+            // would pay every historical order for that integrator, and
+            // `setRate` would silently re-price orders placed under the old
+            // rate.
+            if (order.placedTimestamp == 0) return (false, v);
+
+            // AUDIT F3 (MEDIUM-HIGH). Derive the campaign selectors from the
+            // RECORD, not the report. They were reported values, so the same
+            // key that reports orders also chose which campaign paid — an
+            // INR BUY could be reported as a SELL to hit a higher promo row.
+            // Both fields are on the record we already read.
+            v.user = order.user;
+            v.orderType = _orderTypeLabel(order.orderType);
+            v.currency = order.currency;
+            v.placedAt = order.placedTimestamp;
+            return (true, v);
         } catch {
-            return (false, address(0));
+            return (false, v);
         }
+    }
+
+    /// @dev Diamond order types are a uint8 enum (0=BUY, 1=SELL, 2=PAY).
+    ///      An unrecognised value maps to bytes32(0), which is the ANY
+    ///      wildcard — so it can only ever match a deliberately-wildcard
+    ///      campaign, never be mislabelled as a BUY.
+    function _orderTypeLabel(uint8 orderType) internal pure returns (bytes32) {
+        if (orderType == 0) return ORDER_TYPE_BUY;
+        if (orderType == 1) return ORDER_TYPE_SELL;
+        if (orderType == 2) return ORDER_TYPE_PAY;
+        return ANY;
+    }
+
+    /// @dev Converts a 6-decimal USDC order amount into the reward token's
+    ///      units. A token that does not expose `decimals()` is treated as
+    ///      6dp (1:1), which is the conservative choice — it under-pays
+    ///      rather than over-pays if the assumption is wrong.
+    function _decimalScale(address token) internal view returns (uint256 num, uint256 den) {
+        uint8 dec = 6;
+        try IERC20Metadata(token).decimals() returns (uint8 d) {
+            dec = d;
+        } catch {
+            // keep 6
+        }
+        if (dec >= 6) return (10 ** (uint256(dec) - 6), 1);
+        return (1, 10 ** (6 - uint256(dec)));
     }
 
     /// @dev Exactly one of `bps` / `flatAmount` must be set, and BOTH rate
@@ -765,9 +990,9 @@ contract CashbackRegistry is ICashbackRegistry {
      *      can call. Authorisation is re-checked on every payout, so it is a
      *      live permission rather than a one-time assertion.
      */
-    function _requireFundingControl(address fundingWallet) internal view {
+    function _requireFundingControl(address fundingWallet, address token) internal view {
         if (fundingWallet == msg.sender) return;
-        if (fundingAuthorized[fundingWallet][msg.sender]) return;
+        if (fundingAuthorized[fundingWallet][msg.sender][token]) return;
         revert FundingWalletNotAuthorized();
     }
 

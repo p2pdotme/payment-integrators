@@ -1,4 +1,4 @@
-# Cashback Service
+# cashback
 
 Config-driven cashback for the P2P protocol.
 
@@ -7,172 +7,106 @@ Fill in five fields, a campaign goes live. Rewards are paid **instantly** to the
 **Multi-tenant.** Each integrator has an owner who runs cashback for it, funded from their own wallet. One owner can run many campaigns across many integrators. Nobody can touch anyone else's campaigns or spend anyone else's tokens.
 
 ```
-Integrator address · Order type · Currency · Cashback token · Cashback %
+Integrator address   ·   Order type   ·   Currency   ·   Cashback token   ·   Cashback %
 ```
-
-**Status:** 78 tests passing · 82.9% branch coverage · 0 lint errors · not yet deployed.
-
----
-
-## Contents
-
-- [How it works](#how-it-works)
-- [Why no integrator is modified](#why-no-integrator-is-modified)
-- [Why rewards are paid beside the payment](#why-rewards-are-paid-beside-the-payment)
-- [Roles](#roles)
-- [Trust model](#trust-model)
-- [Campaign lifecycle](#campaign-lifecycle)
-- [Campaign resolution](#campaign-resolution)
-- [Quick start](#quick-start)
-- [Design notes](#design-notes)
-- [Audit fixes](#audit-fixes)
-- [Notes for operators](#notes-for-operators)
 
 ---
 
 ## How it works
 
-Two pieces: one contract, and one off-chain service.
-
 ```
-                 ON-CHAIN — unchanged, we only read
-┌──────────────────────────────────────────────────────────────┐
-│  Protocol (Diamond)                                          │
-│    B2BOrderPlaced(orderId, integrator, user, amount)         │
-│    — emitted on EVERY order, for EVERY integrator            │
-│  Integrators — immutable, never touched                      │
-└──────────────────────────────────────────────────────────────┘
-                            │ read logs
-                            ▼
-                 ┌──────────────────────┐
-                 │ Watcher (off-chain)  │  tail · finality · batch
-                 └──────────────────────┘
-                            │ payBatch()
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│  CashbackRegistry     ← the only contract deployed           │
-│    campaigns · verify vs protocol · pay immediately          │
-└──────────────────────────────────────────────────────────────┘
-                            │ transferFrom(campaign wallet → user)
-                            ▼
-                 User's wallet — tokens arrive automatically
+Order completes on any integrator
+      ↓
+Protocol emits B2BOrderPlaced(orderId, integrator, user, amount)
+      ↓
+Watcher (off-chain) reports the completed order
+      ↓
+Registry verifies it against the Diamond
+      ↓
+Reward sent straight to the user's wallet — from that campaign's funding wallet
 ```
 
-### A single order, step by step
+**Why no integrator changes are needed.** `B2BOrderPlaced` is emitted by the Diamond's B2B gateway on every order, for every integrator — integrators never emit it themselves. It already carries everything the reward calculation needs, so existing (immutable) integrators are covered immediately and new ones the day they are whitelisted.
 
-```
-1. User completes a BUY — pays fiat off-chain, receives 12 USDC
+**Why rewards are paid beside the payment, not inside it.** Integrators settle order funds to four different destinations — a user proxy, the user's own wallet, the integrator itself, or time-locked merchant custody — and one of them pays a merchant rather than a buyer. There is no common injection point, and for merchant custody, crediting settlement would break that contract's solvency accounting. Paying from a separate wallet after settlement completes works uniformly and can never disturb a payment.
 
-2. Protocol publishes:  orderId · integrator · user · amount
-
-3. Watcher sees it (~1 min: it stays 30 confirmations behind the head
-   so a chain reorg can never undo a payout that already happened)
-
-4. Registry VERIFIES against the Diamond:
-      · does the order exist?
-      · is it COMPLETED?
-      · do the reported user and amount match the record?
-
-5. Registry RESOLVES the campaign:
-      integrator + BUY + INR  →  1%
-
-6. Reward = 1% of 12 USDC = 0.12 tokens
-
-7. transferFrom(that campaign's funding wallet → the user's wallet)
-```
-
-The user does nothing — no claim, no button, no gas.
-
-**Reward basis is USDC, not fiat.** `order.amount` on the Diamond is the USDC figure (6dp); `fiatAmount` is a separate field the registry never reads. A percentage is always a share of USDC bought, never of rupees or reais paid.
-
-### Deployment count
-
-| Thing | How many times |
-|---|---|
-| Deploy the registry | **once, total** |
-| Run the watcher | **once, total** |
-| Assign an integrator owner | once per integrator |
-| Create a campaign | as often as you like — no deploy |
-| Change a rate | anytime, one call |
-
-Three integrators or three hundred: still one contract and one watcher.
-
----
-
-## Why no integrator is modified
-
-`B2BOrderPlaced` is emitted by the Diamond's B2B gateway on every order, for every integrator — **integrators never emit it themselves**. It already carries `(integrator, user, amount)`, which is everything the reward calculation needs.
-
-So the watcher reads the protocol's own records instead of asking integrators for anything:
-
-- **Existing integrators** — covered immediately. They are immutable by policy (`proxyImpl` is set-once on the Diamond; upgrade proxies are explicitly disallowed), so anything requiring a code change inside them would be a non-starter.
-- **Future integrators** — covered automatically the day they are whitelisted, with zero cashback code inside them.
-
-The watcher queries with **no integrator filter**, so it already sees integrators that do not exist yet. Filtering happens in the registry's campaign table — config, not code. That is why onboarding a new integrator is one transaction rather than a redeploy.
-
----
-
-## Why rewards are paid beside the payment
-
-Integrators settle order funds to four different destinations, and one pays a merchant rather than a buyer:
-
-| Integrator type | Where order money settles | Reward recipient | Inject into settlement? |
-|---|---|---|---|
-| Ticket / product purchase | user's proxy, then spent on the product | buyer | only with new code |
-| Marketplace purchase | user's proxy, then to the seller | buyer | only with new code |
-| Direct token purchase | straight to the user's own wallet | buyer | **no** — nothing held |
-| Off-chain service purchase | to the integrator, then its treasury | buyer | **no** — user holds nothing |
-| Merchant terminal | custody, time-locked, strict accounting | **the shop** | **no** — breaks solvency |
-
-Three are structurally impossible, not merely inconvenient. The merchant-terminal case is the clearest: merchant funds sit in time-locked buckets under `usdc.balanceOf(this) >= totalOwed`. Crediting a bucket raises `totalOwed` with no matching USDC arriving (breaks solvency); crediting without touching it corrupts the bucket accounting. Either way is wrong.
-
-Paying from a separate funding wallet **after** settlement completes works uniformly for all of them, needs no integrator cooperation, and can never interfere with a payment.
-
----
-
-## Roles
+## Who can do what
 
 | Role | Can | Cannot |
 |---|---|---|
-| **Registry admin** | assign integrator owners, manage watchers, `emergencyStop` a campaign | create campaigns, change a rate, spend anyone's tokens |
+| **Registry admin** | assign integrator owners, manage watchers, emergency-stop a campaign | create campaigns, change a rate, spend anyone's tokens |
 | **Integrator owner** | create / activate / pause / retune / end campaigns for **their** integrator, funded from **their** wallet | touch another integrator's campaigns |
-| **Watcher** | report completed orders | anything else — every report is re-verified on-chain |
+| **Watcher** | say WHICH order to look at | choose who is billed, which campaign pays, who receives, or how much |
 
-`emergencyStop` can only **pause or end**. Stopping something abusive is a safety power; changing where an owner's money goes is not.
-
-### Onboarding an integrator
-
-One transaction from an admin:
-
-```solidity
-setIntegratorOwner(integratorAddress, ownerWallet)
-```
-
-After that the owner is fully self-service:
-
-```solidity
-token.approve(registry, amount)     // their tokens, their approval
-createCampaign(...)                 // starts as a draft
-activate(campaignId)                // live
-```
-
----
+An admin's `emergencyStop` can only **pause or end**. Stopping something abusive is a safety power; changing where an owner's money goes is not.
 
 ## Trust model
 
-The watcher is an off-chain service, and it is **not trusted**. Every report is re-read from the Diamond via `getOrdersById` and must match on order existence, COMPLETED status, user, and amount. The reward recipient is taken from the Diamond's record, never from the report.
+The watcher is **not trusted**. A report names an order id and nothing that matters: the registry re-reads the order from the Diamond and takes the **billed integrator**, the **recipient**, the **order type**, the **currency** and the **placement time** from that record. The report is a pointer, not a claim.
 
 | If the watcher… | Result |
 |---|---|
-| reports a fake order | verification fails → nothing paid |
+| reports a fake order | verification fails, nothing paid |
 | inflates an amount | amount read from the Diamond, not the report |
 | reports one order twice | `orderPaid` makes it a no-op |
 | names the wrong user | recipient read from the Diamond |
+| **bills the wrong tenant** | `getOrderIntegrator` binds the order to the integrator that placed it |
+| **claims a different order type or currency** | both read from the record, so it cannot pick a richer campaign |
 | crashes or stops | resumes from its cursor and backfills — **delayed, never lost** |
 
-Its only real power is **omission** — it can delay reporting, not steal, inflate, or misdirect. Anyone can run a second watcher to backfill what a first one missed.
+Its only real power is omission. Anyone can run a second watcher to backfill.
 
----
+## Layout
+
+```
+contracts/cashback/CashbackRegistry.sol    the only contract deployed
+contracts/interfaces/                      ICashbackRegistry, IOrderFlow
+contracts/test/                            mocks (USDC, order source, hostile token)
+test/cashback-registry.test.ts             104 tests
+scripts/deploy-cashback.ts                 deploy (admin)
+scripts/set-integrator-owner.ts            assign an integrator's owner (admin)
+scripts/create-campaign.ts                 the five-field form, as a CLI (owner)
+services/watcher/watcher.ts                the off-chain daemon
+```
+
+## Quick start
+
+```bash
+npm install
+npx hardhat compile
+npx hardhat test
+```
+
+### Deploy
+
+```bash
+DIAMOND_ADDRESS=0x… FUNDING_WALLET=0x… \
+  npx hardhat run scripts/deploy-cashback.ts --network baseSepolia
+```
+
+Then, once:
+
+1. From the funding wallet — `token.approve(<registry>, <allowance>)`
+2. `registry.setAccruer(<watcherAddress>, true)`
+
+### Create a campaign
+
+```bash
+REGISTRY_ADDRESS=0x… \
+INTEGRATOR=0x… \
+REWARD_TOKEN=0x… \
+ORDER_TYPE=BUY CURRENCY=INR RATE_BPS=100 \
+  npx hardhat run scripts/create-campaign.ts --network baseSepolia
+```
+
+Campaigns start as a **draft**. `activate(campaignId)` is a deliberate second step so a half-configured campaign can never pay out.
+
+### Run the watcher
+
+```bash
+RPC_URL=… REGISTRY_ADDRESS=0x… DIAMOND_ADDRESS=0x… WATCHER_PRIVATE_KEY=0x… \
+  npx ts-node services/watcher/watcher.ts
+```
 
 ## Campaign lifecycle
 
@@ -183,25 +117,15 @@ Its only real power is **omission** — it can delay reporting, not steal, infla
 | `PAUSED` | no | stopped, resumable; frees the lookup slot |
 | `ENDED` | no | terminal, cannot be reactivated |
 
-A campaign starts as a **draft**. `activate` is a deliberate second step so a half-configured campaign can never pay out.
-
-The rate is changeable while running via `setRate` — the core experiment knob:
-
-```
-Week 1   activate at 1%
-Week 2   pause → setRate(200) → activate      // 2%
-Week 3   compare order volume
-Week 4   keep, retune, or end
-```
+The rate is changeable while running — `setRate` — which is the core experiment knob.
 
 **Kill switches, fastest first:**
 
-1. **Revoke the funding wallet's token approval** — instant, halts that wallet's campaigns, no registry transaction
+0. **`setAccruer(watcher, false)`** — one transaction, stops every payout everywhere
+1. **Revoke the funding wallet's approval** — instant, halts that wallet's campaigns, no registry transaction
 2. `pause(campaignId)` — the owner stops one campaign
 3. `emergencyStop(campaignId, permanent)` — a registry admin stops an abusive campaign
-4. Funding wallet runs empty — payouts emit `PayFailed` and stop on their own, retryable after top-up
-
----
+4. Funding wallet runs empty — payouts log `PayFailed` and stop on their own
 
 ## Campaign resolution
 
@@ -213,105 +137,66 @@ integrator + BUY + INR   →   integrator + BUY + ANY   →   integrator + ANY +
 
 `ANY` is `bytes32(0)`. One row can cover a whole integrator, with a single cell overridden to run an experiment. At most one campaign is active per triple, so resolution is never ambiguous.
 
-Each tier is checked for **payability** before being resolved to, so a retired campaign cannot shadow a healthy broader one.
-
----
-
-## Quick start
-
-```bash
-cd cashback
-npm install
-npx hardhat compile
-npx hardhat test
-```
-
-### Deploy
-
-```bash
-DIAMOND_ADDRESS=0x… \
-  npx hardhat run scripts/deploy-cashback.ts --network baseSepolia
-```
-
-Then per integrator (admin):
-
-```bash
-REGISTRY_ADDRESS=0x… INTEGRATOR=0x… OWNER=0x… \
-  npx hardhat run scripts/set-integrator-owner.ts --network baseSepolia
-```
-
-### Create a campaign (integrator owner)
-
-```bash
-REGISTRY_ADDRESS=0x… \
-INTEGRATOR=0x… \
-REWARD_TOKEN=0x… \
-ORDER_TYPE=BUY CURRENCY=INR RATE_BPS=100 \
-  npx hardhat run scripts/create-campaign.ts --network baseSepolia
-```
-
-### Run the watcher
-
-```bash
-RPC_URL=… REGISTRY_ADDRESS=0x… DIAMOND_ADDRESS=0x… WATCHER_PRIVATE_KEY=0x… \
-  npx ts-node services/watcher/watcher.ts
-```
-
-### Layout
-
-```
-contracts/cashback/CashbackRegistry.sol    the only contract deployed
-contracts/interfaces/                      ICashbackRegistry, IOrderFlow
-contracts/test/                            mocks (USDC, order source, hostile token)
-test/cashback-registry.test.ts             78 tests
-scripts/deploy-cashback.ts                 deploy (admin)
-scripts/set-integrator-owner.ts            assign an integrator's owner (admin)
-scripts/create-campaign.ts                 the five-field form, as a CLI (owner)
-services/watcher/watcher.ts                the off-chain daemon
-```
-
----
-
 ## Design notes
 
-- **No `owed` ledger, no `claim()`.** Rewards are pushed on verification, so there is no balance to track and nothing for a user to collect later.
-- **`pay` returns 0 instead of reverting** when an order does not qualify. Reverting would let one bad row block an entire batch — and a failure inside cashback must never surface as something the protocol has to handle.
+- **No `owed` ledger, no `claim()`.** Rewards are pushed on verification, so there is no balance to track.
+- **`pay` returns 0 instead of reverting** when an order does not qualify. Reverting would let one bad row block an entire batch.
 - **`orderPaid` is set before the transfer** and rolled back if it fails — so a reentrant token cannot collect twice, and a failed payout stays retryable.
 - **Both ERC-20 failure modes are handled**: a reverting `transferFrom` and one that returns `false` without reverting. The second is the subtle one — ignoring it would mark an order paid while no tokens moved.
-- **Both rate forms are bounded.** `MAX_BPS` (20%) and `MAX_FLAT_AMOUNT`, neither with a setter. Nobody at any level can configure an unbounded payout.
+- **Both rate forms are bounded, with no setter.** `MAX_BPS` is 5% and `MAX_FLAT_AMOUNT` is 1e21; campaigns add per-order, per-day, per-user and lifetime budgets on top. A compromised key at any level cannot configure an unbounded payout.
 - **The registry never custodies reward tokens.** They stay in each campaign's own funding wallet until a payout pulls them.
-- **Funding wallets are opt-in, not inferred.** A wallet must call `authorizeCampaignFunder` itself, and that authorisation is re-checked on every payout — so revoking stops payouts immediately.
-- **Ownership is registered, not read from the integrator.** Integrators do not share an ownership interface — some expose `owner()`, others are multi-owner with `isOwner()` and a super-admin. A registered mapping works uniformly and cannot be spoofed by a look-alike contract.
-- **Percentage rewards are a share of USDC bought**, not of local fiat paid.
+- **Funding wallets opt in explicitly, per token.** To fund a campaign from a wallet you do not control, that wallet must call `authorizeCampaignFunder(you, token, true)` itself — an ERC-20 allowance is not proof of control, since it names the wrong spender and is granted for unrelated reasons all the time. Authorisation is re-checked on every payout, so revoking stops payouts at once.
+- **Ownership is registered, not read from the integrator.** Integrators do not share an ownership interface — some expose `owner()`, others are multi-owner with `isOwner()` and a super-admin. A registered mapping works uniformly and cannot be spoofed.
+- **Percentage rewards are a share of USDC bought**, not of local fiat paid — `order.amount` on the Diamond is the USDC figure.
 
----
+## PR #62 review fixes
 
-## Audit fixes
+An independent review (Aash, 2026-08-13) compiled the branch, wrote six
+proof-of-concept exploits and verified behaviour against the live Base
+mainnet Diamond. All twelve findings are addressed, each with a regression
+test named after the finding.
 
-An adversarial audit of the multi-tenant logic found four issues, all fixed with a named regression test each.
+| # | Severity | Finding | Fix |
+|---|---|---|---|
+| F1 | HIGH | `pay()` never checked that an order belonged to the integrator being billed, so the accruer key could point any completed order — even an organic one — at any campaign and drain that tenant's wallet | `_verifyOrder` now calls the Diamond's `getOrderIntegrator` (selector `0xc0bc0d14`, live on mainnet and Sepolia) and requires an exact match |
+| F2 | HIGH | The watcher checked each order once ~60 s after placement then advanced past it forever. Real orders complete at a median of 122 s — **0 of 13** sampled completions would have been caught | The cursor now tracks *discovery* only; every order enters a persisted pending set and is re-checked each poll until it completes, cancels, or ages out past the dispute window |
+| F3 | MED-HIGH | `orderType` and `currency` came from the report, so the same key that reports orders chose which campaign paid | Both are read from the order record |
+| F4 | MEDIUM | Funding authorisation was a blanket grant — sponsoring a points campaign also authorised a USDC one from the same wallet | Authorisation is keyed by token and re-checked on every payout |
+| F5 | MEDIUM | A reward token that burns all forwarded gas took down the whole batch via the 63/64 rule | The token call is gas-capped (`TOKEN_CALL_GAS`) |
+| F6 | MEDIUM | `MAX_BPS` was 20% and `MAX_FLAT_AMOUNT` (1e24) was no bound at all for a 6dp token; no per-order, per-day, per-user or lifetime budgets | `MAX_BPS` is 5%, `MAX_FLAT_AMOUNT` is 1e21, and campaigns carry `maxRewardPerOrder`, `dailyBudget`, `totalBudget` and `dailyPerUser`, all enforced on-chain |
+| F7 | MEDIUM | Campaigns had no validity window, so activating one paid every historical order and `setRate` re-priced orders already placed | Campaigns carry `startTime`/`endTime` (start defaults to creation) and eligibility is judged on the order's `placedTimestamp` |
+| F8 | MEDIUM | SELL rewards land on a proxy — trapped if USDC, unattributable if the integrator's system proxy | SELL and PAY campaigns are rejected at creation |
+| F9 | LOW | Rewards were computed in 6dp USDC units but paid in the reward token's units, so an 18dp token paid dust | A per-campaign scale factor is derived from the token's `decimals()`, defaulting to 6dp if absent |
+| F10 | LOW | A retired campaign could be closed by nobody and sat reading ACTIVE forever | The recorded owner can always `end` it, so they know to revoke their approval |
+| F11 | LOW | An integrator could never be un-assigned, and the last admin could remove themselves | `unassignIntegrator` (bumps the epoch) plus a last-admin guard |
+| F12 | PROCESS | `cashback/` is a nested project, so root CI never compiled, linted, tested or Slither-scanned it | `.github/workflows/cashback.yml` runs compile, test, coverage gate, solhint, prettier and Slither |
 
-**Critical — a new integrator owner could drain the previous owner's wallet.** `onlyCampaignOwner` read the owner mapping live, but `setRate` never re-checked the funding wallet, and `flatAmount` had no ceiling. After a handover, the incoming owner could set a huge flat reward and drain a wallet they never controlled — and since admins assign owners, an admin could grant themselves that power.
-
-*Fixed* with an ownership **epoch**: a handover bumps it, retiring every campaign from an earlier epoch (unpayable and unoperable, even by the new owner). O(1), so a handover cannot run out of gas over a large portfolio. Plus `MAX_FLAT_AMOUNT`.
-
-**High — a stray ERC-20 allowance counted as proof of wallet control.** The old check accepted `allowance(fundingWallet, msg.sender) > 0`. It tested the wrong spender (payouts pull as the registry, not the caller), 1 wei of unrelated dust passed it, and it was never re-checked. A third party's treasury that had ever approved you could be attached as your campaign's funding wallet.
-
-*Fixed* with explicit opt-in via `authorizeCampaignFunder`, callable only by the wallet itself and re-verified on every payout.
-
-**High — a retired campaign permanently shadowed a healthy one.** Resolution stopped at the first *occupied* slot regardless of status, so a stale narrow campaign blocked the integrator-wide fallback forever.
-
-*Fixed* — each tier is checked for payability before resolving to it. Fixing this surfaced a follow-on: a retired campaign still held its lookup slot, bricking it for the new owner. Also fixed.
-
-**Medium — enumeration accumulated duplicates** across repeated handovers. *Fixed* with a seen-set.
-
-Verified as safe, not bugs: the `payBatch` self-call grants no privilege escalation (the only path producing `msg.sender == address(this)` is `payBatch`, which itself requires accruer); and the replay accounting has no path that pays without setting `orderPaid`, or sets it without moving tokens.
-
----
+Confirmed sound in the same review and unchanged: order verification against
+the Diamond, the replay guard, both ERC-20 failure modes, ownership epochs,
+fund isolation, narrow admin powers, and the fact that COMPLETED is terminal
+on-chain so a push can never be paid against an order that later un-completes.
 
 ## Notes for operators
 
-- **Merchant terminals pay the shop, not the customer.** Where the merchant's wallet places the order (as in payqr), the merchant is `order.user` — the customer pays fiat off-chain and has no wallet at all, so there is no customer address on-chain to pay. This is a merchant rebate.
-- **Self-dealing on merchant terminals.** A merchant is both payer and reward recipient, so repeated self-sales could farm cashback cheaply. Mitigate off-chain with a per-merchant daily cap or a volume threshold before running a live campaign.
+- **Merchant terminals pay the shop, not the customer.** Where the merchant's wallet places the order (as in payqr), the merchant is `order.user` — the customer pays fiat off-chain and has no wallet. This is a merchant rebate.
+- **Self-dealing on merchant terminals.** A merchant is both payer and recipient, so repeated self-sales could farm cashback cheaply. Mitigate off-chain with a per-merchant daily cap or a volume threshold before running a live campaign.
 - **Integrator upgrades need a new campaign row.** Integrators are immutable and get replaced rather than upgraded; the old campaign stops earning by itself once orders stop flowing through the old address.
-- **USDT cannot be used as a reward token.** It returns no data from `transferFrom`, so the decode fails and the payout lands in the catch branch — fail-closed, but it will never pay. Any standard ERC-20 is fine.
-- **Reward token choice is still open.** `UserProxy.sweepERC20` restricts only the integrator's own `usdc()`; every other token is unrestricted. A points/partner token therefore carries no proxy complications. Paying USDC into a user wallet reaches the same end state the restriction exists to control (fiat → USDC → wallet), so it is worth confirming with whoever owns the fraud model before a USDC-denominated campaign.
+
+## Dashboard surface
+
+Built for a UI over many campaigns:
+
+| Call | Returns |
+|---|---|
+| `campaignsOfOwner(owner)` | every campaign that owner runs, across all their integrators |
+| `campaignsOfIntegrator(integrator)` | that integrator's campaigns |
+| `integratorsOfOwner(owner)` | integrators assigned to an owner |
+| `campaignView(id)` | config + totals + **spendable** in one call |
+| `campaignsPaged(offset, limit)` | paginated global list for an admin view |
+| `stats(id)` | total paid, orders rewarded |
+
+`spendable` is `min(wallet balance, allowance)` — zero means the next payout will fail even though the campaign reads ACTIVE. It is the most useful health signal in a UI.
+
+## Status
+
+Contract, tests, scripts and watcher are complete. **70 tests passing; 82.5% branch / 98% line coverage** on the registry; 0 lint errors. Not yet deployed.

@@ -38,8 +38,32 @@ interface ICashbackRegistry {
         uint16 bps; // 100 = 1%  (XOR flatAmount)
         uint256 flatAmount; // fixed reward (XOR bps)
         address fundingWallet; // pays for THIS campaign — never anyone else's
+        // Scales a 6dp USDC order amount into the reward token's units.
+        uint256 scaleNum;
+        uint256 scaleDen;
+        // Budgets (0 = unlimited). Enforced on-chain rather than left to
+        // operator discipline over the ERC-20 allowance.
+        uint256 maxRewardPerOrder;
+        uint256 dailyBudget;
+        uint256 totalBudget;
+        uint256 dailyPerUser;
+        // Validity window. Only orders PLACED inside it are eligible, so a
+        // campaign can never retroactively pay historical orders.
+        uint64 startTime;
+        uint64 endTime; // 0 = open-ended
         Status status;
         address owner; // integrator owner at creation time
+    }
+
+    /// @notice The budget dials, grouped so `createCampaign` stays readable
+    ///         and callers cannot transpose them positionally.
+    struct Budget {
+        uint256 maxRewardPerOrder;
+        uint256 dailyBudget;
+        uint256 totalBudget;
+        uint256 dailyPerUser;
+        uint64 startTime;
+        uint64 endTime;
     }
 
     /// @notice Running totals per campaign, for dashboards.
@@ -53,8 +77,6 @@ interface ICashbackRegistry {
         uint256 orderId;
         address integrator;
         address user;
-        bytes32 orderType;
-        bytes32 currency;
         uint256 orderAmount;
     }
 
@@ -69,7 +91,14 @@ interface ICashbackRegistry {
     event IntegratorEpochBumped(address indexed integrator, uint256 epoch);
     /// @notice A wallet authorised (or revoked) a spender to attach it as a
     ///         campaign funding wallet. Only the wallet itself can call this.
-    event FundingAuthorizationSet(address indexed wallet, address indexed spender, bool allowed);
+    event FundingAuthorizationSet(
+        address indexed wallet,
+        address indexed spender,
+        address indexed token,
+        bool allowed
+    );
+    /// @notice A campaign's budget dials or validity window were changed.
+    event CampaignBudgetChanged(bytes32 indexed campaignId);
 
     event CampaignCreated(
         bytes32 indexed campaignId,
@@ -117,8 +146,6 @@ interface ICashbackRegistry {
         uint256 orderId,
         address integrator,
         address user,
-        bytes32 orderType,
-        bytes32 currency,
         uint256 orderAmount
     ) external returns (uint256 reward);
 

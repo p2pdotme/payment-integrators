@@ -2,18 +2,30 @@
  * Cashback watcher.
  *
  * Tails the Diamond's `B2BOrderPlaced` event — emitted by the protocol's B2B
- * gateway on EVERY order for EVERY integrator — and reports completed orders
- * to the CashbackRegistry, which pays the reward.
+ * gateway on EVERY order for EVERY integrator — and reports COMPLETED orders
+ * to the CashbackRegistry, which verifies and pays them.
  *
  * This is why no integrator contract is ever modified: the protocol already
  * publishes (integrator, user, amount) centrally, so a new integrator is
  * covered the day it is whitelisted with no cashback code inside it.
  *
- * The watcher is NOT a trusted component. The registry independently re-reads
- * every order from the Diamond and pays the address of record, so a
- * compromised watcher cannot invent orders, inflate amounts, or redirect
- * funds. Its only real power is omission — delaying reports — and anyone can
- * run a second watcher to backfill.
+ * WHY THERE IS A PENDING SET (audit F2). `B2BOrderPlaced` fires at
+ * PLACEMENT; completion happens fiat-time later. Measured on Base mainnet,
+ * orders complete at a median of ~122 s, with a long tail — and a dispute
+ * settlement can complete one days later. An earlier version of this loop
+ * checked each order once, ~60 s after placement, then advanced the cursor
+ * past it forever: 0 of 13 completed orders in a real sample would have been
+ * caught. The programme would have run, emitted no errors, and paid nothing.
+ *
+ * So the cursor now tracks DISCOVERY only. Every order found is added to a
+ * pending set and re-checked on each poll until it completes (paid), is
+ * cancelled, or ages out past the dispute window.
+ *
+ * The watcher is NOT a trusted component. The registry independently
+ * re-reads every order from the Diamond, confirms the integrator binding,
+ * and pays the address of record — so a compromised watcher cannot invent
+ * orders, inflate amounts, or redirect funds. Its only real power is
+ * omission, and anyone can run a second watcher to backfill.
  *
  * Run:
  *   RPC_URL=… REGISTRY_ADDRESS=0x… DIAMOND_ADDRESS=0x… \
@@ -41,10 +53,24 @@ const POLL_MS = Number(process.env.POLL_MS || 5000);
 /** First block to scan on a cold start (the registry's deploy block). */
 const START_BLOCK = Number(process.env.START_BLOCK || 0);
 
-const CURSOR_FILE = process.env.CURSOR_FILE || path.join(__dirname, ".cursor.json");
+/**
+ * How long a placed order stays in the pending set before being given up on.
+ * Must comfortably exceed the protocol's dispute window — a dispute
+ * settlement can move an order to COMPLETED days after placement. Default 14
+ * days; cheap to hold, expensive to under-set (a dropped order is cashback
+ * silently never paid).
+ */
+const PENDING_TTL_MS = Number(process.env.PENDING_TTL_MS || 14 * 24 * 60 * 60 * 1000);
 
-/** Diamond order status — only COMPLETED orders earn cashback. */
+/** Cap on how many pending orders are re-checked per poll, so a large
+ *  backlog degrades gracefully instead of timing out the RPC. */
+const RECHECK_PER_POLL = Number(process.env.RECHECK_PER_POLL || 400);
+
+const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, ".watcher-state.json");
+
+/** Diamond order statuses. */
 const COMPLETED = 3;
+const CANCELLED = 4;
 
 // ─── ABIs (minimal) ─────────────────────────────────────────────────
 
@@ -54,28 +80,47 @@ const DIAMOND_ABI = [
 ];
 
 const REGISTRY_ABI = [
-  "function payBatch((uint256 orderId, address integrator, address user, bytes32 orderType, bytes32 currency, uint256 orderAmount)[] reports)",
+  "function payBatch((uint256 orderId, address integrator, address user, uint256 orderAmount)[] reports)",
   "function orderPaid(uint256 orderId) view returns (bool)",
 ];
 
-const ORDER_TYPE_LABELS = ["BUY", "SELL", "PAY"] as const;
+// ─── State ──────────────────────────────────────────────────────────
+//
+// Crash-safety has two layers: this file (a cheap resume point) and the
+// registry's on-chain `orderPaid` marker (the authoritative guard). Even a
+// lost or corrupted state file cannot cause a double payout — at worst the
+// watcher re-reports orders the registry then no-ops.
 
-// ─── Cursor persistence ─────────────────────────────────────────────
-// Crash-safety comes from two places: this cursor (cheap resume point) and
-// the registry's on-chain `orderPaid` marker (the authoritative guard). Even
-// a corrupted or reset cursor cannot cause a double payout.
+type Pending = {
+  integrator: string;
+  user: string;
+  amount: string; // bigint as decimal string
+  firstSeen: number; // ms epoch, for the TTL
+};
 
-function readCursor(fallback: number): number {
+type State = {
+  lastProcessedBlock: number;
+  pending: Record<string, Pending>; // orderId -> details
+};
+
+function readState(fallbackBlock: number): State {
   try {
-    const raw = JSON.parse(fs.readFileSync(CURSOR_FILE, "utf8"));
-    return typeof raw.lastProcessedBlock === "number" ? raw.lastProcessedBlock : fallback;
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    return {
+      lastProcessedBlock:
+        typeof raw.lastProcessedBlock === "number" ? raw.lastProcessedBlock : fallbackBlock,
+      pending: raw.pending && typeof raw.pending === "object" ? raw.pending : {},
+    };
   } catch {
-    return fallback;
+    return { lastProcessedBlock: fallbackBlock, pending: {} };
   }
 }
 
-function writeCursor(block: number): void {
-  fs.writeFileSync(CURSOR_FILE, JSON.stringify({ lastProcessedBlock: block }, null, 2));
+function writeState(state: State): void {
+  // Write-then-rename so a crash mid-write cannot leave a truncated file.
+  const tmp = `${STATE_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, STATE_FILE);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -98,78 +143,123 @@ async function main() {
   console.log(`watcher up  · registry ${REGISTRY_ADDRESS}`);
   console.log(`            · diamond  ${DIAMOND_ADDRESS}`);
   console.log(`            · signer   ${await signer.getAddress()}`);
-  console.log(`            · ${CONFIRMATIONS} confirmations, batches of ${BATCH_SIZE}`);
+  console.log(
+    `            · ${CONFIRMATIONS} confirmations · batches of ${BATCH_SIZE} · ` +
+      `pending TTL ${Math.round(PENDING_TTL_MS / 3_600_000)}h`
+  );
+
+  const head0 = await provider.getBlockNumber();
+  const state = readState(START_BLOCK || head0);
+  console.log(
+    `            · resuming at block ${state.lastProcessedBlock} ` +
+      `with ${Object.keys(state.pending).length} pending`
+  );
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
       const head = await provider.getBlockNumber();
       const safeHead = head - CONFIRMATIONS;
-      const from = readCursor(START_BLOCK || head) + 1;
 
-      if (safeHead < from) {
-        await sleep(POLL_MS);
-        continue;
+      // ── 1. DISCOVER: add newly placed orders to the pending set ──
+      const from = state.lastProcessedBlock + 1;
+      if (safeHead >= from) {
+        const to = Math.min(safeHead, from + BLOCK_SPAN - 1);
+        const logs = await diamond.queryFilter(diamond.filters.B2BOrderPlaced(), from, to);
+
+        for (const log of logs) {
+          const { orderId, integrator, user, amount } = (log as ethers.EventLog).args;
+          const key = orderId.toString();
+          if (!state.pending[key]) {
+            state.pending[key] = {
+              integrator,
+              user,
+              amount: amount.toString(),
+              firstSeen: Date.now(),
+            };
+          }
+        }
+
+        if (logs.length > 0) {
+          console.log(`blocks ${from}–${to}: discovered ${logs.length}`);
+        }
+        state.lastProcessedBlock = to;
       }
 
-      // Cap the span so a long backfill is chunked rather than rejected.
-      const to = Math.min(safeHead, from + BLOCK_SPAN - 1);
+      // ── 2. RE-CHECK: has anything pending completed since last poll? ──
+      const now = Date.now();
+      const keys = Object.keys(state.pending).slice(0, RECHECK_PER_POLL);
+      const ready: { orderId: bigint; integrator: string; user: string; orderAmount: bigint }[] =
+        [];
 
-      const logs = await diamond.queryFilter(diamond.filters.B2BOrderPlaced(), from, to);
+      for (const key of keys) {
+        const p = state.pending[key];
 
-      const reports: {
-        orderId: bigint;
-        integrator: string;
-        user: string;
-        orderType: string;
-        currency: string;
-        orderAmount: bigint;
-      }[] = [];
+        // Age out anything past the dispute window so the set stays bounded.
+        if (now - p.firstSeen > PENDING_TTL_MS) {
+          console.log(`order ${key}: aged out of pending set (TTL)`);
+          delete state.pending[key];
+          continue;
+        }
 
-      for (const log of logs) {
-        const { orderId, integrator, user, amount } = (log as ethers.EventLog).args;
-
-        // The event fires at placement; cashback is only for orders that
-        // actually settled. Read the current state before reporting.
         let order;
         try {
-          order = await diamond.getOrdersById(orderId);
+          order = await diamond.getOrdersById(key);
         } catch {
-          continue; // unreadable — leave it for a later pass
+          continue; // transient RPC failure — keep it pending, retry next poll
         }
-        if (Number(order.status) !== COMPLETED) continue;
 
-        // Cheap dedupe. The registry enforces this authoritatively anyway;
-        // skipping here just avoids wasting calldata on already-paid orders.
-        if (await registry.orderPaid(orderId)) continue;
+        const status = Number(order.status);
 
-        reports.push({
-          orderId,
-          integrator,
-          user,
-          orderType: ethers.encodeBytes32String(
-            ORDER_TYPE_LABELS[Number(order.orderType)] ?? "BUY"
-          ),
-          currency: order.currency,
-          orderAmount: amount,
+        if (status === CANCELLED) {
+          // Terminal and unrewardable. Drop it.
+          delete state.pending[key];
+          continue;
+        }
+        if (status !== COMPLETED) {
+          continue; // still in flight — this is the case F2 used to drop
+        }
+
+        // Completed. Skip if the registry already has it (crash-safe).
+        if (await registry.orderPaid(key)) {
+          delete state.pending[key];
+          continue;
+        }
+
+        ready.push({
+          orderId: BigInt(key),
+          integrator: p.integrator,
+          user: p.user,
+          orderAmount: BigInt(p.amount),
         });
       }
 
-      for (let i = 0; i < reports.length; i += BATCH_SIZE) {
-        const chunk = reports.slice(i, i + BATCH_SIZE);
-        const tx = await registry.payBatch(chunk);
-        const receipt = await tx.wait();
-        console.log(`paid batch of ${chunk.length}  · block ${receipt?.blockNumber} · ${tx.hash}`);
+      // ── 3. REPORT: the registry verifies and pays ──
+      for (let i = 0; i < ready.length; i += BATCH_SIZE) {
+        const chunk = ready.slice(i, i + BATCH_SIZE);
+        try {
+          const tx = await registry.payBatch(chunk);
+          const receipt = await tx.wait();
+          console.log(`paid batch of ${chunk.length} · block ${receipt?.blockNumber} · ${tx.hash}`);
+          // Only retire them once the batch actually landed.
+          for (const r of chunk) delete state.pending[r.orderId.toString()];
+        } catch (err) {
+          // A failed batch must not stall the cursor — the orders stay
+          // pending and are retried next poll. Logged loudly because a
+          // persistent failure here is the difference between "paying" and
+          // "silently not paying".
+          console.error(`batch of ${chunk.length} failed:`, (err as Error).message);
+        }
       }
 
-      writeCursor(to);
-      if (reports.length > 0) {
-        console.log(`blocks ${from}–${to}: reported ${reports.length}`);
+      writeState(state);
+
+      if (safeHead < state.lastProcessedBlock + 1 && ready.length === 0) {
+        await sleep(POLL_MS);
       }
     } catch (err) {
-      // Never exit on a transient RPC failure — back off and retry. Missed
-      // blocks are picked up on the next pass because the cursor only
-      // advances after a successful sweep.
+      // Never exit on a transient RPC failure. The cursor only advances on a
+      // successful sweep, so nothing is skipped.
       console.error("loop error:", (err as Error).message);
       await sleep(POLL_MS * 2);
     }
