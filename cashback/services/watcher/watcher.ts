@@ -43,8 +43,13 @@ const REGISTRY_ADDRESS = process.env.REGISTRY_ADDRESS || "";
 const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
 const WATCHER_PRIVATE_KEY = process.env.WATCHER_PRIVATE_KEY || "";
 
-/** Blocks to stay behind the head, so a reorg cannot un-do a payout. */
+/** Blocks to stay behind the head when DISCOVERING orders, so a reorg
+ *  cannot un-do a payout we based on a since-orphaned log. */
 const CONFIRMATIONS = Number(process.env.CONFIRMATIONS || 30);
+/** Confirmations to wait on our own payment tx before retiring the orders
+ *  it paid. Lower than CONFIRMATIONS because a re-send is cheap and the
+ *  on-chain `orderPaid` marker prevents double payment either way. */
+const PAYMENT_CONFIRMATIONS = Number(process.env.PAYMENT_CONFIRMATIONS || 3);
 /** Orders per payBatch transaction. */
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 50);
 /** Max blocks per getLogs call (RPC providers cap this). */
@@ -107,13 +112,51 @@ type State = {
 /** Thrown when the state file exists but cannot be parsed. */
 class CorruptStateError extends Error {}
 
+/** Keeps only entries that are actually usable; logs whatever is dropped. */
+function sanitizePending(raw: unknown): Record<string, Pending> {
+  const out: Record<string, Pending> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const p = value as Partial<Pending>;
+    const usable =
+      p &&
+      typeof p.integrator === "string" &&
+      typeof p.user === "string" &&
+      typeof p.amount === "string" &&
+      /^\d+$/.test(p.amount) &&
+      typeof p.firstSeen === "number" &&
+      Number.isFinite(p.firstSeen) &&
+      /^\d+$/.test(key);
+
+    if (usable) {
+      out[key] = {
+        integrator: p.integrator as string,
+        user: p.user as string,
+        amount: p.amount as string,
+        firstSeen: p.firstSeen as number,
+        lastChecked: typeof p.lastChecked === "number" ? p.lastChecked : 0,
+      };
+    } else {
+      console.error(`state: dropping unusable pending entry ${key}`);
+    }
+  }
+  return out;
+}
+
 function readState(fallbackBlock: number): State {
   try {
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
     return {
       lastProcessedBlock:
         typeof raw.lastProcessedBlock === "number" ? raw.lastProcessedBlock : fallbackBlock,
-      pending: raw.pending && typeof raw.pending === "object" ? raw.pending : {},
+      // FOURTH-PASS AUDIT (low). `typeof x === "object"` also accepts an
+      // array, and says nothing about the entries. A hand-edited or
+      // partially-corrupted-but-parseable file could hold an entry whose
+      // `amount` is not numeric; it would throw inside the loop every poll
+      // forever, never being removed. Validate the shape on load and drop
+      // what cannot be used, loudly.
+      pending: sanitizePending(raw.pending),
     };
   } catch (err) {
     // THIRD-PASS AUDIT (medium). A file that EXISTS but does not parse must

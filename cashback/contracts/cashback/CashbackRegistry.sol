@@ -679,8 +679,15 @@ contract CashbackRegistry is ICashbackRegistry {
         // Rolled back below if the transfer fails, leaving it retryable.
         orderPaid[orderId] = true;
 
-        // Snapshot for the delivered-amount measurement below.
-        uint256 balanceBefore = IERC20(c.rewardToken).balanceOf(v.user);
+        // Snapshot for the delivered-amount measurement below, gas-capped
+        // (see `_tryBalanceOf`). A token that cannot report a balance is
+        // not one we can account for, so refuse rather than guess.
+        (bool okBefore, uint256 balanceBefore) = _tryBalanceOf(c.rewardToken, v.user);
+        if (!okBefore) {
+            orderPaid[orderId] = false;
+            emit PayFailed(campaignId, orderId, v.user, reward);
+            return 0;
+        }
 
         // AUDIT F5. Gas-capped so a hostile reward token cannot burn the
         // batch's remaining gas and starve every other row.
@@ -718,7 +725,17 @@ contract CashbackRegistry is ICashbackRegistry {
         // wallet still held funds, and `dailyPerUser` locking someone out
         // early. Measuring the recipient's balance delta is the only figure
         // that is true for every token.
-        uint256 delivered = IERC20(c.rewardToken).balanceOf(v.user) - balanceBefore;
+        // Saturating, not checked-subtraction. FOURTH-PASS AUDIT (high):
+        // a rebasing token — or simply a hostile one — can leave the
+        // recipient's balance LOWER than before, and `a - b` under ^0.8
+        // then panics. Via payBatch that loses one row; called directly it
+        // reverts outright and, because the revert unwinds `orderPaid`, the
+        // row fails identically forever. Saturating to 0 routes it into the
+        // graceful rollback below instead.
+        (bool okAfter, uint256 balanceAfter) = _tryBalanceOf(c.rewardToken, v.user);
+        uint256 delivered = (okAfter && balanceAfter > balanceBefore)
+            ? balanceAfter - balanceBefore
+            : 0;
         if (delivered == 0) {
             // Nothing arrived despite a "successful" call — a no-op token.
             // Roll back rather than burn this order's one payout slot
@@ -1023,6 +1040,30 @@ contract CashbackRegistry is ICashbackRegistry {
         if (orderType == 1) return ORDER_TYPE_SELL;
         if (orderType == 2) return ORDER_TYPE_PAY;
         return ANY;
+    }
+
+    /// @dev Gas-capped, failure-tolerant `balanceOf`.
+    ///
+    ///      FOURTH-PASS AUDIT (critical). The delivered-amount measurement
+    ///      introduced two *uncapped* high-level `balanceOf` calls into the
+    ///      payout path. `rewardToken` is chosen by the tenant, so that is
+    ///      attacker code receiving 63/64 of the batch's remaining gas — a
+    ///      token whose `balanceOf` loops forever drained the batch before
+    ///      `transferFrom` was ever reached, taking down every honest row.
+    ///      That is exactly the griefing `TOKEN_CALL_GAS` exists to stop:
+    ///      the fix for one finding reopened the hole closed by another.
+    ///
+    ///      Capped at the same budget, and a revert or malformed return
+    ///      yields `(false, 0)` so the caller degrades instead of bubbling.
+    function _tryBalanceOf(
+        address token,
+        address who
+    ) internal view returns (bool ok, uint256 bal) {
+        (bool callOk, bytes memory ret) = token.staticcall{ gas: TOKEN_CALL_GAS }(
+            abi.encodeCall(IERC20.balanceOf, (who))
+        );
+        if (!callOk || ret.length < 32) return (false, 0);
+        return (true, abi.decode(ret, (uint256)));
     }
 
     /// @dev The headline reward before any budget clamp. Shared by `pay`

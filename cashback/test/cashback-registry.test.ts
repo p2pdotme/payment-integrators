@@ -2186,3 +2186,134 @@ describe("CashbackRegistry — third-pass regressions", function () {
     expect(await fee.balanceOf(buyer.address)).to.equal(U6("7.5"));
   });
 });
+
+// ─── Fourth-pass audit regressions ───────────────────────────────────
+// Both of these live in the three lines the third pass added: the
+// delivered-amount measurement reopened the gas hole F5 had closed, and
+// made an unusual token a permanently-failing row.
+
+describe("CashbackRegistry — fourth-pass regressions", function () {
+  let alice: SignerWithAddress;
+  let bob: SignerWithAddress;
+  let keeper: SignerWithAddress;
+  let buyer: SignerWithAddress;
+
+  let usdc: any;
+  let orders: any;
+  let reg: any;
+  let intgA: string;
+  let intgB: string;
+
+  const U6 = (n: number | string) => ethers.parseUnits(n.toString(), 6);
+  const NB = {
+    maxRewardPerOrder: 0,
+    dailyBudget: 0,
+    totalBudget: 0,
+    dailyPerUser: 0,
+    startTime: 0,
+    endTime: 0,
+  };
+
+  async function campaign(as: SignerWithAddress, intg: string, token: any, bps = 100) {
+    const tx = await reg
+      .connect(as)
+      .createCampaign(intg, BUY, INR, await token.getAddress(), bps, 0n, as.address, NB);
+    const rc = await tx.wait();
+    const id = rc.logs
+      .map((l: any) => {
+        try {
+          return reg.interface.parseLog(l);
+        } catch {
+          return null;
+        }
+      })
+      .find((e: any) => e && e.name === "CampaignCreated").args.campaignId;
+    await reg.connect(as).activate(id);
+    return id;
+  }
+
+  beforeEach(async function () {
+    [, alice, bob, keeper, buyer] = await ethers.getSigners();
+    intgA = ethers.Wallet.createRandom().address;
+    intgB = ethers.Wallet.createRandom().address;
+
+    usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    orders = await (await ethers.getContractFactory("MockOrderSource")).deploy();
+    reg = await (
+      await ethers.getContractFactory("CashbackRegistry")
+    ).deploy(await orders.getAddress());
+
+    await reg.setAccruer(keeper.address, true);
+    await reg.setIntegratorOwner(intgA, alice.address);
+    await reg.setIntegratorOwner(intgB, bob.address);
+
+    await usdc.mint(alice.address, U6(1_000_000));
+    await usdc.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+  });
+
+  // CRITICAL — the delivered-amount measurement must not hand a hostile
+  // token 63/64 of the batch's gas via an uncapped balanceOf.
+  it("a balanceOf gas bomb cannot starve the rest of the batch", async function () {
+    const bomb = await (await ethers.getContractFactory("MockBalanceBomb")).deploy();
+    await bomb.mint(bob.address, U6(1_000_000));
+    await bomb.connect(bob).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign(alice, intgA, usdc, 100); // honest
+    await campaign(bob, intgB, bomb, 100); // hostile balanceOf
+
+    const reports: any[] = [
+      { orderId: 1, integrator: intgB, user: buyer.address, orderAmount: U6(100) },
+    ];
+    await orders.setOrderFull(1, buyer.address, U6(100), COMPLETED, 0, intgB, 0);
+    for (let i = 2; i <= 10; i++) {
+      await orders.setOrderFull(i, buyer.address, U6(100), COMPLETED, 0, intgA, 0);
+      reports.push({ orderId: i, integrator: intgA, user: buyer.address, orderAmount: U6(100) });
+    }
+
+    await reg.connect(keeper).payBatch(reports);
+
+    // All nine honest rows must still be paid.
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(9));
+  });
+
+  // HIGH — a token that shrinks the recipient must fail gracefully, not
+  // panic on a checked subtraction and poison the row forever.
+  it("a token that lowers the recipient balance fails gracefully", async function () {
+    const shrink = await (await ethers.getContractFactory("MockShrinkingToken")).deploy();
+    await shrink.mint(alice.address, U6(1_000_000));
+    await shrink.mint(buyer.address, U6(100)); // so it has something to halve
+    await shrink.connect(alice).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    const id = await campaign(alice, intgA, shrink, 100);
+    await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intgA, 0);
+
+    // A DIRECT pay() call must not revert — it degrades to PayFailed.
+    await expect(reg.connect(keeper).pay(1, intgA, buyer.address, U6(1000))).to.emit(
+      reg,
+      "PayFailed"
+    );
+
+    expect(await reg.orderPaid(1)).to.equal(false); // retryable, not poisoned
+    expect((await reg.stats(id)).totalPaid).to.equal(0);
+  });
+
+  it("a shrinking token in a batch does not stop the honest rows", async function () {
+    const shrink = await (await ethers.getContractFactory("MockShrinkingToken")).deploy();
+    await shrink.mint(bob.address, U6(1_000_000));
+    await shrink.mint(buyer.address, U6(100));
+    await shrink.connect(bob).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    await campaign(alice, intgA, usdc, 100);
+    await campaign(bob, intgB, shrink, 100);
+
+    await orders.setOrderFull(1, buyer.address, U6(100), COMPLETED, 0, intgB, 0);
+    await orders.setOrderFull(2, buyer.address, U6(100), COMPLETED, 0, intgA, 0);
+
+    await reg.connect(keeper).payBatch([
+      { orderId: 1, integrator: intgB, user: buyer.address, orderAmount: U6(100) },
+      { orderId: 2, integrator: intgA, user: buyer.address, orderAmount: U6(100) },
+    ]);
+
+    expect(await usdc.balanceOf(buyer.address)).to.equal(U6(1)); // honest row paid
+  });
+});
