@@ -6,7 +6,7 @@
  */
 
 import { decodeEventLog, type Address, type Hex } from "viem";
-import { INTEGRATOR_ABI, LIMITS, type Env } from "./config";
+import { INTEGRATOR_ABI, limitsFor, productIdFor, type Env } from "./config";
 import { publicClientFor, relayerFor, readLink, linkBlockedReason } from "./chain";
 import { checkRateLimits, reserveGas, releaseGas } from "./limits";
 import { json, badRequest, clientIp, isHex32 } from "./http";
@@ -22,6 +22,8 @@ interface PayBody {
 
 export async function handlePay(req: Request, env: Env, linkId: string): Promise<Response> {
   if (!isHex32(linkId)) return badRequest("That payment link address is not valid.");
+
+  const limits = limitsFor(env);
 
   const body = (await req.json().catch(() => ({}))) as PayBody;
   const pubKey = typeof body.pubKey === "string" ? body.pubKey : "";
@@ -84,7 +86,7 @@ export async function handlePay(req: Request, env: Env, linkId: string): Promise
     const args = [
       linkId as Hex,
       env.CLIENT_ADDRESS as Address,
-      1n, // productId — pinned; the client prices a single unit
+      productIdFor(env), // pinned by config; never caller-supplied
       quantity,
       link.currency,
       BigInt(body.circleId ?? 0),
@@ -134,7 +136,7 @@ export async function handlePay(req: Request, env: Env, linkId: string): Promise
         account: wallet.account!,
         chain: wallet.chain,
         nonce,
-        gas: (gas * 120n) / 100n,
+        gas: (gas * limits.gasBufferPct) / 100n,
       });
     } catch (err) {
       // Nothing was broadcast, so give the reservation back — otherwise a run
@@ -157,7 +159,7 @@ export async function handlePay(req: Request, env: Env, linkId: string): Promise
     try {
       receipt = await client.waitForTransactionReceipt({
         hash,
-        timeout: LIMITS.receiptTimeoutMs,
+        timeout: limits.receiptTimeoutMs,
       });
     } catch {
       return json(

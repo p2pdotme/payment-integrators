@@ -2,7 +2,7 @@
  * Two Durable Objects, each solving a different concurrency problem.
  */
 
-import type { Env } from "./config";
+import { limitsFor, type Env } from "./config";
 import { publicClientFor, relayerFor } from "./chain";
 
 /**
@@ -89,14 +89,16 @@ export class NonceManager {
  */
 export class LinkLock {
   private state: DurableObjectState;
+  private env: Env;
 
-  constructor(state: DurableObjectState) {
+  constructor(state: DurableObjectState, env: Env) {
     this.state = state;
+    this.env = env;
   }
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
-    const HOLD_MS = 60_000;
+    const HOLD_MS = limitsFor(this.env).linkLockSeconds * 1000;
 
     if (url.pathname === "/acquire") {
       const until = (await this.state.storage.get<number>("until")) ?? 0;

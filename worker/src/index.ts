@@ -9,7 +9,7 @@
  */
 
 import type { Env } from "./config";
-import { LIMITS } from "./config";
+import { limitsFor } from "./config";
 import { publicClientFor, relayerFor } from "./chain";
 import { checkBalance } from "./limits";
 import { handlePay } from "./pay";
@@ -58,7 +58,7 @@ export default {
           const client = publicClientFor(env);
           const { address } = relayerFor(env);
           const balance = await client.getBalance({ address });
-          const warning = await checkBalance(balance, address);
+          const warning = await checkBalance(env, balance, address);
           if (warning) console.warn(`[paylinks] ${warning}`);
 
           console.log(`[paylinks] queued=${queued} delivered=${delivered} balance=${balance} wei`);
@@ -89,7 +89,7 @@ async function health(env: Env): Promise<Response> {
     ]);
     return json({
       ok: true,
-      lowBalance: balance < LIMITS.lowBalanceWei,
+      lowBalance: balance < limitsFor(env).lowBalanceWei,
       block: block.toString(),
     });
   } catch {

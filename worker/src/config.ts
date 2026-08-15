@@ -20,8 +20,31 @@ export interface Env {
   DIAMOND_ADDRESS: string;
   /** The checkout client the widget prices against. Pinned, not caller-supplied. */
   CLIENT_ADDRESS: string;
+  /** The productId the client prices a single unit at. Defaults to 1. */
+  PRODUCT_ID?: string;
   /** Optional: comma-separated origins allowed to call the pay endpoint. */
   ALLOWED_ORIGINS?: string;
+
+  // ─── Operational limits (all optional; see DEFAULT_LIMITS) ──────
+  //
+  // These are the knobs an operator reaches for at 3am — a spam wave, a gas
+  // spike, an RPC that went slow. Baking them into the bundle would mean a
+  // redeploy to turn one down, so every one can be overridden by a var while
+  // still having a sane default that needs no configuration at all.
+  RATE_IP_PER_MINUTE?: string;
+  RATE_LINK_PER_HOUR?: string;
+  MAX_GAS_PER_TX?: string;
+  MAX_GAS_PER_DAY?: string;
+  LOW_BALANCE_WEI?: string;
+  RECEIPT_TIMEOUT_MS?: string;
+  /** Head-room multiplier on the gas estimate, as a percentage. 120 = +20%. */
+  GAS_BUFFER_PCT?: string;
+  /** Blocks scanned per scheduled run when looking for completions. */
+  LOG_SCAN_BLOCKS?: string;
+  /** Webhook deliveries attempted per scheduled run. */
+  WEBHOOK_BATCH?: string;
+  /** Seconds a single-use link is held while a payment is in flight. */
+  LINK_LOCK_SECONDS?: string;
 
   // ─── Bindings ───────────────────────────────────────────────────
   KV: KVNamespace;
@@ -33,8 +56,12 @@ export interface Env {
  * Operational ceilings. These bound COST and BLAST RADIUS, not correctness —
  * correctness is enforced on-chain. A breach here means we stop early and
  * cheaply rather than discovering the problem from a drained gas balance.
+ *
+ * Every value is overridable per environment (see `Env` above). The defaults
+ * below are what ships if nothing is set, and are sized from the contract's
+ * own measured gas report rather than guessed.
  */
-export const LIMITS = {
+export const DEFAULT_LIMITS = {
   /** Per-IP pay attempts. */
   ipPerMinute: 10,
   /** Per-link pay attempts — a public link is a public endpoint. */
@@ -50,7 +77,69 @@ export const LIMITS = {
   lowBalanceWei: 15_000_000_000_000_000n, // 0.015 ETH
   /** How long to wait for a receipt before telling the customer to retry. */
   receiptTimeoutMs: 45_000,
+  /** Head-room over the gas estimate, as a percentage of it. */
+  gasBufferPct: 120n,
+  /** Blocks per scheduled log scan — small enough to finish inside the tick. */
+  logScanBlocks: 800n,
+  /** Webhook deliveries per scheduled run. */
+  webhookBatch: 50,
+  /** How long one link is held while a payment is in flight. */
+  linkLockSeconds: 60,
 } as const;
+
+/**
+ * The resolved shape. `DEFAULT_LIMITS` is `as const`, so its members are
+ * literal types — widened here to plain number/bigint, since the whole point
+ * is that an operator can set something else.
+ */
+export type Limits = {
+  [K in keyof typeof DEFAULT_LIMITS]: (typeof DEFAULT_LIMITS)[K] extends bigint ? bigint : number;
+};
+
+/** Parses a positive number from a var, falling back on anything unusable. */
+function num(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return raw !== undefined && Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** Same, for the bigint-valued knobs (gas and wei). */
+function big(raw: string | undefined, fallback: bigint): bigint {
+  if (raw === undefined) return fallback;
+  try {
+    const n = BigInt(raw);
+    return n > 0n ? n : fallback;
+  } catch {
+    return fallback; // a typo must not disable a ceiling
+  }
+}
+
+/**
+ * Resolves the live limits for this environment.
+ *
+ * A malformed value falls back to the default rather than throwing or
+ * disabling the ceiling — a fat-fingered var should never be the reason a
+ * spend cap stops applying.
+ */
+export function limitsFor(env: Env): Limits {
+  const d = DEFAULT_LIMITS;
+  return {
+    ipPerMinute: num(env.RATE_IP_PER_MINUTE, d.ipPerMinute),
+    linkPerHour: num(env.RATE_LINK_PER_HOUR, d.linkPerHour),
+    maxGasPerTx: big(env.MAX_GAS_PER_TX, d.maxGasPerTx),
+    maxGasPerDay: big(env.MAX_GAS_PER_DAY, d.maxGasPerDay),
+    lowBalanceWei: big(env.LOW_BALANCE_WEI, d.lowBalanceWei),
+    receiptTimeoutMs: num(env.RECEIPT_TIMEOUT_MS, d.receiptTimeoutMs),
+    gasBufferPct: big(env.GAS_BUFFER_PCT, d.gasBufferPct),
+    logScanBlocks: big(env.LOG_SCAN_BLOCKS, d.logScanBlocks),
+    webhookBatch: num(env.WEBHOOK_BATCH, d.webhookBatch),
+    linkLockSeconds: num(env.LINK_LOCK_SECONDS, d.linkLockSeconds),
+  };
+}
+
+/** The productId the pinned checkout client prices a single unit at. */
+export function productIdFor(env: Env): bigint {
+  return big(env.PRODUCT_ID, 1n);
+}
 
 /** Only what the Worker actually calls. A narrow ABI is a narrow blast radius. */
 export const INTEGRATOR_ABI = [

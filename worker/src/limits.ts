@@ -7,7 +7,7 @@
  */
 
 import { formatEther } from "viem";
-import { LIMITS, type Env } from "./config";
+import { limitsFor, type Env } from "./config";
 
 const utcDay = () => Math.floor(Date.now() / 86_400_000);
 
@@ -23,15 +23,17 @@ export async function checkRateLimits(
   linkId: string,
   ip: string
 ): Promise<string | null> {
+  const limits = limitsFor(env);
+
   const perIp = await bump(env.KV, `rl:ip:${ip}:${Math.floor(Date.now() / 60_000)}`, 120);
-  if (perIp > LIMITS.ipPerMinute) return "Too many attempts. Please wait a moment.";
+  if (perIp > limits.ipPerMinute) return "Too many attempts. Please wait a moment.";
 
   const perLink = await bump(
     env.KV,
     `rl:link:${linkId}:${Math.floor(Date.now() / 3_600_000)}`,
     7200
   );
-  if (perLink > LIMITS.linkPerHour) return "This link is receiving too many attempts.";
+  if (perLink > limits.linkPerHour) return "This link is receiving too many attempts.";
 
   return null;
 }
@@ -47,13 +49,15 @@ export async function checkRateLimits(
  * cannot exhaust a day's budget without a single transaction being broadcast.
  */
 export async function reserveGas(env: Env, estimate: bigint): Promise<string | null> {
-  if (estimate > LIMITS.maxGasPerTx) {
+  const limits = limitsFor(env);
+
+  if (estimate > limits.maxGasPerTx) {
     return "This payment could not be processed. Please try again.";
   }
 
   const key = `gas:day:${utcDay()}`;
   const spent = BigInt((await env.KV.get(key)) ?? "0");
-  if (spent + estimate > LIMITS.maxGasPerDay) {
+  if (spent + estimate > limits.maxGasPerDay) {
     return "Payments are temporarily paused. Please try again later.";
   }
 
@@ -71,9 +75,10 @@ export async function releaseGas(env: Env, estimate: bigint): Promise<void> {
 
 /** Returns a human-readable warning when the float is running low, else null. */
 export async function checkBalance(
+  env: Env,
   balanceWei: bigint,
   relayerAddress: string
 ): Promise<string | null> {
-  if (balanceWei >= LIMITS.lowBalanceWei) return null;
+  if (balanceWei >= limitsFor(env).lowBalanceWei) return null;
   return `Relayer ${relayerAddress} is low on gas: ${formatEther(balanceWei)} ETH remaining. Link payments will start failing when it runs dry.`;
 }

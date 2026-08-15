@@ -113,6 +113,53 @@ The daily gas cap (`LIMITS.maxGasPerDay`) bounds a spam campaign to roughly
 1,400 payments' worth of gas per UTC day. Balance warnings fire at 0.015 ETH —
 while there is still time to act, not once the float is gone.
 
+## Configuration
+
+Everything an operator might need to change at 3am is a var, not a constant.
+A rate limit, a gas ceiling, a receipt timeout — none of them require a code
+change and a redeploy to turn down.
+
+**Secrets** — `wrangler secret put`, never in `wrangler.toml`:
+
+| | |
+|---|---|
+| `RELAYER_PRIVATE_KEY` | the relayer EOA's key |
+| `WEBHOOK_SIGNING_KEY` | HMAC key for outbound webhook signatures |
+
+**Wiring** — must be set before the first payment:
+
+| | |
+|---|---|
+| `CHAIN_ID`, `RPC_URL` | which chain |
+| `INTEGRATOR_ADDRESS` | our contract |
+| `DIAMOND_ADDRESS` | the only target `/api/relay-tx` will forward to |
+| `CLIENT_ADDRESS`, `PRODUCT_ID` | the pinned price source |
+| `ALLOWED_ORIGINS` | empty = open, correct for a public pay page |
+
+**Operational limits** — all optional; unset, the defaults in
+`src/config.ts` apply. Those defaults are sized from the contract's own
+measured gas report rather than guessed.
+
+| | default | |
+|---|---|---|
+| `RATE_IP_PER_MINUTE` | 10 | first line against spam, before any RPC |
+| `RATE_LINK_PER_HOUR` | 20 | a link is a public endpoint |
+| `MAX_GAS_PER_TX` | 600,000 | anomaly detector — measured max is ~398k |
+| `MAX_GAS_PER_DAY` | 840,000,000 | ~1,400 payments ≈ $14/day |
+| `GAS_BUFFER_PCT` | 120 | head-room over the estimate |
+| `LOW_BALANCE_WEI` | 0.015 ETH | ~4,300 payments of runway left |
+| `RECEIPT_TIMEOUT_MS` | 45,000 | raise on a slow RPC |
+| `LOG_SCAN_BLOCKS` | 800 | per scheduled run |
+| `WEBHOOK_BATCH` | 50 | deliveries per run |
+| `LINK_LOCK_SECONDS` | 60 | how long a link is held mid-payment |
+
+A malformed value **falls back to its default** rather than throwing or
+resolving to zero. A fat-fingered var must never be the reason a spend cap
+stops applying.
+
+`wrangler.toml` carries a `[env.production]` block for mainnet, where gas is
+real money and the daily cap starts tighter.
+
 ## Setup
 
 ```bash
@@ -122,8 +169,9 @@ wrangler kv namespace create KV          # put the id in wrangler.toml
 wrangler secret put RELAYER_PRIVATE_KEY
 wrangler secret put WEBHOOK_SIGNING_KEY
 
-# then set INTEGRATOR_ADDRESS / DIAMOND_ADDRESS / CLIENT_ADDRESS in wrangler.toml
-wrangler deploy
+# set INTEGRATOR_ADDRESS / DIAMOND_ADDRESS / CLIENT_ADDRESS in wrangler.toml
+wrangler deploy                    # testnet
+wrangler deploy --env production   # mainnet
 ```
 
 On-chain, once: `setTrustedRelayer(<relayer address>)`, then fund that address

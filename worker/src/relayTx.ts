@@ -20,7 +20,7 @@
  */
 
 import { decodeFunctionData, type Address, type Hex } from "viem";
-import { RELAY_SELECTORS, ORDER_ID_ABI, type Env } from "./config";
+import { RELAY_SELECTORS, ORDER_ID_ABI, limitsFor, type Env } from "./config";
 import { publicClientFor, relayerFor, orderIsOurs } from "./chain";
 import { json, badRequest, clientIp, isAddress } from "./http";
 import { checkRateLimits, reserveGas, releaseGas } from "./limits";
@@ -105,7 +105,7 @@ export async function handleRelayTx(req: Request, env: Env): Promise<Response> {
       to: to as Address,
       data: data as Hex,
       nonce,
-      gas: (gas * 120n) / 100n,
+      gas: (gas * limitsFor(env).gasBufferPct) / 100n,
     });
 
     return json({ hash });

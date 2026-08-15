@@ -14,7 +14,7 @@
  */
 
 import { decodeEventLog, type Address, type Hex } from "viem";
-import { INTEGRATOR_ABI, type Env } from "./config";
+import { INTEGRATOR_ABI, limitsFor, type Env } from "./config";
 import { publicClientFor } from "./chain";
 import { json, badRequest } from "./http";
 
@@ -98,7 +98,8 @@ export async function scanAndQueue(env: Env): Promise<number> {
   if (from >= latest) return 0;
 
   // Cloudflare-friendly window; the cursor makes this resumable.
-  const to = from + 800n > latest ? latest : from + 800n;
+  const span = limitsFor(env).logScanBlocks;
+  const to = from + span > latest ? latest : from + span;
 
   // Filter to OrderCompleted at the node rather than pulling every event the
   // integrator emits and discarding most of them — this contract is chatty,
@@ -172,7 +173,7 @@ export async function scanAndQueue(env: Env): Promise<number> {
  * letting it look like everything was delivered.
  */
 export async function deliverQueued(env: Env): Promise<number> {
-  const BATCH = 50;
+  const BATCH = limitsFor(env).webhookBatch;
   const { keys, list_complete } = (await env.KV.list({
     prefix: "hook:q:",
     limit: BATCH,

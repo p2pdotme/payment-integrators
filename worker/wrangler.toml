@@ -3,19 +3,62 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Secrets — set with `wrangler secret put`, NEVER in this file:
+# ─── Secrets ──────────────────────────────────────────────────────────
+# Set with `wrangler secret put`, NEVER in this file:
 #   RELAYER_PRIVATE_KEY   the relayer EOA's key
 #   WEBHOOK_SIGNING_KEY   HMAC key for outbound webhook signatures
 
 [vars]
+# ─── Wiring — must be set before the first payment ────────────────────
 CHAIN_ID = "84532"
 RPC_URL = "https://sepolia.base.org"
 INTEGRATOR_ADDRESS = "0x0000000000000000000000000000000000000000"  # set after deploy
 DIAMOND_ADDRESS = "0x0000000000000000000000000000000000000000"
 CLIENT_ADDRESS = "0x0000000000000000000000000000000000000000"
-# Lock the pay endpoint to your own domains once they are known. Left empty the
-# endpoint is open, which is correct for a public pay page.
+# The productId the pinned client prices a single unit at.
+PRODUCT_ID = "1"
+# Lock the pay endpoint to your own domains once they are known. Left empty
+# the endpoint is open, which is correct for a public pay page.
 ALLOWED_ORIGINS = ""
+
+# ─── Operational limits ───────────────────────────────────────────────
+# Every value below is OPTIONAL. Unset, the service uses the defaults in
+# src/config.ts (DEFAULT_LIMITS), which are sized from the contract's own
+# measured gas report. They live here so an operator can turn a knob during
+# an incident without a code change and redeploy.
+#
+# A malformed value falls back to its default rather than disabling the
+# ceiling — a typo must never be the reason a spend cap stops applying.
+
+# Rate limits. A payment link is a public endpoint; these are the first line
+# against spam, checked before any RPC call.
+RATE_IP_PER_MINUTE = "10"
+RATE_LINK_PER_HOUR = "20"
+
+# Gas ceilings. relayerPlaceOrder measures ~348k average, ~398k max — 600k is
+# an anomaly detector, not a working limit. The daily cap bounds a spam wave
+# to roughly 1,400 payments' worth of gas; at ~$0.01 each that is ~$14/day.
+MAX_GAS_PER_TX = "600000"
+MAX_GAS_PER_DAY = "840000000"
+# Head-room over the estimate, as a percentage. 120 = +20%.
+GAS_BUFFER_PCT = "120"
+
+# Warn while there is still time to act, not once the float is gone.
+# 0.015 ETH ~ 4,300 payments of remaining runway.
+LOW_BALANCE_WEI = "15000000000000000"
+
+# How long to wait for a receipt before telling the customer their payment is
+# still confirming. Raise on a slow RPC; the customer is watching a spinner.
+RECEIPT_TIMEOUT_MS = "45000"
+
+# Scheduled job. Blocks scanned per run when looking for completions, and
+# webhook deliveries attempted per run — both bounded to finish inside a tick.
+LOG_SCAN_BLOCKS = "800"
+WEBHOOK_BATCH = "50"
+
+# How long one link is held while a payment is in flight. Long enough to cover
+# a slow confirmation, short enough that an abandoned attempt frees the link.
+LINK_LOCK_SECONDS = "60"
 
 [[kv_namespaces]]
 binding = "KV"
@@ -36,3 +79,28 @@ new_classes = ["LinkLock", "NonceManager"]
 # Confirms completions on-chain, delivers webhooks, and checks the gas float.
 [triggers]
 crons = ["*/5 * * * *"]
+
+# ─── Production ───────────────────────────────────────────────────────
+# `wrangler deploy --env production`. Only the values that DIFFER from the
+# defaults above need repeating here.
+[env.production.vars]
+CHAIN_ID = "8453"
+RPC_URL = "https://mainnet.base.org"
+INTEGRATOR_ADDRESS = "0x0000000000000000000000000000000000000000"
+DIAMOND_ADDRESS = "0x0000000000000000000000000000000000000000"
+CLIENT_ADDRESS = "0x0000000000000000000000000000000000000000"
+PRODUCT_ID = "1"
+# Mainnet: pin the pay endpoint to your own origins.
+ALLOWED_ORIGINS = ""
+# Mainnet gas is real money — start conservative and raise with observed
+# volume rather than guessing high.
+RATE_IP_PER_MINUTE = "10"
+RATE_LINK_PER_HOUR = "20"
+MAX_GAS_PER_TX = "600000"
+MAX_GAS_PER_DAY = "420000000"
+GAS_BUFFER_PCT = "120"
+LOW_BALANCE_WEI = "30000000000000000"
+RECEIPT_TIMEOUT_MS = "45000"
+LOG_SCAN_BLOCKS = "800"
+WEBHOOK_BATCH = "50"
+LINK_LOCK_SECONDS = "60"
