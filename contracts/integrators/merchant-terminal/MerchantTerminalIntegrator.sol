@@ -76,6 +76,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error NothingToWithdraw();
     error InvalidQuantity();
     error ProductNotFound();
+
+    // ─── Payment links ────────────────────────────────────────────────
+    error LinkExists();
+    error LinkNotFound();
+    error LinkNotActive();
+    error LinkExpired();
+    error LinkAlreadyUsed();
+    error LinkAmountMismatch();
+    error LinkOrdersDisabled();
+    error OnlyTrustedRelayer();
+    error NotLinkOwner();
     error Reentrancy();
     error UnknownWithdrawal();
     error WithdrawalNotCancellable();
@@ -114,6 +125,31 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     // ─── Events ───────────────────────────────────────────────────────
     event OrderPlaced(uint256 indexed orderId, address indexed user, uint256 amount);
+
+    // ─── Payment links ────────────────────────────────────────────────
+    /// @param encryptedConfig Opaque blob, encrypted client-side to the
+    ///        merchant's own relay key: their internal order reference and
+    ///        free-form description. Emitted, never stored — the merchant's
+    ///        own client reads it back from logs.
+    event LinkCreated(
+        bytes32 indexed linkId,
+        address indexed owner,
+        uint96 amount,
+        bytes32 currency,
+        uint64 expiresAt,
+        bool singleUse,
+        bytes encryptedConfig
+    );
+    event LinkRevoked(bytes32 indexed linkId, address indexed revokedBy);
+    /// @dev Emitted alongside `OrderPlaced`, giving indexers a genuine on-chain
+    ///      linkId → orderId correlation for webhook delivery.
+    event LinkOrderPlaced(
+        bytes32 indexed linkId,
+        uint256 indexed orderId,
+        address indexed merchant,
+        uint256 amount
+    );
+    event LinkOrdersEnabledSet(bool enabled);
     event UserProxyDeployed(address indexed user, address proxy);
     // NOTE: the payout handle is intentionally NOT in these events. It is PII
     // (a real UPI/PIX/bank id); emitting it — even encrypted — would bloat logs
@@ -355,6 +391,48 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         releases a daily-count slot for the CURRENT day (a stale cross-day
     ///         cancel must not decrement a freshly-rolled counter).
     mapping(uint256 => uint256) public orderPlacementDay;
+
+    // ─── Payment links ────────────────────────────────────────────────
+    //
+    // A link lets a merchant be paid while absent: they create it with their
+    // own signer, share the URL, and a walletless customer pays through it.
+    // The customer has no key to sign the order with, so `trustedRelayer`
+    // places it on the merchant's behalf — bounded entirely by what the
+    // merchant committed to here at creation time.
+    //
+    // Everything except the description is PLAINTEXT BY DESIGN: an anonymous
+    // customer's browser must be able to verify amount/currency/status
+    // trustlessly, straight from chain, with no merchant signature available
+    // to check at read time. The private description is emitted in
+    // `LinkCreated` (encrypted client-side to the merchant's own relay key,
+    // mirroring the payout handle) rather than stored — the customer never
+    // reads it, and an event costs a fraction of a storage write.
+
+    /// @dev ACTIVE = payable; REVOKED is terminal (a revoked link never
+    ///      returns to ACTIVE — the merchant creates a new one instead).
+    enum LinkStatus {
+        ACTIVE,
+        REVOKED
+    }
+
+    struct PaymentLink {
+        address owner; //      20 ─┐
+        uint96 amount; //      12 ─┘ slot 0 — 0 = customer enters the amount
+        uint64 expiresAt; //    8 ─┐ 0 = never expires
+        uint32 uses; //         4  │ successful orders placed through this link
+        bool singleUse; //      1  │
+        LinkStatus status; //   1 ─┘ slot 1
+        bytes32 currency; //        slot 2 — pinned at creation
+    }
+
+    mapping(bytes32 => PaymentLink) public links;
+
+    /// @notice Kill switch for `relayerPlaceOrder` only. The relayer key lives
+    ///         on an internet-facing service, so operations needs a lever that
+    ///         stops link orders WITHOUT clearing `trustedRelayer` — which
+    ///         would also break `deliverFiatPayout` for every merchant
+    ///         mid-withdrawal. Defaults open; MANAGER can close it instantly.
+    bool public linkOrdersEnabled = true;
     mapping(uint256 => PendingWithdrawal) public withdrawals;
     /// @notice proxy address => the EOA it was deployed for. Set in
     ///         _ensureProxy. Lets validateOrder recognize a SELL placed by one
@@ -803,18 +881,42 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // and re-credits their OWN funds — there is no cross-merchant or pool
         // impact. If authoritative product pricing is ever needed, allowlist
         // `client` (or pin it) and re-verify price*quantity at completion.
+        uint256 total = _quote(client, productId, quantity);
+        orderId = _placeOrder(msg.sender, total, currency, circleId, pubKey);
+    }
+
+    /// @dev Price lookup shared by every order entry point. Reverts identically
+    ///      to the inline logic `userPlaceOrder` used before the extraction.
+    function _quote(
+        address client,
+        uint256 productId,
+        uint256 quantity
+    ) internal view returns (uint256 total) {
         uint256 unitPrice = ICheckoutClient(client).getProductPrice(productId);
         if (unitPrice == 0) revert ProductNotFound();
         if (quantity == 0) revert InvalidQuantity();
-        uint256 total = unitPrice * quantity; // checked mul (0.8 default) — reverts on overflow
+        total = unitPrice * quantity; // checked mul (0.8 default) — reverts on overflow
+    }
 
-        address proxy = _ensureProxy(msg.sender);
+    /// @dev The single BUY-placement path: proxy resolution, the Diamond call,
+    ///      and the bookkeeping `onOrderCancel`/`onOrderComplete` depend on.
+    ///      Extracted verbatim from `userPlaceOrder` so every entry point shares
+    ///      one implementation and the paths cannot drift apart. `merchant` is
+    ///      the account credited — `msg.sender` for the POS flow.
+    function _placeOrder(
+        address merchant,
+        uint256 total,
+        bytes32 currency,
+        uint256 circleId,
+        string calldata pubKey
+    ) internal returns (uint256 orderId) {
+        address proxy = _ensureProxy(merchant);
         // recipientAddr = the merchant's proxy: with usdcThroughIntegrator =
         // false the Diamond sends USDC there at completion and
         // onOrderComplete pulls it into this contract.
         bytes memory data = abi.encodeCall(
             IB2BGateway.placeB2BOrder,
-            (msg.sender, total, currency, proxy, pubKey, circleId, 0, 0)
+            (merchant, total, currency, proxy, pubKey, circleId, 0, 0)
         );
         bytes memory result = UserProxy(proxy).execute(diamond, data, address(usdc), 0);
         orderId = abi.decode(result, (uint256));
@@ -823,10 +925,193 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // validation) — record the merchant here so onOrderCancel can
         // release the daily-count slot. Record the placement day too so a
         // stale cross-day cancellation can't decrement a different day's count.
-        orderToMerchant[orderId] = msg.sender;
+        orderToMerchant[orderId] = merchant;
         orderPlacementDay[orderId] = block.timestamp / 86400;
 
-        emit OrderPlaced(orderId, msg.sender, total);
+        emit OrderPlaced(orderId, merchant, total);
+    }
+
+    // ─── Payment links ────────────────────────────────────────────────
+
+    /// @notice Create a shareable payment link. One sponsored transaction, the
+    ///         same as every other merchant write.
+    /// @param linkId Caller-supplied identifier (a client-side random 32 bytes).
+    ///        Collisions revert rather than overwrite, so one merchant can never
+    ///        clobber another's link — nor their own.
+    /// @param amount Total in USDC (6dp). Pass 0 for a customer-entered amount,
+    ///        which is then bounded only by the merchant's existing per-tx cap.
+    /// @param currency Pinned here so a compromised relayer cannot re-price the
+    ///        link into a different cap / lock-period regime later.
+    /// @param expiresAt Unix seconds; 0 = never expires.
+    /// @param singleUse Auto-consumed after one successful order.
+    /// @param encryptedConfig Encrypted client-side to the merchant's own relay
+    ///        key. Emitted only — never stored, never read on-chain.
+    function createLink(
+        bytes32 linkId,
+        uint96 amount,
+        bytes32 currency,
+        uint64 expiresAt,
+        bool singleUse,
+        bytes calldata encryptedConfig
+    ) external whenNotPaused {
+        if (!registered[msg.sender]) revert NotRegistered();
+        if (linkId == bytes32(0)) revert LinkNotFound();
+        if (links[linkId].owner != address(0)) revert LinkExists();
+        if (currency == bytes32(0)) revert InvalidCurrency();
+        // A link that is already expired at creation could never be paid.
+        if (expiresAt != 0 && expiresAt <= block.timestamp) revert LinkExpired();
+        // A fixed amount above the per-tx cap would create a link that always
+        // reverts at PAY time — in front of the customer, with the merchant
+        // absent. Fail here instead, where the merchant can see and fix it.
+        //
+        // The cap MUST be keyed off the merchant's REGISTERED currency, not the
+        // link's: that is what `validateOrder` enforces at pay time (an INR
+        // merchant keeps their INR cap even on a BRL link). Keying this off
+        // `currency` instead would let a merchant create a link that passes
+        // here and still reverts when a customer tries to pay it — exactly the
+        // failure this check exists to prevent.
+        // (amount == 0 is the variable case: bounded by the cap at pay time.)
+        if (amount != 0 && uint256(amount) > perTxCap(merchants[msg.sender].currency)) {
+            revert ExceedsPerTxCap();
+        }
+
+        links[linkId] = PaymentLink({
+            owner: msg.sender,
+            amount: amount,
+            expiresAt: expiresAt,
+            uses: 0,
+            singleUse: singleUse,
+            status: LinkStatus.ACTIVE,
+            currency: currency
+        });
+
+        emit LinkCreated(
+            linkId,
+            msg.sender,
+            amount,
+            currency,
+            expiresAt,
+            singleUse,
+            encryptedConfig
+        );
+    }
+
+    /// @notice Permanently deactivate a link. Callable by its owner or an admin
+    ///         — deliberately NOT by the relayer, which has no authority over
+    ///         link lifecycle. Revocation is checked inside `relayerPlaceOrder`
+    ///         itself, so there is no window where a stale cached view says
+    ///         "active" after the merchant has genuinely revoked.
+    /// @dev Deliberately allows revoking an EXPIRED or already-consumed link:
+    ///      those are unpayable anyway, and a merchant tidying their list should
+    ///      never hit an error for closing something that is already closed.
+    ///      Only a second revoke of the same link is rejected, so the event
+    ///      stream never reports the same revocation twice.
+    function revokeLink(bytes32 linkId) external {
+        PaymentLink storage link = links[linkId];
+        if (link.owner == address(0)) revert LinkNotFound();
+        if (link.owner != msg.sender && !isOwner[msg.sender]) revert NotLinkOwner();
+        if (link.status == LinkStatus.REVOKED) revert LinkNotActive();
+
+        link.status = LinkStatus.REVOKED;
+        emit LinkRevoked(linkId, msg.sender);
+    }
+
+    /// @notice Place an order against a link on the merchant's behalf. The only
+    ///         function the relayer can call.
+    ///
+    /// The merchant credited is resolved from the LINK, never from calldata, so
+    /// the relayer cannot direct funds anywhere the merchant did not choose. It
+    /// also cannot reach `withdrawUSDC` / `withdrawFiat` / `updateProfile` —
+    /// those require `msg.sender` to be the merchant, and the relayer is never a
+    /// registered merchant. Worst case for a fully compromised key is placing
+    /// spurious orders that CREDIT merchants, at the cost of its own gas.
+    ///
+    /// Routes through the same `_placeOrder` path as the POS flow, so
+    /// `validateOrder` still applies the frozen-merchant switch, the per-tx cap,
+    /// and the daily limit automatically.
+    function relayerPlaceOrder(
+        bytes32 linkId,
+        address client,
+        uint256 productId,
+        uint256 quantity,
+        bytes32 currency,
+        uint256 circleId,
+        string calldata pubKey
+    ) external whenNotPaused nonReentrant returns (uint256 orderId) {
+        if (msg.sender != trustedRelayer) revert OnlyTrustedRelayer();
+        if (!linkOrdersEnabled) revert LinkOrdersDisabled();
+
+        PaymentLink storage link = links[linkId];
+        if (link.owner == address(0)) revert LinkNotFound();
+        if (link.status != LinkStatus.ACTIVE) revert LinkNotActive();
+        if (link.expiresAt != 0 && block.timestamp > link.expiresAt) revert LinkExpired();
+        if (link.singleUse && link.uses != 0) revert LinkAlreadyUsed();
+        // Pinned at creation: even a compromised relayer cannot re-price the
+        // link into another currency's cap / lock-period regime.
+        if (currency != link.currency) revert InvalidCurrency();
+
+        uint256 total = _quote(client, productId, quantity);
+        // A fixed-amount link must match EXACTLY. A variable link (amount == 0)
+        // is bounded by the merchant's existing per-tx cap in validateOrder.
+        if (link.amount != 0 && total != uint256(link.amount)) revert LinkAmountMismatch();
+
+        // CEI: consume the use BEFORE the external call, so a single-use link is
+        // spent the moment it is committed — independent of `nonReentrant`.
+        unchecked {
+            link.uses++;
+        }
+
+        address merchant = link.owner;
+        orderId = _placeOrder(merchant, total, currency, circleId, pubKey);
+        emit LinkOrderPlaced(linkId, orderId, merchant, total);
+    }
+
+    /// @notice Whether a link can be paid right now. The pay page's precheck —
+    ///         a customer should never tap Pay into a link that cannot settle.
+    function isLinkActive(bytes32 linkId) external view returns (bool) {
+        PaymentLink storage link = links[linkId];
+        if (link.owner == address(0)) return false;
+        if (link.status != LinkStatus.ACTIVE) return false;
+        if (link.expiresAt != 0 && block.timestamp > link.expiresAt) return false;
+        if (link.singleUse && link.uses != 0) return false;
+        return true;
+    }
+
+    /// @notice Full link record for the pay page and the merchant's list.
+    function getLink(
+        bytes32 linkId
+    )
+        external
+        view
+        returns (
+            address owner,
+            uint96 amount,
+            bytes32 currency,
+            uint64 expiresAt,
+            bool singleUse,
+            LinkStatus status,
+            uint32 uses
+        )
+    {
+        PaymentLink storage link = links[linkId];
+        if (link.owner == address(0)) revert LinkNotFound();
+        return (
+            link.owner,
+            link.amount,
+            link.currency,
+            link.expiresAt,
+            link.singleUse,
+            link.status,
+            link.uses
+        );
+    }
+
+    /// @notice Stop or resume link orders. Does NOT affect the relayer's
+    ///         unrelated keeper duties (`deliverFiatPayout`), so merchant
+    ///         withdrawals keep working while link orders are halted.
+    function setLinkOrdersEnabled(bool enabled) external onlyRole(Role.MANAGER) {
+        linkOrdersEnabled = enabled;
+        emit LinkOrdersEnabledSet(enabled);
     }
 
     // ─── Withdrawals ──────────────────────────────────────────────────

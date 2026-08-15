@@ -27,7 +27,7 @@ It differs from the other integrators as follows:
 **All merchant USDC is custodied inside the integrator itself. There is no external
 vault.** USDC swept from a merchant proxy at BUY completion lands directly on the
 integrator's own balance, and every withdrawal pays out from that same balance. The
-integrator keeps both the funds *and* the accounting (per-merchant settlement
+integrator keeps both the funds _and_ the accounting (per-merchant settlement
 buckets, `totalOwed`, roles, limits).
 
 The hard solvency invariant is a **local** property, checkable from one contract:
@@ -63,6 +63,46 @@ failure mode structurally. See **Upgrades** below.
    `transferERC20ToIntegrator` (it now sits in the integrator's own custody) and
    records a `SettlementBucket {amount, unlockTimestamp = now + lockPeriod(currency)}`.
 
+### BUY via a payment link (customer has no wallet)
+
+`userPlaceOrder` credits `msg.sender`, so only the merchant's own signer can call
+it. That works at the counter, where the merchant's device signs while the
+customer pays fiat beside them — but not for a link the customer opens on their
+own phone, with no wallet, while the merchant is away.
+
+1. Merchant calls `createLink(linkId, amount, currency, expiresAt, singleUse,
+encryptedConfig)` from their own signer. `owner` is taken from `msg.sender`,
+   so a link can only ever be created for oneself.
+2. The customer opens the link and taps Pay. Their browser has no key, so a
+   keeper — the contract's existing `trustedRelayer` — calls
+   `relayerPlaceOrder(linkId, client, productId, quantity, currency, circleId,
+pubKey)` on the merchant's behalf.
+3. From there the order is **identical to a counter sale**: same `_placeOrder`
+   → `UserProxy` → Diamond path, same `onOrderComplete` sweep, same
+   `SettlementBucket`. Payment links change nothing about custody or when funds
+   unlock.
+
+The merchant credited is read from `links[linkId].owner`, never from calldata —
+there is no parameter that could express "credit someone else".
+`relayerPlaceOrder` routes through the same `_placeOrder` helper as
+`userPlaceOrder`, so `validateOrder` applies the frozen-merchant switch, the
+per-tx cap, and the daily count to link payments automatically, and the two
+paths cannot drift apart.
+
+`revokeLink(linkId)` is callable by the link's owner or an `isOwner[]` admin —
+deliberately **not** by the relayer, which has no authority over link lifecycle.
+Because status, expiry, and use count are all checked inside `relayerPlaceOrder`
+itself, a revocation and the next payment attempt can never diverge.
+
+`setLinkOrdersEnabled(bool)` (MANAGER) is a kill switch scoped to link orders
+only: flipping it off stops `relayerPlaceOrder` while leaving the relayer's
+unrelated keeper duties — and every merchant's fiat withdrawal — working.
+
+**Relayer blast radius.** The relayer is never a registered merchant, so
+`withdrawUSDC`, `withdrawFiat`, and `updateProfile` all reject it on
+`msg.sender`. The worst a fully compromised relayer key can do is place spurious
+orders that **credit** merchants, at the cost of its own gas.
+
 ### SELL (merchant withdraws fiat)
 
 1. Merchant calls `withdrawFiat(amount, circleId, pubKey, encPayout)` against
@@ -80,16 +120,20 @@ integrator's own balance.
 
 ## Limits (enforced in `validateOrder`)
 
-| Limit | Value |
-| --- | --- |
-| Per-transaction cap | 50 USDC (INR) / 100 USDC (other markets) |
-| Daily transaction count | 25 per merchant per UTC day |
-| Settlement lock | default 10 min; per-currency override; bounds [1 min, 30 days] |
+| Limit                   | Value                                                          |
+| ----------------------- | -------------------------------------------------------------- |
+| Per-transaction cap     | 50 USDC (INR) / 100 USDC (other markets)                       |
+| Daily transaction count | 25 per merchant per UTC day                                    |
+| Settlement lock         | default 10 min; per-currency override; bounds [1 min, 30 days] |
 
 The settlement lock is **admin-configurable with no redeploy**: `setSettlementPeriod`
 sets the global default and `setLockPeriod(currency, seconds)` overrides per currency
 (both super-admin-only, both bounded). Lock changes apply to **new** credits only;
 existing buckets keep their original unlock timestamp.
+
+Link payments consume the **same** allowance as counter sales — one shared
+per-tx cap and one shared daily count per merchant, because both paths reach
+`validateOrder` through the same `_placeOrder` helper.
 
 The merchant's own proxy is carved out of `validateOrder` so SELL/withdrawal
 placements do not hit buy-side limits. The daily counter resets when the UTC day
@@ -157,8 +201,17 @@ dormant-leftover recovery via escheat).
 - `validateOrder` / `onOrderComplete` / `onOrderCancel` are `onlyDiamond`.
 - Settlement buckets are compacted (spent buckets dropped) and bounded by
   `MAX_BUCKETS = 256` to keep withdrawal gas bounded.
-- `nonReentrant` + CEI on `userPlaceOrder`, every withdrawal, and all
-  reconcile/recovery paths.
+- `nonReentrant` + CEI on `userPlaceOrder`, `relayerPlaceOrder`, every
+  withdrawal, and all reconcile/recovery paths. `relayerPlaceOrder` increments
+  the link's use counter **before** the external call, so a single-use link is
+  consumed at commit time independently of the reentrancy guard.
+- Payment links pin what the merchant committed to: a fixed amount must match
+  exactly (`LinkAmountMismatch`), and the currency is fixed at creation
+  (`InvalidCurrency`), so even a compromised relayer cannot re-price a link into
+  another currency's cap or lock-period regime. `createLink` also rejects an
+  amount above the merchant's per-tx cap — keyed off their **registered**
+  currency, matching what `validateOrder` enforces at pay time — so a link
+  cannot be created that would only fail once a customer tries to pay it.
 - The offramp fee is charged to the withdrawing merchant (debited from their own
   buckets), never sourced from the commingled pool.
 - The merchant payout handle is **client-side encrypted** to the merchant's relay
