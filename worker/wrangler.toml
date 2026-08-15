@@ -1,0 +1,38 @@
+name = "paylinks-relayer"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Secrets — set with `wrangler secret put`, NEVER in this file:
+#   RELAYER_PRIVATE_KEY   the relayer EOA's key
+#   WEBHOOK_SIGNING_KEY   HMAC key for outbound webhook signatures
+
+[vars]
+CHAIN_ID = "84532"
+RPC_URL = "https://sepolia.base.org"
+INTEGRATOR_ADDRESS = "0x0000000000000000000000000000000000000000"  # set after deploy
+DIAMOND_ADDRESS = "0x0000000000000000000000000000000000000000"
+CLIENT_ADDRESS = "0x0000000000000000000000000000000000000000"
+# Lock the pay endpoint to your own domains once they are known. Left empty the
+# endpoint is open, which is correct for a public pay page.
+ALLOWED_ORIGINS = ""
+
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[[durable_objects.bindings]]
+name = "LINK_LOCK"
+class_name = "LinkLock"
+
+[[durable_objects.bindings]]
+name = "NONCE"
+class_name = "NonceManager"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["LinkLock", "NonceManager"]
+
+# Confirms completions on-chain, delivers webhooks, and checks the gas float.
+[triggers]
+crons = ["*/5 * * * *"]
