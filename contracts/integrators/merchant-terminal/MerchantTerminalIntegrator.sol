@@ -955,6 +955,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         bytes calldata encryptedConfig
     ) external whenNotPaused {
         if (!registered[msg.sender]) revert NotRegistered();
+        // A frozen merchant cannot be paid (validateOrder blocks it), so letting
+        // them mint links would only produce ones that fail in front of a
+        // customer. `updateProfile` already refuses a frozen merchant; this
+        // keeps the freeze switch meaning the same thing everywhere.
+        if (merchants[msg.sender].isFrozen) revert MerchantIsFrozen();
         if (linkId == bytes32(0)) revert LinkNotFound();
         if (links[linkId].owner != address(0)) revert LinkExists();
         if (currency == bytes32(0)) revert InvalidCurrency();
@@ -1068,12 +1073,34 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     /// @notice Whether a link can be paid right now. The pay page's precheck —
     ///         a customer should never tap Pay into a link that cannot settle.
+    ///
+    /// This deliberately checks MORE than the link's own fields. The link's
+    /// state can be perfect while the payment is still guaranteed to fail:
+    /// the merchant may have been frozen since creation, link orders may be
+    /// halted, the contract may be paused, or an admin may have lowered the
+    /// per-tx cap below a fixed link's amount. Every one of those reverts
+    /// inside `relayerPlaceOrder` — in front of a customer, with no merchant
+    /// present to explain — so the precheck has to see them too.
+    ///
+    /// Not covered here: the merchant's daily count, which is only knowable
+    /// against the current UTC day and is better surfaced to the merchant than
+    /// guessed at by the pay page.
     function isLinkActive(bytes32 linkId) external view returns (bool) {
         PaymentLink storage link = links[linkId];
         if (link.owner == address(0)) return false;
         if (link.status != LinkStatus.ACTIVE) return false;
         if (link.expiresAt != 0 && block.timestamp > link.expiresAt) return false;
         if (link.singleUse && link.uses != 0) return false;
+
+        // Contract- and merchant-level gates the payment would hit anyway.
+        if (paused) return false;
+        if (!linkOrdersEnabled) return false;
+        Merchant storage m = merchants[link.owner];
+        if (!registered[link.owner] || m.isFrozen) return false;
+        // A fixed amount that no longer fits the cap can never settle. Keyed
+        // off the REGISTERED currency, matching `validateOrder`.
+        if (link.amount != 0 && uint256(link.amount) > perTxCap(m.currency)) return false;
+
         return true;
     }
 

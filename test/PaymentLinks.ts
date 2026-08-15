@@ -227,6 +227,20 @@ describe("MerchantTerminalIntegrator — payment links", function () {
       await expect(payLink(LINK_B, 2, BRL)).to.emit(integrator, "LinkOrderPlaced");
     });
 
+    it("refuses a frozen merchant — the freeze switch means the same thing everywhere", async function () {
+      // A frozen merchant cannot be paid, so minting links would only produce
+      // ones that fail in front of a customer. `updateProfile` already refuses
+      // a frozen merchant; this keeps the behaviour consistent.
+      await integrator.freezeMerchant(merchant1.address);
+      await expect(createLink(merchant1, LINK_A, linkAmount(1))).to.be.revertedWithCustomError(
+        integrator,
+        "MerchantIsFrozen"
+      );
+
+      await integrator.unfreezeMerchant(merchant1.address);
+      await expect(createLink(merchant1, LINK_A, linkAmount(1))).to.emit(integrator, "LinkCreated");
+    });
+
     it("getLink reverts for an id that was never created", async function () {
       await expect(integrator.getLink(LINK_B)).to.be.revertedWithCustomError(
         integrator,
@@ -505,6 +519,61 @@ describe("MerchantTerminalIntegrator — payment links", function () {
 
     it("rejects a payment against an id that was never created", async function () {
       await expect(payLink(LINK_B, 1)).to.be.revertedWithCustomError(integrator, "LinkNotFound");
+    });
+  });
+
+  // ─── The pay page's precheck ──────────────────────────────────────
+
+  describe("isLinkActive tells the pay page the truth", function () {
+    // The pay page shows a Pay button based on this. If it says true and the
+    // payment then reverts, the customer is alone with a failure and the
+    // merchant is asleep. So it has to see every gate the payment would hit.
+
+    it("goes false when the merchant is frozen after creation", async function () {
+      await createLink(merchant1, LINK_A, linkAmount(1));
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(true);
+
+      await integrator.freezeMerchant(merchant1.address);
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(false);
+      await expectCallFailedWith(payLink(LINK_A, 1), "MerchantIsFrozen()");
+
+      await integrator.unfreezeMerchant(merchant1.address);
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(true);
+    });
+
+    it("goes false when an admin lowers the cap below a fixed link's amount", async function () {
+      await integrator.setPerTxCap(INR, USDC(50));
+      await createLink(merchant1, LINK_A, linkAmount(4)); // 40 USDC
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(true);
+
+      await integrator.setPerTxCap(INR, USDC(10));
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(false);
+      await expectCallFailedWith(payLink(LINK_A, 4), "ExceedsPerTxCap()");
+    });
+
+    it("goes false when link orders are halted, and true again when resumed", async function () {
+      await createLink(merchant1, LINK_A, linkAmount(1));
+      await integrator.setLinkOrdersEnabled(false);
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(false);
+
+      await integrator.setLinkOrdersEnabled(true);
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(true);
+    });
+
+    it("goes false while the contract is paused", async function () {
+      await createLink(merchant1, LINK_A, linkAmount(1));
+      await integrator.pause();
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(false);
+
+      await integrator.unpause();
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(true);
+    });
+
+    it("stays true for a variable-amount link under a low cap — bounded at pay time", async function () {
+      await createLink(merchant1, LINK_A, 0n);
+      await integrator.setPerTxCap(INR, USDC(10));
+      // The link itself is payable; only an over-cap QUANTITY would fail.
+      expect(await integrator.isLinkActive(LINK_A)).to.equal(true);
     });
   });
 
