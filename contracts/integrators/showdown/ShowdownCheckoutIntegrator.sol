@@ -131,6 +131,14 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     error OfframpNotAuthorized();
     error OfframpRecordNotFound();
     error OfframpAlreadyReconciled();
+    /// @notice The Diamond's authoritative `actualUsdtAmount` is unusable: zero,
+    ///         or below the principal this contract escrowed at placement. Either
+    ///         means a re-price, a partial fill or a fee-model change — surface it
+    ///         rather than pulling an amount nobody agreed to. (#72)
+    error OfframpFeeNotReady();
+    /// @notice The order is not in ACCEPTED, so there is no matched merchant to
+    ///         deliver to. (#72)
+    error OfframpNotDeliverable();
     error InsufficientBridgedFunds();
 
     // ─── Events ───────────────────────────────────────────────────────
@@ -1005,27 +1013,44 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
             emit CancelledOrderCompleted(orderId, session.user);
         }
 
-        if (amount != session.amount) {
-            // Re-pin to what the Diamond says it delivered — but never above what
-            // actually arrived. `unbridgedTotal` is a claim on a POOLED balance,
-            // so reserving more than is backed would let this order's burn spend
-            // another buyer's USDC and break `balanceOf(this) >= unbridgedTotal`.
-            //
-            // Clamp rather than revert: the gateway routes funds BEFORE this hook
-            // and swallows a revert, so reverting would strand the delivered USDC
-            // with no session record (sweepable as owner "surplus") — the same
-            // asymmetry the cancel-then-complete branch above turns on.
-            //
-            // Deliberately NOT re-checked against the tier cap. Clamping an
-            // over-delivery down to the cap would leave the excess unreserved and
-            // owner-sweepable, converting an AML limit breach into a user fund
-            // loss. The cap is enforced at placement, where it belongs.
-            //
-            // Unreachable on today's gateway (it passes exactly the amount it
-            // transferred, verified against contracts-v4). This is defence in
-            // depth: the integrator is immutable and the Diamond is not.
-            uint256 backed = usdc.balanceOf(address(this)) - unbridgedTotal;
-            uint256 pinned = amount > backed ? backed : amount;
+        // Reserve at most what was PLACED, and at most what is actually
+        // unreserved on this contract right now. `unbridgedTotal` is a claim on a
+        // POOLED balance, so over-reserving lets this order's burn spend another
+        // buyer's USDC and breaks `balanceOf(this) >= unbridgedTotal`.
+        //
+        // Runs UNCONDITIONALLY (#73). An earlier version only ran when the
+        // reported amount differed from the placed one, which missed the case the
+        // invariant actually needs: a Diamond that reports the placed amount
+        // while transferring less. Bounding by `session.amount` rather than by
+        // free balance alone also stops an over-report from reserving unrelated
+        // surplus already sitting here — e.g. USDC from a user who pointed a
+        // Solana burn at the integrator instead of `offrampMintRecipient(user)`,
+        // the confusion this contract warns about elsewhere.
+        //
+        // Clamp rather than revert: the gateway routes funds BEFORE this hook and
+        // swallows a revert, so reverting would strand the delivered USDC with no
+        // session record (sweepable as owner "surplus") — the same asymmetry the
+        // cancel-then-complete branch above turns on.
+        //
+        // Deliberately NOT re-checked against the tier cap: clamping an
+        // over-delivery down to the cap would leave the excess unreserved and
+        // owner-sweepable, converting an AML limit breach into a user fund loss.
+        // The cap is enforced at placement, where it belongs.
+        //
+        // Unreachable on today's gateway (it passes exactly the amount it
+        // transferred, verified against contracts-v4). Defence in depth: this
+        // integrator is immutable and the Diamond is not.
+        uint256 bal = usdc.balanceOf(address(this));
+        // Saturating: the invariant should make this non-negative, but a panic
+        // here would strand the delivered USDC, which is what we are preventing.
+        uint256 backed = bal > unbridgedTotal ? bal - unbridgedTotal : 0;
+        uint256 pinned = amount < session.amount ? amount : session.amount;
+        if (pinned > backed) pinned = backed;
+        // Emit on ANY discrepancy, including an over-report clamped back to the
+        // placed amount — `OnrampAmountAdjusted` is the alert that the Diamond
+        // delivered something other than what was placed, and it should never be
+        // silent just because the clamp absorbed it.
+        if (amount != session.amount || pinned != session.amount) {
             emit OnrampAmountAdjusted(orderId, session.amount, pinned);
             session.amount = pinned;
         }
@@ -1347,10 +1372,31 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         // own proxy and userBridgeBackToSolana remains open to them. (#53)
         if (blocked[record.user]) revert UserIsBlocked();
 
+        // The Diamond names the amount this contract is about to grant an
+        // allowance over, out of the seller's proxy. Bound it in both directions
+        // before trusting it — MerchantTerminalIntegrator guards this same
+        // boundary four ways and this one carried only the balance check. (#72)
+        //
+        // The order must be ACCEPTED: PLACED means no matched merchant to pay,
+        // and PAID/COMPLETED/CANCELLED mean this is a replay or a dead order.
+        if (IOrderFlow(diamond).getOrdersById(orderId).status != STATUS_ACCEPTED) {
+            revert OfframpNotDeliverable();
+        }
+
         IOrderFlow.AdditionalOrderDetailsView memory aod = IOrderFlow(diamond)
             .getAdditionalOrderDetails(orderId);
         uint256 needed = aod.actualUsdtAmount;
-        if (needed == 0) needed = record.usdcAmount;
+        // Was: `if (needed == 0) needed = record.usdcAmount;`. That fallback read
+        // as a safety net but is unreachable for an ACCEPTED order — the Diamond
+        // writes actualUsdtAmount at placement and only zeroes it on cancel — so
+        // a zero here means the Diamond is not in the state we think it is.
+        // Refuse instead of inventing an amount.
+        if (needed == 0) revert OfframpFeeNotReady();
+        // The Diamond documents actualUsdtAmount as principal + fee, so anything
+        // BELOW the escrowed principal is a re-price, a partial fill or a fee
+        // model change. No upper bound here: that needs a MAX_SELL_FEE_BPS, the
+        // same input still outstanding on #44.
+        if (needed < record.usdcAmount) revert OfframpFeeNotReady();
 
         address proxy = _ensureProxy(record.user);
         if (usdc.balanceOf(proxy) < needed) revert InsufficientBridgedFunds();
@@ -1383,6 +1429,10 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      *      and slot, and the accounting correctness matters more than the
      *      observability edge. Funds are unaffected either way.
      */
+    /// @dev Diamond order status: 0 PLACED, 1 ACCEPTED, 2 PAID, 3 COMPLETED,
+    ///      4 CANCELLED. Only ACCEPTED is deliverable. (#72)
+    uint8 private constant STATUS_ACCEPTED = 1;
+
     function reconcile(uint256 orderId) external {
         OfframpRecord storage record = offramps[orderId];
         if (!record.initialized) revert OfframpRecordNotFound();

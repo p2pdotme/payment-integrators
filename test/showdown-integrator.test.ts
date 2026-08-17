@@ -614,6 +614,68 @@ describe("ShowdownCheckoutIntegrator", function () {
     // against a POOLED balance — so one order's burn could spend another
     // buyer's funds. Unreachable on today's gateway (it passes exactly what it
     // transferred); pinned here because the integrator is immutable.
+    // #73 part 1: the clamp used to be nested inside `if (amount != session.amount)`,
+    // so a Diamond reporting the PLACED amount while transferring less skipped it
+    // entirely — crediting unbridgedTotal with USDC that never arrived and making
+    // withdrawUsdc revert forever on any genuine surplus sent later.
+    it("clamps a short delivery even when the Diamond reports the placed amount", async function () {
+      await tokenMessenger.setBurnLimitPerMessage(usdcAddr, 0); // keep funds pooled
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userBuyUsdcToSolana(USDC(50), INR, SOLANA_ATA, 1, "", 0, 0);
+
+      // Reports $50 (exactly what was placed) but transfers nothing.
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          integratorAddr,
+          orderId,
+          user.address,
+          USDC(50),
+          integratorAddr
+        )
+      )
+        .to.emit(integrator, "OnrampAmountAdjusted")
+        .withArgs(orderId, USDC(50), 0);
+
+      expect(await integrator.unbridgedTotal()).to.equal(0);
+      expect((await integrator.getSession(orderId)).amount).to.equal(0);
+      // Surplus arriving later stays sweepable, rather than being permanently
+      // locked behind an unbridgedTotal that nothing backs.
+      await mockUsdc.mint(integratorAddr, USDC(7));
+      await expect(integrator.connect(owner).withdrawUsdc(owner.address, USDC(7))).to.not.be
+        .reverted;
+    });
+
+    // #73 part 2: `backed` was the whole unreserved balance, so an over-report
+    // could reserve unrelated surplus — e.g. a user who pointed a Solana burn at
+    // the integrator instead of offrampMintRecipient(user).
+    it("does not let an over-report reserve pre-existing surplus", async function () {
+      await tokenMessenger.setBurnLimitPerMessage(usdcAddr, 0);
+      await mockUsdc.mint(integratorAddr, USDC(30)); // unrelated surplus, already here
+
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userBuyUsdcToSolana(USDC(50), INR, SOLANA_ATA, 1, "", 0, 0);
+      await mockUsdc.mint(integratorAddr, USDC(50)); // the real delivery
+
+      // Balance is now $80 and none of it is reserved, so the old `backed`-only
+      // bound would have pinned the full reported $80 and swallowed the surplus.
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          integratorAddr,
+          orderId,
+          user.address,
+          USDC(80),
+          integratorAddr
+        )
+      )
+        .to.emit(integrator, "OnrampAmountAdjusted")
+        .withArgs(orderId, USDC(50), USDC(50));
+
+      expect(await integrator.unbridgedTotal()).to.equal(USDC(50));
+      // The $30 is still surplus and still the owner's to sweep.
+      await expect(integrator.connect(owner).withdrawUsdc(owner.address, USDC(30))).to.not.be
+        .reverted;
+    });
+
     it("clamps an over-reported delivery so one order cannot reserve another buyer's USDC", async function () {
       await tokenMessenger.setBurnLimitPerMessage(usdcAddr, 0); // burns fail → funds stay pooled
       await verify(user2, "kyc", KYC_CAP, "kyc-u2");
@@ -1231,6 +1293,62 @@ describe("ShowdownCheckoutIntegrator", function () {
     // #53.2: delivery is initiator-only. `encUpi` IS the fiat payout target, so
     // any third party permitted to supply it could redirect the seller's cash to
     // itself. There is no relayer to opt into — not even the owner.
+    // #72: the Diamond names the amount this contract grants an allowance over,
+    // out of the seller's own proxy. MerchantTerminalIntegrator bounds that same
+    // boundary four ways; this contract carried only the balance check.
+    describe("Diamond-trust guards on delivery (#72)", function () {
+      async function acceptedOrder(amount = USDC(50)) {
+        await bridgeIn(user, USDC(5000)); // no cap on bridging in — that's the point
+        const orderId = await mockDiamond.nextOrderId();
+        await integrator.connect(user).userInitiateOfframp(amount, INR, 0, 1, 0, "pub");
+        await mockDiamond.acceptSellOrder(orderId, "merchant-pubkey");
+        return orderId;
+      }
+
+      it("refuses when actualUsdtAmount is zero instead of inventing the principal", async function () {
+        const orderId = await acceptedOrder();
+        await mockDiamond.setAdditionalOrderDetailsFeeUnready(true);
+        await expect(
+          integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi")
+        ).to.be.revertedWithCustomError(integrator, "OfframpFeeNotReady");
+      });
+
+      it("refuses when actualUsdtAmount is below the escrowed principal", async function () {
+        const orderId = await acceptedOrder(USDC(50));
+        // Below principal = a re-price, partial fill or fee-model change.
+        await mockDiamond.setActualUsdtAmountOverride(orderId, USDC(40));
+        await expect(
+          integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi")
+        ).to.be.revertedWithCustomError(integrator, "OfframpFeeNotReady");
+      });
+
+      it("refuses to deliver an order that is not ACCEPTED", async function () {
+        // PLACED: no matched merchant to pay.
+        await bridgeIn(user, USDC(100));
+        const orderId = await mockDiamond.nextOrderId();
+        await integrator.connect(user).userInitiateOfframp(USDC(50), INR, 0, 1, 0, "pub");
+        await expect(
+          integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi")
+        ).to.be.revertedWithCustomError(integrator, "OfframpNotDeliverable");
+
+        // And a replay after a successful delivery (status is now PAID).
+        await mockDiamond.acceptSellOrder(orderId, "merchant-pubkey");
+        await integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi");
+        await expect(
+          integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi")
+        ).to.be.revertedWithCustomError(integrator, "OfframpNotDeliverable");
+      });
+
+      it("delivers normally when the Diamond reports principal + a real fee", async function () {
+        await mockDiamond.setSellFeeBps(100); // 1%
+        const orderId = await acceptedOrder(USDC(50));
+        await expect(integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi")).to.emit(
+          integrator,
+          "OfframpUpiDelivered"
+        );
+      });
+    });
+
     it("restricts UPI delivery to the initiator, with no relayer escape", async function () {
       await bridgeIn(user, USDC(50));
       const orderId = await mockDiamond.nextOrderId();

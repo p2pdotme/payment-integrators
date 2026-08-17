@@ -375,20 +375,33 @@ contract MockDiamond {
                 reserved2: 0,
                 actualUsdtAmount: additionalOrderDetailsFeeUnready
                     ? 0
-                    : sellOrders[orderId].amount + _sellFee(sellOrders[orderId].amount),
+                    : actualUsdtAmountOverride[orderId] != 0
+                        ? actualUsdtAmountOverride[orderId]
+                        : sellOrders[orderId].amount + _sellFee(sellOrders[orderId].amount),
                 actualFiatAmount: 0
             });
     }
 
     /// @notice When set, `getAdditionalOrderDetails` returns 0 for
-    ///         actualUsdtAmount. Showdown has no `OfframpFeeNotReady` error (grep
-    ///         confirms zero hits) — `deliverOfframpUpi` FALLS BACK to
-    ///         `record.usdcAmount` (principal) in that case, so this flag
-    ///         exercises the fee-not-ready fallback branch, not a revert. (#55)
+    ///         actualUsdtAmount. Showdown's `deliverOfframpUpi` now REVERTS
+    ///         `OfframpFeeNotReady` on this rather than falling back to the
+    ///         principal — the fallback read as a safety net but is unreachable
+    ///         for an ACCEPTED order, since the real Diamond writes
+    ///         actualUsdtAmount at placement and only zeroes it on cancel. (#72)
     bool public additionalOrderDetailsFeeUnready;
 
     function setAdditionalOrderDetailsFeeUnready(bool v) external {
         additionalOrderDetailsFeeUnready = v;
+    }
+
+    /// @notice Force a specific `actualUsdtAmount` for one order, so tests can
+    ///         express a Diamond that re-prices, partially fills or changes its
+    ///         fee model — values the bps fee alone cannot produce (notably any
+    ///         amount BELOW the escrowed principal). 0 = use the computed value.
+    mapping(uint256 => uint256) public actualUsdtAmountOverride;
+
+    function setActualUsdtAmountOverride(uint256 orderId, uint256 amount) external {
+        actualUsdtAmountOverride[orderId] = amount;
     }
 
     /// @notice Mock of GetterFacet.getOrdersById. Only the `status`,
