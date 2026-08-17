@@ -45,7 +45,9 @@ A wallet is funded only when a real human is established behind it:
 - **`verified(wallet)` already true** on the integrator. Every later drip
   takes this path and needs no bearer credential at all.
 
-`blocked(wallet)` is refused on both paths.
+`blocked(wallet)` is refused on both paths, and that read fails **closed** — an
+RPC fault refuses the request rather than funding through it. It is the
+operator's only revocation lever, so it does not get to be best-effort.
 
 Then three ceilings, all per UTC day:
 
@@ -56,9 +58,12 @@ Then three ceilings, all per UTC day:
 | **per nullifier, value** | 1.6×10¹⁵ wei | a nullifier is per-(tenant, human), so one person spreading across many wallets shares one budget |
 | global | 2×10¹⁷ wei | circuit breaker |
 
-The per-nullifier cap is the one that matters. Without it, a genuinely-KYC'd
-user could request attestations for a fresh wallet each time and drain the
-faucet a drip at a time.
+The per-nullifier cap is defence in depth. It only binds once one identity
+spans three or more wallets, and the passport service's 1:N dedup is supposed
+to prevent that from being possible at all — but that property lives in another
+service and is not verified here, which is exactly why the cap exists. The
+nullifier is canonicalised before it is used as a ledger key; the raw request
+string has many spellings that decode identically.
 
 Worst case for a determined attacker who really did pass a passport check is
 their own per-identity cap. That is cents.

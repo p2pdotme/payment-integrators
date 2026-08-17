@@ -46,6 +46,29 @@ class InvalidAttestation(Exception):
     """The attestation is malformed, expired, or not signed by the attestor."""
 
 
+def canonical_nullifier(nullifier: str) -> str:
+    """The one spelling of a nullifier that may be used as a ledger key.
+
+    `bytes.fromhex` is far more forgiving than it looks: it ignores ASCII
+    whitespace and is case-insensitive, so `"AB"*32`, `"ab"*32` and
+    `" ".join(["ab"]*32)` all decode to the same 32 bytes and recover the same
+    signer. Keying the per-identity ledger on the raw request string therefore
+    let one identity hold unlimited distinct budget rows just by respelling
+    its own nullifier — the per-human cap it exists to enforce would not bind.
+
+    Wallets were already canonicalised (`to_checksum_address`, lowered in the
+    store); this closes the same hole on the other key.
+    """
+    raw = nullifier[2:] if nullifier.startswith(("0x", "0X")) else nullifier
+    try:
+        decoded = bytes.fromhex(raw)
+    except ValueError as exc:
+        raise InvalidAttestation(f"nullifier is not hex: {exc}") from exc
+    if len(decoded) != 32:
+        raise InvalidAttestation("nullifier must be 32 bytes")
+    return "0x" + decoded.hex()
+
+
 @dataclass(frozen=True)
 class Attestation:
     wallet: str

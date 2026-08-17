@@ -88,13 +88,30 @@ class Rpc:
         except ChainError:
             tip = 1_000_000  # 0.001 gwei — plenty on an L2
 
+        # 21,000 is the exact intrinsic cost of a transfer to an EOA and leaves
+        # nothing for a recipient that runs code — a deployed smart account, or
+        # an EIP-7702-delegated EOA, would run out of gas and the transfer
+        # would revert. Those are exactly the wallets an on-ramp meets, so pay
+        # for a real estimate when the recipient has code.
+        gas = 21_000
+        try:
+            if self.call("eth_getCode", [to_checksum_address(to), "latest"]) not in ("0x", "", None):
+                estimate = self.call(
+                    "eth_estimateGas",
+                    [{"from": account.address, "to": to_checksum_address(to), "value": hex(amount_wei)}],
+                )
+                gas = max(gas, int(int(str(estimate), 16) * 1.5))
+        except ChainError:
+            # Estimation is best-effort; 21,000 still covers the common case.
+            pass
+
         tx = {
             "type": 2,
             "chainId": chain_id,
             "nonce": nonce,
             "to": to_checksum_address(to),
             "value": amount_wei,
-            "gas": 21_000,
+            "gas": gas,
             # Room for the base fee to double while the transfer is in flight;
             # unused headroom is refunded, an underpriced drip just sits there.
             "maxFeePerGas": base_fee * 2 + tip,

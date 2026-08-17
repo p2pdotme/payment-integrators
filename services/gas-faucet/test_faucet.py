@@ -12,7 +12,13 @@ import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-from attestation import Attestation, InvalidAttestation, check_attestation, recover_attestor
+from attestation import (
+    Attestation,
+    InvalidAttestation,
+    canonical_nullifier,
+    check_attestation,
+    recover_attestor,
+)
 from policy import Limits, decide, drip_target_wei, floor_wei
 from store import Store, utc_day_start
 
@@ -339,3 +345,46 @@ class TestStore:
         store.record(chain_id=8453, wallet="0xB", nullifier=None,
                      amount_wei=20, tx_hash=None, now=now)
         assert store.usage(wallet="0xC", nullifier=None, now=now).global_wei == 30
+
+
+# ── the per-identity ledger key ─────────────────────────────────────────────
+
+
+class TestCanonicalNullifier:
+    """`bytes.fromhex` is permissive enough that the raw request string is not
+    a safe ledger key: whitespace is ignored and case does not matter, so one
+    identity could hold unlimited distinct budget rows just by respelling its
+    own nullifier — and the per-human cap would never bind."""
+
+    CANON = "0x" + "ab" * 32
+
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            "ab" * 32,
+            "0x" + "ab" * 32,
+            "0X" + "ab" * 32,
+            "AB" * 32,
+            "0x" + "Ab" * 32,
+            " ".join(["ab"] * 32),
+            "\t".join(["ab"] * 32),
+        ],
+    )
+    def test_every_spelling_collapses_to_one_key(self, spelling):
+        assert canonical_nullifier(spelling) == self.CANON
+
+    def test_the_permissiveness_this_defends_against_is_real(self):
+        # Guard the premise: if bytes.fromhex ever stops ignoring whitespace,
+        # this test should be the thing that notices.
+        assert bytes.fromhex(" ".join(["ab"] * 32)) == bytes.fromhex("ab" * 32)
+
+    def test_rejects_the_wrong_length(self):
+        with pytest.raises(InvalidAttestation, match="32 bytes"):
+            canonical_nullifier("0xabcd")
+
+    def test_rejects_non_hex(self):
+        with pytest.raises(InvalidAttestation, match="not hex"):
+            canonical_nullifier("0x" + "zz" * 32)
+
+    def test_distinct_identities_stay_distinct(self):
+        assert canonical_nullifier("ab" * 32) != canonical_nullifier("cd" * 32)

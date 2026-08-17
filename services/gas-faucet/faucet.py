@@ -56,7 +56,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from attestation import Attestation, InvalidAttestation, check_attestation
+from attestation import (
+    Attestation,
+    InvalidAttestation,
+    canonical_nullifier,
+    check_attestation,
+)
 from chain import SEL_BLOCKED, SEL_VERIFIED, ChainError, Rpc, account_from_key
 from policy import Decision, Limits, decide, drip_target_wei, floor_wei
 from store import Store
@@ -218,15 +223,22 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
     Raises 403 when it cannot be established — never funds on the benefit of
     the doubt, because the doubt is exactly what an attacker supplies.
     """
-    # Denylisted wallets get nothing, on either path. Cheap, and it would be
-    # perverse to fund a wallet the integrator has already refused to serve.
+    # Denylisted wallets get nothing, on either path — this is the operator's
+    # only revocation lever, so it fails CLOSED.
+    #
+    # It used to swallow ChainError and continue, on the theory that an
+    # integrator might not expose the getter. That theory was empty: `blocked`
+    # and `verified` are declared together on every integrator using this
+    # faucet, so anything missing one is missing both and would 502 below
+    # anyway. What the except actually caught was RPC faults — a timeout, a
+    # 429, an empty result — each of which turned a denylisted wallet into a
+    # funded one, silently.
     try:
-        if rpc.read_bool(integrator.address, SEL_BLOCKED, wallet):
-            raise HTTPException(403, "wallet_blocked")
-    except ChainError:
-        # Getter missing or RPC hiccup — fall through to the checks below
-        # rather than failing a legitimate user over an unrelated read.
-        pass
+        is_blocked = rpc.read_bool(integrator.address, SEL_BLOCKED, wallet)
+    except ChainError as exc:
+        raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+    if is_blocked:
+        raise HTTPException(403, "wallet_blocked")
 
     if req.attestation is not None:
         try:
@@ -245,7 +257,12 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
             )
         except InvalidAttestation as exc:
             raise HTTPException(403, f"invalid_attestation: {exc}") from exc
-        return req.attestation.nullifier
+        # Canonical form only — the raw request string is attacker-chosen and
+        # has many spellings that decode identically (see canonical_nullifier).
+        try:
+            return canonical_nullifier(req.attestation.nullifier)
+        except InvalidAttestation as exc:
+            raise HTTPException(403, f"invalid_attestation: {exc}") from exc
 
     try:
         if rpc.read_bool(integrator.address, SEL_VERIFIED, wallet):
@@ -330,29 +347,45 @@ def request_gas(req: GasRequest) -> GasResponse:
 
     # Broadcast is booked; confirmation is a courtesy so the caller can send
     # its own transaction immediately instead of polling the balance.
-    pending = not _await_receipt(rpc, tx_hash)
+    #
+    # A reverted transfer is reported as NOT funded. The drip stays on the
+    # ledger deliberately — the gas was spent and the cap should feel it — but
+    # telling the caller `funded: true` when nothing moved is worse than
+    # useless: it is the one signal they have, and it would be a lie.
+    outcome = _await_receipt(rpc, tx_hash)
 
     return GasResponse(
-        funded=True,
-        reason=decision.reason,
+        funded=outcome != "failed",
+        reason=decision.reason if outcome != "failed" else "send_reverted",
         balanceWei=str(balance),
         targetWei=str(target),
-        amountWei=str(decision.amount),
+        amountWei=str(decision.amount) if outcome != "failed" else "0",
         txHash=tx_hash,
-        pending=pending,
+        pending=outcome == "pending",
     )
 
 
-def _await_receipt(rpc: Rpc, tx_hash: str, *, attempts: int = 12, delay: float = 1.0) -> bool:
-    """Wait briefly for the drip to land. False means "still in flight"."""
+def _await_receipt(rpc: Rpc, tx_hash: str, *, attempts: int = 12, delay: float = 1.0) -> str:
+    """Wait briefly for the drip to land: "success" | "failed" | "pending".
+
+    A receipt existing is not the same as the transfer having worked — a
+    reverted or out-of-gas transaction has one too, with `status: 0x0`. This
+    used to return True on any non-null receipt, so the caller reported
+    `funded: true` for a transfer that moved nothing, and the client had no way
+    to tell the difference except by reading the balance itself.
+    """
     for _ in range(attempts):
         try:
-            if rpc.call("eth_getTransactionReceipt", [tx_hash]) is not None:
-                return True
+            receipt = rpc.call("eth_getTransactionReceipt", [tx_hash])
+            if receipt is not None:
+                status = receipt.get("status") if isinstance(receipt, dict) else None
+                # Pre-Byzantium receipts have no status field; treat absence as
+                # success rather than inventing a failure.
+                return "failed" if status is not None and int(str(status), 16) == 0 else "success"
         except ChainError:
             pass
         time.sleep(delay)
-    return False
+    return "pending"
 
 
 @app.get("/v1/gas/status")
