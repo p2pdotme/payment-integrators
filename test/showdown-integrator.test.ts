@@ -381,21 +381,50 @@ describe("ShowdownCheckoutIntegrator", function () {
     // _maxFeeFor(0) used to underflow on `amount - 1`. Newly reachable once the
     // delivery clamp (#73) can pin a session to zero — a panic there would take
     // down onOrderComplete instead of failing closed into BridgeFailed.
-    it("a zero-pinned session does not panic in _maxFeeFor", async function () {
+
+    // #87: the previous version of this test asserted `to.not.be.reverted` on
+    // the completion call. That proves nothing — `_bridge` runs inside
+    // `try this.selfBridge()`, so the catch swallows the panic and the outer
+    // transaction succeeds either way. It passed with the fix reverted.
+    //
+    // What actually differs is the reason bytes carried by BridgeFailed:
+    //   with the fix     Error("Amount must be nonzero")  0x08c379a0…  (CCTP refuses)
+    //   without the fix  Panic(0x11) arithmetic underflow 0x4e487b71…
+    it("a zero-pinned session fails closed in CCTP, not on an arithmetic panic", async function () {
       await verify(user, "kyc", KYC_CAP);
       const orderId = await mockDiamond.nextOrderId();
       await integrator.connect(user).userBuyUsdcToSolana(USDC(50), INR, SOLANA_ATA, 1, "", 0, 0);
-      // Reports $50, transfers nothing -> clamp pins the session to 0.
-      await expect(
-        mockDiamond.adminCallOnOrderComplete(
+
+      // Reports $50, transfers nothing -> the clamp (#73) pins the session to 0.
+      const rc = await (
+        await mockDiamond.adminCallOnOrderComplete(
           integratorAddr,
           orderId,
           user.address,
           USDC(50),
           integratorAddr
         )
-      ).to.not.be.reverted;
+      ).wait();
       expect((await integrator.getSession(orderId)).amount).to.equal(0);
+
+      const reasons: string[] = [];
+      for (const log of rc!.logs) {
+        try {
+          const parsed = integrator.interface.parseLog(log as never);
+          if (parsed?.name === "BridgeFailed") reasons.push(parsed.args[1] as string);
+        } catch {
+          /* not ours */
+        }
+      }
+      expect(reasons.length, "expected a BridgeFailed for the zero-amount burn").to.equal(1);
+      // Panic(uint256) selector. 0x11 is arithmetic over/underflow.
+      expect(
+        reasons[0].startsWith("0x4e487b71"),
+        `_maxFeeFor(0) underflowed: BridgeFailed carried a Panic instead of a CCTP revert (${reasons[0]})`
+      ).to.equal(false);
+      // And it is the burn refusing a zero amount, i.e. Error(string).
+      expect(reasons[0].startsWith("0x08c379a0")).to.equal(true);
+
       expect(await integrator.unbridgedTotal()).to.equal(0);
     });
   });
