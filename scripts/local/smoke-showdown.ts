@@ -208,6 +208,12 @@ async function main() {
       `  ✅ path clears (proxy auth + validateOrder + placeB2BOrder) -> orderId ${orderId}`
     );
   } catch (e: any) {
+    // Must count as a failure, not just print one. This is the core onramp path:
+    // if it reverts, the integrator does not work at all. Printing "✗" without
+    // touching `failures` let the run exit 0 with the product broken — the exact
+    // lying-green behaviour #47 was filed about, surviving in the one step where
+    // it mattered most.
+    ok(false);
     console.log(`  ✗ reverted: ${decodeErr(integrator.interface, e)}`);
   }
 

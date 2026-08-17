@@ -360,6 +360,15 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     ///         service signs at one tier cannot be inflated by a higher limit
     ///         attested at a different tier/service. See #45. ABI note: the
     ///         auto-getter is now `grantedLimit(address,uint8)`.
+    ///
+    ///         ⚠️ A signed DOWNGRADE is advisory, not binding. The digest binds
+    ///         `wallet = msg.sender`, so the service cannot push one onto a
+    ///         flagged user — they simply never claim it. And the replay guard is
+    ///         per-nullifier, not per-user, so any OTHER unexpired higher-limit
+    ///         attestation re-raises the cap after a downgrade is claimed.
+    ///         `setUserBlocked` is the only lever that binds a flagged user.
+    ///         Exposure meanwhile is bounded by the immutable tier ceilings and
+    ///         the daily count.
     mapping(address => mapping(uint8 => uint256)) public grantedLimit;
     /// @notice Highest KYC tier the user has claimed (see TIER_* constants).
     mapping(address => uint8) public userTier;
@@ -1322,7 +1331,8 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      * @notice Forward the encrypted UPI payload to the Diamond, letting it pull
      *         the sale's USDC from the seller's proxy. Reads the authoritative
      *         `actualUsdtAmount` (principal + fee) from the Diamond rather than
-     *         assuming the principal. Callable by the initiator or the relayer.
+     *         assuming the principal. Callable ONLY by the order's initiator —
+     *         there is no relayer path (#53.2); see the note by `offrampEnabled`.
      */
     function deliverOfframpUpi(uint256 orderId, string calldata encUpi) external nonReentrant {
         OfframpRecord memory record = offramps[orderId];

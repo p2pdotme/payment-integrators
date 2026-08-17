@@ -7,6 +7,7 @@ A two-way fiat ↔ USDC ramp for [Showdown](https://showdown.gg) whose user-faci
 - **Onramp (fiat → USDC on Solana).** The user pays local fiat on the P2P network. The Diamond delivers the purchased USDC to the integrator, which immediately burns it via CCTP and authorizes a mint to the user's Solana USDC account. The final product the user holds is native USDC on Solana — no wrapped asset, no third-party bridge.
 
   > **The mint is `amount − fee`, not `amount`.** Circle deducts its attestation fee from the burned amount, so the recipient receives less than was burned whenever a fee applies. On the shipped defaults this is a distinction without a difference — `bridgeMinFinalityThreshold = 2000` (Standard) costs **0 bps** on Base → Solana, verified against Circle's live fee API, so the mint equals the burn exactly. It stops being free the moment anyone calls `setBridgeMinFinalityThreshold(1000)` (Fast, 1.3 bps) and raises `bridgeMaxFeeBps` to match. The widget must quote the **net** amount rather than the order amount if Fast is ever enabled.
+
 - **Offramp (USDC on Solana → fiat).** The user burns USDC on Solana with CCTP, naming their Base-side `UserProxy` as the `mintRecipient`. Once it lands there, they place a SELL on the Diamond funded from that proxy balance and receive fiat.
 
 Both directions are gated by tiered simple-kyc attestations, because both convert between fiat and USDC the user actually controls.
@@ -23,7 +24,11 @@ The per-tx cap is a function of the KYC tier **and** the settlement region:
 
 Plus **5 orders per user per UTC day**, budgeted _separately_ for each direction — 5 onramps and, independently, 5 offramps.
 
-The effective cap is `min(attested limit, tierCap[tier][region])`. The simple-kyc service signs a dollar limit into the attestation, and the contract clamps it to its own per-(tier, region) ceiling. Tiers stack monotonically: claiming a higher tier raises the cap, claiming a lower one never lowers it. The same matrix applies to onramp and offramp.
+The effective cap is `min(attested limit, tierCap[tier][region])`. The simple-kyc service signs a dollar limit into the attestation, and the contract clamps it to its own per-(tier, region) ceiling. `grantedLimit` is keyed per tier, so a sub-cap signed at one tier cannot be inflated by a limit attested at another. The same matrix applies to onramp and offramp.
+
+> **A signed downgrade is advisory, not binding.** Claiming a _lower_ limit at the same tier does reduce the cap — but it only takes effect if the user chooses to claim it, and it can be undone. The EIP-712 digest binds `wallet = msg.sender`, so the service cannot push a downgrade onto a flagged user; they can simply never submit it. And because the replay guard is per-nullifier rather than per-user, any **other** still-unexpired higher-limit attestation re-raises the cap after a downgrade has been claimed. Reproduced: claim $100 → claim a $5 downgrade → claim a second unexpired $100 → `effectiveLimit` reads $100 again.
+>
+> So a risk downgrade is a cooperative mechanism for tightening a compliant user's own limit. **The only lever that binds a flagged user is `setUserBlocked`**, which gates placement outright and cannot be reversed by any attestation. Exposure in the meantime is bounded by the immutable ceilings ($200/tx max) and the 5/day count. Treat the signed downgrade as a nudge and the block as the control.
 
 ### The ceilings are immutable
 
@@ -53,7 +58,11 @@ A block deliberately does **not** gate `userBridgeBackToSolana` or `userRescueSt
 
 ### Daily counts are placements, not settlements
 
-The live Diamond does not call `onOrderCancel` — the selector is absent from every mainnet facet, and the hook exists only on the unmerged `feat/integrator-on-order-cancel` branch. Until that ships, a cancelled or expired order **keeps its slot**. This is the safe direction (a slot can never be freed early, so the cap can't be exceeded), but a user whose orders keep failing is locked out until the next UTC day — and 00:00 UTC is 05:30 IST, mid-morning in India. Worth surfacing in the UI at 5/day.
+`onOrderCancel` **is** live on the mainnet Diamond as of contracts-v4 #362 (deployed 2026-08-05) — but it is a **per-integrator opt-in that defaults to OFF**, so until a super-admin calls `setIntegratorCancelCallback(<integrator>, true)` a cancelled or expired order still **keeps its slot**. That call is deploy gate D9 and happens _after_ registration; skip it and daily limits silently stay placements-per-day.
+
+Two caveats even once it is enabled. It is **BUY-only** — `onB2BOrderCancelled` is gated on `orderType == BUY`, so the offramp side always relies on `reconcile` to release its own slot. And the callback is capped at **250k gas**, because cancellation runs inside the permissionless `autoCancelExpiredOrders` keeper; this integrator's hook measures 27,860 gas, comfortably inside.
+
+Keeping the slot is the safe direction (it can never be freed early, so the cap can't be exceeded), but a user whose orders keep failing is locked out until the next UTC day — and 00:00 UTC is 05:30 IST, mid-morning in India. Worth surfacing in the UI at 5/day either way.
 
 Attestation intake (`submitLivenessAttestation` / `submitKycAttestation`) is byte-compatible with `UsdcDirectCheckoutIntegrator` — same EIP-712 typehashes, `KycVerifier` / `LivenessVerifier` domains, and per-(tenant, human) single-use nullifiers.
 

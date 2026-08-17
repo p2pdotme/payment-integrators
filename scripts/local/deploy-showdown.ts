@@ -230,6 +230,27 @@ async function main() {
         ? "Owner check:          ✅ DEPLOY_OWNER set (signer identity skipped under DRY_RUN)"
         : "Owner check:          ✅ signer matches DEPLOY_OWNER"
     );
+
+    // Neither attestor may be the deploy key on mainnet. `owner` IS the deployer
+    // (immutable), so an attestor equal to it means that single key can both sign
+    // attestations and spend against them — a self-attestable lane at the tier's
+    // full ceiling, paying no fiat. `set-showdown-attestors.ts` enforces this too,
+    // but that script is optional and this one is not: the property has to live on
+    // the path nobody can skip, not only in the tool they might remember to run.
+    for (const [label, attestor] of [
+      ["LIVENESS_ATTESTOR", LIVENESS_ATTESTOR],
+      ["KYC_ATTESTOR", KYC_ATTESTOR],
+    ] as const) {
+      if (attestor.toLowerCase() === me.toLowerCase()) {
+        throw new Error(
+          `${label} is the deploy key (${me}). On mainnet that ships a SELF-ATTESTABLE tier: ` +
+            `owner is immutable and equals the deployer, so one key could sign its own ` +
+            `attestations up to the tier ceiling. Take each attestor from its service's own ` +
+            `/v1/attestor endpoint.`
+        );
+      }
+    }
+    console.log("Attestor check:       ✅ neither attestor is the deploy key");
   }
 
   // solanaDomain is immutable and CCTP domain IDs are network-agnostic — Solana
