@@ -214,7 +214,10 @@ some fraction of real users' resolvers will do the same thing.
 
 **Watch:** faucet `/healthz` (`funderBalanceWei`, `spentTodayWei` against the
 cap) · `SettlementRoutingAnomaly` on the integrator — it can only fire on a
-mis-registration, so any occurrence is an incident · completion rate versus the
+mis-registration or a mis-described completion, so any occurrence is an
+incident, and since 2026-08-17 it reads this contract's USDC balance rather
+than the callback's `recipientAddr`, which the Diamond passes unchanged in
+both routing branches and which therefore could never have caught one · completion rate versus the
 1.57% organic baseline.
 
 **Levers, in escalating order:** `setBlocked` one wallet · `setRegionCap(region, lower)`

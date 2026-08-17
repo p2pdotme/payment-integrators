@@ -95,6 +95,48 @@ contract MockDiamond {
      *         integrator's pinned proxyImpl. Mirrors the real
      *         B2BGatewayFacet._resolveIntegrator (no isAuthorizedProxy callback).
      */
+    /* ── Adversarial modes ────────────────────────────────────────────────
+     *
+     * An integrator's own defences against a misbehaving Diamond cannot be
+     * tested by a Diamond that always behaves. These switches let a test drive
+     * the gateway off the happy path deliberately. All default false, so
+     * existing suites are unaffected.
+     */
+
+    /// @notice Mirrors `B2BGatewayStorage.IntegratorConfig.usdcThroughIntegrator`.
+    ///         The real gateway routes settlement on this but passes
+    ///         `recipientAddr` to `onOrderComplete` in BOTH branches — the
+    ///         asymmetry an integrator's routing alarm has to survive.
+    bool public usdcThroughIntegrator;
+    /// @notice Place without ever calling `validateOrder`.
+    bool public skipValidation;
+    /// @notice Call `validateOrder` twice for one placement.
+    bool public doubleValidate;
+    /// @notice Call `validateOrder` with an amount the integrator did not ask for.
+    bool public tamperValidationAmount;
+    /// @notice Hand back an order id that has already been used.
+    uint256 public forceOrderId;
+
+    function setUsdcThroughIntegrator(bool v) external {
+        usdcThroughIntegrator = v;
+    }
+
+    function setSkipValidation(bool v) external {
+        skipValidation = v;
+    }
+
+    function setDoubleValidate(bool v) external {
+        doubleValidate = v;
+    }
+
+    function setTamperValidationAmount(bool v) external {
+        tamperValidationAmount = v;
+    }
+
+    function setForceOrderId(uint256 id) external {
+        forceOrderId = id;
+    }
+
     function placeB2BOrder(
         address user,
         uint256 amount,
@@ -107,10 +149,19 @@ contract MockDiamond {
     ) external returns (uint256 orderId) {
         address effectiveIntegrator = _resolveIntegrator();
 
-        bool allowed = IP2PIntegrator(effectiveIntegrator).validateOrder(user, amount, currency);
-        require(allowed, "Validation failed");
+        if (!skipValidation) {
+            bool allowed = IP2PIntegrator(effectiveIntegrator).validateOrder(
+                user,
+                tamperValidationAmount ? amount + 1 : amount,
+                currency
+            );
+            require(allowed, "Validation failed");
+            if (doubleValidate) {
+                IP2PIntegrator(effectiveIntegrator).validateOrder(user, amount, currency);
+            }
+        }
 
-        orderId = nextOrderId++;
+        orderId = forceOrderId != 0 ? forceOrderId : nextOrderId++;
         orders[orderId] = Order({
             integrator: effectiveIntegrator,
             user: user,
@@ -210,9 +261,17 @@ contract MockDiamond {
         require(!order.cancelled, "Cancelled is terminal");
         order.completed = true;
 
-        // Transfer USDC to recipientAddr (mirrors usdcThroughIntegrator = false)
-        usdc.safeTransfer(order.recipientAddr, order.amount);
+        // Routing follows the flag, exactly as B2BGatewayFacet does.
+        if (usdcThroughIntegrator) {
+            usdc.safeTransfer(order.integrator, order.amount);
+        } else {
+            usdc.safeTransfer(order.recipientAddr, order.amount);
+        }
 
+        // ...but the callback carries `recipientAddr` in BOTH branches. This
+        // is not an oversight in the mock; it is what the real gateway does,
+        // and it is the reason an integrator cannot detect a mis-registration
+        // from this argument.
         try
             IP2PIntegrator(order.integrator).onOrderComplete(
                 orderId,

@@ -28,7 +28,7 @@ import { ethers } from "hardhat";
  *     5 orders/day per wallet
  *
  * Each number is ALSO an immutable MAX_* constant in the bytecode. The
- * constructor and the owner's setters can only ever go at or below them, so
+ * constructor and the owner's setters are bounded by them, so
  * the policy holds against a compromised owner key as well as a compromised
  * attestor key. Pass lower values to launch tighter; the owner can lower
  * further later, never raise.

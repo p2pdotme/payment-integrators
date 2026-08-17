@@ -5,11 +5,14 @@ import { ethers } from "hardhat";
  * the settlement invariant. Split out from the E2E so a run interrupted after
  * placement can be resumed without burning another daily slot.
  *
- *   ORDER_ID=586 npx hardhat run scripts/local/_finish-585.ts --network baseSepolia
+ *   ORDER_ID=586 npx hardhat run scripts/local/resume-own-order.ts --network baseSepolia
+ *
+ * Addresses default to the Base Sepolia deployment and are env-overridable, so
+ * this works against a redeploy without editing the file.
  */
 const S = ["PLACED", "ACCEPTED", "PAID", "COMPLETED", "CANCELLED"];
-const D = "0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9";
-const I = "0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032";
+const D = process.env.DIAMOND_ADDRESS || "0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9";
+const I = process.env.INTEGRATOR_ADDRESS || "0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032";
 const T = "0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d";
 const ID = BigInt(process.env.ORDER_ID || "586");
 const AMT = BigInt(process.env.AMOUNT || "2000000");

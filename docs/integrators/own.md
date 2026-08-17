@@ -48,7 +48,7 @@ Own's perps-margin bridge already uses. Verified live (Aug 2026):
 |---|---|
 | Route | Base `8453` USDC `0x8335…2913` → Robinhood `4663` USDG `0x5fc5…d168` |
 | Both legs | `supportsBridging: true` on Relay's `/chains` feed |
-| Live quote | 100 USDC in → **99.947424 USDG** out, ETA ~2s, impact −0.07% |
+| Live quote | 100 USDC in → **99.82 USDG** out, ETA ~2s, impact −0.15% |
 | Steps | one signature — see below |
 | Recipient | a parameter — set to the user's own address |
 
@@ -138,6 +138,44 @@ single most common integration failure here (see §6).
 plus **5 orders per wallet per day**. Maximum exposure per wallet per day is
 therefore $500 (India) / $1,000 (abroad).
 
+### The caps are USDC-denominated, not fiat
+
+Read the table as "a verified user receives at most $200 of USDC per
+transaction". It does **not** bound the fiat they hand over, and the difference
+is not a rounding detail.
+
+`buyUsdc` forwards `fiatAmountLimit`, `circleId` and
+`preferredPaymentChannelConfigId` from the caller without validating them. On a
+BUY the Diamond does not treat `fiatAmountLimit` as a ceiling — it *substitutes*
+it. `OrderFlowFacet` reverts only when the computed fiat exceeds the limit and
+otherwise assigns `fiatAmount = _fiatAmountLimit`, with the favourable-price
+delta accruing to the merchant. So the figure a caller passes is the figure the
+buyer owes, and a $100 USDC order can commit an arbitrarily larger fiat leg,
+bounded by the assigned merchant's collateral rather than by anything here.
+
+Three things keep this from being a live problem, and it is worth being precise
+about which:
+
+- The buyer is spending their own money. There is no path by which a third
+  party profits, and settlement still lands in the buyer's own wallet.
+- own-app computes `fiatAmountLimit` from a live quote plus a 2% drift
+  tolerance (`FIAT_LIMIT_TOLERANCE_BPS`), so no app user can reach the case.
+- The exposure is therefore a caller going directly to the contract, harming
+  only themselves.
+
+What it does mean is that a compliance claim of the form "a verified user moves
+at most $200 per transaction" is true of the USDC leg and **not** of the fiat
+leg. If that claim has to hold on both sides, the contract needs to bound
+`fiatAmountLimit` against the Diamond's own computed amount — a deliberate
+change, not a wording fix.
+
+Two related gaps in the same area. There is no **aggregate** cap at any layer:
+exposure is (attestations) x (per-tx cap) x 5 per day, and the Diamond adds no
+ceiling of its own. And the protocol's consumer blacklist does not reach this
+path — `placeOrder` carries the `txnAmountValid` check, while
+`placeOrderForB2B` carries only `nonReentrant exchangeActive`. Denylisting here
+is `setBlocked` on this contract, and nothing else.
+
 The effective cap is `min(attested limit, regionCap[region])`: the service signs
 a dollar limit into the attestation, and the contract clamps it to an on-chain
 per-region ceiling. **A compromised attestor key cannot authorize more than the
@@ -160,11 +198,27 @@ MAX_REGION_CAP_ABROAD    = 200e6;   // $200
 MAX_DAILY_TX_COUNT_LIMIT = 5;
 ```
 
-`setRegionCap` and `setDailyTxCountLimit` check against these, so the owner can
-only ever make the contract **more** restrictive. The policy holds against a
-compromised **owner** key, not merely a compromised attestor — which matters
-because a whitelisted integrator that can raise its own caps is a risk to the
-protocol, not just to Own.
+`setRegionCap` and `setDailyTxCountLimit` check against these, so **no limit
+can ever exceed its ceiling** — not by the owner, not by anyone. That bound
+holds against a compromised **owner** key, which matters because a whitelisted
+integrator that could raise its own caps is a risk to the protocol, not just to
+Own.
+
+Note precisely what that does and does not say.
+
+Movement *below* a ceiling is free in both directions. An owner who lowers
+India to $25 can restore it to $100 in the next block — the setters are not a
+one-way ratchet, and deliberately so: a cap tightened during an incident has to
+be restorable without redeploying. Earlier drafts of this doc and the contract
+said the owner "can only ever tighten". That was wrong, and it is corrected
+here.
+
+The ceilings also bound the **per-transaction** USDC amount, not aggregate
+exposure. `setAttestor` is unbounded, so a compromised owner can point the
+attestor at a key it holds and mint attestations for as many wallets as it
+likes; the per-tx and per-day-per-wallet limits survive, but nothing caps the
+number of wallets. **Owner compromise is a superset of attestor compromise** —
+which is the real reason `owner` must be a multisig, more than `sweepUsdc` is.
 
 ### Attestation binding
 
@@ -198,6 +252,21 @@ non-zero balance means a stray transfer or a mis-registration, and in both cases
 the funds are otherwise stuck. `SettlementRoutingAnomaly` fires on the first
 mis-routed completion, so the condition is visible before any balance
 accumulates.
+
+> That last sentence was **false until 2026-08-17**, and the fix is worth
+> understanding because it is not obvious. The Diamond routes settlement on
+> `usdcThroughIntegrator` but passes `_order.recipientAddr` to
+> `onOrderComplete` in **both** branches (`B2BGatewayFacet`, the transfer at
+> `:330-333` against the callback at `:343-350`). So under a mis-registration
+> the callback still names the buyer: the old check compared it to
+> `session.user`, found them equal, saw nothing wrong, and marked the session
+> settled while the USDC sat on this contract. The alarm was silent in exactly
+> the case it existed for.
+>
+> The check now reads **this contract's own USDC balance**, which is the
+> invariant itself rather than a proxy for it. It compares against the settled
+> amount rather than zero, so a stranger cannot trip it — and permanently break
+> settlement bookkeeping — by sending a single wei.
 
 ---
 
@@ -296,9 +365,33 @@ user's proxy both held nothing. That assertion is the point of the test.
 
 ### Order TTL — measured
 
-A buy order is payable for **~5 minutes from PLACEMENT**, not from merchant
-acceptance. Measured 2026-08-04 with `scripts/local/measure-order-ttl.ts`, which
-probes `paidBuyOrder` via free `eth_call`:
+**Corrected 2026-08-17.** An earlier version of this section said the window
+runs "~5 minutes from PLACEMENT, not from merchant acceptance". That was the
+wrong way round, and the measurement could not have shown otherwise: order 587
+was accepted **8 seconds** after it was placed, so the two anchors were 8
+seconds apart and indistinguishable.
+
+Expiry is **status-dependent** (`libOrderProcessorFacet.getOrderExpiresAt`):
+
+| status | expires at | default |
+|---|---|---|
+| `PLACED` | `placedTs + placedExpiry` | 3 min |
+| `ACCEPTED` | `acceptedTs + acceptedExpiry` | **5 min from ACCEPTANCE** |
+| `PAID` | `paidTs + paidExpiry` | 10 min |
+
+There is a second, independent bound that applies specifically to the buyer:
+`paidBuyOrder` also rejects `block.timestamp >= placedTimestamp + orderExpiry`
+when the caller is the order's user. So the real deadline is the **earlier of
+the two**, and which one binds depends on how fast a merchant accepted.
+
+The practical consequence: **do not compute the deadline client-side.** Read
+`getOrderExpiresAt(orderId)` from the Diamond, which is authoritative across
+every status. Computing `placedTimestamp + 300` happens to be conservative when
+a merchant accepts quickly and is dangerously generous when they do not — and
+being generous here means telling a user to send fiat to an order that is
+already dead.
+
+The original measurement, for the record:
 
 ```
 t+283s  ACCEPTED  paidBuyOrder → OK
@@ -310,8 +403,9 @@ consequences:
 
 - **Scripts** must place and pay in one tight loop — even re-reading the order
   record (which lags on this RPC) can burn the window. Orders **585** and **586**
-  were lost this way and are still holding merchant capacity; clear them with
-  demo-merchant-bot `cancel-hanging-orders`.
+  were lost this way; both have since auto-cancelled and are no longer holding
+  merchant capacity. To clear a stuck one, use demo-merchant-bot
+  `cancel-hanging-orders`.
 - **Real users** get ~5 minutes to open their banking app, pay, and confirm.
   That is tight but workable, so no protocol change is needed — but a client
   MUST show the deadline and MUST NOT send `paidBuyOrder` on the user's behalf.

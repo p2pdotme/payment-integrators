@@ -534,7 +534,11 @@ describe("OwnCheckoutIntegrator", function () {
         )
       )
         .to.emit(integrator, "SettlementRoutingAnomaly")
-        .withArgs(orderId, user.address, user.address, USDC(10), integratorAddr);
+        // The 6th field is this contract's USDC balance. Zero here: this entry
+        // point only replays the callback and moves no money, which is exactly
+        // why it could never have caught a real mis-registration. The test
+        // above in "the mis-registration alarm" drives the actual routing.
+        .withArgs(orderId, user.address, user.address, USDC(10), integratorAddr, 0);
 
       // …and the session is NOT marked settled on a mismatch.
       expect((await integrator.getSession(orderId)).settled).to.equal(false);
@@ -765,6 +769,143 @@ describe("OwnCheckoutIntegrator", function () {
         verifyingContract: integratorAddr,
       });
       expect(await integrator.domainSeparator()).to.equal(expected);
+    });
+  });
+
+  /*
+   * A Diamond that does not behave.
+   *
+   * Everything this contract inherits from its siblings was already covered;
+   * the guards it invented for itself were not. Each of the four below
+   * survived deletion with the whole suite still green, because every negative
+   * path in the rest of the file stops at the friendly pre-check in `buyUsdc`
+   * and never reaches a live placement. These drive the gateway off the happy
+   * path instead.
+   */
+  describe("defences against a misbehaving Diamond", function () {
+    it("refuses to record a placement the gate never saw", async function () {
+      // OrderValidationMissing. A Diamond that skips validateOrder has created
+      // an order without passing this contract's limits — the placement must
+      // unwind, not be recorded.
+      await verify(user, CAP_INDIA);
+      await mockDiamond.setSkipValidation(true);
+      await expect(
+        integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0)
+      ).to.be.revertedWithCustomError(integrator, "OrderValidationMissing");
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(DAILY_COUNT);
+    });
+
+    it("refuses an order id it has already recorded", async function () {
+      // OrderIdAlreadyUsed. Reusing an id would silently overwrite a live
+      // session and orphan the first order's bookkeeping.
+      await verify(user, CAP_INDIA);
+      const first = await mockDiamond.nextOrderId();
+      await integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0);
+
+      await mockDiamond.setForceOrderId(first);
+      await expect(
+        integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0)
+      ).to.be.revertedWithCustomError(integrator, "OrderIdAlreadyUsed");
+
+      const session = await integrator.getSession(first);
+      expect(session.amount).to.equal(USDC(10));
+      expect(session.settled).to.equal(false);
+    });
+
+    it("refuses a validateOrder that does not match the placement in flight", async function () {
+      // The pending-placement tuple binding. validateOrder must approve only
+      // the exact (user, amount, currency) buyUsdc is mid-flight on — a
+      // tampered amount makes it return false, and the gateway unwinds.
+      await verify(user, CAP_INDIA);
+      await mockDiamond.setTamperValidationAmount(true);
+      // Reverts, but not with the gateway's own string: UserProxy.execute wraps
+      // any failed call in CallFailed(bytes), so the reason is opaque at this
+      // boundary. What matters is that nothing was recorded.
+      await expect(integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0)).to.be
+        .reverted;
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(DAILY_COUNT);
+      expect((await integrator.getSession(await mockDiamond.nextOrderId())).user).to.equal(
+        ethers.ZeroAddress
+      );
+    });
+
+    it("consumes exactly one daily slot when the gate is called twice", async function () {
+      // pending.validated is single-use: a second validateOrder inside one
+      // placement must not consume a second slot.
+      await verify(user, CAP_INDIA);
+      await mockDiamond.setDoubleValidate(true);
+      await integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0);
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(DAILY_COUNT - 1);
+    });
+
+    it("rejects a validateOrder arriving with no placement in flight", async function () {
+      // Standalone predicate, called straight from the Diamond. Without the
+      // binding this would be a free daily-slot burn, or worse an approval.
+      await verify(user, CAP_INDIA);
+      const asDiamond = await impersonateDiamond();
+      expect(
+        await integrator.connect(asDiamond).validateOrder.staticCall(user.address, USDC(10), INR)
+      ).to.equal(false);
+    });
+  });
+
+  describe("the mis-registration alarm", function () {
+    /*
+     * The Diamond routes settlement on `usdcThroughIntegrator` but passes
+     * `recipientAddr` to onOrderComplete in BOTH branches, so under a
+     * mis-registration the callback still names the buyer. An alarm keyed on
+     * that argument is silent in exactly the case it exists for; this one
+     * reads the contract's own balance instead.
+     */
+    it("fires when settlement lands here instead of the buyer", async function () {
+      await verify(user, CAP_INDIA);
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0);
+
+      await mockDiamond.setUsdcThroughIntegrator(true);
+      const before = await mockUsdc.balanceOf(user.address);
+
+      await expect(mockDiamond.simulateOrderComplete(orderId)).to.emit(
+        integrator,
+        "SettlementRoutingAnomaly"
+      );
+
+      // The money is here, the buyer got nothing, and the session is NOT
+      // marked settled — an anomaly must never look like a completion.
+      expect(await mockUsdc.balanceOf(integratorAddr)).to.equal(USDC(10));
+      expect(await mockUsdc.balanceOf(user.address)).to.equal(before);
+      expect((await integrator.getSession(orderId)).settled).to.equal(false);
+    });
+
+    it("stays quiet on a correctly routed completion", async function () {
+      await verify(user, CAP_INDIA);
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0);
+
+      await expect(mockDiamond.simulateOrderComplete(orderId)).to.not.emit(
+        integrator,
+        "SettlementRoutingAnomaly"
+      );
+      expect((await integrator.getSession(orderId)).settled).to.equal(true);
+      expect(await mockUsdc.balanceOf(integratorAddr)).to.equal(0);
+    });
+
+    it("is not trippable by a stranger sending dust", async function () {
+      // Comparing against the settled amount rather than zero. A `!= 0` test
+      // would let anyone permanently break settlement bookkeeping for the
+      // price of one wei, since an anomaly refuses to mark the session
+      // settled.
+      await verify(user, CAP_INDIA);
+      await mockUsdc.mint(stranger.address, USDC(1));
+      await mockUsdc.connect(stranger).transfer(integratorAddr, 1n);
+
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0);
+      await expect(mockDiamond.simulateOrderComplete(orderId)).to.not.emit(
+        integrator,
+        "SettlementRoutingAnomaly"
+      );
+      expect((await integrator.getSession(orderId)).settled).to.equal(true);
     });
   });
 });

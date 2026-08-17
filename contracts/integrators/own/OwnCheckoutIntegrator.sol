@@ -51,11 +51,25 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *         key cannot authorize more than the region allows.
  *
  *         Every one of those numbers is ALSO an immutable `MAX_*` constant in
- *         the bytecode. `setRegionCap` / `setDailyTxCountLimit` can only ever
- *         move a limit DOWN. The policy therefore holds against a compromised
- *         OWNER key, not merely a compromised attestor — which matters because
- *         a whitelisted integrator that could raise its own caps is a risk to
- *         the protocol, not just to Own.
+ *         the bytecode, and `setRegionCap` / `setDailyTxCountLimit` check
+ *         against them. So no limit can ever exceed its ceiling — not by the
+ *         owner, not by anyone. That bound holds against a compromised OWNER
+ *         key, which matters because a whitelisted integrator that could raise
+ *         its own caps is a risk to the protocol, not just to Own.
+ *
+ *         Note what this does NOT say. Movement below a ceiling is free in
+ *         both directions: an owner who lowers India to $25 can restore it to
+ *         $100 in the next block. That is deliberate — a cap tightened during
+ *         an incident has to be restorable, and one-way setters would mean
+ *         redeploying to undo an operational decision. The guarantee is the
+ *         ceiling, not monotonicity.
+ *
+ *         And the ceilings bound the PER-TRANSACTION USDC amount. A
+ *         compromised owner can still point `setAttestor` at a key it holds
+ *         and mint attestations for unlimited wallets, so the aggregate is
+ *         bounded only by $ceiling x 5 x (wallets it cares to create). Owner
+ *         compromise is a superset of attestor compromise; `owner` should be a
+ *         multisig for that reason and not merely for `sweepUsdc`.
  *
  *         ── Region is settlement geography, not nationality ──────────────
  *         `region` is derived from the order's fiat currency, i.e. which rail
@@ -129,20 +143,34 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
     event OnrampOrderCancelled(uint256 indexed orderId, address indexed user, uint256 amount);
 
     /**
-     * @notice Emitted when a completion callback does not describe the order
-     *         this contract placed — in particular when `recipientAddr` is not
-     *         the buyer. Under the intended registration
-     *         (`usdcThroughIntegrator = false`) this can never fire; if it
-     *         does, the integrator was mis-registered and settlement is being
-     *         routed somewhere other than the buyer's wallet. Loud on-chain so
-     *         it is caught on the first order rather than the hundredth.
+     * @notice Emitted when a completion does not look like the order this
+     *         contract placed — either the callback describes something else,
+     *         or the money did not go where the callback says it went.
+     *
+     * @dev    `integratorBalance` is the load-bearing field, and the reason
+     *         this event is not driven by `recipientAddr` alone.
+     *
+     *         The Diamond routes settlement on `usdcThroughIntegrator`
+     *         (`B2BGatewayFacet` — `safeTransfer(integrator, …)` when true,
+     *         `safeTransfer(_order.recipientAddr, …)` when false) but passes
+     *         `_order.recipientAddr` to this callback in BOTH branches. So
+     *         under a mis-registration the argument still names the buyer, and
+     *         a check on `recipientAddr` sees nothing wrong while the USDC
+     *         sits here. The alarm was silent in exactly the case it existed
+     *         for.
+     *
+     *         The balance is not fooled by that, because it is the invariant
+     *         itself rather than a proxy for it: this contract is never a
+     *         settlement destination, so holding the amount that was just
+     *         settled means the money did not reach the buyer.
      */
     event SettlementRoutingAnomaly(
         uint256 indexed orderId,
         address indexed expectedUser,
         address callbackUser,
         uint256 callbackAmount,
-        address callbackRecipient
+        address callbackRecipient,
+        uint256 integratorBalance
     );
 
     event UsdcSwept(address indexed to, uint256 amount);
@@ -324,10 +352,12 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
     }
 
     /**
-     * @notice Lower the per-tx cap for one region. Setting a cap to 0 disables
+     * @notice Set the per-tx cap for one region. Setting a cap to 0 disables
      *         that region without touching anyone's attestation.
-     * @dev    Can only ever set a value AT OR BELOW the matching immutable
-     *         `MAX_REGION_CAP_*` — the owner may tighten policy, never loosen.
+     * @dev    Bounded by the matching immutable `MAX_REGION_CAP_*`: a cap can
+     *         never exceed its ceiling. It CAN move freely below it, in either
+     *         direction — this is not a one-way ratchet, so a cap tightened
+     *         during an incident can be restored without redeploying.
      */
     function setRegionCap(uint8 region, uint256 cap) external onlyOwner {
         _setRegionCap(region, cap);
@@ -371,6 +401,14 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
      *         withdrawal path for user funds; `SettlementRoutingAnomaly` fires
      *         on the first mis-routed completion so the condition is visible
      *         before any balance accumulates.
+     *
+     *         That last sentence is only true because the anomaly check reads
+     *         this contract's USDC balance. It previously keyed on the
+     *         callback's `recipientAddr`, which the Diamond passes unchanged
+     *         in both routing branches — so under the one condition that puts
+     *         funds here, the alarm said nothing and this hatch was the only
+     *         thing standing between a mis-registration and stuck user money,
+     *         with nobody told to reach for it.
      */
     function sweepUsdc(address to, uint256 amount) external onlyOwner nonReentrant {
         if (to == address(0)) revert InvalidAddress();
@@ -668,8 +706,34 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
         Session storage session = sessions[orderId];
         if (session.user == address(0) || session.settled || session.cancelled) return;
 
-        if (session.user != user || session.amount != amount || recipientAddr != session.user) {
-            emit SettlementRoutingAnomaly(orderId, session.user, user, amount, recipientAddr);
+        // Did the money actually leave? This contract is never a settlement
+        // destination, so holding the amount that was just settled means it
+        // did not reach the buyer — the signature of a mis-registered
+        // `usdcThroughIntegrator`.
+        //
+        // Compared against `amount` rather than zero on purpose. A `!= 0` test
+        // would be tripped by anyone sending this address a single wei of
+        // USDC, and since an anomaly refuses to mark the session settled, that
+        // would let a stranger permanently break settlement bookkeeping for
+        // every subsequent order for the price of dust. Requiring the full
+        // settled amount prices that attack at one order's USDC apiece, and
+        // matches what a real mis-routing looks like.
+        uint256 selfBalance = usdc.balanceOf(address(this));
+
+        if (
+            session.user != user ||
+            session.amount != amount ||
+            recipientAddr != session.user ||
+            selfBalance >= amount
+        ) {
+            emit SettlementRoutingAnomaly(
+                orderId,
+                session.user,
+                user,
+                amount,
+                recipientAddr,
+                selfBalance
+            );
             return;
         }
 
