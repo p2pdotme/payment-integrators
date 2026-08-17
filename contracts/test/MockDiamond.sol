@@ -292,9 +292,13 @@ contract MockDiamond {
     function simulateOrderComplete(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(!order.completed, "Already completed");
-        // CANCELLED is terminal on the real Diamond — a test must never be able
-        // to "complete" a cancelled BUY and validate an impossible transition.
-        require(!order.cancelled, "Cancelled is terminal");
+        // A CANCELLED BUY is NOT terminal on the real Diamond: OrderFlowHelper
+        // lets an admin re-open a CANCELLED BUY to PAID and complete from there
+        // (the dispute path). `orders` here is the BUY mapping, so completing a
+        // cancelled order is a faithful transition to model, not an impossible
+        // one — the prior `require(!cancelled)` was stricter than the protocol.
+        // See #56 (mirror of #41: a mock encoding a belief about the Diamond
+        // rather than the Diamond's code).
         order.completed = true;
 
         // Routing follows the flag, exactly as B2BGatewayFacet does.
@@ -640,7 +644,7 @@ contract MockDiamond {
     function simulateOrderCompleteNoCallback(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(!order.completed, "Already completed");
-        require(!order.cancelled, "Cancelled is terminal");
+        // A CANCELLED BUY is not terminal — see simulateOrderComplete / #56.
         order.completed = true;
         // Route USDC to the proxy exactly like a real completion, but skip the
         // integrator callback (the swallowed-revert end state).
