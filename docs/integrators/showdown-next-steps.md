@@ -78,7 +78,7 @@ Note the Diamond's fee comes off the same proxy balance, so the proxy needs **pr
 
 > **Decided 2026-08-13 (#44): this is handled in the widget, not the contract.** Before the user confirms a cash-out the widget must quote **the exact fiat they will receive, net of fees**, and only proceed on that confirmation. The corollary is a constraint, not just a display: the widget must also **cap the maximum cash-out at balance − fee headroom**, or a user who taps "max" still places an order that cannot be delivered. No `MAX_SELL_FEE_BPS` bound was added to the contract, so a caller that bypasses the widget and calls `userInitiateOfframp` directly can still strand — recoverable via `reconcile`, never a loss of funds.
 
-**Delivery is initiator-only.** `deliverOfframpUpi` can be called only by the address that placed the order. There is no relayer path (#53.2), because `encUpi` *is* the payout destination and is encrypted to the merchant — who is unknown until after the accept — so no one can pre-authorise a delivery on the user's behalf without also being able to redirect the money. The user's client encrypts `encUpi` locally and submits it.
+**Delivery is initiator-only.** `deliverOfframpUpi` can be called only by the address that placed the order. There is no relayer path (#53.2), because `encUpi` _is_ the payout destination and is encrypted to the merchant — who is unknown until after the accept — so no one can pre-authorise a delivery on the user's behalf without also being able to redirect the money. The user's client encrypts `encUpi` locally and submits it.
 
 **KYC gate UI.** `submitLivenessAttestation` / `submitKycAttestation`, and read `effectiveLimit(address,bytes32 currency)` (or `effectiveLimits(address) → (india, abroad)`) / `userTier(user)` to drive the cap shown. The one-arg `effectiveLimit(user)` no longer exists — ABI break (see the widget note below). The passport upsell is region-dependent: liveness→passport is $20→$100 (INR) or $50→$200 (abroad), NOT a flat $20→$50 (that difference is India-vs-Abroad within the SAME liveness tier). (#54)
 
@@ -113,7 +113,11 @@ Both confirmed live against the real service (a bogus hash returns a structured 
  {"finalityThreshold":2000,"minimumFee":0}]     // Standard: free
 ```
 
-So the contract's shipped defaults (`bridgeMinFinalityThreshold = 2000`, `bridgeMaxFeeBps = 0`) are **valid on mainnet today** — previously only verified on Sepolia. Switching to Fast needs `setBridgeMaxFeeBps(≥ 2)` to clear the 1.3 bps minimum, comfortably inside the immutable `MAX_BRIDGE_MAX_FEE_BPS = 100` ceiling. A burn whose `maxFee` is under Circle's minimum reverts _at burn time_ ("Insufficient max fee") and lands in the retry path — it does not lose funds.
+So the contract's shipped defaults (`bridgeMinFinalityThreshold = 2000`, `bridgeMaxFeeBps = 0`) are **valid on mainnet today** — previously only verified on Sepolia.
+
+> **Switching to Fast takes TWO setters, in this order** (#54): `setBridgeMaxFeeBps(≥ 2)` to clear the 1.3 bps minimum, **then** `setBridgeMinFinalityThreshold(1000)`. `_bridge` passes the threshold verbatim and derives nothing from the fee, so raising only the fee sends one transaction and every burn still goes out Standard — the operator believes onramps now land in seconds and nothing has changed. The threshold setter rejects anything other than 1000 or 2000 (#75), so the second step cannot be fat-fingered, but it also cannot be skipped.
+>
+> ⚠️ **Do not rely on a burn-time revert as the safety net.** An earlier version of this doc claimed a `maxFee` below Circle's minimum "reverts at burn time and lands in the retry path". That was never verified on the network that holds real money: probing the live Base mainnet TokenMessengerV2 `0x28b5a0e9…8cf5d`, the whole minimum-fee surface is **absent** — `minFee()`, `getMinFeeAmount(uint256)`, `minFeeController()` and `version()` all revert, while contemporaneous accessors answer normally. Strong evidence the deployed bytecode predates the `require(_maxFee >= _calcMinFeeAmount(_amount))` on Circle's master branch. `MockCctp` models the _stricter_ master behaviour, so the unit tests confirm a fail-closed property the chain may not provide. Order the two setters correctly rather than counting on a revert to catch you.
 
 ### Onramp delivery (Base → Solana) — the harder half
 
@@ -136,7 +140,7 @@ So the contract's shipped defaults (`bridgeMinFinalityThreshold = 2000`, `bridge
 2. **Client-side, in the widget.** The user already has a Solana wallet — they can sign `receiveMessage` themselves. Near-zero infra, but it breaks if they close the tab, and ~15 min of Standard finality makes that likely.
 3. **Circle's forwarding service.** No infra at all. **Confirm it covers Solana as a destination and the pricing at our volume** — that is the open question.
 
-**Recommendation: 2 + 1 as a backstop.** Let the widget attempt delivery so the happy path is instant and free, and run a sweeper that periodically re-scans for burns with no matching mint and submits them. Because delivery is permissionless and attestations never expire, the backstop can be simple and can run on a cron — it never races the widget destructively, it just delivers whatever is outstanding. That gets the launch-blocking property (nothing stays undelivered) without making the first version of the relayer load-bearing.
+**Recommendation: 2 + 1 as a backstop.** Let the widget attempt delivery so the happy path is instant and free, and run a sweeper that periodically re-scans for burns with no matching mint and submits them. Because delivery is permissionless and attestations never expire **for Standard transfers, which is what ships** (see §5 — a Fast message carries a real 24h `expirationBlock` and needs `POST /v2/reattest/{nonce}`, so switching to Fast invalidates this premise), the backstop can be simple and can run on a cron — it never races the widget destructively, it just delivers whatever is outstanding. That gets the launch-blocking property (nothing stays undelivered) without making the first version of the relayer load-bearing.
 
 **Minimum to launch:** the backstop sweeper for the onramp direction. Everything else can follow.
 
@@ -162,7 +166,7 @@ Defaults are Standard Transfer, free: `bridgeMinFinalityThreshold = 2000`, `brid
 - The owner **cannot touch in-flight funds**: `withdrawUsdc` is hard-bounded by `unbridgedTotal` and can only sweep genuine surplus.
 - The stuck-bridge escape is **buyer-only, after 7 days** (`userRescueStuckBridge`) — never an owner power. It returns Base-side USDC rather than the Solana USDC ordered: a deliberate trade against permanent loss, bounded by the tier cap, unreachable while CCTP is healthy.
 - The Solana destination is **pinned at order time** and cannot be redirected by anyone, including the owner — which is why `retryBridge` is safe to leave permissionless.
-- Owner powers are: attestor rotation, tier caps, daily count, the offramp kill switch, bridge fee/finality, and surplus sweep. **Not** offramp delivery — there is no `offrampRelayer` (#53.2, decided 2026-08-13), so the owner can never name who delivers a user's payout. No upgradeability — the integrator is immutable by repo policy.
+- Owner powers are: attestor rotation, tier caps, daily count, **per-wallet blocking (`setUserBlocked`, which zeroes a user's limit in BOTH directions at the authoritative gate — the audit's own F5 fix, and the only lever that binds a flagged user)**, the offramp kill switch, bridge fee/finality, and surplus sweep. **Not** offramp delivery — there is no `offrampRelayer` (#53.2, decided 2026-08-13), so the owner can never name who delivers a user's payout. No upgradeability — the integrator is immutable by repo policy.
 
 ## 9. Limits (settled 2026-07-27)
 

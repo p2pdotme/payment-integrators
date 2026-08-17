@@ -41,10 +41,24 @@ import { ethers } from "hardhat";
  *
  * ── Addresses ──────────────────────────────────────────────────────────────
  * Everything network-specific is preset below and picked by chainId, so the
- * mainnet deploy needs no address arguments at all:
+ * mainnet deploy needs no ADDRESS arguments — but it does need three mandatory
+ * env vars, and the command below is the one that actually works (#54: an
+ * earlier version of this header showed a command missing DEPLOY_OWNER, which
+ * throws on mainnet, and marked it optional in the full form):
  *
+ *   EXPECTED_CHAIN_ID=8453 DEPLOY_OWNER=0x... \
  *   LIVENESS_ATTESTOR=0x... KYC_ATTESTOR=0x... \
  *   npx hardhat run scripts/local/deploy-showdown.ts --network base
+ *
+ * EXPECTED_CHAIN_ID is required on EVERY network (#76): every mainnet-only guard
+ * below sits behind `isMainnet`, so a stale --network or RPC would skip all of
+ * them and deploy to Sepolia with a green exit. DEPLOY_OWNER is required on
+ * mainnet and asserted equal to the signer — `owner` is immutable, so deploying
+ * from the wrong key means a full redeploy and re-whitelist. Neither attestor
+ * may equal the deploy key on mainnet (#69).
+ *
+ * Run it once with DRY_RUN=1 first: that executes every preflight check
+ * (burnability, Solana route, settlement token, attestors) and deploys nothing.
  *
  * Any preset can still be overridden by the matching env var. Base Sepolia has
  * no Diamond/USDC preset (they move around) — pass DIAMOND_ADDRESS and
@@ -57,7 +71,7 @@ import { ethers } from "hardhat";
  *   [SOLANA_DOMAIN=5] [DAILY_TX_COUNT_LIMIT=5] \
  *   [LIVENESS_CAP_INDIA=20000000] [LIVENESS_CAP_ABROAD=50000000] \
  *   [KYC_CAP_INDIA=100000000] [KYC_CAP_ABROAD=200000000] \
- *   [DEPLOY_OWNER=0x...] [SKIP_REGISTER=false] \
+ *   DEPLOY_OWNER=0x... (REQUIRED on mainnet) [SKIP_REGISTER=false] \
  *   npx hardhat run scripts/local/deploy-showdown.ts --network baseSepolia
  */
 

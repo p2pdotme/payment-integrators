@@ -159,7 +159,9 @@ async function main() {
     console.log(`  – already tier ${tierNow}; liveness ceiling no longer binding`);
   }
 
-  // 2. Upgrade to passport+liveness — ceiling rises to $50, not to the attested $1000.
+  // 2. Upgrade to passport+liveness — the INR ceiling rises to $100 (Abroad $200),
+  //    not to the attested $1000. NOT $50: that is the liveness Abroad cell, a
+  //    region difference within the SAME tier, not the passport upsell. (#54)
   if ((await integrator.userTier(me)) < 2n) {
     const nullifier = ethers.keccak256(ethers.toUtf8Bytes(`smoke:kyc:${me}:${SHOWDOWN_ADDRESS}`));
     const limit = ethers.parseUnits("1000", 6);

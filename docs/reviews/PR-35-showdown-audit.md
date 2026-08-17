@@ -1,15 +1,21 @@
 # PR #35 — Showdown CCTP Checkout Integrator — pre-prod launch audit
 
-> ⚠️ **STALE — do not use as the go/no-go source (#54).** This doc was cut before
-> the later commits and now describes a contract that has since changed:
-> D1/D3 predate the deploy-script preset lock + `DRY_RUN` carve-out; the test
-> count is 81 (head is higher); F4 overclaims reentrancy coverage that `8cbc368`'s
-> `MockReentrantUSDC` only later added; and no finding covers `onOrderComplete`'s
-> settle-and-re-charge behaviour or the #44/#45/#51/#53/#55 fixes. The authoritative
-> current state is the open PR(s) + `~/Downloads/showdown-prod-readiness.md`. A full
-> re-cut (or moving this into the PR body) is tracked in #54; the load-bearing wrong
-> claims elsewhere (deploy-script "never raise", the widget ABI, attestation expiry,
-> Fast-Transfer two-setter) are corrected in this same change.
+> **Re-cut 2026-08-17 against the merged head (#54).** The load-bearing wrong claims this doc
+> carried are corrected in place and marked: **D1** described the deploy script as doing the
+> opposite of what it does, **D3** predated the `DRY_RUN` carve-out and the EOA-owner decision, and
+> **F4** overclaimed reentrancy coverage that the mutation review disproved. Test counts are no
+> longer stated here — they moved every commit and were wrong within a day; the PR carries the
+> current number.
+>
+> **What this doc is:** the launch audit's findings (F1–F10) and the deploy gates (D1–D10), which are
+> still the right go/no-go checklist. **What it is not:** a description of every change since. Three
+> further adversarial review rounds followed this audit and their findings are tracked as issues
+> (#44 #45 #47 #51 #52 #53 #55 #68 #69 #72 #73 #74 #75 #76 #78 — all closed), not folded in here.
+> Read this for the gates; read the PR body for current state.
+>
+> Two findings below are superseded by upstream work rather than by anything in this repo: **F9**
+> (`onOrderCancel` is live as of contracts-v4 #362, opt-in and default-off — see D9) and the
+> `offrampRelayer` half of the delivery discussion (the relayer was removed outright, #53.2).
 
 **Scope:** `contracts/integrators/showdown/ShowdownCheckoutIntegrator.sol` (branch
 `feat/showdown-cctp-integrator`), plus its deploy / smoke / attestor scripts, tests and docs.
@@ -89,10 +95,18 @@ Showdown did not.
 
 - `recipientAddr != address(this)` → **revert** `UnexpectedRecipient`. The USDC did not arrive here,
   so recording it would be a lie; the gateway swallows the revert and nothing is stranded here.
-- `amount != session.amount` → **re-pin the session to what was delivered** and emit
-  `OnrampAmountAdjusted`. Here a revert would be _wrong_: the USDC did arrive, and a swallowed revert
-  leaves it with no session record — i.e. sweepable by the owner as "surplus". The siblings can
-  revert with `AmountMismatch` because they do not pool user funds; Showdown cannot.
+- The delivered amount → **clamped, and the clamp runs unconditionally**. A revert would be _wrong_:
+  the USDC did arrive, and a swallowed revert leaves it with no session record — i.e. sweepable by
+  the owner as "surplus". The siblings can revert with `AmountMismatch` because they do not pool user
+  funds; Showdown cannot.
+
+  **Superseded (#73):** this originally read "re-pin to what was delivered", and the first
+  implementation did exactly that, only when the reported amount differed from the placed one. Both
+  halves were wrong. The session is now pinned to `min(reported, placed, unreserved balance)` on
+  **every** completion — a Diamond that reports the placed amount while transferring less is the case
+  the pooled-balance invariant actually needs, and bounding by free balance alone let an over-report
+  reserve unrelated surplus. `OnrampAmountAdjusted` still fires on any discrepancy, including one the
+  clamp absorbs.
 
 Happy path is unchanged (no netting ⇒ always equal). Alert on `OnrampAmountAdjusted`; it should never
 fire.
@@ -116,7 +130,14 @@ hooks) and `UserProxy.execute` is itself guarded, but `userBridgeBackToSolana` r
 **Fix:** transient-storage `nonReentrant` (matching `UserProxy`) on the seven value-moving
 entrypoints. Deliberately **not** on `validateOrder` (the Diamond re-enters it inside
 `userBuyUsdcToSolana` / `userInitiateOfframp`) nor on `onOrderComplete` / `selfBridge` (which
-self-call by design). Covered by the existing suite, which exercises both re-entry paths.
+self-call by design).
+
+**Correction (#54):** this finding originally claimed the guards were "covered by the existing
+suite, which exercises both re-entry paths". They were not. No mock re-entered the burn path, so the
+plain suite could not see it — commit `8cbc368` exists precisely because of that gap, adding
+`MockReentrantUSDC`, which re-enters `retryBridge` from inside the messenger's `transferFrom`. That
+is a real regression pin, verified by mutation: reverting the CEI ordering in `_bridge` turns exactly
+one test red. The audit overclaimed coverage the mutation review disproved.
 
 ### F5 — (product): no way to stop one user → **FIXED**
 
@@ -132,13 +153,20 @@ raise it before assuming this covers it.
 
 ### F6 — INFO: a block does not stop an order already placed (no fix — deliberate)
 
-`setUserBlocked` gates _placement_ (`userBuyUsdcToSolana`, `userInitiateOfframp`, `validateOrder`).
-It does not gate `deliverOfframpUpi` or `onOrderComplete`, so an order placed before the block runs to
-completion.
+`setUserBlocked` gates _placement_ (`userBuyUsdcToSolana`, `userInitiateOfframp`, `validateOrder`)
+and does not gate `onOrderComplete`, so a BUY placed before the block runs to completion.
 
-That is the right trade in both directions. Blocking `deliverOfframpUpi` would leave a placed SELL
-unfunded, holding merchant capacity until it expires — the stranded-order failure that has bitten the
-INR and BRL relayers before. Blocking `onOrderComplete` would strand USDC the Diamond has already
+> **Half of this finding was reversed (#53.1).** It originally said the block also does not gate
+> `deliverOfframpUpi`, and argued that was correct. It is not, and the contract now honours
+> `blocked[record.user]` at delivery: `blocked[]` exists precisely to stop a payout on a fraud report
+> or sanctions hit, so a seller blocked _after_ placement must not be paid. The stranding worry that
+> justified the old position does not apply — the USDC is still on the seller's own proxy, and both
+> `userBridgeBackToSolana` and `userRescueProxyUsdc` (#74) remain open to them. The asymmetry that
+> survives is with the `offrampEnabled` kill switch, which _does_ deliberately let in-flight orders
+> settle so an accepted merchant is not stranded.
+
+The `onOrderComplete` half stands. Blocking it would strand USDC the Diamond has already delivered,
+recoverable only through the 7-day rescue. Blocking `onOrderComplete` would strand USDC the Diamond has already
 delivered, recoverable only through the 7-day rescue. **Operationally: a block takes effect from the
 next placement, not retroactively.** If an in-flight order must be stopped, that is a Diamond-side
 cancellation, not an integrator lever.
@@ -218,7 +246,7 @@ guard accepts any string into an empty slot — so a set relayer could redirect 
 itself, with the order still moving to PAID and every health metric reading clean.
 
 Binding it to a user EIP-712 signature over `keccak256(encUpi)` was considered and **rejected as
-illusory**: `encUpi` is encrypted to the *matched merchant*, who is unknown until after the accept,
+illusory**: `encUpi` is encrypted to the _matched merchant_, who is unknown until after the accept,
 so the user cannot pre-sign the destination at placement. By the time they can sign it they are
 online and can simply deliver it themselves. Since Showdown's client encrypts `encUpi` locally, the
 relayer bought no capability the user lacked — only a way to lose money. Removing it also shrinks
@@ -242,16 +270,33 @@ bound stays available until the deploy transaction and not after.
 
 - **D1 — CCTP addresses in the deploy script are TESTNET-ONLY.** `0x8FE6B999…` / `0xE737e5cE…` are
   the V2 addresses shared by every supported EVM _testnet_; Base mainnet's differ. A wrong messenger
-  produces burns that can never be minted — the silent, unrecoverable failure mode. **Mitigated:** the
-  script now _refuses_ to run on chainId 8453 unless `TOKEN_MESSENGER` and `MESSAGE_TRANSMITTER` are
-  supplied explicitly, and hard-fails if `burnLimitsPerMessage(USDC) == 0` on mainnet. Verify both
-  against Circle's published Base-mainnet CCTP V2 addresses before deploying.
+  produces burns that can never be minted — the silent, unrecoverable failure mode.
+
+  **Mitigated, but not the way this gate originally described (#54).** The script does the opposite
+  of "refuses to run unless the addresses are supplied": verified Base-mainnet CCTP V2 addresses are
+  **baked into a preset table** picked by chainId, and a conflicting `TOKEN_MESSENGER` /
+  `MESSAGE_TRANSMITTER` / `DIAMOND_ADDRESS` / `USDC_ADDRESS` in the environment is **ignored** on
+  mainnet unless `ALLOW_ADDRESS_OVERRIDE=true`. That is deliberate and stronger: `.env` carries
+  testnet values and dotenv applies them to every network, so honouring them would point a mainnet
+  deploy at the Sepolia Diamond — the exact mistake the table exists to prevent.
+
+  On top of the presets the script hard-fails on mainnet if `burnLimitsPerMessage(USDC) == 0`, if
+  the Solana route is missing, if the Diamond holds none of the configured USDC (D2), if
+  `EXPECTED_CHAIN_ID` is absent or mismatched (#76), or if either attestor equals the deploy key
+  (#69). Note `ALLOW_ADDRESS_OVERRIDE` unlocks the Diamond and USDC presets together with one flag —
+  a legitimate Diamond override silently re-opens the USDC one.
+
 - **D2 — `usdc` must be canonical Circle USDC on Base mainnet,** and it must be the token the mainnet
   Diamond actually settles in. This is doubly load-bearing: the `UserProxy` USDC-trap resolves via
   `integrator.usdc()`, _and_ CCTP will only burn Circle-issued USDC. This is exactly the Sepolia
   GoofyGoober problem — on mainnet it must not exist.
-- **D3 — `owner` is immutable: deploy FROM the Showdown multisig.** No transfer, no renounce, no
-  timelock. The script now refuses a mainnet deploy whose signer does not match `DEPLOY_OWNER`.
+- **D3 — `owner` is immutable: deploy FROM the owner key.** No transfer, no renounce, no timelock.
+  The script refuses a mainnet deploy whose signer does not match `DEPLOY_OWNER`, **except under
+  `DRY_RUN=1`**, which skips the signer-identity assertion so a read-only preflight does not require
+  the real owner key in hand (the `DEPLOY_OWNER` presence check still applies). Superseded on one
+  point: the owner is a Showdown-held **EOA**, not a multisig — a Safe cannot be a hardhat deploy
+  signer and this bytecode has no `_owner` constructor parameter, so a Safe-owned deploy is not
+  expressible. Decision recorded 2026-08-13.
 - **D4 — Attestors must come from each live service's own `/v1/attestor` endpoint,** never a
   partner- or teammate-relayed value. Both Showdown attestors were wrong once on Sepolia for that
   exact reason. Each service's EIP-712 domain must set `verifyingContract` = the **prod** integrator
@@ -312,7 +357,7 @@ bound stays available until the deploy transaction and not after.
 
 ---
 
-## Test coverage added (+27, total 81)
+## Test coverage (see the PR for the current count — this section is not re-cut per commit)
 
 Region matrix across all four cells and both directions, resolved inside `validateOrder`; the
 immutable ceilings (setter _and_ constructor rejection, per-cell, plus the daily-count and bridge-fee
@@ -321,10 +366,13 @@ budgets and the 6th-order cutoff in each; block/unblock at both the entrypoint a
 gate, and the two "a block never traps funds" paths; the delivered-amount re-pin, the
 `balanceOf >= unbridgedTotal` invariant after a short delivery, and the wrong-recipient rejection.
 
-**Still-open coverage gaps** (low risk — the crypto is byte-identical to the reviewed siblings):
-cross-UTC-day-boundary cancel (the reason `placementDay` is stored), cross-`verifyingContract` /
-`chainId` replay rejection, signature malleability/format cases, and an explicit reentrancy test
-against `contracts/test/ReentrantTarget.sol`.
+**Gaps since closed** (#54, #47, #78): the reentrancy test now exists as `MockReentrantUSDC` (not
+`ReentrantTarget.sol`, which was the wrong shape — it could not re-enter mid-burn); signature
+malleability is covered by the low-s test; the rescue boundary is exercised at exactly
+`completedAt + BRIDGE_RESCUE_DELAY`; and UTC-day-boundary tests now exist for both direction budgets.
+
+**Still open:** cross-`verifyingContract` / `chainId` replay rejection (low risk — the EIP-712 stack
+is byte-identical by diff to the reviewed siblings).
 
 ---
 
