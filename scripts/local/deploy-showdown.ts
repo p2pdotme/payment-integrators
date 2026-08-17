@@ -145,6 +145,26 @@ async function main() {
   const chainId = Number((await ethers.provider.getNetwork()).chainId);
   const isMainnet = chainId === 8453;
 
+  // ── Assert the network BEFORE anything adapts to it. ─────────────────────
+  // Every mainnet-only guard below is behind `isMainnet`, so a stale --network
+  // or a stale RPC does not trip them — it silently produces a full Base Sepolia
+  // deployment, a green exit and a verify command for the wrong chain. The
+  // rotation script was made to require this for the same reason (#52); the
+  // deploy script is the one that must not be skippable. (#76)
+  const EXPECTED_CHAIN_ID = process.env.EXPECTED_CHAIN_ID || "";
+  if (!EXPECTED_CHAIN_ID) {
+    throw new Error(
+      `EXPECTED_CHAIN_ID is required (8453 = Base mainnet, 84532 = Base Sepolia). ` +
+        `This run would have deployed to chainId ${chainId}. Set it explicitly so a stale ` +
+        `--network or RPC cannot silently deploy to the wrong chain.`
+    );
+  }
+  if (String(chainId) !== EXPECTED_CHAIN_ID) {
+    throw new Error(
+      `chainId ${chainId} != EXPECTED_CHAIN_ID ${EXPECTED_CHAIN_ID} — refusing to deploy on the wrong network`
+    );
+  }
+
   // ── Resolve addresses: explicit env var wins, else the network preset. ────
   const preset = PRESETS[chainId];
   if (!preset) {
@@ -311,6 +331,29 @@ async function main() {
     console.log(`⚠️  ${msg}`);
   } else {
     console.log(`✅ Solana route present: remoteTokenMessengers(${SOLANA_DOMAIN}) = ${remote}`);
+  }
+
+  // ── D2: prove the Diamond actually settles in this USDC. ─────────────────
+  // No settlement-token getter exists on the Diamond (usdc(), usdt(),
+  // settlementToken() and token() all revert), so a balance probe is the
+  // available check. A mismatch is silent and unrecoverable: orders complete
+  // delivering token X, unbridgedTotal accrues in token Y, every burn reverts,
+  // and both withdrawUsdc and userRescueStuckBridge revert forever. (#76)
+  if (isMainnet) {
+    const settleBal: bigint = await new ethers.Contract(
+      USDC_ADDRESS,
+      ["function balanceOf(address) view returns (uint256)"],
+      deployer
+    ).balanceOf(DIAMOND_ADDRESS);
+    if (settleBal === 0n && process.env.ALLOW_ZERO_SETTLEMENT_BALANCE !== "true") {
+      throw new Error(
+        `Diamond ${DIAMOND_ADDRESS} holds 0 of ${USDC_ADDRESS}. On mainnet the Diamond settles ` +
+          `in the token it holds, so a zero balance means this is very likely the wrong token — ` +
+          `the Sepolia GoofyGoober mistake, on a network where it cannot be undone. Verify by ` +
+          `hand and pass ALLOW_ZERO_SETTLEMENT_BALANCE=true only if you are certain.`
+      );
+    }
+    console.log(`Settlement check:     ✅ Diamond holds ${f(settleBal)} of the configured USDC`);
   }
 
   if (DRY_RUN) {
