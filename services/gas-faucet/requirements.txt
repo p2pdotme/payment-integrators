@@ -1,5 +1,131 @@
-fastapi
-uvicorn[standard]
-pydantic>=2
-httpx
-eth-account>=0.13
+# Fully pinned, including transitive dependencies. Regenerate with:
+#
+#   pip-compile --strip-extras -o requirements.txt requirements.in
+#
+# WHY THIS IS PINNED. This process holds FAUCET_PRIVATE_KEY and calls
+# account.sign_transaction in the same interpreter. The Dockerfile runs
+# `pip install -r requirements.txt` on every rebuild, so an unpinned list
+# re-resolves against PyPI each deploy — a malicious release of eth-account, or
+# of anything in its transitive tree, would execute next to the key with no
+# code change, no review and no diff entry to notice. It is the one exposure
+# here where the whole float goes rather than a capped slice of it.
+#
+# NOT hash-pinned yet. `--generate-hashes` needs every wheel for every platform
+# and timed out against PyPI when this was generated. Exact pins stop a NEW
+# malicious release, which is the vector above; hashes would additionally stop
+# a compromised existing release being swapped in place. Worth adding.
+annotated-doc==0.0.5
+    # via fastapi
+annotated-types==0.8.0
+    # via pydantic
+anyio==4.14.2
+    # via
+    #   httpx
+    #   starlette
+    #   watchfiles
+bitarray==3.10.1
+    # via eth-account
+certifi==2026.7.22
+    # via
+    #   httpcore
+    #   httpx
+ckzg==2.1.8
+    # via eth-account
+click==8.4.2
+    # via uvicorn
+cytoolz==1.1.0
+    # via eth-utils
+eth-abi==6.0.0b1
+    # via eth-account
+eth-account==0.13.7
+    # via -r requirements.in
+eth-hash==0.8.0
+    # via eth-utils
+eth-keyfile==0.8.1
+    # via eth-account
+eth-keys==0.7.0
+    # via
+    #   eth-account
+    #   eth-keyfile
+eth-rlp==2.2.0
+    # via eth-account
+eth-typing==6.0.0
+    # via
+    #   eth-abi
+    #   eth-keys
+    #   eth-utils
+eth-utils==6.0.0
+    # via
+    #   eth-abi
+    #   eth-account
+    #   eth-keyfile
+    #   eth-keys
+    #   eth-rlp
+    #   rlp
+fastapi==0.141.1
+    # via -r requirements.in
+h11==0.16.0
+    # via
+    #   httpcore
+    #   uvicorn
+hexbytes==1.3.1
+    # via
+    #   eth-account
+    #   eth-rlp
+httpcore==1.0.9
+    # via httpx
+httptools==0.8.0
+    # via uvicorn
+httpx==0.28.1
+    # via -r requirements.in
+idna==3.18
+    # via
+    #   anyio
+    #   httpx
+parsimonious==0.10.0
+    # via eth-abi
+pycryptodome==3.23.0
+    # via eth-keyfile
+pydantic==2.13.4
+    # via
+    #   -r requirements.in
+    #   eth-account
+    #   eth-utils
+    #   fastapi
+pydantic-core==2.46.4
+    # via pydantic
+python-dotenv==1.2.3
+    # via uvicorn
+pyyaml==6.0.3
+    # via uvicorn
+regex==2026.7.19
+    # via parsimonious
+rlp==4.1.0
+    # via
+    #   eth-account
+    #   eth-rlp
+starlette==1.6.0
+    # via fastapi
+toolz==1.1.0
+    # via cytoolz
+typing-extensions==4.16.0
+    # via
+    #   anyio
+    #   eth-typing
+    #   fastapi
+    #   pydantic
+    #   pydantic-core
+    #   starlette
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via
+    #   fastapi
+    #   pydantic
+uvicorn==0.52.3
+    # via -r requirements.in
+uvloop==0.22.1
+    # via uvicorn
+watchfiles==1.2.0
+    # via uvicorn
+websockets==17.0.1
+    # via uvicorn

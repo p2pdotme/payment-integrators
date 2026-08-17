@@ -159,29 +159,29 @@ Two things that will bite otherwise:
   second instance races it. `Dockerfile` already pins `--workers 1`; keep the
   replica count at 1 too.
 
-## Live deployment (Base Sepolia)
+## Live deployment
 
-| | |
-|---|---|
-| URL | `https://gas-faucet-production.up.railway.app` |
-| Railway project | `p2p-gas-faucet` / service `gas-faucet` |
-| Funder | [`0x679472FBDD46f2cC3a5580540877c38372604ccb`](https://sepolia.basescan.org/address/0x679472FBDD46f2cC3a5580540877c38372604ccb) — 0.02 ETH, ~660 drips |
-| Integrator | `0x6e2Feec8…`, attestor `0xA0bE0151…` (the live passport service) |
-| Global cap | 0.01 ETH/day, sized to half the float |
-| Volume | mounted at `/data`, ledger at `/data/faucet.db` |
+Deployment specifics — URL, funder address, float — are **not recorded here.**
+This repository is public, and a page pairing a live endpoint with the hot
+wallet that funds it and its current balance is a map nobody needs drawn for
+them. The addresses are on chain regardless; assembling them into one page is
+the part that was avoidable.
 
-The funder is a **dedicated throwaway key**, not the deployer and not the
-super-admin mnemonic. That mnemonic is the integrator's immutable `owner`
-(`pause`, `setBlocked`, `setRegionCap`, `sweepUsdc`); it must never sit in the
-environment of a public HTTP service. Top the faucet up by *sending* it ETH.
+Ask the P2P side for the current deployment details, or read them from the
+Railway project.
 
-> `PORT` is pinned to `8788` so the container, the Dockerfile's `EXPOSE`, and
-> the Railway domain's target port all agree. Railway otherwise injects its own
-> `PORT` (8080 in practice) and the generated domain 502s.
+Two settings the service now enforces rather than documenting, because both
+used to be correct only if an operator read a runbook:
 
-> The RPC is the public `sepolia.base.org`, which rate-limits and rejects some
-> user agents. Fine for testing; point `FAUCET_RPC_URLS` at a dedicated
-> endpoint before this carries real traffic.
+- **`FAUCET_DB_PATH` must be absolute.** Every daily cap is a SUM over that
+  file; on a container a relative path is ephemeral, so the caps reset on every
+  deploy and nothing surfaces it. The service refuses to start otherwise.
+  `FAUCET_ALLOW_EPHEMERAL_DB=1` overrides it for local runs and CI.
+- **`/healthz` returns a status word only.** The funder address, its balance,
+  the spend so far and the global cap moved to `/v1/ops/health`, which is
+  absent unless `FAUCET_OPS_TOKEN` is set and matched. A default-open
+  operational endpoint on a key-holding service is a live budget gauge for
+  anyone who finds it.
 
 ## Verified
 

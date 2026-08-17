@@ -28,10 +28,18 @@ The alternatives were weighed and rejected:
 - **ERC-2771 meta-transactions** on the integrator would cover
   `submitPassportAttestation` and `buyUsdc`, but not `paidBuyOrder`. A new
   contract, a re-audit and a re-whitelist to only shrink the problem.
-- **ERC-4337 / EIP-7702** would cover everything, but partner apps connect
-  external wallets (RainbowKit, MetaMask, WalletConnect). There is no embedded
-  signing stack to drive an authorization, and moving to smart accounts would
-  change every user's address.
+- **ERC-4337** would cover everything, but it moves the user to a smart
+  account with a different address — and that address becomes `_order.user`,
+  the address the attestation binds to, and the key for the integrator's
+  per-wallet daily limits. Workable, but a migration.
+- **EIP-7702** would also cover everything, and an earlier version of this
+  section rejected it for "changing every user's address". **That was wrong**
+  — it is true of 4337 and false of 7702, where the EOA keeps its address and
+  inner calls still see the user as `msg.sender`. The real objections are
+  narrower: wallet support for signing the authorization is uneven, and a
+  delegated EOA carries a one-in-flight-transaction limit on Base. Recorded
+  properly because somebody will re-evaluate this from this paragraph in six
+  months, and the wrong reason would have sent them the wrong way.
 
 ## What stops it being a free ETH tap
 
@@ -58,15 +66,30 @@ Then three ceilings, all per UTC day:
 | **per nullifier, value** | 1.6×10¹⁵ wei | a nullifier is per-(tenant, human), so one person spreading across many wallets shares one budget |
 | global | 2×10¹⁷ wei | circuit breaker |
 
-The per-nullifier cap is defence in depth. It only binds once one identity
-spans three or more wallets, and the passport service's 1:N dedup is supposed
-to prevent that from being possible at all — but that property lives in another
-service and is not verified here, which is exactly why the cap exists. The
-nullifier is canonicalised before it is used as a ledger key; the raw request
-string has many spellings that decode identically.
+The per-nullifier cap is defence in depth. The primary control is now on
+chain: the faucet reads `nullifierSpent` and refuses an attestation whose
+identity has already verified a wallet, because the contract makes a nullifier
+globally single-use and one passport therefore verifies exactly one wallet
+ever. Without that read the faucet paid for cold start after cold start on the
+same identity, each into a `submitPassportAttestation` that reverts — money
+out, user still stuck.
+
+The nullifier is canonicalised before it is used as a ledger key (`bytes.fromhex`
+ignores whitespace and case, so one identity had many spellings), and on the
+`verified()` path — where the caller sends no attestation — it is recalled from
+the ledger. Otherwise omitting one optional field bought a second, uncounted
+wallet allowance.
+
+### What the caps do and do not bound
 
 Worst case for a determined attacker who really did pass a passport check is
-their own per-identity cap. That is cents.
+their own per-identity cap, which is cents.
+
+That is one attacker out of three. These caps are enforced by the same process
+that holds the key, using a SQLite file beside it. **Against a leaked key or
+code execution in this container they are irrelevant and the whole float goes.**
+That is the reason the float is small and the dependency list is pinned, not
+the caps.
 
 ## Sizing
 

@@ -108,28 +108,33 @@ def recover_attestor(
     """
     raw = _signature_bytes(attestation.signature)
 
-    nullifier = attestation.nullifier
-    nullifier_bytes = bytes.fromhex(
-        nullifier[2:] if nullifier.startswith("0x") else nullifier
-    )
-    if len(nullifier_bytes) != 32:
-        raise InvalidAttestation("nullifier must be 32 bytes")
+    # Reuse the canonicaliser: it raises InvalidAttestation rather than the
+    # bare ValueError `bytes.fromhex` throws. That ValueError used to escape
+    # the handler entirely and surface as a 500, so a one-character typo in a
+    # nullifier was indistinguishable from the service being broken — and it
+    # let anyone fill a key-holding service's 5xx budget with junk.
+    nullifier_bytes = bytes.fromhex(canonical_nullifier(attestation.nullifier)[2:])
 
-    signable = encode_typed_data(
-        domain_data={
-            "name": DOMAIN_NAME,
-            "version": DOMAIN_VERSION,
-            "chainId": chain_id,
-            "verifyingContract": to_checksum_address(integrator),
-        },
-        message_types=_TYPES,
-        message_data={
-            "wallet": to_checksum_address(attestation.wallet),
-            "nullifier": nullifier_bytes,
-            "limit": attestation.limit,
-            "expiry": attestation.expiry,
-        },
-    )
+    try:
+        signable = encode_typed_data(
+            domain_data={
+                "name": DOMAIN_NAME,
+                "version": DOMAIN_VERSION,
+                "chainId": chain_id,
+                "verifyingContract": to_checksum_address(integrator),
+            },
+            message_types=_TYPES,
+            message_data={
+                "wallet": to_checksum_address(attestation.wallet),
+                "nullifier": nullifier_bytes,
+                "limit": attestation.limit,
+                "expiry": attestation.expiry,
+            },
+        )
+    except Exception as exc:
+        # A bad address, a negative limit, an out-of-range expiry — all raise
+        # ValueError/TypeError here and none of them is a server fault.
+        raise InvalidAttestation(f"malformed attestation: {exc}") from exc
 
     try:
         return to_checksum_address(Account.recover_message(signable, signature=raw))

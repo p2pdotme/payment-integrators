@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -62,7 +63,14 @@ from attestation import (
     canonical_nullifier,
     check_attestation,
 )
-from chain import SEL_BLOCKED, SEL_VERIFIED, ChainError, Rpc, account_from_key
+from chain import (
+    SEL_BLOCKED,
+    SEL_NULLIFIER_SPENT,
+    SEL_VERIFIED,
+    ChainError,
+    Rpc,
+    account_from_key,
+)
 from policy import Decision, Limits, decide, drip_target_wei, floor_wei
 from store import Store
 
@@ -134,7 +142,19 @@ LIMITS = Limits(
     max_wei_global=_int_env("FAUCET_MAX_WEI_GLOBAL", 200_000_000_000_000_000),
 )
 
-STORE = Store(os.environ.get("FAUCET_DB_PATH", "faucet.db"))
+_DB_PATH = os.environ.get("FAUCET_DB_PATH", "faucet.db")
+if os.environ.get("FAUCET_ALLOW_EPHEMERAL_DB") != "1" and not os.path.isabs(_DB_PATH):
+    # Every daily cap is a SUM over this file. On a container a relative path
+    # is ephemeral, so the caps silently reset on each deploy — the failure is
+    # invisible until someone reconciles spend against the ledger. The correct
+    # setting used to live only in a runbook; now the service refuses to start
+    # without it. Set FAUCET_ALLOW_EPHEMERAL_DB=1 for local runs and tests.
+    raise RuntimeError(
+        f"FAUCET_DB_PATH must be an absolute path on a persistent volume, got {_DB_PATH!r}. "
+        "Every daily cap is computed from this file; on ephemeral disk they reset on deploy. "
+        "Set FAUCET_ALLOW_EPHEMERAL_DB=1 to override for local use."
+    )
+STORE = Store(_DB_PATH)
 _ACCOUNT = (
     account_from_key(os.environ["FAUCET_PRIVATE_KEY"])
     if os.environ.get("FAUCET_PRIVATE_KEY")
@@ -154,7 +174,17 @@ def _rpc(chain_id: int) -> Rpc:
     return _RPCS[chain_id]
 
 
-app = FastAPI(title="P2P Gas Faucet", version="1.0")
+# No Swagger, no ReDoc, no schema. This process holds a key and is exposed
+# publicly; a self-documenting console over it is a convenience for exactly one
+# kind of visitor. Set FAUCET_ENABLE_DOCS=1 in a private environment.
+_DOCS = os.environ.get("FAUCET_ENABLE_DOCS") == "1"
+app = FastAPI(
+    title="P2P Gas Faucet",
+    version="1.0",
+    docs_url="/docs" if _DOCS else None,
+    redoc_url="/redoc" if _DOCS else None,
+    openapi_url="/openapi.json" if _DOCS else None,
+)
 if ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX:
     app.add_middleware(
         CORSMiddleware,
@@ -195,6 +225,27 @@ class GasResponse(BaseModel):
 
 @app.get("/healthz")
 def healthz() -> dict:
+    """Liveness only.
+
+    This used to publish the funder address, its balance on every chain, spend
+    so far and the global cap — a live budget gauge on an unauthenticated
+    endpoint, which tells a visitor exactly how much is left and when the caps
+    reset. Operators get the same numbers from /v1/ops/health with a token.
+    """
+    return {"status": "ok" if _ACCOUNT else "no_key"}
+
+
+@app.get("/v1/ops/health")
+def ops_health(token: str = "") -> dict:
+    """The operational numbers, behind a shared secret.
+
+    Unavailable rather than public when FAUCET_OPS_TOKEN is unset, because a
+    default-open operational endpoint is how the previous version leaked.
+    """
+    expected = os.environ.get("FAUCET_OPS_TOKEN", "")
+    if not expected or not secrets.compare_digest(token, expected):
+        raise HTTPException(404, "not_found")
+
     out: dict = {
         "status": "ok" if _ACCOUNT else "no_key",
         "integrators": [
@@ -217,12 +268,54 @@ def healthz() -> dict:
     return out
 
 
+def _recall_nullifier(wallet: str) -> str | None:
+    """The identity a verified wallet was funded under, from the ledger.
+
+    See `Store.nullifier_for`. Returns None for a wallet the faucet has never
+    funded — which is a genuine unknown, not a licence: that wallet has its own
+    per-wallet caps, and the first drip it ever takes goes through the
+    attestation path and records the identity for every drip after.
+    """
+    return STORE.nullifier_for(wallet)
+
+
 def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -> str | None:
     """Establish a human is behind `wallet`. Returns their nullifier, if known.
 
     Raises 403 when it cannot be established — never funds on the benefit of
     the doubt, because the doubt is exactly what an attacker supplies.
+
+    Ordered cheapest-first on purpose. Signature verification is free and
+    local; every chain read costs an RPC call this service pays for. Doing the
+    `blocked` read before looking at the attestation meant an unauthenticated
+    caller could bill us an `eth_call` per request with a junk body, which is
+    the opposite of what `policy.decide` documents as the intended order.
     """
+    nullifier: str | None = None
+
+    if req.attestation is not None:
+        # Free and local. Anything malformed or unsigned dies here, before a
+        # single RPC call is spent on it.
+        try:
+            check_attestation(
+                Attestation(
+                    wallet=wallet,
+                    nullifier=req.attestation.nullifier,
+                    limit=req.attestation.limit,
+                    expiry=req.attestation.expiry,
+                    signature=req.attestation.signature,
+                ),
+                chain_id=integrator.chain_id,
+                integrator=integrator.address,
+                attestor=integrator.attestor,
+                now=int(time.time()),
+            )
+            # Canonical form only — the raw request string is attacker-chosen
+            # and has many spellings that decode identically.
+            nullifier = canonical_nullifier(req.attestation.nullifier)
+        except InvalidAttestation as exc:
+            raise HTTPException(403, f"invalid_attestation: {exc}") from exc
+
     # Denylisted wallets get nothing, on either path — this is the operator's
     # only revocation lever, so it fails CLOSED.
     #
@@ -240,33 +333,30 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
     if is_blocked:
         raise HTTPException(403, "wallet_blocked")
 
-    if req.attestation is not None:
+    if nullifier is not None:
+        # Has this passport already verified a wallet?
+        #
+        # The nullifier is GLOBALLY single-use in the contract
+        # (`nullifierSpent`), so one passport verifies exactly one wallet ever.
+        # Without this read the faucet happily funded the cold start for wallet
+        # after wallet on the same identity, each into a
+        # `submitPassportAttestation` that reverts `NullifierAlreadySpent` —
+        # money out, user still stuck, which is the exact outcome this module
+        # exists to prevent.
         try:
-            check_attestation(
-                Attestation(
-                    wallet=wallet,
-                    nullifier=req.attestation.nullifier,
-                    limit=req.attestation.limit,
-                    expiry=req.attestation.expiry,
-                    signature=req.attestation.signature,
-                ),
-                chain_id=integrator.chain_id,
-                integrator=integrator.address,
-                attestor=integrator.attestor,
-                now=int(time.time()),
-            )
-        except InvalidAttestation as exc:
-            raise HTTPException(403, f"invalid_attestation: {exc}") from exc
-        # Canonical form only — the raw request string is attacker-chosen and
-        # has many spellings that decode identically (see canonical_nullifier).
-        try:
-            return canonical_nullifier(req.attestation.nullifier)
-        except InvalidAttestation as exc:
-            raise HTTPException(403, f"invalid_attestation: {exc}") from exc
+            if rpc.read_bool32(integrator.address, SEL_NULLIFIER_SPENT, nullifier):
+                raise HTTPException(403, "nullifier_already_spent")
+        except ChainError as exc:
+            raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+        return nullifier
 
     try:
         if rpc.read_bool(integrator.address, SEL_VERIFIED, wallet):
-            return None
+            # No nullifier on this path — the wallet is verified on chain and
+            # the caller sent no attestation. `_recall_nullifier` recovers it
+            # from the ledger so the per-identity cap still applies; see there
+            # for why omitting the field must not be a way to opt out of it.
+            return _recall_nullifier(wallet)
     except ChainError as exc:
         raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
@@ -293,19 +383,36 @@ def request_gas(req: GasRequest) -> GasResponse:
     rpc = _rpc(integrator.chain_id)
     nullifier = _authorise(req, integrator, rpc, wallet)
 
-    try:
-        balance = rpc.balance(wallet)
-        base_fee = rpc.base_fee()
-        funder_balance = rpc.balance(_ACCOUNT.address)
-    except ChainError as exc:
-        raise HTTPException(502, f"chain_unreachable: {exc}") from exc
-
-    target = drip_target_wei(base_fee, LIMITS)
-
-    # Serialise from the usage read through to the insert: two concurrent
-    # requests for the same wallet must not both read a pre-drip total and
-    # each decide they're under the cap.
+    # Serialise the WHOLE decision — the chain reads included, not just the
+    # ledger read.
+    #
+    # The balance used to be read out here, before the lock. Six concurrent
+    # requests for one empty wallet then all saw a balance of zero, all decided
+    # to fund, and the wallet received four times the target: `funded` four
+    # times and `wallet_daily_count_reached` twice, with `sufficient_balance`
+    # never firing at all. That made `policy.decide`'s top-up-only-the-shortfall
+    # arithmetic dead code and left `max_drips_per_wallet` as the only surviving
+    # bound.
+    #
+    # The money was small. The user-facing damage was not: a client that
+    # retries on a slow response burns the wallet's entire daily allowance in
+    # one burst, and the buyer is then refused until midnight UTC while holding
+    # four times the gas they needed. `policy.decide` checks
+    # `sufficient_balance` before the caps precisely so that asking repeatedly
+    # cannot exhaust someone's day, and that guarantee was void.
+    #
+    # This holds the lock across three RPC round trips, which serialises
+    # concurrent drips. That is the intent: one key, one nonce sequence, and
+    # sends were already serialised here anyway.
     with _SEND_LOCK:
+        try:
+            balance = rpc.balance(wallet)
+            base_fee = rpc.base_fee()
+            funder_balance = rpc.balance(_ACCOUNT.address)
+        except ChainError as exc:
+            raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+
+        target = drip_target_wei(base_fee, LIMITS)
         usage = STORE.usage(wallet=wallet, nullifier=nullifier)
         decision: Decision = decide(
             balance=balance,
@@ -392,27 +499,49 @@ def _await_receipt(rpc: Rpc, tx_hash: str, *, attempts: int = 12, delay: float =
 def status(chainId: int, integrator: str, wallet: str) -> dict:
     """What the faucet would do for this wallet, without doing it.
 
-    Lets a client decide whether to bother asking, and makes the caps
-    inspectable during an incident without reading the database.
+    `wouldFund` runs the SAME `decide()` the funding path runs. It used to be
+    `balance < floor_wei(target)`, which ignored every cap — so it answered
+    true for a wallet the caps would refuse, and the incident runbook tells
+    operators to trust that field.
     """
-    integrator_key = (chainId, to_checksum_address(integrator).lower())
+    try:
+        integrator_key = (chainId, to_checksum_address(integrator).lower())
+        wallet = to_checksum_address(wallet)
+    except Exception as exc:
+        # Outside a try this raised ValueError and surfaced as a 500 — an
+        # attacker-controlled 5xx on a key-holding service, indistinguishable
+        # from the faucet being broken.
+        raise HTTPException(400, f"bad_address: {exc}") from exc
+
     if integrator_key not in INTEGRATORS:
         raise HTTPException(403, "integrator_not_allowed")
 
-    wallet = to_checksum_address(wallet)
     rpc = _rpc(chainId)
     try:
         balance = rpc.balance(wallet)
         target = drip_target_wei(rpc.base_fee(), LIMITS)
+        funder_balance = rpc.balance(_ACCOUNT.address) if _ACCOUNT else 0
     except ChainError as exc:
         raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
-    usage = STORE.usage(wallet=wallet, nullifier=None)
+    nullifier = STORE.nullifier_for(wallet)
+    usage = STORE.usage(wallet=wallet, nullifier=nullifier)
+    decision = decide(
+        balance=balance,
+        target=target,
+        wallet_drips_today=usage.wallet_drips,
+        wallet_wei_today=usage.wallet_wei,
+        nullifier_wei_today=usage.nullifier_wei,
+        global_wei_today=usage.global_wei,
+        funder_balance=funder_balance,
+        limits=LIMITS,
+    )
     return {
         "balanceWei": str(balance),
         "targetWei": str(target),
         "floorWei": str(floor_wei(target)),
-        "wouldFund": balance < floor_wei(target),
+        "wouldFund": decision.fund,
+        "reason": decision.reason,
         "dripsToday": usage.wallet_drips,
         "weiToday": str(usage.wallet_wei),
     }
