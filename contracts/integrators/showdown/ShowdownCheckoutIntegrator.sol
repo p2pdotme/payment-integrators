@@ -155,6 +155,9 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     event BridgeMaxFeeBpsUpdated(uint256 bps);
     event BridgeFinalityThresholdUpdated(uint32 threshold);
     event UsdcWithdrawn(address indexed to, uint256 amount);
+    /// @notice A user pulled bridged-in USDC off their own proxy to their own
+    ///         wallet without using CCTP. (#74)
+    event ProxyUsdcRescued(address indexed user, uint256 amount);
     event UserProxyDeployed(address indexed user, address proxy);
 
     /// @param tier 1 = liveness, 2 = passport + liveness (KYC)
@@ -1207,6 +1210,49 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     }
 
     /**
+     * @notice Withdraw bridged-in USDC from your own proxy to your own wallet,
+     *         without going through CCTP.
+     * @dev    Every other exit for offramp funds needs something else to be
+     *         working: `userBridgeBackToSolana` needs a successful CCTP burn (the
+     *         burn is in the same tx, so a paused or migrated TokenMessenger
+     *         reverts the whole call), and `deliverOfframpUpi` needs
+     *         `offrampEnabled`, a tier above 0, not being blocked, and a matched
+     *         merchant. `UserProxy.sweepERC20` rejects USDC by design and
+     *         `transferERC20ToIntegrator` is integrator-only, so without this the
+     *         user cannot reach their own proxy balance at all — and neither can
+     *         the owner, since `withdrawUsdc` only moves this contract's balance.
+     *
+     *         That contradicted the invariant stated twice in this file and in
+     *         showdown.md: a block never traps funds. It does not now. (#74)
+     *
+     *         Deliberately NOT gated on `blocked[]` or `offrampEnabled`, for the
+     *         same reason `userBridgeBackToSolana` and `userRescueStuckBridge`
+     *         are not: this moves only the caller's own already-paid-for funds
+     *         back to the caller. A block stops new conversions; it must never
+     *         seize or strand. No delay either — unlike an onramp rescue there is
+     *         nothing in flight to wait on; the escrow check below is what
+     *         protects an accepted merchant.
+     */
+    function userRescueProxyUsdc(uint256 amount) external nonReentrant {
+        if (amount == 0) revert InvalidAmount();
+
+        address proxy = _ensureProxy(msg.sender);
+        // Same escrow rule as bridging out: never move USDC committed to an
+        // outstanding SELL.
+        if (usdc.balanceOf(proxy) < pendingOfframpTotal[msg.sender] + amount) {
+            revert InsufficientBridgedFunds();
+        }
+
+        // Via the integrator, since the proxy will only release USDC to it. The
+        // pooled invariant is untouched: balance rises then falls in one tx and
+        // `unbridgedTotal` never moves.
+        UserProxy(proxy).transferERC20ToIntegrator(address(usdc), amount);
+        usdc.safeTransfer(msg.sender, amount);
+
+        emit ProxyUsdcRescued(msg.sender, amount);
+    }
+
+    /**
      * @notice Last-resort exit for the buyer when CCTP has refused an onramp's
      *         burn for `BRIDGE_RESCUE_DELAY`: pull the USDC to their own wallet
      *         instead of leaving it stranded.
@@ -1266,7 +1312,13 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         if (solanaRecipient == bytes32(0)) revert InvalidSolanaRecipient();
 
         address proxy = _ensureProxy(msg.sender);
-        if (usdc.balanceOf(proxy) < amount) revert InsufficientBridgedFunds();
+        // Respect the SELL escrow: bridging out funds already committed to an
+        // outstanding offramp would strand a merchant who has accepted it, and
+        // delivery would then revert until they cancel. Self-inflicted griefing
+        // rather than theft, but the escrow exists precisely to stop it.
+        if (usdc.balanceOf(proxy) < pendingOfframpTotal[msg.sender] + amount) {
+            revert InsufficientBridgedFunds();
+        }
 
         // Pull to the integrator and burn in the same tx: if the burn reverts,
         // the whole call reverts and the USDC is never left sitting here.

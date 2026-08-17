@@ -1642,6 +1642,180 @@ describe("ShowdownCheckoutIntegrator", function () {
 
   // ─── Bridging back to Solana ────────────────────────────────────────
 
+  describe("test hardening (#78)", function () {
+    beforeEach(async function () {
+      await verify(user, "kyc", KYC_CAP);
+    });
+
+    // The _bridge idempotency guard survived mutation because both of its
+    // callers carry their own check. Reaching it directly is the only way to pin
+    // it — impersonating the contract is exactly the "future second caller" the
+    // guard was added for.
+    it("_bridge refuses an already-bridged session even when reached directly", async function () {
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userBuyUsdcToSolana(USDC(20), INR, SOLANA_ATA, 1, "", 0, 0);
+      await mockDiamond.simulateOrderComplete(orderId);
+      expect((await integrator.getSession(orderId)).bridged).to.equal(true);
+
+      await ethers.provider.send("hardhat_setBalance", [integratorAddr, "0xde0b6b3a7640000"]);
+      const asSelf = integrator.connect(await ethers.getImpersonatedSigner(integratorAddr));
+      // Bypasses onOrderComplete's `fulfilled` guard and retryBridge's own check.
+      await expect(asSelf.selfBridge(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "AlreadyBridged"
+      );
+    });
+
+    it("_bridge refuses a rescued session reached directly", async function () {
+      await tokenMessenger.setBurnLimitPerMessage(usdcAddr, 0); // force fail-closed
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userBuyUsdcToSolana(USDC(20), INR, SOLANA_ATA, 1, "", 0, 0);
+      await mockDiamond.simulateOrderComplete(orderId);
+      const delay = await integrator.BRIDGE_RESCUE_DELAY();
+      await ethers.provider.send("evm_increaseTime", [Number(delay) + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await integrator.connect(user).userRescueStuckBridge(orderId);
+      expect((await integrator.getSession(orderId)).rescued).to.equal(true);
+
+      await ethers.provider.send("hardhat_setBalance", [integratorAddr, "0xde0b6b3a7640000"]);
+      const asSelf = integrator.connect(await ethers.getImpersonatedSigner(integratorAddr));
+      await expect(asSelf.selfBridge(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "AlreadyBridged"
+      );
+    });
+
+    // No test crossed a UTC day boundary, so the day-bucket arithmetic that the
+    // whole daily-count limit rests on was never exercised.
+    it("the daily count resets across a UTC day boundary", async function () {
+      const full = await integrator.getRemainingDailyCount(user.address);
+      for (let i = 0; i < Number(full); i++) {
+        await integrator.connect(user).userBuyUsdcToSolana(USDC(1), INR, SOLANA_ATA, 1, "", 0, 0);
+      }
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(0);
+      // validateOrder returns false and the Diamond hard-reverts the placement.
+      await expect(
+        integrator.connect(user).userBuyUsdcToSolana(USDC(1), INR, SOLANA_ATA, 1, "", 0, 0)
+      ).to.be.reverted;
+
+      // Cross into the next UTC day.
+      await ethers.provider.send("evm_increaseTime", [24 * 60 * 60]);
+      await ethers.provider.send("evm_mine", []);
+
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(full);
+      await expect(
+        integrator.connect(user).userBuyUsdcToSolana(USDC(1), INR, SOLANA_ATA, 1, "", 0, 0)
+      ).to.not.be.reverted;
+    });
+
+    it("the offramp daily count buckets independently across the same boundary", async function () {
+      await bridgeIn(user, USDC(500));
+      const full = await integrator.getRemainingOfframpDailyCount(user.address);
+      for (let i = 0; i < Number(full); i++) {
+        await integrator.connect(user).userInitiateOfframp(USDC(1), INR, 0, 1, 0, "pub");
+      }
+      expect(await integrator.getRemainingOfframpDailyCount(user.address)).to.equal(0);
+      // Onramp budget is untouched by offramp usage.
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(
+        await integrator.dailyTxCountLimit()
+      );
+
+      await ethers.provider.send("evm_increaseTime", [24 * 60 * 60]);
+      await ethers.provider.send("evm_mine", []);
+      expect(await integrator.getRemainingOfframpDailyCount(user.address)).to.equal(full);
+    });
+  });
+
+  describe("proxy USDC rescue (#74) and the SELL escrow", function () {
+    beforeEach(async function () {
+      await verify(user, "kyc", KYC_CAP);
+    });
+
+    it("lets a user pull bridged-in USDC out when CCTP is unusable", async function () {
+      const proxy = await bridgeIn(user, USDC(300));
+      // Circle pauses / migrates the messenger: every burn reverts.
+      await tokenMessenger.setBurnLimitPerMessage(usdcAddr, 0);
+      await expect(integrator.connect(user).userBridgeBackToSolana(USDC(300), SOLANA_ATA)).to.be
+        .reverted;
+
+      const before = await mockUsdc.balanceOf(user.address);
+      await expect(integrator.connect(user).userRescueProxyUsdc(USDC(300)))
+        .to.emit(integrator, "ProxyUsdcRescued")
+        .withArgs(user.address, USDC(300));
+      expect(await mockUsdc.balanceOf(user.address)).to.equal(before + USDC(300));
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(0);
+    });
+
+    it("still works for a blocked user — a block must never trap funds", async function () {
+      await bridgeIn(user, USDC(100));
+      await integrator.connect(owner).setUserBlocked(user.address, true);
+      await expect(integrator.connect(user).userRescueProxyUsdc(USDC(100))).to.emit(
+        integrator,
+        "ProxyUsdcRescued"
+      );
+    });
+
+    it("still works with the offramp kill switch off, and for an unverified user", async function () {
+      await bridgeIn(user2, USDC(40)); // user2 has no attestation at all
+      await integrator.connect(owner).setOfframpEnabled(false);
+      await expect(integrator.connect(user2).userRescueProxyUsdc(USDC(40))).to.emit(
+        integrator,
+        "ProxyUsdcRescued"
+      );
+    });
+
+    it("cannot touch USDC escrowed against an outstanding SELL", async function () {
+      await bridgeIn(user, USDC(100));
+      await integrator.connect(user).userInitiateOfframp(USDC(80), INR, 0, 1, 0, "pub");
+      // $80 is committed; only $20 is free.
+      await expect(
+        integrator.connect(user).userRescueProxyUsdc(USDC(30))
+      ).to.be.revertedWithCustomError(integrator, "InsufficientBridgedFunds");
+      await expect(integrator.connect(user).userRescueProxyUsdc(USDC(20))).to.emit(
+        integrator,
+        "ProxyUsdcRescued"
+      );
+    });
+
+    // Low 3 from the same review: bridging out ignored the escrow entirely, so a
+    // seller could strand a merchant who had accepted their SELL.
+    it("bridging back to Solana also respects the SELL escrow", async function () {
+      await bridgeIn(user, USDC(100));
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(80), INR, 0, 1, 0, "pub");
+      await mockDiamond.acceptSellOrder(orderId, "merchant-pubkey");
+
+      await expect(
+        integrator.connect(user).userBridgeBackToSolana(USDC(100), SOLANA_ATA)
+      ).to.be.revertedWithCustomError(integrator, "InsufficientBridgedFunds");
+      // The uncommitted remainder is still free to move.
+      await expect(integrator.connect(user).userBridgeBackToSolana(USDC(20), SOLANA_ATA)).to.emit(
+        integrator,
+        "BridgedBackToSolana"
+      );
+      // And the merchant's order is still deliverable.
+      await expect(integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi")).to.emit(
+        integrator,
+        "OfframpUpiDelivered"
+      );
+    });
+
+    it("rejects a zero amount and cannot drain someone else's proxy", async function () {
+      await bridgeIn(user, USDC(50));
+      await expect(integrator.connect(user).userRescueProxyUsdc(0)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidAmount"
+      );
+      // stranger has their own (empty) proxy — they cannot reach user's.
+      await expect(
+        integrator.connect(stranger).userRescueProxyUsdc(USDC(50))
+      ).to.be.revertedWithCustomError(integrator, "InsufficientBridgedFunds");
+      expect(await mockUsdc.balanceOf(await integrator.proxyAddress(user.address))).to.equal(
+        USDC(50)
+      );
+    });
+  });
+
   describe("userBridgeBackToSolana", function () {
     beforeEach(async function () {
       await verify(user, "kyc", KYC_CAP);
