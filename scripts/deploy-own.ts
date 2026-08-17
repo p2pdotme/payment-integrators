@@ -30,8 +30,9 @@ import { ethers } from "hardhat";
  * Each number is ALSO an immutable MAX_* constant in the bytecode. The
  * constructor and the owner's setters are bounded by them, so
  * the policy holds against a compromised owner key as well as a compromised
- * attestor key. Pass lower values to launch tighter; the owner can lower
- * further later, never raise.
+ * attestor key. Pass lower values to launch tighter — the owner can still
+ * move a limit anywhere at or below its ceiling afterwards, in either
+ * direction, so launching low does not burn the headroom.
  *
  * ── The attestor ──────────────────────────────────────────────────────────
  * `ATTESTOR` is the secp256k1 signer of the passport+liveness service. It MUST

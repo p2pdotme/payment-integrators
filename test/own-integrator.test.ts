@@ -384,7 +384,7 @@ describe("OwnCheckoutIntegrator", function () {
       );
     });
 
-    it("lets the owner tighten a region cap but never raise it", async function () {
+    it("lets the owner move a region cap freely at or below its ceiling", async function () {
       await expect(integrator.connect(owner).setRegionCap(REGION.INDIA, USDC(25)))
         .to.emit(integrator, "RegionCapUpdated")
         .withArgs(REGION.INDIA, USDC(25));
@@ -399,7 +399,7 @@ describe("OwnCheckoutIntegrator", function () {
       expect(await integrator.regionCap(REGION.INDIA)).to.equal(USDC(100));
     });
 
-    it("lets the owner tighten the daily count but never raise it past 5", async function () {
+    it("lets the owner move the daily count freely at or below 5", async function () {
       await integrator.connect(owner).setDailyTxCountLimit(2);
       expect(await integrator.dailyTxCountLimit()).to.equal(2);
       await expect(integrator.connect(owner).setDailyTxCountLimit(6)).to.be.revertedWithCustomError(
@@ -890,22 +890,56 @@ describe("OwnCheckoutIntegrator", function () {
       expect(await mockUsdc.balanceOf(integratorAddr)).to.equal(0);
     });
 
-    it("is not trippable by a stranger sending dust", async function () {
-      // Comparing against the settled amount rather than zero. A `!= 0` test
-      // would let anyone permanently break settlement bookkeeping for the
-      // price of one wei, since an anomaly refuses to mark the session
-      // settled.
-      await verify(user, CAP_INDIA);
-      await mockUsdc.mint(stranger.address, USDC(1));
-      await mockUsdc.connect(stranger).transfer(integratorAddr, 1n);
+    it("cannot be held down by a stranger funding this contract", async function () {
+      /*
+       * The alarm reads the Diamond's routing flag, not a balance.
+       *
+       * A balance is a symptom anyone can manufacture, and manufacturing it
+       * once is enough: the balance is never consumed, so a single transfer of
+       * a full order's worth used to make EVERY subsequent order anomalous
+       * until an owner swept — and the attacker could redo it after each
+       * sweep. The cost was not one order's USDC per order, it was one order's
+       * USDC per sweep cycle to keep the alarm ringing permanently. An alarm a
+       * stranger can hold down is one operators stop believing.
+       *
+       * The largest transfer any order could justify is the abroad ceiling.
+       */
+      await verify(user, CAP_ABROAD);
+      await mockUsdc.mint(stranger.address, CAP_ABROAD);
+      await mockUsdc.connect(stranger).transfer(integratorAddr, CAP_ABROAD);
+      expect(await mockUsdc.balanceOf(integratorAddr)).to.equal(CAP_ABROAD);
 
+      // Three ordinary orders, all after the transfer. Every one settles.
+      for (let i = 0; i < 3; i++) {
+        const orderId = await mockDiamond.nextOrderId();
+        await integrator.connect(user).buyUsdc(USDC(10), USD, 1, "pubkey", 0, 0);
+        await expect(mockDiamond.simulateOrderComplete(orderId)).to.not.emit(
+          integrator,
+          "SettlementRoutingAnomaly"
+        );
+        expect((await integrator.getSession(orderId)).settled).to.equal(true);
+      }
+
+      // The stray balance is still sitting there, and still means nothing.
+      expect(await mockUsdc.balanceOf(integratorAddr)).to.equal(CAP_ABROAD);
+    });
+
+    it("falls back to the balance when the Diamond's config cannot be read", async function () {
+      // A Diamond that no longer answers is already a deeply abnormal state.
+      // A griefable signal beats no signal there, so the balance test remains
+      // as the fallback — but only there.
+      await verify(user, CAP_INDIA);
       const orderId = await mockDiamond.nextOrderId();
       await integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0);
-      await expect(mockDiamond.simulateOrderComplete(orderId)).to.not.emit(
+
+      await mockDiamond.setUsdcThroughIntegrator(true);
+      await mockDiamond.setConfigReadable(false);
+
+      await expect(mockDiamond.simulateOrderComplete(orderId)).to.emit(
         integrator,
         "SettlementRoutingAnomaly"
       );
-      expect((await integrator.getSession(orderId)).settled).to.equal(true);
+      expect((await integrator.getSession(orderId)).settled).to.equal(false);
     });
   });
 });

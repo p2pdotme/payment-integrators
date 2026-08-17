@@ -187,9 +187,11 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
 
     // ─── Immutable policy ceilings ────────────────────────────────────
     // Compiled into the bytecode. Nothing — owner included — can move them.
-    // `setRegionCap` and `setDailyTxCountLimit` check against these, so the
-    // deployed contract can only ever become MORE restrictive than launch
-    // policy, never less.
+    // `setRegionCap` and `setDailyTxCountLimit` check against these, so no
+    // limit can ever exceed its ceiling. Movement BELOW a ceiling is free in
+    // both directions: launching under one leaves room to move back up to it
+    // later, which is deliberate (see the header) and is why this is not
+    // phrased as "only ever more restrictive".
 
     /// @notice Passport + liveness, India (INR) — $100 per tx.
     uint256 public constant MAX_REGION_CAP_INDIA = 100e6;
@@ -706,25 +708,36 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
         Session storage session = sessions[orderId];
         if (session.user == address(0) || session.settled || session.cancelled) return;
 
-        // Did the money actually leave? This contract is never a settlement
-        // destination, so holding the amount that was just settled means it
-        // did not reach the buyer — the signature of a mis-registered
-        // `usdcThroughIntegrator`.
+        // Ask the Diamond how it is routing us, rather than inferring it from
+        // a balance. `usdcThroughIntegrator` is the actual cause; a balance is
+        // a symptom, and a symptom anyone can manufacture.
         //
-        // Compared against `amount` rather than zero on purpose. A `!= 0` test
-        // would be tripped by anyone sending this address a single wei of
-        // USDC, and since an anomaly refuses to mark the session settled, that
-        // would let a stranger permanently break settlement bookkeeping for
-        // every subsequent order for the price of dust. Requiring the full
-        // settled amount prices that attack at one order's USDC apiece, and
-        // matches what a real mis-routing looks like.
+        // The balance test this replaced looked adequate — it compared against
+        // the settled amount rather than zero, so dust could not trip it — but
+        // the balance is never consumed. One transfer of a full order's worth
+        // left a standing balance that made EVERY later order anomalous until
+        // an owner swept, and the attacker could redo it after each sweep. The
+        // price was not an order's USDC apiece; it was one order's USDC per
+        // sweep cycle, to keep the alarm ringing forever. An alarm that a
+        // stranger can hold down is an alarm operators learn to ignore, which
+        // is how a real mis-registration would then go unnoticed — the exact
+        // failure the alarm exists to prevent, reached by a different road.
+        (bool routesHere, bool flagKnown) = _routesThroughIntegrator();
+
+        // Reported for diagnosis, not used as the signal.
         uint256 selfBalance = usdc.balanceOf(address(this));
+
+        // The balance remains the fallback for the one case the flag cannot
+        // answer: a Diamond that no longer exposes a readable config at all.
+        // That is already a deeply abnormal state, and a griefable signal
+        // beats no signal there.
+        bool misrouted = flagKnown ? routesHere : selfBalance >= amount;
 
         if (
             session.user != user ||
             session.amount != amount ||
             recipientAddr != session.user ||
-            selfBalance >= amount
+            misrouted
         ) {
             emit SettlementRoutingAnomaly(
                 orderId,
@@ -765,6 +778,47 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
     }
 
     // ─── Internals ────────────────────────────────────────────────────
+
+    /// @dev `bytes4(keccak256("getIntegratorConfig(address)"))`.
+    bytes4 private constant _GET_INTEGRATOR_CONFIG = 0x17353447;
+
+    /**
+     * @dev Is the Diamond routing this integrator's settlements to us?
+     *
+     *      A raw `staticcall` that reads word 1 and ignores everything after
+     *      it, which is deliberate and is the whole reason this is safe to
+     *      depend on. `B2BGatewayStorage.IntegratorConfig` has been three
+     *      fields, then four, and is now five — the extra one landed in the
+     *      MIDDLE both times, which is what silently decoded `proxyImpl` to
+     *      zero in the deploy script. Through all of it `isActive` and
+     *      `usdcThroughIntegrator` have stayed words 0 and 1; only the tail
+     *      has moved. Verified against the live Base mainnet and Base Sepolia
+     *      Diamonds 2026-08-17.
+     *
+     *      So a typed tuple decode would revert or mis-read on the next
+     *      change, while reading a fixed leading word cannot. A view this
+     *      contract depends on for a safety alarm must not be the thing that
+     *      breaks when the protocol grows a field.
+     *
+     * @return routes True when settlement is routed here instead of the buyer.
+     * @return known  False when the config could not be read at all, so
+     *                `routes` carries no information and the caller must fall
+     *                back to something else.
+     */
+    function _routesThroughIntegrator() private view returns (bool routes, bool known) {
+        (bool ok, bytes memory ret) = diamond.staticcall(
+            abi.encodeWithSelector(_GET_INTEGRATOR_CONFIG, address(this))
+        );
+        // Two words minimum: anything shorter cannot contain word 1.
+        if (!ok || ret.length < 64) return (false, false);
+
+        uint256 flag;
+        assembly {
+            // ret + 0x20 is word 0 (isActive); + 0x40 is word 1.
+            flag := mload(add(ret, 0x40))
+        }
+        return (flag != 0, true);
+    }
 
     function _salt(address user) internal pure returns (bytes32) {
         return bytes32(uint256(uint160(user)));

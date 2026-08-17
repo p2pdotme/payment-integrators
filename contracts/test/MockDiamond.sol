@@ -121,6 +121,42 @@ contract MockDiamond {
         usdcThroughIntegrator = v;
     }
 
+    /**
+     * @notice Mirrors `B2BGatewayFacet.getIntegratorConfig`, including the
+     *         field ORDER of the deployed struct — five words, with the
+     *         routing flag at word 1 and `proxyImpl` last.
+     * @dev    The order is the point. `cancelCallbackEnabled` was inserted in
+     *         the middle, which is what makes a stale typed decode read
+     *         `proxyImpl` as zero. An integrator that reads word 1 raw is
+     *         unaffected, and this mock has to have the same shape for that to
+     *         mean anything in a test.
+     */
+    struct IntegratorConfigView {
+        bool isActive;
+        bool usdcThroughIntegrator;
+        bool cancelCallbackEnabled;
+        uint256 activeOrderCount;
+        address proxyImpl;
+    }
+
+    /// @notice Set false to simulate a Diamond whose config cannot be read.
+    bool public configReadable = true;
+
+    function setConfigReadable(bool v) external {
+        configReadable = v;
+    }
+
+    function getIntegratorConfig(
+        address integrator
+    ) external view returns (IntegratorConfigView memory cfg) {
+        require(configReadable, "config unreadable");
+        cfg.isActive = true;
+        cfg.usdcThroughIntegrator = usdcThroughIntegrator;
+        cfg.cancelCallbackEnabled = false;
+        cfg.activeOrderCount = 0;
+        cfg.proxyImpl = integratorProxyImpl[integrator];
+    }
+
     function setSkipValidation(bool v) external {
         skipValidation = v;
     }

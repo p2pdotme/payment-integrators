@@ -237,8 +237,8 @@ not an ongoing clock. Revocation is `setBlocked`.
 | Power | Bounded by |
 |---|---|
 | `setAttestor` | — (rotate the service signer; existing grants stand) |
-| `setRegionCap` | `MAX_REGION_CAP_*` — lower only |
-| `setDailyTxCountLimit` | `MAX_DAILY_TX_COUNT_LIMIT` — lower only, never 0 |
+| `setRegionCap` | `MAX_REGION_CAP_*` — anywhere at or below it, either direction |
+| `setDailyTxCountLimit` | `MAX_DAILY_TX_COUNT_LIMIT` — anywhere at or below it, never 0 |
 | `setBlocked` | — (denylist a wallet) |
 | `pause` / `unpause` | — (stops new placements) |
 | `sweepUsdc` | see below |
@@ -265,8 +265,18 @@ accumulates.
 >
 > The check now reads **this contract's own USDC balance**, which is the
 > invariant itself rather than a proxy for it. It compares against the settled
-> amount rather than zero, so a stranger cannot trip it — and permanently break
-> settlement bookkeeping — by sending a single wei.
+> amount rather than zero. **That was still not enough**, and the second
+> version is worth recording too: a balance is never consumed, so one transfer
+> of a full order's worth left a standing balance that made every later order
+> anomalous until an owner swept — one order's USDC per *sweep cycle* to hold
+> the alarm down permanently, not per order. An alarm a stranger can hold down
+> is one operators stop believing, which is the original failure by another
+> road.
+>
+> The check now reads the Diamond's `usdcThroughIntegrator` flag directly, via
+> a raw `staticcall` that takes word 1 and ignores the tail — drift-proof
+> because that struct has grown twice and only ever in the tail. The balance
+> survives as the fallback for a Diamond whose config cannot be read at all.
 
 ---
 
