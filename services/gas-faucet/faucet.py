@@ -51,11 +51,12 @@ import os
 import secrets
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from eth_utils import to_checksum_address
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -66,12 +67,15 @@ from attestation import (
     check_attestation,
 )
 from chain import (
+    SEL_ATTESTOR,
     SEL_BLOCKED,
     SEL_NULLIFIER_SPENT,
+    SEL_PAUSED,
     SEL_VERIFIED,
     ChainError,
     Rpc,
     account_from_key,
+    fee_ceiling_wei,
 )
 from policy import Decision, Limits, decide, drip_target_wei, floor_wei
 from store import Store
@@ -169,11 +173,17 @@ LIMITS = Limits(
     # A full first journey is ~1.36M gas measured; round up for the proxy
     # deploy and any facet growth.
     gas_units=_int_env("FAUCET_GAS_UNITS", 1_500_000),
-    safety_factor=_int_env("FAUCET_SAFETY_FACTOR", 4),
-    # Floors and ceilings in wei. The ceiling is the real protection: at Base's
-    # usual 0.005 gwei a target lands near 3e13 wei (~$0.06), and this caps a
-    # fee spike at roughly ten times that rather than letting it scale freely.
-    min_target=_int_env("FAUCET_MIN_TARGET_WEI", 20_000_000_000_000),
+    # Two journeys, not four. The first drip must cover the whole first journey
+    # plus retry headroom — but the client re-asks the faucet before EVERY
+    # order, so a smaller drip just means more automatic top-ups, invisible to
+    # the user. Four journeys' worth was provisioning for orders that refill
+    # themselves anyway, at double the price on every cap and half the float's
+    # lifetime. (Review finding: the size was asserted, never argued.)
+    safety_factor=_int_env("FAUCET_SAFETY_FACTOR", 2),
+    # Floors and ceilings in wei. At Base's usual 0.005 gwei the target lands
+    # near 1.5e13 (~$0.03, ~2 journeys); the floor is the fee-spike safety net
+    # and the ceiling stops a spike scaling the drip freely.
+    min_target=_int_env("FAUCET_MIN_TARGET_WEI", 10_000_000_000_000),
     max_target=_int_env("FAUCET_MAX_TARGET_WEI", 400_000_000_000_000),
     max_drips_per_wallet=_int_env("FAUCET_MAX_DRIPS_PER_WALLET", 4),
     max_wei_per_wallet=_int_env("FAUCET_MAX_WEI_PER_WALLET", 800_000_000_000_000),
@@ -201,6 +211,111 @@ _ACCOUNT = (
 )
 #: One key, one nonce sequence. Every send is serialised behind this.
 _SEND_LOCK = threading.Lock()
+
+# ── on-chain reconciliation caches ───────────────────────────────────────────
+# The configured attestor has bitten two integrations by silently disagreeing
+# with the chain. The contract's own attestor() is what decides whether a
+# funded submit succeeds, so it is what this service verifies against; the
+# config value is the availability fallback, and a disagreement is an alarm.
+_ATTESTOR_TTL_S = 300
+_ATTESTOR_CACHE: dict[tuple[int, str], tuple[str, float]] = {}
+_PAUSED_TTL_S = 60
+_PAUSED_CACHE: dict[tuple[int, str], tuple[bool, float]] = {}
+
+
+def _effective_attestor(integrator: Integrator, rpc: Rpc) -> str:
+    """The signer cold-start attestations are verified against.
+
+    Chain first, config as fallback. If the two disagree, the chain wins —
+    it is the one the contract will hold the submit to — and the mismatch is
+    logged as an alarm, because it means either the config or the deployment
+    is wrong and every operator believes the other one.
+    """
+    key = (integrator.chain_id, integrator.address.lower())
+    hit = _ATTESTOR_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[1] < _ATTESTOR_TTL_S:
+        return hit[0]
+    try:
+        onchain = rpc.read_address(integrator.address, SEL_ATTESTOR)
+    except ChainError as exc:
+        log.warning(
+            _event("attestor_unreadable", integrator=integrator.label, detail=str(exc))
+        )
+        return integrator.attestor
+    if onchain.lower() != integrator.attestor.lower():
+        log.error(
+            _event("attestor_mismatch", integrator=integrator.label,
+                   configured=integrator.attestor, onchain=onchain)
+        )
+    _ATTESTOR_CACHE[key] = (onchain, now)
+    return onchain
+
+
+def _integrator_paused(integrator: Integrator, rpc: Rpc) -> bool:
+    """Is the integrator refusing new placements right now?
+
+    Funding a wallet during a pause spends a drip on a purchase that cannot
+    currently happen. Unreadable is treated as NOT paused: the checks that
+    guard money (blocked, verified, the caps) already fail closed, and pausing
+    the faucet on a flaky read would add an availability failure to an
+    economy check.
+    """
+    key = (integrator.chain_id, integrator.address.lower())
+    hit = _PAUSED_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[1] < _PAUSED_TTL_S:
+        return hit[0]
+    try:
+        paused = rpc.read_flag(integrator.address, SEL_PAUSED)
+    except ChainError:
+        return False
+    _PAUSED_CACHE[key] = (paused, now)
+    return paused
+
+
+# ── rate limiting ────────────────────────────────────────────────────────────
+# In-process sliding windows. This is honest throttling, not security — an
+# attacker with many IPs walks around it, and real edge limiting belongs in
+# front of the service. What it stops is the cheap version: one caller turning
+# a public endpoint into an RPC-cost amplifier, and a buggy client hammering
+# the chain reads. Generous enough that no legitimate client ever sees it.
+RATE_IP_PER_MIN = _int_env("FAUCET_RATE_IP_PER_MIN", 60)
+RATE_WALLET_PER_MIN = _int_env("FAUCET_RATE_WALLET_PER_MIN", 12)
+_RATE_LOCK = threading.Lock()
+_RATE_BUCKETS: dict[str, deque] = {}
+
+
+def _over_limit(key: str, limit: int) -> bool:
+    now = time.time()
+    with _RATE_LOCK:
+        bucket = _RATE_BUCKETS.setdefault(key, deque())
+        while bucket and bucket[0] <= now - 60:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            return True
+        bucket.append(now)
+        # Bound memory: drop idle buckets rather than growing forever.
+        if len(_RATE_BUCKETS) > 10_000:
+            for k in [k for k, q in _RATE_BUCKETS.items() if not q or q[-1] < now - 60]:
+                del _RATE_BUCKETS[k]
+    return False
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+# ── float alerting ───────────────────────────────────────────────────────────
+#: Warn when the funder holds fewer than this many targets. The empty state
+#: used to be a 200 the client swallows — heal-able (send ETH) but detected by
+#: nobody. `event=low_balance` is the line to alert on.
+LOW_BALANCE_DRIPS = _int_env("FAUCET_LOW_BALANCE_DRIPS", 100)
+_LOW_BALANCE_LOG_INTERVAL_S = 3600
+_last_low_balance_log = 0.0
 _RPCS: dict[int, Rpc] = {}
 
 
@@ -387,7 +502,10 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
                 ),
                 chain_id=integrator.chain_id,
                 integrator=integrator.address,
-                attestor=integrator.attestor,
+                # The chain's attestor(), not the config: it is the signer the
+                # CONTRACT will hold the funded submit to. Config is only the
+                # fallback when the chain cannot be read.
+                attestor=_effective_attestor(integrator, rpc),
                 now=int(time.time()),
             )
             # Canonical form only — the raw request string is attacker-chosen
@@ -467,15 +585,24 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
 
 
 @app.post("/v1/gas/request", response_model=GasResponse)
-def request_gas(req: GasRequest) -> GasResponse:
+def request_gas(req: GasRequest, request: Request) -> GasResponse:
     if _ACCOUNT is None:
         raise HTTPException(503, "faucet_not_configured")
+
+    ip = _client_ip(request)
+    if _over_limit(f"ip:{ip}", RATE_IP_PER_MIN):
+        log.info(_event("rate_limited", scope="ip", ip=ip))
+        raise HTTPException(429, "rate_limited")
 
     try:
         wallet = to_checksum_address(req.wallet)
         integrator_addr = to_checksum_address(req.integrator)
     except Exception as exc:
         raise HTTPException(400, f"bad_address: {exc}") from exc
+
+    if _over_limit(f"wallet:{wallet.lower()}", RATE_WALLET_PER_MIN):
+        log.info(_event("rate_limited", scope="wallet", wallet=_short(wallet)))
+        raise HTTPException(429, "rate_limited")
 
     integrator = INTEGRATORS.get((req.chainId, integrator_addr.lower()))
     if integrator is None:
@@ -521,7 +648,39 @@ def request_gas(req: GasRequest) -> GasResponse:
             raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
         target = drip_target_wei(base_fee, LIMITS)
-        usage = STORE.usage(wallet=wallet, nullifier=nullifier)
+
+        # An integrator that is paused cannot take the purchase this gas is
+        # for. The drip would not be lost — gas keeps — but spending budget on
+        # it now is spending during exactly the window an operator has said
+        # "stop". Declined, not refused: this is an economy decision, not an
+        # authorisation failure.
+        if _integrator_paused(integrator, rpc):
+            log.info(
+                _event("declined", reason="integrator_paused", wallet=_short(wallet),
+                       integrator=integrator.label)
+            )
+            return GasResponse(
+                funded=False,
+                reason="integrator_paused",
+                balanceWei=str(balance),
+                targetWei=str(target),
+            )
+
+        # The float alarm. The empty state is a 200 the client swallows by
+        # contract, so this log line is the only thing that turns "quietly
+        # refusing everyone" into a page before the wallet actually runs dry.
+        global _last_low_balance_log
+        if (
+            funder_balance < LOW_BALANCE_DRIPS * target
+            and time.time() - _last_low_balance_log > _LOW_BALANCE_LOG_INTERVAL_S
+        ):
+            _last_low_balance_log = time.time()
+            log.warning(
+                _event("low_balance", funder_balance_wei=funder_balance,
+                       target_wei=target, drips_left=funder_balance // max(target, 1))
+            )
+
+        usage = STORE.usage(wallet=wallet, nullifier=nullifier, chain_id=integrator.chain_id)
         decision: Decision = decide(
             balance=balance,
             target=target,
@@ -529,7 +688,10 @@ def request_gas(req: GasRequest) -> GasResponse:
             wallet_wei_today=usage.wallet_wei,
             nullifier_wei_today=usage.nullifier_wei,
             global_wei_today=usage.global_wei,
-            funder_balance=funder_balance,
+            # The caps meter what a drip SENDS; the transaction fee is real
+            # spend too, so the funder check provisions the worst-case fee for
+            # this drip before deciding the float can afford it.
+            funder_balance=max(0, funder_balance - fee_ceiling_wei(base_fee)),
             limits=LIMITS,
         )
 
@@ -598,11 +760,20 @@ def request_gas(req: GasRequest) -> GasResponse:
     # ledger deliberately — the gas was spent and the cap should feel it — but
     # telling the caller `funded: true` when nothing moved is worse than
     # useless: it is the one signal they have, and it would be a lie.
-    outcome = _await_receipt(rpc, tx_hash)
+    outcome, fee_wei = _await_receipt(rpc, tx_hash)
+    if fee_wei:
+        try:
+            STORE.record_fee(tx_hash, fee_wei)
+        except Exception as exc:
+            log.error(
+                _event("ledger_write_failed", wallet=_short(wallet),
+                       fee_wei=fee_wei, tx=_short(tx_hash, 12), detail=str(exc))
+            )
     log.info(
         _event("funded" if outcome != "failed" else "send_reverted",
                wallet=_short(wallet), integrator=integrator.label,
-               amount_wei=decision.amount, tx=_short(tx_hash, 12), outcome=outcome)
+               amount_wei=decision.amount, fee_wei=fee_wei,
+               tx=_short(tx_hash, 12), outcome=outcome)
     )
 
     return GasResponse(
@@ -616,31 +787,48 @@ def request_gas(req: GasRequest) -> GasResponse:
     )
 
 
-def _await_receipt(rpc: Rpc, tx_hash: str, *, attempts: int = 12, delay: float = 1.0) -> str:
-    """Wait briefly for the drip to land: "success" | "failed" | "pending".
+def _await_receipt(
+    rpc: Rpc, tx_hash: str, *, attempts: int = 12, delay: float = 1.0
+) -> tuple[str, int]:
+    """Wait briefly for the drip to land.
+
+    Returns ("success" | "failed" | "pending", actual_fee_wei).
 
     A receipt existing is not the same as the transfer having worked — a
     reverted or out-of-gas transaction has one too, with `status: 0x0`. This
     used to return True on any non-null receipt, so the caller reported
-    `funded: true` for a transfer that moved nothing, and the client had no way
-    to tell the difference except by reading the balance itself.
+    `funded: true` for a transfer that moved nothing.
+
+    The fee (gasUsed x effectiveGasPrice) is what the transaction genuinely
+    cost the funder and is booked to the ledger by the caller, so the caps
+    meter real spend rather than only the value sent. "pending" carries fee 0:
+    a bounded, one-in-flight-wide under-count, and the clamps in chain.py
+    bound how far it can be wrong.
     """
     for _ in range(attempts):
         try:
             receipt = rpc.call("eth_getTransactionReceipt", [tx_hash])
+            if isinstance(receipt, dict):
+                status = receipt.get("status")
+                fee = 0
+                try:
+                    fee = int(str(receipt.get("gasUsed", "0x0")), 16) * int(
+                        str(receipt.get("effectiveGasPrice", "0x0")), 16
+                    )
+                except (TypeError, ValueError):
+                    pass  # a node that omits either field books no fee
+                failed = status is not None and int(str(status), 16) == 0
+                return ("failed" if failed else "success", fee)
             if receipt is not None:
-                status = receipt.get("status") if isinstance(receipt, dict) else None
-                # Pre-Byzantium receipts have no status field; treat absence as
-                # success rather than inventing a failure.
-                return "failed" if status is not None and int(str(status), 16) == 0 else "success"
+                return ("success", 0)
         except ChainError:
             pass
         time.sleep(delay)
-    return "pending"
+    return ("pending", 0)
 
 
 @app.get("/v1/gas/status")
-def status(chainId: int, integrator: str, wallet: str) -> dict:
+def status(chainId: int, integrator: str, wallet: str, request: Request) -> dict:
     """What the faucet would do for this wallet, without doing it.
 
     `wouldFund` runs the SAME `decide()` the funding path runs. It used to be
@@ -648,6 +836,10 @@ def status(chainId: int, integrator: str, wallet: str) -> dict:
     true for a wallet the caps would refuse, and the incident runbook tells
     operators to trust that field.
     """
+    ip = _client_ip(request)
+    if _over_limit(f"ip:{ip}", RATE_IP_PER_MIN):
+        raise HTTPException(429, "rate_limited")
+
     try:
         integrator_key = (chainId, to_checksum_address(integrator).lower())
         wallet = to_checksum_address(wallet)
@@ -670,7 +862,7 @@ def status(chainId: int, integrator: str, wallet: str) -> dict:
         raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
     nullifier = STORE.nullifier_for(wallet)
-    usage = STORE.usage(wallet=wallet, nullifier=nullifier)
+    usage = STORE.usage(wallet=wallet, nullifier=nullifier, chain_id=chainId)
     decision = decide(
         balance=balance,
         target=target,

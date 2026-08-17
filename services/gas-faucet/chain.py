@@ -20,6 +20,12 @@ SEL_BLOCKED = "0x" + keccak(text="blocked(address)")[:4].hex()
 #: passport verifies exactly one wallet, ever, so an attestation whose
 #: nullifier is already spent describes a submit that will revert.
 SEL_NULLIFIER_SPENT = "0x" + keccak(text="nullifierSpent(bytes32)")[:4].hex()
+#: `attestor()` — the signer the CONTRACT will verify a submitted attestation
+#: against, which is therefore the one this service should verify against too.
+SEL_ATTESTOR = "0x" + keccak(text="attestor()")[:4].hex()
+#: `paused()` — funding a wallet while the integrator is paused spends a drip
+#: on a purchase that cannot currently happen.
+SEL_PAUSED = "0x" + keccak(text="paused()")[:4].hex()
 
 #: Ceilings on what one drip's TRANSACTION may cost, as opposed to what it
 #: sends. Every cap in policy.py meters `amount_wei` only, so without these the
@@ -28,6 +34,20 @@ SEL_NULLIFIER_SPENT = "0x" + keccak(text="nullifierSpent(bytes32)")[:4].hex()
 #: times Base's usual base fee.
 MAX_TRANSFER_GAS = int(os.environ.get("FAUCET_MAX_TRANSFER_GAS", 250_000))
 MAX_FEE_PER_GAS_WEI = int(os.environ.get("FAUCET_MAX_FEE_PER_GAS_WEI", 5_000_000_000))
+
+#: Tip fallback when eth_maxPriorityFeePerGas is unavailable. Named so the fee
+#: ceiling below and send_value cannot drift apart.
+DEFAULT_TIP_WEI = 1_000_000  # 0.001 gwei — plenty on an L2
+
+
+def fee_ceiling_wei(base_fee: int) -> int:
+    """The most one drip's TRANSACTION can cost, given the current base fee.
+
+    Used by the funder-balance check: the caps meter what a drip SENDS, so the
+    fee has to be provisioned here or the funder can be drained below what the
+    ledger says it should hold.
+    """
+    return MAX_TRANSFER_GAS * min(base_fee * 2 + DEFAULT_TIP_WEI, MAX_FEE_PER_GAS_WEI)
 
 
 class ChainError(Exception):
@@ -89,10 +109,29 @@ class Rpc:
         )
         raw = str(result or "0x")
         if raw in ("0x", ""):
-            # No code at the address, or a getter that isn't there. Treated as
-            # "not verified" by callers, never as "verified".
+            # No code at the address, or a getter that isn't there. Raised
+            # rather than defaulted: callers turn this into a 502 and refuse
+            # service, never guess in either direction. (An earlier comment
+            # here claimed callers treated it as "not verified" — stale since
+            # the denylist was made fail-closed.)
             raise ChainError("empty eth_call result")
         return int(raw, 16) != 0
+
+    def read_flag(self, contract: str, selector: str) -> bool:
+        """`eth_call` a no-argument `f() -> bool` getter."""
+        result = self.call("eth_call", [{"to": contract, "data": selector}, "latest"])
+        raw = str(result or "0x")
+        if raw in ("0x", ""):
+            raise ChainError("empty eth_call result")
+        return int(raw, 16) != 0
+
+    def read_address(self, contract: str, selector: str) -> str:
+        """`eth_call` a no-argument `f() -> address` getter."""
+        result = self.call("eth_call", [{"to": contract, "data": selector}, "latest"])
+        raw = str(result or "0x")
+        if len(raw) < 42:
+            raise ChainError("empty eth_call result")
+        return to_checksum_address("0x" + raw[-40:])
 
     # ── writes ───────────────────────────────────────────────────────────
 
@@ -111,7 +150,7 @@ class Rpc:
         try:
             tip = int(str(self.call("eth_maxPriorityFeePerGas", [])), 16)
         except ChainError:
-            tip = 1_000_000  # 0.001 gwei — plenty on an L2
+            tip = DEFAULT_TIP_WEI
 
         # 21,000 is the exact intrinsic cost of a transfer to an EOA and leaves
         # nothing for a recipient that runs code — a deployed smart account, or

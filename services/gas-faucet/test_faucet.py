@@ -146,7 +146,12 @@ class TestDecide:
 
 # ── attestation ─────────────────────────────────────────────────────────────
 
-CHAIN_ID = 8453
+# Base Sepolia — matching the deployment INTEGRATOR below actually lives on.
+# This used to say 8453 (mainnet) against the Sepolia address, which made every
+# signature-domain test assert a (chainId, verifyingContract) pair that exists
+# on no chain. The tests passed anyway because both sides used the same wrong
+# pair — worth remembering when reading any "parity" test. (#83)
+CHAIN_ID = 84532
 INTEGRATOR = "0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032"
 TYPES = {
     "KycAttestation": [
@@ -230,7 +235,7 @@ class TestAttestation:
             )
 
     def test_rejects_one_minted_for_a_different_chain(self, attestor, user):
-        att = _sign(attestor, wallet=user.address, chain_id=84532)
+        att = _sign(attestor, wallet=user.address, chain_id=8453)
         with pytest.raises(InvalidAttestation):
             check_attestation(
                 att, chain_id=CHAIN_ID, integrator=INTEGRATOR,
@@ -251,6 +256,17 @@ class TestAttestation:
         with pytest.raises(InvalidAttestation):
             check_attestation(
                 swapped, chain_id=CHAIN_ID, integrator=INTEGRATOR,
+                attestor=attestor.address, now=int(time.time()),
+            )
+
+    def test_rejects_a_limit_zero_attestation(self, attestor, user):
+        # The attestor should never sign limit 0 — the funded wallet could
+        # never buy. Reaching the contract would only surface it when the user
+        # first tries to purchase; refusing here surfaces it at the source. (#80)
+        att = _sign(attestor, wallet=user.address, limit=0)
+        with pytest.raises(InvalidAttestation, match="limit"):
+            check_attestation(
+                att, chain_id=CHAIN_ID, integrator=INTEGRATOR,
                 attestor=attestor.address, now=int(time.time()),
             )
 
@@ -337,6 +353,45 @@ class TestStore:
         store.record(chain_id=8453, wallet="0xAbCd", nullifier=None,
                      amount_wei=7, tx_hash=None, now=now)
         assert store.usage(wallet="0xABCD", nullifier=None, now=now).wallet_wei == 7
+
+    def test_wallet_and_identity_sums_are_scoped_per_chain(self, store):
+        # The same address exists on every chain with independent balances;
+        # pooling one wallet's allowance across chains would under-fund a
+        # legitimate cross-chain user. The GLOBAL sum stays unscoped on
+        # purpose — one process, one key, one float.
+        now = utc_day_start() + 60
+        store.record(chain_id=8453, wallet="0xA", nullifier="0xN",
+                     amount_wei=100, tx_hash=None, now=now)
+        store.record(chain_id=84532, wallet="0xA", nullifier="0xN",
+                     amount_wei=40, tx_hash=None, now=now)
+
+        base = store.usage(wallet="0xA", nullifier="0xN", chain_id=8453, now=now)
+        assert base.wallet_wei == 100
+        assert base.nullifier_wei == 100
+        sepolia = store.usage(wallet="0xA", nullifier="0xN", chain_id=84532, now=now)
+        assert sepolia.wallet_wei == 40
+        # the float breaker sees both
+        assert base.global_wei == 140
+
+    def test_fees_count_toward_every_cap(self, store):
+        # A drip's transaction fee is real spend from the same float. Booked
+        # after the receipt, summed with the amount — otherwise real spend
+        # exceeds booked spend by a number the recipient's receive() code
+        # helps choose.
+        now = utc_day_start() + 60
+        store.record(chain_id=8453, wallet="0xA", nullifier="0xN",
+                     amount_wei=100, tx_hash="0xT1", now=now)
+        store.record_fee("0xT1", 7)
+        usage = store.usage(wallet="0xA", nullifier="0xN", chain_id=8453, now=now)
+        assert usage.wallet_wei == 107
+        assert usage.nullifier_wei == 107
+        assert usage.global_wei == 107
+
+    def test_a_missing_fee_books_as_zero(self, store):
+        now = utc_day_start() + 60
+        store.record(chain_id=8453, wallet="0xA", nullifier=None,
+                     amount_wei=100, tx_hash="0xT2", now=now)
+        assert store.usage(wallet="0xA", nullifier=None, chain_id=8453, now=now).wallet_wei == 100
 
     def test_global_total_spans_every_wallet(self, store):
         now = utc_day_start() + 60

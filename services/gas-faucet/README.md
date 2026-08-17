@@ -45,11 +45,23 @@ The alternatives were weighed and rejected:
 
 A wallet is funded only when a real human is established behind it:
 
-- **A passport attestation** signed by that integrator's attestor, verified
-  here against the identical EIP-712 message the contract checks — same
-  `KycVerifier` domain, same typehash, `verifyingContract` pinned to the
-  integrator, same low-`s` rejection. This is the cold-start path: the wallet
-  has no gas, so it cannot have submitted on chain yet.
+- **A passport attestation**, verified here against the identical EIP-712
+  message the contract checks — same `KycVerifier` domain, same typehash,
+  `verifyingContract` pinned to the integrator, same low-`s` rejection, and a
+  refusal of `limit: 0` (a wallet that could never buy). This is the cold-start
+  path: the wallet has no gas, so it cannot have submitted on chain yet.
+
+  The signer it verifies against is **the contract's own `attestor()`**, read
+  from chain and cached five minutes — because that is the signer the funded
+  submit will be held to. The configured value is only the fallback when the
+  chain cannot be read, and any disagreement between the two is logged as
+  `event=attestor_mismatch`: it means either the config or the deployment is
+  wrong, and every operator believes the other one. A config-only attestor
+  silently rejecting every cold start has bitten two prior integrations.
+
+  An attestation whose nullifier is already spent on chain is refused too —
+  one passport verifies exactly one wallet, ever, so funding a second cold
+  start on the same identity pays for a submit that must revert.
 - **`verified(wallet)` already true** on the integrator. Every later drip
   takes this path and needs no bearer credential at all.
 
@@ -64,7 +76,13 @@ Then three ceilings, all per UTC day:
 | per wallet, count | 4 drips | bounds a loop |
 | per wallet, value | 8×10¹⁴ wei | bounds one wallet |
 | **per nullifier, value** | 1.6×10¹⁵ wei | a nullifier is per-(tenant, human), so one person spreading across many wallets shares one budget |
-| global | 2×10¹⁷ wei | circuit breaker |
+| global | 2×10¹⁷ wei | circuit breaker over the float (unscoped by chain — one process, one key, one float) |
+
+Sums meter **amount sent plus the transaction's actual fee** (booked from the
+receipt), and the per-wallet/per-identity sums are scoped per chain. The
+funder-balance check provisions a worst-case fee ceiling before agreeing to a
+drip, so the float cannot be drained below what the ledger claims by fees
+nobody counted.
 
 The per-nullifier cap is defence in depth. The primary control is now on
 chain: the faucet reads `nullifierSpent` and refuses an attestation whose
@@ -107,8 +125,11 @@ strands users mid-order, and needlessly generous the rest of the time. The
 ceiling is the real protection: it is what stops a gas spike turning each drip
 into actual money.
 
-At Base's usual fee this lands at 3×10¹³ wei (~$0.06, about four full
-journeys).
+At Base's usual fee this lands at 1.5×10¹³ wei (~$0.03, about two full
+journeys). Two, not four: the first drip must cover the whole first journey
+plus retry headroom, but the client re-asks the faucet before every subsequent
+order, so a smaller drip just means more automatic top-ups — invisible to the
+user, and half the price on every cap and the float.
 
 ## Not in the funds path
 
@@ -133,7 +154,15 @@ event=integrator label=own chain=8453 address=0x… attestor=0x…
 event=refused   reason=invalid_attestation wallet=0x60907330… integrator=own detail=…
 event=declined  reason=sufficient_balance wallet=0x… balance_wei=… target_wei=…
 event=funding   wallet=0x… amount_wei=30000000000000
-event=funded    wallet=0x… tx=0x3fb6033e… outcome=success
+event=funded    wallet=0x… tx=0x3fb6033e… fee_wei=… outcome=success
+event=attestor_mismatch integrator=own configured=0x… onchain=0x…
+event=low_balance funder_balance_wei=… drips_left=42
+event=rate_limited scope=wallet wallet=0x…
+```
+
+Alert on `event=low_balance` (the float is running out; heal by sending ETH)
+and on `event=attestor_mismatch` (cold starts are about to fail for whichever
+side is wrong).
 ```
 
 The service had none of this. It matters for one failure in particular: a

@@ -159,6 +159,15 @@ def check_attestation(
     if now >= attestation.expiry:
         raise InvalidAttestation("attestation expired")
 
+    # A limit-0 attestation is one the attestor should never sign: the
+    # contract computes effectiveLimit = min(granted, regionCap), so the funded
+    # wallet could never buy anything. The signature makes this unforgeable —
+    # reaching here means the SERVICE is misconfigured — and funding it anyway
+    # would be money out with the user still stuck, found only when they try
+    # to buy. Refuse loudly instead. (#80)
+    if attestation.limit <= 0:
+        raise InvalidAttestation("attested limit is zero — the funded wallet could never buy")
+
     signer = recover_attestor(attestation, chain_id=chain_id, integrator=integrator)
     if signer.lower() != attestor.lower():
         raise InvalidAttestation("not signed by this integrator's attestor")

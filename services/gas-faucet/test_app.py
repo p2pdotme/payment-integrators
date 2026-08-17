@@ -23,7 +23,7 @@ from eth_account.messages import encode_typed_data
 
 INTEG = "0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032"
 CHAIN = 84532
-TARGET = 30_000_000_000_000
+TARGET = 15_000_000_000_000
 ATTESTOR = Account.from_key("0x" + "11" * 32)
 
 os.environ["FAUCET_ALLOW_EPHEMERAL_DB"] = "1"
@@ -49,7 +49,24 @@ class FakeRpc:
         self.sent: list[tuple[str, int]] = []
         self.fail_reads = False
         self.receipt_status = "0x1"
+        # The attestor the CHAIN reports. Defaults to the configured one;
+        # tests steer it to exercise the mismatch paths.
+        self.chain_attestor = ATTESTOR.address
+        self.attestor_unreadable = False
+        self.paused = False
+        self.receipt_gas_used = "0x5208"          # 21_000
+        self.receipt_gas_price = "0x2d4b370"      # ~0.047 gwei
         self.lock = threading.Lock()
+
+    def read_address(self, contract, selector):
+        if self.attestor_unreadable or self.fail_reads:
+            raise faucet.ChainError("rpc down")
+        return self.chain_attestor
+
+    def read_flag(self, contract, selector):
+        if self.fail_reads:
+            raise faucet.ChainError("rpc down")
+        return self.paused
 
     def balance(self, addr):
         if addr.lower() == faucet._ACCOUNT.address.lower():
@@ -74,7 +91,11 @@ class FakeRpc:
 
     def call(self, method, params):
         if method == "eth_getTransactionReceipt":
-            return {"status": self.receipt_status}
+            return {
+                "status": self.receipt_status,
+                "gasUsed": self.receipt_gas_used,
+                "effectiveGasPrice": self.receipt_gas_price,
+            }
         return "0x1"
 
     def send_value(self, *, account, to, amount_wei, chain_id, base_fee):
@@ -82,6 +103,16 @@ class FakeRpc:
             self.balances[to.lower()] = self.balances.get(to.lower(), 0) + amount_wei
             self.sent.append((to.lower(), amount_wei))
         return "0x" + secrets.token_hex(32)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state():
+    """Rate buckets and reconciliation caches are process-global; a test that
+    inherited another's would assert against the wrong world."""
+    faucet._RATE_BUCKETS.clear()
+    faucet._ATTESTOR_CACHE.clear()
+    faucet._PAUSED_CACHE.clear()
+    yield
 
 
 @pytest.fixture
@@ -367,3 +398,106 @@ class TestLogging:
         # The nullifier is a per-human pseudonym: truncated, so it can
         # correlate an incident without being a usable bearer token if leaked.
         assert att["nullifier"] not in text
+
+
+# ── the chain is the attestor authority ─────────────────────────────────────
+
+
+class TestAttestorFromChain:
+    """The faucet verifies cold starts against the contract's own attestor(),
+    because that is the signer the funded submit will be held to. The config
+    value is the availability fallback — and a mismatch is an alarm, not a
+    working state. A wrong config used to reject every cold start while
+    looking exactly like an outage; it bit two prior integrations."""
+
+    def test_the_chain_attestor_wins_over_a_wrong_config(self, client, rpc, caplog):
+        # Chain rotated to a new signer; config is stale. Attestations from
+        # the CHAIN's signer must fund — they are the ones the contract will
+        # accept — and the disagreement must be logged as an alarm.
+        rotated = Account.from_key("0x" + "55" * 32)
+        rpc.chain_attestor = rotated.address
+        w = Account.create().address
+        with caplog.at_level("ERROR", logger="faucet"):
+            r = req(client, w, sign(w, signer=rotated))
+        assert r.json()["funded"] is True
+        assert "event=attestor_mismatch" in caplog.text
+
+    def test_a_config_signed_attestation_fails_once_the_chain_rotated(self, client, rpc):
+        # The inverse: config-signed attestations are exactly the ones whose
+        # on-chain submit would revert InvalidSignature. Funding them is money
+        # out with the user still stuck.
+        rotated = Account.from_key("0x" + "55" * 32)
+        rpc.chain_attestor = rotated.address
+        w = Account.create().address
+        assert req(client, w, sign(w, signer=ATTESTOR)).status_code == 403
+
+    def test_config_is_the_fallback_when_the_chain_is_unreadable(self, client, rpc, caplog):
+        rpc.attestor_unreadable = True
+        w = Account.create().address
+        with caplog.at_level("WARNING", logger="faucet"):
+            r = req(client, w, sign(w, signer=ATTESTOR))
+        assert r.json()["funded"] is True
+        assert "event=attestor_unreadable" in caplog.text
+
+
+class TestPausedIntegrator:
+    def test_a_paused_integrator_declines_rather_than_funds(self, client, rpc, caplog):
+        # Gas keeps, but spending budget during the exact window an operator
+        # said "stop" is spending against their decision. A decline, not a
+        # 4xx — the caller did nothing wrong.
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        rpc.paused = True
+        with caplog.at_level("INFO", logger="faucet"):
+            body = req(client, w).json()
+        assert body["funded"] is False
+        assert body["reason"] == "integrator_paused"
+        assert rpc.sent == []
+        assert "reason=integrator_paused" in caplog.text
+
+    def test_an_unreadable_paused_flag_does_not_block_funding(self, client, rpc, monkeypatch):
+        # paused is an economy check; the money checks (blocked, verified,
+        # caps) already fail closed. An availability failure here would add a
+        # second way for an RPC flake to stop everyone.
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        real_read_flag = rpc.read_flag
+        def flaky(contract, selector):
+            raise faucet.ChainError("rpc down")
+        monkeypatch.setattr(rpc, "read_flag", flaky)
+        assert req(client, w).json()["funded"] is True
+
+
+class TestRateLimit:
+    def test_a_wallet_hammering_the_faucet_gets_429(self, client, rpc, monkeypatch):
+        monkeypatch.setattr(faucet, "RATE_WALLET_PER_MIN", 3)
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        codes = [req(client, w).status_code for _ in range(5)]
+        assert codes[:3] == [200, 200, 200]
+        assert codes[3:] == [429, 429]
+
+    def test_an_ip_hammering_status_gets_429(self, client, rpc, monkeypatch):
+        monkeypatch.setattr(faucet, "RATE_IP_PER_MIN", 2)
+        p = {"chainId": CHAIN, "integrator": INTEG, "wallet": Account.create().address}
+        codes = [client.get("/v1/gas/status", params=p).status_code for _ in range(4)]
+        assert codes[2:] == [429, 429]
+
+
+class TestFeeAccounting:
+    def test_the_actual_fee_lands_in_the_ledger(self, client, rpc):
+        # gasUsed 21000 x 0.047054 gwei — the fee a real Base receipt showed.
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        req(client, w)
+        row = faucet.STORE._conn.execute(
+            "SELECT fee_wei FROM drips WHERE wallet = ?", (w.lower(),)
+        ).fetchone()
+        assert row[0] == str(21_000 * 0x2D4B370)
+
+    def test_the_fee_counts_toward_the_wallet_cap(self, client, rpc):
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        req(client, w)
+        usage = faucet.STORE.usage(wallet=w, nullifier=None, chain_id=CHAIN)
+        assert usage.wallet_wei == TARGET + 21_000 * 0x2D4B370
