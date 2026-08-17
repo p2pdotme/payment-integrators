@@ -1671,6 +1671,88 @@ describe("ShowdownCheckoutIntegrator", function () {
 
   // ─── Bridging back to Solana ────────────────────────────────────────
 
+  describe("final-review fixes (#71 #89 #90)", function () {
+    beforeEach(async function () {
+      await verify(user, "kyc", KYC_CAP);
+    });
+
+    // #71: the live Diamond's setSellOrderUpi auto-cancels on a failed pull and
+    // RETURNS SUCCESS. A returned execute is not proof of delivery.
+    it("does not emit OfframpUpiDelivered when the Diamond auto-cancelled", async function () {
+      await bridgeIn(user, USDC(50));
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(50), INR, 0, 1, 0, "pub");
+      await mockDiamond.acceptSellOrder(orderId, "merchant-pubkey");
+      await mockDiamond.setForceSellUpiAutoCancel(true);
+
+      await expect(integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi"))
+        .to.emit(integrator, "OfframpDeliveryAutoCancelled")
+        .and.to.not.emit(integrator, "OfframpUpiDelivered");
+      // Nothing was pulled — the principal is still on the proxy, and reconcile
+      // can release the escrow off the now-CANCELLED order.
+      expect(await mockUsdc.balanceOf(await integrator.proxyAddress(user.address))).to.equal(
+        USDC(50)
+      );
+      await integrator.reconcile(orderId);
+      expect(await integrator.pendingOfframpTotal(user.address)).to.equal(0);
+    });
+
+    it("still emits OfframpUpiDelivered when the Diamond really pulled", async function () {
+      await bridgeIn(user, USDC(50));
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(50), INR, 0, 1, 0, "pub");
+      await mockDiamond.acceptSellOrder(orderId, "merchant-pubkey");
+      await expect(integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi")).to.emit(
+        integrator,
+        "OfframpUpiDelivered"
+      );
+    });
+
+    // #89: the re-charge went to placementDay's bucket, which nothing reads
+    // after midnight — netting the user one extra placement. It must charge the
+    // CURRENT day.
+    it("cancel-then-complete across midnight charges today's bucket, not yesterday's", async function () {
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userBuyUsdcToSolana(USDC(20), INR, SOLANA_ATA, 1, "", 0, 0);
+
+      // Cancel frees the slot on day one...
+      const diamondAddr = await mockDiamond.getAddress();
+      await ethers.provider.send("hardhat_setBalance", [diamondAddr, "0xde0b6b3a7640000"]);
+      const asDiamond = integrator.connect(await ethers.getImpersonatedSigner(diamondAddr));
+      await asDiamond.onOrderCancel(orderId);
+
+      // ...midnight passes...
+      await ethers.provider.send("evm_increaseTime", [24 * 60 * 60]);
+      await ethers.provider.send("evm_mine", []);
+      const fullToday = await integrator.getRemainingDailyCount(user.address);
+
+      // ...and the admin re-opens + completes the cancelled BUY on day two.
+      await mockDiamond.simulateOrderComplete(orderId);
+      expect(await integrator.getRemainingDailyCount(user.address)).to.equal(fullToday - 1n);
+    });
+
+    // #90 repro, verbatim from the issue: drain to exactly the escrow floor,
+    // then your own delivery is impossible by the fee.
+    it("a seller cannot drain to the bare principal and strand their accepted SELL", async function () {
+      await mockDiamond.setSellFee(ethers.parseUnits("0.1", 6)); // INR small-order fee
+      await bridgeIn(user, USDC(100));
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(9), INR, 0, 1, 0, "pub");
+      await mockDiamond.acceptSellOrder(orderId, "merchant-pubkey");
+
+      // The old guard allowed rescuing down to exactly $9; delivery then needed
+      // $9.10 and reverted forever. The $1 headroom keeps the fee covered.
+      await expect(
+        integrator.connect(user).userRescueProxyUsdc(USDC(91))
+      ).to.be.revertedWithCustomError(integrator, "InsufficientBridgedFunds");
+      await integrator.connect(user).userRescueProxyUsdc(USDC(90));
+      await expect(integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi")).to.emit(
+        integrator,
+        "OfframpUpiDelivered"
+      );
+    });
+  });
+
   describe("test hardening (#78)", function () {
     beforeEach(async function () {
       await verify(user, "kyc", KYC_CAP);
@@ -1796,11 +1878,15 @@ describe("ShowdownCheckoutIntegrator", function () {
     it("cannot touch USDC escrowed against an outstanding SELL", async function () {
       await bridgeIn(user, USDC(100));
       await integrator.connect(user).userInitiateOfframp(USDC(80), INR, 0, 1, 0, "pub");
-      // $80 is committed; only $20 is free.
+      // $80 principal + $1 SELL_FEE_HEADROOM committed (#90); only $19 is free.
       await expect(
         integrator.connect(user).userRescueProxyUsdc(USDC(30))
       ).to.be.revertedWithCustomError(integrator, "InsufficientBridgedFunds");
-      await expect(integrator.connect(user).userRescueProxyUsdc(USDC(20))).to.emit(
+      // Draining to exactly the principal floor is the #90 grief — refused.
+      await expect(
+        integrator.connect(user).userRescueProxyUsdc(USDC(20))
+      ).to.be.revertedWithCustomError(integrator, "InsufficientBridgedFunds");
+      await expect(integrator.connect(user).userRescueProxyUsdc(USDC(19))).to.emit(
         integrator,
         "ProxyUsdcRescued"
       );
@@ -1817,8 +1903,8 @@ describe("ShowdownCheckoutIntegrator", function () {
       await expect(
         integrator.connect(user).userBridgeBackToSolana(USDC(100), SOLANA_ATA)
       ).to.be.revertedWithCustomError(integrator, "InsufficientBridgedFunds");
-      // The uncommitted remainder is still free to move.
-      await expect(integrator.connect(user).userBridgeBackToSolana(USDC(20), SOLANA_ATA)).to.emit(
+      // The remainder minus the $1 fee headroom (#90) is still free to move.
+      await expect(integrator.connect(user).userBridgeBackToSolana(USDC(19), SOLANA_ATA)).to.emit(
         integrator,
         "BridgedBackToSolana"
       );

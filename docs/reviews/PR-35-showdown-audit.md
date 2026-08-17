@@ -25,7 +25,7 @@ deploy, and re-cut the limits to the agreed policy — ceilings the owner can mo
 `IOrderFlow` / `UserProxy`; harness-fidelity check against `MockDiamond`; diff against the reviewed
 siblings (`LotPotCheckoutIntegrator`, `UsdcDirectCheckoutIntegrator`, and the Investabl audit
 `PR-40-investabl-audit.md`, of which Showdown is the two-way superset); compiled + ran the suite
-(`evm: cancun`, `viaIR`). Baseline **54/54**, after changes **81/81**.
+(`evm: cancun`, `viaIR`). Test counts are stated in the PR, not here — they move every commit (#88).
 
 ---
 
@@ -125,14 +125,14 @@ budgets of `dailyTxCountLimit` each.
 
 Showdown had no reentrancy guards. **Correction (#77):** this originally said "the siblings use
 `nonReentrant`", which is false for half of them — `MarketplaceCheckoutIntegrator`,
-`UsdcDirectCheckoutIntegrator` and both LotPot versions have **zero**. Only `MerchantTerminal` (19)
-and `Investabl` (2) had any. Getting this wrong is itself the evidence for #77's argument: nobody
+`UsdcDirectCheckoutIntegrator` and both LotPot versions have **zero**; `MerchantTerminal` (19),
+`Investabl` (2) and — since the merge with main — `OwnCheckoutIntegrator` (3) carry some (#88). Getting this wrong is itself the evidence for #77's argument: nobody
 holds a family-wide view, so each audit assumes the others are fine. Not exploitable with real USDC (no transfer
 hooks) and `UserProxy.execute` is itself guarded, but `userBridgeBackToSolana` reads
 `usdc.balanceOf(proxy)` and _then_ pulls — a hook-bearing token would double-spend it.
 
-**Fix:** transient-storage `nonReentrant` (matching `UserProxy`) on the seven value-moving
-entrypoints. Deliberately **not** on `validateOrder` (the Diamond re-enters it inside
+**Fix:** transient-storage `nonReentrant` (matching `UserProxy`) on the value-moving
+entrypoints (eight at head — `userRescueProxyUsdc` arrived after this audit was cut, #88). Deliberately **not** on `validateOrder` (the Diamond re-enters it inside
 `userBuyUsdcToSolana` / `userInitiateOfframp`) nor on `onOrderComplete` / `selfBridge` (which
 self-call by design).
 

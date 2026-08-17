@@ -6,7 +6,7 @@ See [`showdown.md`](./showdown.md) for the contract design itself.
 
 ## Where we are
 
-`ShowdownCheckoutIntegrator` is built, unit-tested (81 tests), deployed and whitelisted on Base Sepolia.
+`ShowdownCheckoutIntegrator` is built, unit-tested (see the PR for the current count), deployed and whitelisted on Base Sepolia.
 
 > ⚠️ **The deployed Sepolia build is stale.** The pre-prod audit ([`docs/reviews/PR-35-showdown-audit.md`](../reviews/PR-35-showdown-audit.md)) changed the limit model and the completion accounting, so the bytecode differs from `0x450642C7…`. That address still enforces the old flat $20/$50 with owner-raisable caps. **Re-deploy and re-whitelist before any further testing.**
 
@@ -53,7 +53,7 @@ Both attestors are currently set to the **deployer key** so the demo can sign at
 1. Register the integrator address as the tenant `contract_address` in **both** the liveness and the KYC simple-kyc services, so they sign attestations bound to it.
 2. Rotate the signers: `setLivenessAttestor(<liveness GET /v1/attestor>)`, `setKycAttestor(<kyc GET /v1/attestor>)`. Both are owner-settable, no redeploy.
 
-The services can sign whatever dollar limit they like — the contract clamps to `tierCap[tier][region]`, so the tiers hold even if a signer key leaks. Adjust with `setTierCap(tier, region, cap)`, which can only ever move a cap _down_ from its immutable `MAX_*` ceiling; setting a cell to `0` disables that lane without touching anyone's attestation.
+The services can sign whatever dollar limit they like — the contract clamps to `tierCap[tier][region]`, so the tiers hold even if a signer key leaks. Adjust with `setTierCap(tier, region, cap)`, bounded only by the immutable `MAX_*` ceiling — **not a ratchet** (#88): a cap lowered during an incident can be raised straight back to the ceiling, and a lane disabled with `0` can be re-enabled. The guarantee is "never above `MAX_*`", not "monotonically down". Setting a cell to `0` disables that lane without touching anyone's attestation.
 
 **Attestor values must come from the service's own `/v1/attestor` endpoint, never from a partner- or teammate-relayed value.** Both Showdown attestors were wrong once on Sepolia for exactly that reason (fixed 2026-07-25). `scripts/local/set-showdown-attestors.ts` fetches the signer from the service rather than taking it as an argument, which is the point of the script.
 
@@ -82,7 +82,13 @@ Note the Diamond's fee comes off the same proxy balance, so the proxy needs **pr
 
 **KYC gate UI.** `submitLivenessAttestation` / `submitKycAttestation`, and read `effectiveLimit(address,bytes32 currency)` (or `effectiveLimits(address) → (india, abroad)`) / `userTier(user)` to drive the cap shown. The one-arg `effectiveLimit(user)` no longer exists — ABI break (see the widget note below). The passport upsell is region-dependent: liveness→passport is $20→$100 (INR) or $50→$200 (abroad), NOT a flat $20→$50 (that difference is India-vs-Abroad within the SAME liveness tier). (#54)
 
-**Escape hatch.** `userBridgeBackToSolana(amount, ata)` returns bridged-in funds to Solana instead of offramping — worth exposing for users who change their mind or whose tier doesn't cover the amount.
+**Escape hatches — the widget should expose all three** (#88):
+
+- `userBridgeBackToSolana(amount, ata)` returns bridged-in funds to Solana instead of offramping.
+- `userRescueProxyUsdc(amount)` (#74) withdraws proxy USDC straight to the user's Base wallet with **no CCTP dependency** — the only exit that works while Circle's messenger is paused or migrated, and it is ungated by `blocked[]`, the kill switch, and KYC tier.
+- Both exits respect the SELL escrow plus a $1 `SELL_FEE_HEADROOM` (#90), so they can never strand an accepted merchant's delivery.
+
+**Abandoning a placed SELL** (#86): there is deliberately no cancel entrypoint (#51.1 decision — a cancel landing after fiat is sent is a merchant double-spend). The recovery path is: the order expires on the Diamond's own TTL (live mainnet: PLACED 180s, ACCEPTED 300s, PAID 600s for INR/BRL/EUR), anyone calls the Diamond's permissionless `autoCancelExpiredOrders([orderId])`, then anyone calls the integrator's permissionless `reconcile(orderId)` — **`reconcile` is what releases the escrow** and, for a never-accepted order, refunds the daily slot. Total wait is minutes, not days. The widget should offer this as the "cancel" affordance.
 
 ## 5. Attestation delivery — the missing service, and the launch blocker
 

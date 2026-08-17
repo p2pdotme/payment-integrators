@@ -197,10 +197,13 @@ async function main() {
     // every network, so honouring it here would silently point a mainnet deploy at
     // a testnet Diamond — the exact mistake this table exists to prevent. Opting
     // back in has to be deliberate.
-    if (isMainnet && differs && process.env.ALLOW_ADDRESS_OVERRIDE !== "true") {
+    // Per-address opt-in (#84): one blanket ALLOW_ADDRESS_OVERRIDE unlocked the
+    // Diamond and USDC presets together, so a legitimate Diamond override
+    // silently re-opened the USDC one. Each address now needs its own flag.
+    if (isMainnet && differs && process.env[`ALLOW_${envName}_OVERRIDE`] !== "true") {
       console.log(
         `   ignoring ${envName}=${fromEnv} for ${what} — using the verified mainnet preset. ` +
-          `Pass ALLOW_ADDRESS_OVERRIDE=true to use the env value instead.`
+          `Pass ALLOW_${envName}_OVERRIDE=true to use the env value instead.`
       );
       return presetValue as string;
     }
@@ -401,7 +404,34 @@ async function main() {
   console.log("  proxyImpl:                 ", proxyImpl);
 
   // 2. Register on the Diamond — usdcThroughIntegrator = FALSE.
-  if (!SKIP_REGISTER) {
+  //
+  // registerIntegrator is onlySuperAdmin, a role p2p holds. On mainnet the
+  // deploy signer is the Showdown-held owner EOA (DEPLOY_OWNER), which does NOT
+  // hold it — so blindly sending the tx here would revert AFTER the immutable
+  // deploy, burning the one run where a mistake is permanent. Read the role
+  // first; when the signer is not the super-admin, skip registration and print
+  // what p2p needs instead of throwing at the finish line. (#85) Sepolia only
+  // ever worked because the deployer holds the role there.
+  // NB: probed by staticCall rather than a superAdmin() getter — the mainnet
+  // Diamond's facet set has no such getter ("Function does not exist"), so the
+  // only reliable authorization test is simulating the registration itself.
+  let canRegister = !SKIP_REGISTER;
+  if (canRegister) {
+    const probe = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI, deployer);
+    try {
+      await probe.registerIntegrator.staticCall(integratorAddr, false, proxyImpl);
+    } catch (e: unknown) {
+      canRegister = false;
+      const reason = (e as { shortMessage?: string; message?: string }).shortMessage ?? "";
+      console.log(`\n! registerIntegrator would revert for this signer (${reason}) — skipping.`);
+      console.log("  Expected on mainnet: registration is onlySuperAdmin (held by p2p), while the");
+      console.log("  deploy signer is the Showdown owner EOA. p2p completes the whitelist");
+      console.log("  (WHITELISTING.md steps 3-4):");
+      console.log(`    1. registerIntegrator(${integratorAddr}, false, ${proxyImpl})`);
+      console.log(`    2. setIntegratorCancelCallback(${integratorAddr}, true)   // gate D9`);
+    }
+  }
+  if (canRegister) {
     console.log("\nRegistering on the Diamond (usdcThroughIntegrator=false)…");
     const b2b = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI, deployer);
     const before = await b2b.getIntegratorConfig(integratorAddr);

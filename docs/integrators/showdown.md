@@ -54,7 +54,9 @@ Setting a cell to `0` disables that (tier, region) lane without touching anyone'
 
 `setUserBlocked(user, bool)` zeroes a wallet's effective limit in both directions. It is a **binary gate only** — limits themselves come solely from the KYC tier and the region ceiling, never from a per-user owner setting.
 
-A block deliberately does **not** gate `userBridgeBackToSolana` or `userRescueStuckBridge`: those move only the user's own already-paid-for funds back out. A block stops new conversions; it never seizes or strands anything.
+A block deliberately does **not** gate the three fund exits — `userBridgeBackToSolana`, `userRescueStuckBridge`, or `userRescueProxyUsdc` (#74): those move only the user's own already-paid-for funds back out. A block stops new conversions; it never seizes or strands anything.
+
+One caveat (#86): while a SELL the user placed is still outstanding, its principal plus a $1 `SELL_FEE_HEADROOM` is escrowed and the exits refuse to touch it — that protects the accepted merchant, not the protocol. The escrow releases through the permissionless `reconcile(orderId)` once the order is terminal; an abandoned order reaches terminal by the Diamond's own expiry (minutes) plus the permissionless `autoCancelExpiredOrders`.
 
 ### Daily counts are placements, not settlements
 
@@ -94,6 +96,7 @@ The burn runs inside `onOrderComplete` through an external self-call under `try/
 - **`retryBridge(orderId)`** — permissionless. The destination and amount were pinned at order time, so the caller can't redirect anything; they only pay gas. Reverts bubble so you can see why CCTP refused.
 - **`userRescueStuckBridge(orderId)`** — buyer-only, and only after `BRIDGE_RESCUE_DELAY` (7 days). Pulls the USDC to the buyer's own wallet. This is never an owner power. It hands the buyer Base-side USDC rather than the Solana USDC they ordered — a deliberate trade against permanent loss, bounded by their tier cap and unreachable while CCTP is healthy. Note the bound is now up to $200 per order rather than $50 — this is the one path where USDC reaches a user's EOA, so it is the one place the `UserProxy` USDC-trap is deliberately relaxed.
 - **`userBridgeBackToSolana(amount, ata)`** — returns bridged-in funds sitting on a proxy back to Solana instead of offramping them.
+- **`userRescueProxyUsdc(amount)`** (#74) — withdraws proxy USDC straight to the user's Base wallet with no CCTP involvement at all. This is the exit that still works when Circle's messenger is paused or migrated — the case where `userBridgeBackToSolana` reverts inside the burn — and it is ungated by `blocked[]`, `offrampEnabled` and KYC tier. Both proxy exits leave the SELL escrow + `SELL_FEE_HEADROOM` untouched (#90).
 
 ## Bridge configuration
 
@@ -102,13 +105,13 @@ The burn runs inside `onOrderComplete` through an external self-call under `try/
 | `bridgeMinFinalityThreshold` | `2000`  | Standard Transfer — finalized, free, ~13–19 min from Base. `1000` = Fast Transfer (seconds, charges a fee).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `bridgeMaxFeeBps`            | `0`     | `maxFee = 0` is valid while Circle's `minimumFee` is 0. Verified against the live fee schedule for **Base → Solana on mainnet** (2026-07-27): `0` at finality 2000, `1.3` bps at 1000 — so the shipped defaults work on mainnet. Fast Transfer needs **two** setters — `setBridgeMaxFeeBps(≥ 2)` **and** `setBridgeMinFinalityThreshold(1000)`; raising only the fee leaves every burn on Standard (#54). Bounded by `MAX_BRIDGE_MAX_FEE_BPS = 100` (1%), ~77× the live Fast fee — ample headroom while ruling out an owner routing an arbitrary share of every burn to the attestation service. |
 
-Both are owner-settable, and a burn that fails on fee grounds lands in the retry path rather than losing funds.
+Both are owner-settable. **Do not treat a burn-time fee revert as the safety net** (#88): Circle's docs say an insufficient `maxFee` reverts the burn at source, but the deployed Base messenger exposes none of the minimum-fee surface (`minFee()` etc. all revert — #75's probe), so the deployed build likely predates that enforcement and the claim has never been verified by simulating a burn. Today it is moot — the live minimum fee at Standard is 0, so there is nothing to revert on. If Fast is ever enabled, order the two setters correctly (fee first, then threshold) rather than counting on a revert to catch a mistake.
 
 ## Token model, and the Base Sepolia caveat
 
 `usdc` is simultaneously the token the Diamond settles in **and** the token CCTP burns. These coincide on Base mainnet, where the Diamond settles in Circle USDC.
 
-**They do not coincide on Base Sepolia.** That Diamond settles in a mock token (`GoofyGoober`, `0x4095fE…`), and Circle's TokenMinter reports `burnLimitsPerMessage(GG) == 0` — it will not burn it. On Sepolia the order flow, KYC tiers, proxy auth, and full lifecycle are live and exercisable, but every bridge attempt fails closed into fulfilled-but-unbridged. The CCTP leg itself is covered by the unit tests (`MockTokenMessengerV2` reproduces Circle's exact require ladder, including the unsupported-token case). Deploy against a Diamond that settles in real USDC to bridge for real.
+**They do not coincide on Base Sepolia.** That Diamond settles in a mock token (`GoofyGoober`, `0x4095fE…`), and Circle's TokenMinter reports `burnLimitsPerMessage(GG) == 0` — it will not burn it. On Sepolia the order flow, KYC tiers, proxy auth, and full lifecycle are live and exercisable, but every bridge attempt fails closed into fulfilled-but-unbridged. The CCTP leg itself is covered by the unit tests — noting (#88) that `MockTokenMessengerV2` models Circle's **master-branch** require ladder, which is stricter than the deployed Base build (the live messenger has no minimum-fee surface), so the tests confirm a fail-closed property the chain may not provide. Deploy against a Diamond that settles in real USDC to bridge for real.
 
 `scripts/local/deploy-showdown.ts` reports whether the configured token is CCTP-burnable before deploying.
 

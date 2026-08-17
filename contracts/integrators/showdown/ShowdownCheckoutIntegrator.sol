@@ -212,6 +212,10 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         address proxy
     );
     event OfframpUpiDelivered(uint256 indexed orderId, uint256 usdcPulled);
+    /// @notice `setSellOrderUpi` returned success but the Diamond auto-cancelled
+    ///         instead of pulling (its failed-pull branch cancels and returns).
+    ///         Nothing was paid; the principal is still on the seller's proxy. (#71)
+    event OfframpDeliveryAutoCancelled(uint256 indexed orderId, uint8 status);
     event OfframpReconciled(uint256 indexed orderId, uint8 status);
 
     // ─── Tier / region constants ──────────────────────────────────────
@@ -1035,9 +1039,13 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
             // the F2 delivery-accounting rule: never revert once the money has
             // arrived. Settle normally, re-charge the daily slot onOrderCancel
             // released, and leave `cancelled = true` as the honest record.
-            // Over-counting is the safe direction — it can only make the NEXT
-            // placement stricter, never looser.
-            userDailyCount[session.user][uint256(session.placementDay)] += 1;
+            // Charge the CURRENT day's bucket, not placementDay's. (#89) Same
+            // day they are identical; across a midnight boundary the cancel
+            // freed a slot the user could re-spend on day one, and re-charging
+            // day one's bucket — which nothing reads any more — would net one
+            // extra placement. Charging today keeps over-counting as the safe
+            // direction it claims to be: stricter, never looser.
+            userDailyCount[session.user][block.timestamp / 1 days] += 1;
             emit CancelledOrderCompleted(orderId, session.user);
         }
 
@@ -1211,7 +1219,12 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     /**
      * @notice Withdraw bridged-in USDC from your own proxy to your own wallet,
-     *         without going through CCTP.
+     *         without going through CCTP. One caveat (#86): USDC escrowed against
+     *         an outstanding SELL (plus SELL_FEE_HEADROOM) is not withdrawable
+     *         until the order is terminal and the permissionless `reconcile`
+     *         releases it — an abandoned order reaches terminal via the Diamond's
+     *         own expiry plus the permissionless `autoCancelExpiredOrders`, so
+     *         the wait is minutes and needs no one's permission.
      * @dev    Every other exit for offramp funds needs something else to be
      *         working: `userBridgeBackToSolana` needs a successful CCTP burn (the
      *         burn is in the same tx, so a paused or migrated TokenMessenger
@@ -1239,7 +1252,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         address proxy = _ensureProxy(msg.sender);
         // Same escrow rule as bridging out: never move USDC committed to an
         // outstanding SELL.
-        if (usdc.balanceOf(proxy) < pendingOfframpTotal[msg.sender] + amount) {
+        if (usdc.balanceOf(proxy) < _escrowFloor(msg.sender) + amount) {
             revert InsufficientBridgedFunds();
         }
 
@@ -1316,7 +1329,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         // outstanding offramp would strand a merchant who has accepted it, and
         // delivery would then revert until they cancel. Self-inflicted griefing
         // rather than theft, but the escrow exists precisely to stop it.
-        if (usdc.balanceOf(proxy) < pendingOfframpTotal[msg.sender] + amount) {
+        if (usdc.balanceOf(proxy) < _escrowFloor(msg.sender) + amount) {
             revert InsufficientBridgedFunds();
         }
 
@@ -1486,7 +1499,22 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         bytes memory data = abi.encodeCall(IOrderFlow.setSellOrderUpi, (orderId, encUpi, 0));
         UserProxy(proxy).execute(diamond, data, address(usdc), needed);
 
-        emit OfframpUpiDelivered(orderId, needed);
+        // The live OrderFlowFacet wraps its USDC pull in try/catch and, on ANY
+        // failure, AUTO-CANCELS the order and returns success — it does not
+        // revert. So a returned `execute` is not proof of delivery. Read the
+        // status back and only report a delivery the Diamond actually made;
+        // otherwise the event stream reports a payout that never happened while
+        // the seller's daily slot stays consumed. Same pattern as
+        // MerchantTerminalIntegrator. (#71)
+        uint8 postStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
+        if (postStatus == STATUS_PAID) {
+            emit OfframpUpiDelivered(orderId, needed);
+        } else {
+            // Auto-cancelled: nothing was pulled, the principal is still on the
+            // seller's proxy. `reconcile` (permissionless) releases the escrow
+            // and, for a never-accepted order, refunds the daily slot.
+            emit OfframpDeliveryAutoCancelled(orderId, postStatus);
+        }
     }
 
     /**
@@ -1514,6 +1542,27 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     /// @dev Diamond order status: 0 PLACED, 1 ACCEPTED, 2 PAID, 3 COMPLETED,
     ///      4 CANCELLED. Only ACCEPTED is deliverable. (#72)
     uint8 private constant STATUS_ACCEPTED = 1;
+    uint8 private constant STATUS_PAID = 2;
+
+    /// @notice Flat fee headroom the user EXITS must leave on top of the escrowed
+    ///         principals, so a seller cannot drain the proxy to exactly the
+    ///         escrow floor after a merchant accepts and strand their own
+    ///         delivery by the fee. (#90)
+    /// @dev    The Diamond's SELL fee is FIXED and applies only at or under the
+    ///         small-order threshold — live mainnet values 2026-08-17: $0.10 INR,
+    ///         $0.05 BRL, $0.125 EUR, $0 USD/NGN, thresholds $10/$2. $1 covers
+    ///         8× the largest live fee, i.e. at least eight concurrent small
+    ///         SELLs. Applied only in `userRescueProxyUsdc` /
+    ///         `userBridgeBackToSolana`; `userInitiateOfframp` deliberately still
+    ///         escrows the bare principal — full-balance placement handling is
+    ///         widget-side by the recorded #44 decision, and a headroom there
+    ///         would block the max cash-out outright.
+    uint256 public constant SELL_FEE_HEADROOM = 1e6;
+
+    function _escrowFloor(address user) internal view returns (uint256) {
+        uint256 pending = pendingOfframpTotal[user];
+        return pending == 0 ? 0 : pending + SELL_FEE_HEADROOM;
+    }
 
     function reconcile(uint256 orderId) external {
         OfframpRecord storage record = offramps[orderId];

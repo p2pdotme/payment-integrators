@@ -52,7 +52,7 @@ const ABI = [
 /** `GET <base>/v1/attestor` -> checksummed signer address. */
 async function fetchAttestor(base: string): Promise<string> {
   const url = `${base.replace(/\/$/, "")}/v1/attestor`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
   const body = (await res.json()) as { address?: string };
   if (!body.address || !ethers.isAddress(body.address)) {
@@ -134,9 +134,37 @@ async function main() {
     console.log(`\n! KYC_API unset — leaving kycAttestor at ${await integrator.kycAttestor()}`);
   }
 
+  // Pinning (#84): the fetch stays the source of truth, but on mainnet the
+  // operator must independently state what they expect the service to return.
+  // Without this, pointing LIVENESS_API/KYC_API at a staging, stale or
+  // compromised host installs that host's signer and the run exits green — the
+  // wrong-host hole left open after the relayed-value hole was closed. The
+  // post-rotation gate only rejects zero and the deploy key; any other address
+  // passed. A mismatch now fails closed before any transaction is sent.
+  const isMainnetRun = chainId === 8453n;
+  const PINS: Record<string, string> = {
+    liveness: process.env.EXPECTED_LIVENESS_ATTESTOR || "",
+    kyc: process.env.EXPECTED_KYC_ATTESTOR || "",
+  };
+
   for (const t of targets) {
     console.log(`\n── ${t.tier} ──────────────────────────────`);
     const live = await fetchAttestor(t.api);
+    const pin = PINS[t.tier];
+    if (isMainnetRun && !pin) {
+      throw new Error(
+        `EXPECTED_${t.tier.toUpperCase()}_ATTESTOR is required on mainnet: state the signer you ` +
+          `expect ${t.api}/v1/attestor to return, from a second source (the service operator), ` +
+          `so a wrong or compromised host cannot install its own signer silently.`
+      );
+    }
+    if (pin && pin.toLowerCase() !== live.toLowerCase()) {
+      throw new Error(
+        `${t.api}/v1/attestor returned ${live}, but EXPECTED_${t.tier.toUpperCase()}_ATTESTOR is ` +
+          `${pin}. Refusing to rotate — either the pin is stale or the host is not the one you ` +
+          `think it is. Resolve which before installing anything.`
+      );
+    }
     const current: string = await integrator[t.read]();
     console.log(`  live signer:      ${live}   (${t.api}/v1/attestor)`);
     console.log(`  on-chain current: ${current}`);
