@@ -123,7 +123,11 @@ budgets of `dailyTxCountLimit` each.
 
 ### F4 — LOW (defense-in-depth): no reentrancy guards → **FIXED**
 
-The siblings use `nonReentrant`; Showdown had none. Not exploitable with real USDC (no transfer
+Showdown had no reentrancy guards. **Correction (#77):** this originally said "the siblings use
+`nonReentrant`", which is false for half of them — `MarketplaceCheckoutIntegrator`,
+`UsdcDirectCheckoutIntegrator` and both LotPot versions have **zero**. Only `MerchantTerminal` (19)
+and `Investabl` (2) had any. Getting this wrong is itself the evidence for #77's argument: nobody
+holds a family-wide view, so each audit assumes the others are fine. Not exploitable with real USDC (no transfer
 hooks) and `UserProxy.execute` is itself guarded, but `userBridgeBackToSolana` reads
 `usdc.balanceOf(proxy)` and _then_ pulls — a hook-bearing token would double-spend it.
 
