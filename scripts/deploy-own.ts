@@ -130,6 +130,27 @@ async function main() {
     throw new Error("DIAMOND_ADDRESS and USDC_ADDRESS are required (no preset on this network)");
   }
 
+  // ── Owner ───────────────────────────────────────────────────────────────
+  // `owner` is `address public immutable` with no transfer path, so this is
+  // the one input on this whole script that cannot be corrected afterwards.
+  // Getting it wrong costs a redeploy, a fresh P2P whitelist request, a new
+  // tenant, and every already-verified user re-attesting — the EIP-712 domain
+  // binds `verifyingContract`, so their grants do not carry over.
+  //
+  // It defaulted silently to the deployer EOA, while the RECOVERABLE mistake
+  // next to it (a wrong attestor, fixable with setAttestor) hard-throws on
+  // mainnet. That is exactly backwards, and the documented mainnet command
+  // does not pass DEPLOY_OWNER at all — so the copy-pasteable path was the
+  // one that burned the owner key.
+  if (isMainnet && !process.env.DEPLOY_OWNER) {
+    throw new Error(
+      "DEPLOY_OWNER is required on mainnet. `owner` is immutable with no " +
+        "transfer path — pass the Own multisig. Defaulting to the deployer " +
+        "EOA would hand pause/setBlocked/setRegionCap/sweepUsdc to a hot key " +
+        "permanently."
+    );
+  }
+
   // ── Attestor ────────────────────────────────────────────────────────────
   if (!ATTESTOR) {
     if (isMainnet) {
@@ -173,7 +194,14 @@ async function main() {
   }
 
   console.log("\nConfig:");
-  console.log(`  owner:            ${DEPLOY_OWNER}`);
+  // Marked for the same reason the attestor is: an unmarked address in a
+  // DRY_RUN print reads as "configured" whether or not anyone chose it. This
+  // one is permanent, so it gets the louder marker.
+  console.log(
+    `  owner:            ${DEPLOY_OWNER}${
+      DEPLOY_OWNER === deployer.address ? "  (⚠️ DEPLOYER EOA — IMMUTABLE, use a multisig)" : ""
+    }`
+  );
   console.log(
     `  attestor:         ${ATTESTOR}${ATTESTOR === deployer.address ? "  (⚠️ deployer placeholder)" : ""}`
   );

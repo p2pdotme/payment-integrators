@@ -204,9 +204,18 @@ accumulates.
 ## 4. Deployment
 
 ```bash
-DIAMOND_ADDRESS=0x... USDC_ADDRESS=0x... ATTESTOR=0x... \
+DEPLOY_OWNER=0x... ATTESTOR=0x... \
+  DIAMOND_ADDRESS=0x... USDC_ADDRESS=0x... \
   npx hardhat run scripts/deploy-own.ts --network base
 ```
+
+**`DEPLOY_OWNER` must be the Own multisig.** `owner` is `immutable` with no
+transfer path, so it is the one input here that cannot be corrected afterwards
+— getting it wrong costs a redeploy, a fresh whitelist request, a new tenant,
+and every verified user re-attesting, because the EIP-712 domain binds
+`verifyingContract` and their grants do not carry over. It used to default
+silently to the deployer EOA; on mainnet the script now refuses to run without
+it.
 
 Add `DRY_RUN=1` to run every preflight check and print the resolved config
 without deploying. Base mainnet Diamond/USDC are presets; Base Sepolia needs
