@@ -139,6 +139,8 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     /// @notice The order is not in ACCEPTED, so there is no matched merchant to
     ///         deliver to. (#72)
     error OfframpNotDeliverable();
+    /// @notice `minFinalityThreshold` must be 1000 (Fast) or 2000 (Standard). (#75)
+    error InvalidFinalityThreshold();
     error InsufficientBridgedFunds();
 
     // ─── Events ───────────────────────────────────────────────────────
@@ -353,6 +355,9 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     ///         Circle starts enforcing a minimum fee, or when using Fast
     ///         Transfers, which do charge.
     uint256 public bridgeMaxFeeBps;
+    /// @notice The only two `minFinalityThreshold` values CCTP V2 defines.
+    uint32 public constant FINALITY_FAST = 1000;
+    uint32 public constant FINALITY_STANDARD = 2000;
     /// @notice `minFinalityThreshold` passed to `depositForBurn`.
     ///         2000 = Standard Transfer (finalized, free, ~13-19 min from Base).
     ///         1000 = Fast Transfer (confirmed, seconds, charges up to maxFee).
@@ -618,7 +623,27 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         emit BridgeMaxFeeBpsUpdated(bps);
     }
 
+    /// @notice Switch between Standard and Fast Transfer. Restricted to the two
+    ///         values CCTP V2 actually defines.
+    /// @dev    Every other limit here is bounded by a bytecode constant; this
+    ///         setter was the one exception, which contradicted the governance
+    ///         story stated at the top of this file. An arbitrary value is not
+    ///         rejected by CCTP — it is silently normalised by the attestation
+    ///         service, so e.g. 500 becomes a Fast transfer that charges a fee
+    ///         while `bridgeMaxFeeBps` defaults to 0, turning every burn into a
+    ///         fail-closed retry that looks like a CCTP outage. (#75)
+    ///
+    ///         Switching to Fast is a TWO-setter operation: raise
+    ///         `bridgeMaxFeeBps` to cover Circle's fee (1.3 bps on Base → Solana
+    ///         at the time of writing, so >= 2) BEFORE calling this, or every
+    ///         burn fails closed. Fast messages also carry a real 24h
+    ///         `expirationBlock` and need `POST /v2/reattest/{nonce}` after it —
+    ///         the "attestations never expire" property the delivery sweeper
+    ///         relies on holds only for Standard.
     function setBridgeMinFinalityThreshold(uint32 threshold) external onlyOwner {
+        if (threshold != FINALITY_FAST && threshold != FINALITY_STANDARD) {
+            revert InvalidFinalityThreshold();
+        }
         bridgeMinFinalityThreshold = threshold;
         emit BridgeFinalityThresholdUpdated(threshold);
     }
@@ -1171,6 +1196,11 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     /// @dev CCTP requires `maxFee < amount`; clamp so a misconfigured bps can
     ///      never make the burn unsatisfiable.
     function _maxFeeFor(uint256 amount) internal view returns (uint256) {
+        // amount == 0 would underflow on `amount - 1` below and panic. Newly
+        // reachable since the delivery clamp (#73) can legitimately pin a session
+        // to 0 when nothing arrived; the burn then fails closed into BridgeFailed
+        // rather than taking down the completion hook with a panic. (#75)
+        if (amount == 0) return 0;
         uint256 fee = (amount * bridgeMaxFeeBps) / 10_000;
         if (fee >= amount) fee = amount - 1;
         return fee;
