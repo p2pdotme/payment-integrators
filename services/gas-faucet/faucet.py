@@ -46,10 +46,12 @@ degraded convenience, never as a blocked ramp.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from eth_utils import to_checksum_address
@@ -75,6 +77,43 @@ from policy import Decision, Limits, decide, drip_target_wei, floor_wei
 from store import Store
 
 GWEI = 10**9
+
+logging.basicConfig(
+    level=os.environ.get("FAUCET_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("faucet")
+
+
+def _event(event: str, **fields: object) -> str:
+    """One key=value line per decision, greppable and cheap to read.
+
+    There was no logging at all, and two failures this service documents are
+    specifically the kind you cannot tell apart without it. A wrong `attestor`
+    rejects every cold-start request — `Integrator.attestor` says so, and it
+    has bitten two prior integrations — and from the outside that looks exactly
+    like the faucet being down. The client fails open by contract, so a user
+    sees nothing either way. Without a line naming the reason there is no
+    signal anywhere in the system.
+
+    NEVER log a signature, a private key, or a full attestation. The nullifier
+    is a per-(tenant, human) pseudonym and is logged truncated: enough to
+    correlate one person's requests during an incident, not enough to be a
+    bearer token if the logs leak.
+    """
+    parts = [f"event={event}"]
+    for k, v in fields.items():
+        if v is None:
+            continue
+        parts.append(f"{k}={v}")
+    return " ".join(parts)
+
+
+def _short(value: str | None, keep: int = 10) -> str | None:
+    """Truncate an address or nullifier for logging."""
+    if not value:
+        return None
+    return value if len(value) <= keep else value[:keep] + "…"
 
 
 def _int_env(name: str, default: int) -> int:
@@ -174,6 +213,46 @@ def _rpc(chain_id: int) -> Rpc:
     return _RPCS[chain_id]
 
 
+def _announce() -> None:
+    """What this process actually resolved its config to.
+
+    Most failures here are wiring, not logic — an attestor that does not match
+    the service, a DB path that is not persistent, a missing key — and none of
+    them is visible from a request. Printing the resolved config once turns a
+    confusing "every request is a 403" into an obvious one, and gives an
+    incident a fixed point to compare against.
+
+    Addresses only. No key, no token.
+    """
+    log.info(
+        _event(
+            "startup",
+            funder=_ACCOUNT.address if _ACCOUNT else "NONE",
+            integrators=len(INTEGRATORS),
+            chains=",".join(str(c) for c in sorted(RPC_URLS)) or "none",
+            db=_DB_PATH,
+            docs="on" if _DOCS else "off",
+            ops_endpoint="on" if os.environ.get("FAUCET_OPS_TOKEN") else "off",
+        )
+    )
+    for i in INTEGRATORS.values():
+        # The attestor especially. A wrong one here rejects every cold start
+        # and is otherwise indistinguishable from an outage — compare this
+        # against the service's own GET /v1/attestor when cold starts fail.
+        log.info(
+            _event("integrator", label=i.label, chain=i.chain_id,
+                   address=i.address, attestor=i.attestor)
+        )
+    if not _ACCOUNT:
+        log.error(_event("misconfigured", detail="FAUCET_PRIVATE_KEY unset; every request 503s"))
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _announce()
+    yield
+
+
 # No Swagger, no ReDoc, no schema. This process holds a key and is exposed
 # publicly; a self-documenting console over it is a convenience for exactly one
 # kind of visitor. Set FAUCET_ENABLE_DOCS=1 in a private environment.
@@ -184,6 +263,7 @@ app = FastAPI(
     docs_url="/docs" if _DOCS else None,
     redoc_url="/redoc" if _DOCS else None,
     openapi_url="/openapi.json" if _DOCS else None,
+    lifespan=_lifespan,
 )
 if ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX:
     app.add_middleware(
@@ -314,6 +394,13 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
             # and has many spellings that decode identically.
             nullifier = canonical_nullifier(req.attestation.nullifier)
         except InvalidAttestation as exc:
+            # The single most valuable line here. A wrong `attestor` makes
+            # EVERY cold start fail exactly like this, and without the reason
+            # spelled out it is indistinguishable from the faucet being down.
+            log.warning(
+                _event("refused", reason="invalid_attestation", wallet=_short(wallet),
+                       integrator=integrator.label, detail=str(exc))
+            )
             raise HTTPException(403, f"invalid_attestation: {exc}") from exc
 
     # Denylisted wallets get nothing, on either path — this is the operator's
@@ -329,8 +416,13 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
     try:
         is_blocked = rpc.read_bool(integrator.address, SEL_BLOCKED, wallet)
     except ChainError as exc:
+        log.error(_event("chain_unreachable", detail=str(exc)))
         raise HTTPException(502, f"chain_unreachable: {exc}") from exc
     if is_blocked:
+        log.warning(
+            _event("refused", reason="wallet_blocked", wallet=_short(wallet),
+                   integrator=integrator.label)
+        )
         raise HTTPException(403, "wallet_blocked")
 
     if nullifier is not None:
@@ -345,8 +437,14 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
         # exists to prevent.
         try:
             if rpc.read_bool32(integrator.address, SEL_NULLIFIER_SPENT, nullifier):
+                log.info(
+                    _event("refused", reason="nullifier_already_spent",
+                           wallet=_short(wallet), nullifier=_short(nullifier),
+                           integrator=integrator.label)
+                )
                 raise HTTPException(403, "nullifier_already_spent")
         except ChainError as exc:
+            log.error(_event("chain_unreachable", detail=str(exc)))
             raise HTTPException(502, f"chain_unreachable: {exc}") from exc
         return nullifier
 
@@ -358,8 +456,13 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
             # for why omitting the field must not be a way to opt out of it.
             return _recall_nullifier(wallet)
     except ChainError as exc:
+        log.error(_event("chain_unreachable", detail=str(exc)))
         raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
+    log.info(
+        _event("refused", reason="not_verified", wallet=_short(wallet),
+               integrator=integrator.label)
+    )
     raise HTTPException(403, "not_verified")
 
 
@@ -378,6 +481,10 @@ def request_gas(req: GasRequest) -> GasResponse:
     if integrator is None:
         # An allowlist, not a filter: an unknown integrator could point the
         # attestation check at an attestor of the caller's choosing.
+        log.warning(
+            _event("refused", reason="integrator_not_allowed",
+                   integrator=_short(integrator_addr), chain=req.chainId)
+        )
         raise HTTPException(403, "integrator_not_allowed")
 
     rpc = _rpc(integrator.chain_id)
@@ -410,6 +517,7 @@ def request_gas(req: GasRequest) -> GasResponse:
             base_fee = rpc.base_fee()
             funder_balance = rpc.balance(_ACCOUNT.address)
         except ChainError as exc:
+            log.error(_event("chain_unreachable", detail=str(exc)))
             raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
         target = drip_target_wei(base_fee, LIMITS)
@@ -426,6 +534,15 @@ def request_gas(req: GasRequest) -> GasResponse:
         )
 
         if not decision.fund:
+            # Not an error. `sufficient_balance` is the common case and the
+            # caps are working as designed — but an operator asking "why did
+            # this user get nothing" needs the reason, and the client swallows
+            # the body by contract.
+            log.info(
+                _event("declined", reason=decision.reason, wallet=_short(wallet),
+                       nullifier=_short(nullifier), integrator=integrator.label,
+                       balance_wei=balance, target_wei=target)
+            )
             return GasResponse(
                 funded=False,
                 reason=decision.reason,
@@ -433,6 +550,11 @@ def request_gas(req: GasRequest) -> GasResponse:
                 targetWei=str(target),
             )
 
+        log.info(
+            _event("funding", wallet=_short(wallet), nullifier=_short(nullifier),
+                   integrator=integrator.label, amount_wei=decision.amount,
+                   balance_wei=balance, target_wei=target)
+        )
         try:
             tx_hash = rpc.send_value(
                 account=_ACCOUNT,
@@ -442,15 +564,32 @@ def request_gas(req: GasRequest) -> GasResponse:
                 base_fee=base_fee,
             )
         except ChainError as exc:
+            log.error(
+                _event("send_failed", wallet=_short(wallet),
+                       integrator=integrator.label, amount_wei=decision.amount,
+                       detail=str(exc))
+            )
             raise HTTPException(502, f"send_failed: {exc}") from exc
 
-        STORE.record(
-            chain_id=integrator.chain_id,
-            wallet=wallet,
-            nullifier=nullifier,
-            amount_wei=decision.amount,
-            tx_hash=tx_hash,
-        )
+        try:
+            STORE.record(
+                chain_id=integrator.chain_id,
+                wallet=wallet,
+                nullifier=nullifier,
+                amount_wei=decision.amount,
+                tx_hash=tx_hash,
+            )
+        except Exception as exc:
+            # The ETH has already left. Every cap is a SUM over this table, so
+            # a silent failure here means an uncharged drip and a breaker that
+            # never trips — and a read-only volume would make that EVERY
+            # request. Loud, and the caller still gets its txHash rather than a
+            # 500 for money that did move.
+            log.error(
+                _event("ledger_write_failed", wallet=_short(wallet),
+                       amount_wei=decision.amount, tx=_short(tx_hash, 12),
+                       detail=str(exc))
+            )
 
     # Broadcast is booked; confirmation is a courtesy so the caller can send
     # its own transaction immediately instead of polling the balance.
@@ -460,6 +599,11 @@ def request_gas(req: GasRequest) -> GasResponse:
     # telling the caller `funded: true` when nothing moved is worse than
     # useless: it is the one signal they have, and it would be a lie.
     outcome = _await_receipt(rpc, tx_hash)
+    log.info(
+        _event("funded" if outcome != "failed" else "send_reverted",
+               wallet=_short(wallet), integrator=integrator.label,
+               amount_wei=decision.amount, tx=_short(tx_hash, 12), outcome=outcome)
+    )
 
     return GasResponse(
         funded=outcome != "failed",
@@ -522,6 +666,7 @@ def status(chainId: int, integrator: str, wallet: str) -> dict:
         target = drip_target_wei(rpc.base_fee(), LIMITS)
         funder_balance = rpc.balance(_ACCOUNT.address) if _ACCOUNT else 0
     except ChainError as exc:
+        log.error(_event("chain_unreachable", detail=str(exc)))
         raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
     nullifier = STORE.nullifier_for(wallet)

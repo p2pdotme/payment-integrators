@@ -121,6 +121,34 @@ refill it, rather than funding it once and forgetting.
 still work for anyone already holding gas. A client that blocks its ramp on a
 faucet error has made a convenience into a dependency.
 
+## Observability
+
+One structured line per decision, on stdout, which is where Railway collects
+it. `event=` is always first, so `grep event=refused` and
+`grep reason=invalid_attestation` both work.
+
+```
+event=startup   funder=0x… integrators=1 chains=8453 db=/data/faucet.db docs=off
+event=integrator label=own chain=8453 address=0x… attestor=0x…
+event=refused   reason=invalid_attestation wallet=0x60907330… integrator=own detail=…
+event=declined  reason=sufficient_balance wallet=0x… balance_wei=… target_wei=…
+event=funding   wallet=0x… amount_wei=30000000000000
+event=funded    wallet=0x… tx=0x3fb6033e… outcome=success
+```
+
+The service had none of this. It matters for one failure in particular: a
+wrong `attestor` rejects **every** cold-start request, and from outside — with
+a client that fails open by contract — that is indistinguishable from the
+faucet being down. It has bitten two prior integrations. `event=refused
+reason=invalid_attestation` is the line that tells them apart, and the startup
+banner prints the resolved attestor to compare against the service's own
+`GET /v1/attestor`.
+
+Never logged: signatures, the private key, or a full nullifier. The nullifier
+is a per-(tenant, human) pseudonym and is truncated — enough to correlate one
+person's requests during an incident, not enough to be a bearer token if the
+logs leak. Tests assert all three.
+
 ## API
 
 ```

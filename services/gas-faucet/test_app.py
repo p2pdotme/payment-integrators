@@ -310,3 +310,60 @@ class TestStatusEndpoint:
                           params={"chainId": CHAIN, "integrator": INTEG, "wallet": w}).json()
         assert body["wouldFund"] is False
         assert body["reason"] == "wallet_daily_count_reached"
+
+
+# ── the signal itself ───────────────────────────────────────────────────────
+
+
+class TestLogging:
+    """There was no logging at all, and two documented failures are the kind
+    you cannot tell apart without it.
+
+    `Integrator.attestor` warns that a wrong value "silently rejects every
+    cold-start request, which looks identical to the faucet being down" — and
+    it has bitten two prior integrations. These assert the line that
+    distinguishes them exists, and that nothing secret rides along with it.
+    """
+
+    def test_a_wrong_attestor_says_so(self, client, rpc, caplog):
+        w = Account.create().address
+        impostor = Account.from_key("0x" + "44" * 32)
+        with caplog.at_level("INFO", logger="faucet"):
+            req(client, w, sign(w, signer=impostor))
+        text = caplog.text
+        assert "reason=invalid_attestation" in text
+        assert "attestor" in text, "the reason must name what actually failed"
+
+    def test_every_refusal_names_its_reason(self, client, rpc, caplog):
+        with caplog.at_level("INFO", logger="faucet"):
+            req(client, Account.create().address)  # not verified
+        assert "reason=not_verified" in caplog.text
+
+    def test_a_funded_drip_is_recorded(self, client, rpc, caplog):
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        with caplog.at_level("INFO", logger="faucet"):
+            req(client, w)
+        assert "event=funding" in caplog.text
+        assert "event=funded" in caplog.text
+
+    def test_a_decline_is_recorded_with_its_reason(self, client, rpc, caplog):
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        rpc.balances[w.lower()] = 10**18  # plenty
+        with caplog.at_level("INFO", logger="faucet"):
+            req(client, w)
+        assert "event=declined" in caplog.text
+        assert "reason=sufficient_balance" in caplog.text
+
+    def test_no_signature_or_key_is_ever_logged(self, client, rpc, caplog):
+        w = Account.create().address
+        att = sign(w)
+        with caplog.at_level("DEBUG", logger="faucet"):
+            req(client, w, att)
+        text = caplog.text
+        assert att["signature"] not in text, "a signature reached the logs"
+        assert os.environ["FAUCET_PRIVATE_KEY"] not in text
+        # The nullifier is a per-human pseudonym: truncated, so it can
+        # correlate an incident without being a usable bearer token if leaked.
+        assert att["nullifier"] not in text
