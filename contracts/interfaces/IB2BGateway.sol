@@ -20,9 +20,8 @@ interface IB2BGateway {
     /// @notice SELL counterpart of placeB2BOrder. Whitelisted integrators bypass
     ///         protocol-side RP / daily / monthly / yearly volume limits and
     ///         enforce their own limits in `validateOrder`. Integrators that
-    ///         act on behalf of users without a Base address (e.g. an
-    ///         offramp for users on another chain) should pass
-    ///         `user = address(this)`.
+    ///         act on behalf of users without a Base address (e.g. the
+    ///         TradeStars Solana offramp) should pass `user = address(this)`.
     function placeB2BSellOrder(
         address user,
         uint256 amount,
