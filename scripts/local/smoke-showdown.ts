@@ -6,7 +6,8 @@ import { ethers } from "hardhat";
  * Proves, against the real Diamond:
  *   1. The EIP-712 attestation domain binds to this contract + chain — a
  *      locally-signed liveness/KYC attestation is accepted and moves the tier.
- *   2. The on-chain tier ceilings ($20 / $50) clamp an over-generous attested
+ *   2. The on-chain tier ceilings (liveness $20/$50, passport $100/$200 by
+ *      India/Abroad) clamp an over-generous attested
  *      limit.
  *   3. The full onramp path — proxy CREATE2 deploy, B2B gateway proxy-auth,
  *      validateOrder, placeB2BOrder — succeeds, simulated via staticCall so no
@@ -26,7 +27,15 @@ import { ethers } from "hardhat";
 
 const SHOWDOWN_ADDRESS = process.env.SHOWDOWN_ADDRESS || "";
 const f = (n: bigint) => ethers.formatUnits(n, 6);
-const ok = (b: boolean) => (b ? "✅" : "✗");
+
+// Track failures so a failing smoke run has a MEANINGFUL exit code. Previously
+// every assertion was a bare console.log and main() ended with process.exit(0),
+// so a script that "lies about passing" was worse than none (#47).
+let failures = 0;
+const ok = (b: boolean) => {
+  if (!b) failures++;
+  return b ? "✅" : "✗";
+};
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -139,7 +148,7 @@ async function main() {
   }
   const tierNow = await integrator.userTier(me);
   const livenessLimit = await integrator.effectiveLimit(me, INR);
-  console.log(`  tier=${tierNow} granted=$${f(await integrator.grantedLimit(me))}`);
+  console.log(`  tier=${tierNow} granted=$${f(await integrator.grantedLimit(me, tierNow))}`);
   if (tierNow === 1n) {
     console.log(
       `  ${ok(livenessLimit === ethers.parseUnits("20", 6))} effectiveLimit (INR) clamped to $${f(livenessLimit)} (expect $20)`
@@ -199,14 +208,22 @@ async function main() {
       `  ✅ path clears (proxy auth + validateOrder + placeB2BOrder) -> orderId ${orderId}`
     );
   } catch (e: any) {
+    // Must count as a failure, not just print one. This is the core onramp path:
+    // if it reverts, the integrator does not work at all. Printing "✗" without
+    // touching `failures` let the run exit 0 with the product broken — the exact
+    // lying-green behaviour #47 was filed about, surviving in the one step where
+    // it mattered most.
+    ok(false);
     console.log(`  ✗ reverted: ${decodeErr(integrator.interface, e)}`);
   }
 
   // 5. Over-cap order must be refused by the contract's own ceiling — and for
-  //    that reason specifically, not some unrelated revert.
+  //    that reason specifically, not some unrelated revert. By this point the
+  //    signer is tier-2 ($100 INR cap), so the probe must EXCEED $100, not the
+  //    stale $51 that is under cap and always "failed" this check (#47).
   try {
     await integrator.userBuyUsdcToSolana.staticCall(
-      ethers.parseUnits("51", 6),
+      ethers.parseUnits("101", 6),
       INR,
       ata,
       1,
@@ -214,10 +231,10 @@ async function main() {
       0,
       0
     );
-    console.log("  ✗ $51 order was NOT refused — the tier ceiling is not holding");
+    console.log(`  ${ok(false)} $101 INR order was NOT refused — the tier ceiling is not holding`);
   } catch (e: any) {
     const name = decodeErr(integrator.interface, e);
-    console.log(`  ${ok(name === "KycLimitExceeded")} $51 order refused with ${name}`);
+    console.log(`  ${ok(name === "KycLimitExceeded")} $101 INR order refused with ${name}`);
   }
 
   // 6. A zero Solana recipient must be refused — a burn to bytes32(0) would be
@@ -232,13 +249,19 @@ async function main() {
       0,
       0
     );
-    console.log("  ✗ zero Solana recipient was NOT refused");
+    console.log(`  ${ok(false)} zero Solana recipient was NOT refused`);
   } catch (e: any) {
     const name = decodeErr(integrator.interface, e);
     console.log(
       `  ${ok(name === "InvalidSolanaRecipient")} zero Solana recipient refused with ${name}`
     );
   }
+
+  // Meaningful exit code: fail the run if any assertion failed (#47).
+  if (failures > 0) {
+    throw new Error(`smoke: ${failures} assertion(s) failed — see the ✗ marks above`);
+  }
+  console.log(`\n✅ smoke passed — ${failures} failures`);
 }
 
 main()

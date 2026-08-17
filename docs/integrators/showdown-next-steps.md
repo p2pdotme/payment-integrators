@@ -74,9 +74,13 @@ The offramp maps cleanly onto the existing `<Cashout>` host-callback shape; the 
 3. Deliver the attested message on Base (see §5) — `receiveFromSolana(message, attestation)` is a convenience passthrough on the integrator, or call MessageTransmitterV2 directly; it's permissionless either way.
 4. Poll `bridgedBalance(user)` until it reflects, then `userInitiateOfframp(...)`.
 
-Note the Diamond's fee comes off the same proxy balance, so the proxy needs **principal + fee** by delivery time, not just principal. `userInitiateOfframp` only checks the principal; `deliverOfframpUpi` reads the authoritative `actualUsdtAmount` and will revert with `InsufficientBridgedFunds` if the proxy is short. Worth surfacing headroom in the UI.
+Note the Diamond's fee comes off the same proxy balance, so the proxy needs **principal + fee** by delivery time, not just principal. `userInitiateOfframp` only checks the principal; `deliverOfframpUpi` reads the authoritative `actualUsdtAmount` and will revert with `InsufficientBridgedFunds` if the proxy is short.
 
-**KYC gate UI.** `submitLivenessAttestation` / `submitKycAttestation`, and read `effectiveLimit(user)` / `userTier(user)` to drive the cap shown and the upsell from $20 → $50.
+> **Decided 2026-08-13 (#44): this is handled in the widget, not the contract.** Before the user confirms a cash-out the widget must quote **the exact fiat they will receive, net of fees**, and only proceed on that confirmation. The corollary is a constraint, not just a display: the widget must also **cap the maximum cash-out at balance − fee headroom**, or a user who taps "max" still places an order that cannot be delivered. No `MAX_SELL_FEE_BPS` bound was added to the contract, so a caller that bypasses the widget and calls `userInitiateOfframp` directly can still strand — recoverable via `reconcile`, never a loss of funds.
+
+**Delivery is initiator-only.** `deliverOfframpUpi` can be called only by the address that placed the order. There is no relayer path (#53.2), because `encUpi` *is* the payout destination and is encrypted to the merchant — who is unknown until after the accept — so no one can pre-authorise a delivery on the user's behalf without also being able to redirect the money. The user's client encrypts `encUpi` locally and submits it.
+
+**KYC gate UI.** `submitLivenessAttestation` / `submitKycAttestation`, and read `effectiveLimit(address,bytes32 currency)` (or `effectiveLimits(address) → (india, abroad)`) / `userTier(user)` to drive the cap shown. The one-arg `effectiveLimit(user)` no longer exists — ABI break (see the widget note below). The passport upsell is region-dependent: liveness→passport is $20→$100 (INR) or $50→$200 (abroad), NOT a flat $20→$50 (that difference is India-vs-Abroad within the SAME liveness tier). (#54)
 
 **Escape hatch.** `userBridgeBackToSolana(amount, ata)` returns bridged-in funds to Solana instead of offramping — worth exposing for users who change their mind or whose tier doesn't cover the amount.
 
@@ -84,7 +88,7 @@ Note the Diamond's fee comes off the same proxy balance, so the proxy needs **pr
 
 **CCTP does not auto-deliver.** `depositForBurn` burns the USDC and emits a message; that is _all_ it does. It authorizes a mint — it does not perform one. The mint only happens when someone calls `receiveMessage(message, attestation)` on the **destination** chain. Nothing in the contract, on either side, does this. Without a service that does, an onramp burns on Base and **the user's USDC never appears on Solana**, while `unbridgedTotal` reads 0 and the integrator looks perfectly healthy.
 
-**Sizing the risk correctly:** this is an _availability_ problem, not a _safety_ one. Showdown burns with `destinationCaller = bytes32(0)`, so delivery is permissionless, and Circle's attestations do not expire — anyone can submit a stale message months later and the mint still lands, to the recipient encoded in the message and nobody else. So funds are never lost. But an onramp that doesn't deliver is a user who paid fiat and has nothing, which is a support incident on day one.
+**Sizing the risk correctly:** this is an _availability_ problem, not a _safety_ one. Showdown burns with `destinationCaller = bytes32(0)`, so delivery is permissionless, and Circle's attestations of a **finalized (Standard) transfer do not expire** (`expirationBlock == 0`, accepted at any block) — anyone can submit a stale message months later and the mint still lands, to the recipient encoded in the message and nobody else. So funds are never lost. ⚠️ (#54) This holds only for Standard, which is what ships (`bridgeMinFinalityThreshold = 2000`). A **Fast** (unfinalized) message carries a real 24h `expirationBlock` and needs `POST /v2/reattest/{nonce}` — so if the bridge is ever switched to Fast, the "never expires" premise the cron sweeper relies on is false. But an onramp that doesn't deliver is a user who paid fiat and has nothing, which is a support incident on day one.
 
 ### The three steps, per transfer
 
@@ -158,7 +162,7 @@ Defaults are Standard Transfer, free: `bridgeMinFinalityThreshold = 2000`, `brid
 - The owner **cannot touch in-flight funds**: `withdrawUsdc` is hard-bounded by `unbridgedTotal` and can only sweep genuine surplus.
 - The stuck-bridge escape is **buyer-only, after 7 days** (`userRescueStuckBridge`) — never an owner power. It returns Base-side USDC rather than the Solana USDC ordered: a deliberate trade against permanent loss, bounded by the tier cap, unreachable while CCTP is healthy.
 - The Solana destination is **pinned at order time** and cannot be redirected by anyone, including the owner — which is why `retryBridge` is safe to leave permissionless.
-- Owner powers are: attestor rotation, tier caps, daily count, offramp kill switch + relayer, bridge fee/finality, and surplus sweep. No upgradeability — the integrator is immutable by repo policy.
+- Owner powers are: attestor rotation, tier caps, daily count, the offramp kill switch, bridge fee/finality, and surplus sweep. **Not** offramp delivery — there is no `offrampRelayer` (#53.2, decided 2026-08-13), so the owner can never name who delivers a user's payout. No upgradeability — the integrator is immutable by repo policy.
 
 ## 9. Limits (settled 2026-07-27)
 
@@ -175,7 +179,7 @@ Consequences to carry into the widget:
 
 - **Quote the region-correct cap.** `effectiveLimits(user)` returns `(india, abroad)` in one call; `effectiveLimit(user, currency)` is the exact figure for a given order. The old one-argument `effectiveLimit(user)` is **gone** — an ABI break.
 - **`tierCap` is now `tierCap(tier, region)`.** Same for the smoke and attestor scripts, already updated.
-- **Surface the daily budget.** `getRemainingDailyCount(user)` and `getRemainingOfframpDailyCount(user)`. At 5/day, and with cancels not releasing slots (§below), a user can hit the wall in an afternoon.
+- **Surface the daily budget.** `getRemainingDailyCount(user)` and `getRemainingOfframpDailyCount(user)`. At 5/day a user can hit the wall in an afternoon — and until the cancel callback is switched on for this integrator (see the audit's F9: `contracts-v4` #362 is live but **opt-in, default off**), a cancelled or expired BUY keeps its slot until UTC midnight. The SELL side always relies on `reconcile` regardless.
 - **Blocked users.** `blocked(user)` is a binary owner gate; the entrypoints revert `UserIsBlocked`. Show it distinctly from "not verified" — the fix is different.
 
 ## Open decisions
@@ -184,4 +188,4 @@ Consequences to carry into the widget:
 2. **Who delivers attestations** (§5) — **the launch blocker.** Recommendation is widget-side delivery plus a backstop sweeper; the open question is whether Circle's forwarding service covers Solana at our volume, which would remove the work entirely.
 3. **Fast vs Standard transfers** (§6).
 4. **Who owns the Solana ATA creation UX** (§4) — widget vs. Showdown's own app.
-5. **Who holds the mainnet `owner` key** — decided: a **Showdown multisig**. `owner` is immutable with no transfer and no renounce, so the deploy must be sent _from_ that multisig. See the audit's deploy gates.
+5. **Who holds the mainnet `owner` key** — **decided 2026-08-10: a Showdown-held EOA, deployed from that key.** `owner` is immutable with no transfer and no renounce, so whoever sends the deploy transaction is owner forever; `deploy-showdown.ts` enforces `signer == DEPLOY_OWNER` on mainnet. This supersedes the earlier "Showdown multisig" note, which the contract cannot express: a Safe is a contract and cannot be a deploy signer, so a multisig owner would need an `_owner` constructor param (readiness P5 option 2) — deliberately not taken. Exposure is bounded by the immutable ceilings ($200/tx × 5/day per wallet, `withdrawUsdc` surplus-only), which is what makes an EOA acceptable here. The trade-off to accept knowingly: that one key also holds attestor rotation, tier caps, the offramp kill switch and `offrampRelayer`, so key custody is the whole control.

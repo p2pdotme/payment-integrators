@@ -142,7 +142,6 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     event DailyTxCountLimitUpdated(uint256 count);
     event UserBlockedUpdated(address indexed user, bool isBlocked);
     event OfframpEnabledUpdated(bool enabled);
-    event OfframpRelayerUpdated(address indexed relayer);
     event BridgeMaxFeeBpsUpdated(uint256 bps);
     event BridgeFinalityThresholdUpdated(uint32 threshold);
     event UsdcWithdrawn(address indexed to, uint256 amount);
@@ -321,9 +320,22 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     /// @notice Master switch for the offramp flow. Defaults ON at deploy.
     bool public offrampEnabled;
-    /// @notice Optional relayer permitted to deliver UPI on a user's behalf
-    ///         (in addition to the order's initiator). 0 = user-only.
-    address public offrampRelayer;
+    // NOTE (#53.2, decided 2026-08-13): there is deliberately NO `offrampRelayer`.
+    // An earlier revision let an owner-set relayer call `deliverOfframpUpi` for
+    // someone else's order. That is not a relay — `encUpi` IS the fiat payout
+    // target, `placeB2BSellOrder` leaves `order.encUpi` empty, and the Diamond's
+    // substitution guard accepts any string into an empty slot, so a relayer
+    // could redirect ANY seller's payout to itself (first writer wins; the order
+    // then moves to PAID and every health metric still reads clean).
+    //
+    // Binding it with a user EIP-712 signature over keccak256(encUpi) was
+    // considered and rejected as illusory: `encUpi` is encrypted to the MATCHED
+    // MERCHANT, who is unknown until after the accept, so the user cannot
+    // pre-sign the destination at placement. By the time they can sign it they
+    // are online and can simply call `deliverOfframpUpi` themselves.
+    //
+    // Showdown's client encrypts `encUpi` locally, so a relayer buys no
+    // capability the user does not already have. Delivery is initiator-only.
 
     // ─── Bridge config ────────────────────────────────────────────────
 
@@ -340,10 +352,24 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     // ─── Per-user entitlement ─────────────────────────────────────────
 
-    /// @notice Per-tx USDC ceiling attested by the simple-kyc service. The
-    ///         effective cap is this clamped by
+    /// @notice Per-tx USDC ceiling attested by the simple-kyc service, keyed
+    ///         `grantedLimit[user][tier]`. The effective cap reads the CURRENT
+    ///         tier's own attested limit, clamped by
     ///         `tierCap[userTier[user]][regionFor(currency)]`.
-    mapping(address => uint256) public grantedLimit;
+    /// @dev    Per-tier (not one shared scalar) so a per-user AML sub-cap the
+    ///         service signs at one tier cannot be inflated by a higher limit
+    ///         attested at a different tier/service. See #45. ABI note: the
+    ///         auto-getter is now `grantedLimit(address,uint8)`.
+    ///
+    ///         ⚠️ A signed DOWNGRADE is advisory, not binding. The digest binds
+    ///         `wallet = msg.sender`, so the service cannot push one onto a
+    ///         flagged user — they simply never claim it. And the replay guard is
+    ///         per-nullifier, not per-user, so any OTHER unexpired higher-limit
+    ///         attestation re-raises the cap after a downgrade is claimed.
+    ///         `setUserBlocked` is the only lever that binds a flagged user.
+    ///         Exposure meanwhile is bounded by the immutable tier ceilings and
+    ///         the daily count.
+    mapping(address => mapping(uint8 => uint256)) public grantedLimit;
     /// @notice Highest KYC tier the user has claimed (see TIER_* constants).
     mapping(address => uint8) public userTier;
     /// @notice Per-(tenant, human) nullifier sets, namespaced by service so a
@@ -390,12 +416,19 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         uint256 usdcAmount; // principal placed (excludes fee)
         uint8 lastStatus; // last reconciled Diamond status (3=COMPLETED,4=CANCELLED)
         bool initialized;
+        uint32 placementDay; // UTC day the SELL slot was consumed, for release keying (#51)
     }
 
     /// @notice Offramp records, keyed by Diamond orderId.
     mapping(uint256 => OfframpRecord) public offramps;
     /// @notice orderId => the address that initiated the offramp (may deliver UPI).
     mapping(uint256 => address) public orderInitiator;
+    /// @notice Sum of a user's placed-but-not-yet-terminal SELL principals. A
+    ///         reservation, not a lock: `userInitiateOfframp` requires the proxy
+    ///         balance to cover `pending + new amount`, so N SELLs can't be
+    ///         over-committed against one balance (only one would ever settle).
+    ///         Released on terminal `reconcile`. (#51 / #44 over-commit half)
+    mapping(address => uint256) public pendingOfframpTotal;
 
     // ─── Modifiers ────────────────────────────────────────────────────
 
@@ -464,7 +497,13 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
             _diamond == address(0) ||
             _usdc == address(0) ||
             _tokenMessenger == address(0) ||
-            _messageTransmitter == address(0)
+            _messageTransmitter == address(0) ||
+            // Attestors are immutable in practice too: a deploy that zeroes them
+            // ships a contract where no one can ever verify (both entrypoints
+            // revert `AttestorNotSet`), and `owner` cannot be transferred, so the
+            // only remedy is a redeploy + re-whitelist. Refuse at construction.
+            _livenessAttestor == address(0) ||
+            _kycAttestor == address(0)
         ) revert InvalidAddress();
 
         diamond = _diamond;
@@ -491,12 +530,19 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     // ─── Admin ────────────────────────────────────────────────────────
 
+    /// @dev Zero is rejected rather than treated as "disable this tier". Zeroing
+    ///      an attestor fails closed (`AttestorNotSet`), so it would brick the
+    ///      tier silently and irreversibly for anyone mid-verification; the
+    ///      supported way to close a lane is `setTierCap(tier, region, 0)`, which
+    ///      leaves attestations verifiable. Same reasoning in the constructor.
     function setLivenessAttestor(address attestor) external onlyOwner {
+        if (attestor == address(0)) revert InvalidAddress();
         livenessAttestor = attestor;
         emit LivenessAttestorUpdated(attestor);
     }
 
     function setKycAttestor(address attestor) external onlyOwner {
+        if (attestor == address(0)) revert InvalidAddress();
         kycAttestor = attestor;
         emit KycAttestorUpdated(attestor);
     }
@@ -553,11 +599,6 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     function setOfframpEnabled(bool flag) external onlyOwner {
         offrampEnabled = flag;
         emit OfframpEnabledUpdated(flag);
-    }
-
-    function setOfframpRelayer(address relayer) external onlyOwner {
-        offrampRelayer = relayer;
-        emit OfframpRelayerUpdated(relayer);
     }
 
     /// @dev Bounded by `MAX_BRIDGE_MAX_FEE_BPS` so a misconfigured or
@@ -658,14 +699,17 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         _applyGrant(msg.sender, limit, TIER_KYC, nullifier);
     }
 
-    /// @dev Monotonic: a claim only ever raises the user's limit / tier. The
+    /// @dev The TIER is monotonic (a claim only ever raises it). The per-tier
+    ///      LIMIT is NOT: a fresh same-tier attestation OVERWRITES that tier's
+    ///      granted limit, so a risk-driven downgrade the service signs actually
+    ///      binds (#45). Cross-tier limits no longer bleed into each other. The
     ///      attestation `expiry` is a claim-freshness deadline (checked above),
     ///      not an ongoing clock — the per-(tenant, human) nullifier is
     ///      single-use, so an expiring grant could never be re-claimed.
     function _applyGrant(address user, uint256 limit, uint8 tier, bytes32 nullifier) internal {
-        if (limit > grantedLimit[user]) grantedLimit[user] = limit;
+        grantedLimit[user][tier] = limit;
         if (tier > userTier[user]) userTier[user] = tier;
-        emit KycClaimed(user, tier, nullifier, limit, grantedLimit[user]);
+        emit KycClaimed(user, tier, nullifier, limit, grantedLimit[user][tier]);
     }
 
     // ─── Views ────────────────────────────────────────────────────────
@@ -701,7 +745,7 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         if (blocked[user]) return 0;
         uint8 tier = userTier[user];
         if (tier == TIER_NONE) return 0;
-        uint256 lim = grantedLimit[user];
+        uint256 lim = grantedLimit[user][tier];
         uint256 cap = tierCap[tier][regionFor(currency)];
         return lim < cap ? lim : cap;
     }
@@ -962,8 +1006,28 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         }
 
         if (amount != session.amount) {
-            emit OnrampAmountAdjusted(orderId, session.amount, amount);
-            session.amount = amount;
+            // Re-pin to what the Diamond says it delivered — but never above what
+            // actually arrived. `unbridgedTotal` is a claim on a POOLED balance,
+            // so reserving more than is backed would let this order's burn spend
+            // another buyer's USDC and break `balanceOf(this) >= unbridgedTotal`.
+            //
+            // Clamp rather than revert: the gateway routes funds BEFORE this hook
+            // and swallows a revert, so reverting would strand the delivered USDC
+            // with no session record (sweepable as owner "surplus") — the same
+            // asymmetry the cancel-then-complete branch above turns on.
+            //
+            // Deliberately NOT re-checked against the tier cap. Clamping an
+            // over-delivery down to the cap would leave the excess unreserved and
+            // owner-sweepable, converting an AML limit breach into a user fund
+            // loss. The cap is enforced at placement, where it belongs.
+            //
+            // Unreachable on today's gateway (it passes exactly the amount it
+            // transferred, verified against contracts-v4). This is defence in
+            // depth: the integrator is immutable and the Diamond is not.
+            uint256 backed = usdc.balanceOf(address(this)) - unbridgedTotal;
+            uint256 pinned = amount > backed ? backed : amount;
+            emit OnrampAmountAdjusted(orderId, session.amount, pinned);
+            session.amount = pinned;
         }
 
         session.fulfilled = true;
@@ -1001,7 +1065,10 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         Session storage session = sessions[orderId];
         if (session.user == address(0)) return;
         if (session.fulfilled) revert OrderAlreadyFulfilled();
-        if (session.cancelled) revert OrderAlreadyCancelled();
+        // IP2PIntegrator asks this hook to tolerate repeat calls — return
+        // rather than revert. Returning BEFORE the decrement below also keeps a
+        // repeat call from double-freeing the daily slot. (#55)
+        if (session.cancelled) return;
         session.cancelled = true;
 
         uint256 day = uint256(session.placementDay);
@@ -1038,6 +1105,13 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
 
     function _bridge(uint256 orderId) internal {
         Session storage session = sessions[orderId];
+        // Local idempotency guard. Previously this check lived only in
+        // retryBridge, so _bridge's safety rested on four separate external
+        // facts (the CEI order, onOrderComplete's `fulfilled` guard,
+        // retryBridge's check, and there being exactly one `this.selfBridge`
+        // caller). Making it local means a future second caller can never
+        // double-burn one session out of another buyer's pooled reservation. (#55)
+        if (session.bridged || session.rescued) revert AlreadyBridged();
         uint256 amount = session.amount;
         bytes32 recipient = session.solanaRecipient;
         uint256 maxFee = _maxFeeFor(amount);
@@ -1192,7 +1266,18 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         if (amount > lim) revert KycLimitExceeded();
 
         address proxy = _ensureProxy(msg.sender);
-        if (usdc.balanceOf(proxy) < amount) revert InsufficientBridgedFunds();
+        // Escrow, not just a balance check: the proxy must cover every
+        // outstanding SELL principal plus this one, so a user can't place N
+        // orders against the same balance and strand all but one at delivery.
+        // (#51 escrow / #44 over-commit). NOTE: the per-order fee is charged on
+        // top and is Diamond-determined, unknown at placement, so this does not
+        // by itself prevent a single FULL-balance SELL from being undeliverable
+        // (`needed = principal + fee > balance`) — see #44; the widget must
+        // reserve fee headroom (surface via getRemainingOfframpDailyCount +
+        // proxy balance) and/or p2p confirms a max-fee bound to enforce here.
+        if (usdc.balanceOf(proxy) < pendingOfframpTotal[msg.sender] + amount) {
+            revert InsufficientBridgedFunds();
+        }
 
         orderId = _placeSellOrder(
             proxy,
@@ -1208,9 +1293,11 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
             user: msg.sender,
             usdcAmount: amount,
             lastStatus: 0,
-            initialized: true
+            initialized: true,
+            placementDay: uint32(block.timestamp / 1 days)
         });
         orderInitiator[orderId] = msg.sender;
+        pendingOfframpTotal[msg.sender] += amount;
 
         emit OfframpInitiated(orderId, msg.sender, amount, proxy);
     }
@@ -1244,14 +1331,21 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      * @notice Forward the encrypted UPI payload to the Diamond, letting it pull
      *         the sale's USDC from the seller's proxy. Reads the authoritative
      *         `actualUsdtAmount` (principal + fee) from the Diamond rather than
-     *         assuming the principal. Callable by the initiator or the relayer.
+     *         assuming the principal. Callable ONLY by the order's initiator —
+     *         there is no relayer path (#53.2); see the note by `offrampEnabled`.
      */
     function deliverOfframpUpi(uint256 orderId, string calldata encUpi) external nonReentrant {
         OfframpRecord memory record = offramps[orderId];
         if (!record.initialized) revert OfframpRecordNotFound();
-        if (msg.sender != orderInitiator[orderId] && msg.sender != offrampRelayer) {
-            revert OfframpNotAuthorized();
-        }
+        // Initiator-only by design (#53.2) — see the note by `offrampEnabled`.
+        if (msg.sender != orderInitiator[orderId]) revert OfframpNotAuthorized();
+        // Honour a block placed AFTER the order was placed. blocked[] exists
+        // precisely to stop a payout (fraud report / sanctions), so unlike the
+        // offrampEnabled kill switch — which we deliberately let in-flight orders
+        // settle to avoid stranding an accepted merchant — a blocked seller must
+        // NOT be delivered. No stranding risk: the USDC is still on the seller's
+        // own proxy and userBridgeBackToSolana remains open to them. (#53)
+        if (blocked[record.user]) revert UserIsBlocked();
 
         IOrderFlow.AdditionalOrderDetailsView memory aod = IOrderFlow(diamond)
             .getAdditionalOrderDetails(orderId);
@@ -1275,14 +1369,45 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      * @dev No refund handling: a cancel-while-PAID returns USDC to `order.user`,
      *      which is the seller's own proxy, so the funds are already back where
      *      they started and are re-offrampable (or bridgeable back to Solana).
+     *
+     *      On a terminal status it also does the offramp accounting cleanup:
+     *      release the escrow reservation, and refund the daily SELL slot for an
+     *      order that expired without any merchant accepting it. The terminal
+     *      latch guarantees this runs exactly once per order.
+     *
+     *      Known limitation (#55): a settled dispute can drive a COMPLETED (3)
+     *      SELL back to CANCELLED (4) with a refund; the latch keeps this record
+     *      at its first terminal status, so the off-chain view built on
+     *      `OfframpReconciled` can misreport that late transition. Left as-is on
+     *      purpose — reopening the latch would risk double-releasing the escrow
+     *      and slot, and the accounting correctness matters more than the
+     *      observability edge. Funds are unaffected either way.
      */
     function reconcile(uint256 orderId) external {
         OfframpRecord storage record = offramps[orderId];
         if (!record.initialized) revert OfframpRecordNotFound();
         if (record.lastStatus == 3 || record.lastStatus == 4) revert OfframpAlreadyReconciled();
 
-        uint8 currentStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
+        IOrderFlow.OrderView memory ord = IOrderFlow(diamond).getOrdersById(orderId);
+        uint8 currentStatus = ord.status;
         record.lastStatus = currentStatus;
+
+        if (currentStatus == 3 || currentStatus == 4) {
+            // Release this order's escrow reservation (runs once, per the latch).
+            uint256 amt = record.usdcAmount;
+            uint256 pending = pendingOfframpTotal[record.user];
+            pendingOfframpTotal[record.user] = pending > amt ? pending - amt : 0;
+
+            // Refund the daily SELL slot ONLY for an order no merchant ever
+            // accepted (expired / never taken), so a stranded-before-accept SELL
+            // doesn't burn the day. A merchant-accepted order keeps its slot —
+            // releasing that could be farmed to waste merchant capacity. (#51)
+            if (currentStatus == 4 && ord.acceptedMerchant == address(0)) {
+                uint256 day = uint256(record.placementDay);
+                uint256 c = userDailyOfframpCount[record.user][day];
+                if (c > 0) userDailyOfframpCount[record.user][day] = c - 1;
+            }
+        }
         emit OfframpReconciled(orderId, currentStatus);
     }
 

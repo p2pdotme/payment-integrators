@@ -1,5 +1,16 @@
 # PR #35 — Showdown CCTP Checkout Integrator — pre-prod launch audit
 
+> ⚠️ **STALE — do not use as the go/no-go source (#54).** This doc was cut before
+> the later commits and now describes a contract that has since changed:
+> D1/D3 predate the deploy-script preset lock + `DRY_RUN` carve-out; the test
+> count is 81 (head is higher); F4 overclaims reentrancy coverage that `8cbc368`'s
+> `MockReentrantUSDC` only later added; and no finding covers `onOrderComplete`'s
+> settle-and-re-charge behaviour or the #44/#45/#51/#53/#55 fixes. The authoritative
+> current state is the open PR(s) + `~/Downloads/showdown-prod-readiness.md`. A full
+> re-cut (or moving this into the PR body) is tracked in #54; the load-bearing wrong
+> claims elsewhere (deploy-script "never raise", the widget ABI, attestation expiry,
+> Fast-Transfer two-setter) are corrected in this same change.
+
 **Scope:** `contracts/integrators/showdown/ShowdownCheckoutIntegrator.sol` (branch
 `feat/showdown-cctp-integrator`), plus its deploy / smoke / attestor scripts, tests and docs.
 **Goal of this pass (per request):** confirm the contract is launch-ready for a Base **mainnet**
@@ -151,15 +162,30 @@ fiat→spendable-USDC route that skips consumer-side fraud checks. The bound has
 user already paid fiat for) still looks right, but it is a design decision worth re-confirming at the
 new number rather than inheriting.
 
-### F9 — INFO: `onOrderCancel` is dead code on the live protocol (no fix — documented)
+### F9 — RESOLVED upstream 2026-08-10: `onOrderCancel` is live, but Showdown must opt in
 
-Confirmed in the Investabl audit against the Base-mainnet Diamond: selector `0x7ff83a04` is absent
-from **all 21 facets**; the hook exists only on the unmerged `feat/integrator-on-order-cancel`.
-So `dailyTxCountLimit` bounds **placements** per day — a cancelled or expired order keeps its slot.
-Strictly safe (a slot can never be freed early ⇒ the cap cannot be exceeded); the cost is UX, and it
-bites harder at 5/day than it did at 10. Compounded by the short-TTL order expiry that has stranded
-orders before. Documented in the contract NatSpec and `showdown.md`; **surface remaining-count in the
-widget.**
+**Superseded.** This finding recorded that selector `0x7ff83a04` was absent from all 21 mainnet
+facets, so `dailyTxCountLimit` bounded **placements** per day. That was true until 2026-08-05.
+
+`contracts-v4` **#362** ("opt-in `IP2PIntegrator.onOrderCancel` on B2B BUY cancellation + bounded
+callbacks", merge `962911e`) is now **merged and deployed** to the mainnet Diamond. Verified
+2026-08-10: `setIntegratorCancelCallback(address,bool)` (`0x42de055b`) is present in live facet
+`0x06909D396f04579fcEc20af17eAC6Efe56Bb939E`, and `getIntegratorConfig` now returns five fields
+including `cancelCallbackEnabled`.
+
+Three things follow for Showdown:
+
+1. **It is opt-in and defaults to off.** Enabling is a separate super-admin
+   `setIntegratorCancelCallback(showdown, true)` call **after** registration — see the deploy gates.
+   Until that call, `dailyTxCountLimit` still bounds placements per day exactly as described above.
+2. **It is BUY-only.** `onB2BOrderCancelled` is gated on `orderType == BUY`, so the offramp/SELL side
+   still relies on `reconcile` to release its own daily slot.
+3. **The gas cap is real.** #362 bounds the cancel callback at 250k gas because it runs inside the
+   permissionless `autoCancelExpiredOrders` keeper. Showdown's `onOrderCancel` measures **27,860**
+   gas (24,416 on a repeat call), comfortably inside, and #362 names Showdown as qualifying on all
+   three of its enable gates.
+
+Still **surface remaining-count in the widget** either way.
 
 ### F10 — INFO: the per-tx cap bounds the SELL _principal_, not principal + fee (no fix)
 
@@ -167,6 +193,48 @@ widget.**
 `actualUsdtAmount` (= principal + the Diamond's fee) from the proxy. So the value actually leaving a
 user can exceed their tier cap by the fee. Immaterial in size; noted so the cap is not described as a
 strict bound on value moved.
+
+---
+
+## The three PR #58 design calls — settled 2026-08-13
+
+PR #58 fixed what it could and deliberately left three questions to p2p, all of them
+bytecode-gating because the integrator is immutable. All three are now decided.
+
+### #51.1 — `userCancelOfframp`: **not adding it**
+
+A user-facing SELL cancel is not shipping. A cancel that could still land after the merchant has
+sent the rupees is a merchant-funded double-spend, and it could not be verified against
+`MockDiamond.cancelSellOrder`, which is permissive. Users who change their mind wait for expiry;
+`reconcile` then releases the escrow and — for an order no merchant ever accepted — refunds the
+daily slot. That path is already implemented and tested. Cost is UX on a mistyped amount, not funds.
+
+### #53.2 — `offrampRelayer`: **removed entirely**
+
+The state variable, the `setOfframpRelayer` setter and the `OfframpRelayerUpdated` event are gone;
+`deliverOfframpUpi` is now initiator-only. This was not merely a dormant power: `encUpi` **is** the
+fiat payout target, `placeB2BSellOrder` leaves `order.encUpi` empty, and the Diamond's substitution
+guard accepts any string into an empty slot — so a set relayer could redirect any seller's payout to
+itself, with the order still moving to PAID and every health metric reading clean.
+
+Binding it to a user EIP-712 signature over `keccak256(encUpi)` was considered and **rejected as
+illusory**: `encUpi` is encrypted to the *matched merchant*, who is unknown until after the accept,
+so the user cannot pre-sign the destination at placement. By the time they can sign it they are
+online and can simply deliver it themselves. Since Showdown's client encrypts `encUpi` locally, the
+relayer bought no capability the user lacked — only a way to lose money. Removing it also shrinks
+the owner's authority: the owner can no longer name who delivers a payout.
+
+### #44 — fee headroom: **widget-side, no contract bound**
+
+No `MAX_SELL_FEE_BPS` was added. The Diamond's fee is charged on top of principal and is unknown
+until delivery, so a full-balance SELL can still be undeliverable. This is handled in the product:
+the widget quotes the exact net fiat before the user confirms, and **caps the maximum cash-out at
+balance − fee headroom** so an undeliverable order cannot be placed through the UI.
+
+Residual, accepted knowingly: a caller that bypasses the widget and hits `userInitiateOfframp`
+directly can still strand. Funds are never lost — the USDC stays on the user's own proxy, `reconcile`
+releases the escrow and refunds the slot, and `userBridgeBackToSolana` remains open. The contract-side
+bound stays available until the deploy transaction and not after.
 
 ---
 
@@ -200,6 +268,15 @@ strict bound on value moved.
   arrives** — while `unbridgedTotal` reads 0 and the contract looks perfectly healthy. Note this is
   _worse_ than the fail-closed case: there is no on-chain recovery once the burn lands. It stays
   permissionless and therefore recoverable by anyone, forever — but someone has to do it.
+- **D9 — Enable the cancel callback after registration.** `setIntegratorCancelCallback(showdown, true)`,
+  super-admin, on the Diamond. New since `contracts-v4` #362 (2026-08-05) and **defaults to off**, so
+  skipping it silently leaves `dailyTxCountLimit` bounding placements/day rather than orders/day. See
+  F9. Do it after `registerIntegrator`, not before — the setter reverts `ZeroAddress` for an
+  unregistered integrator.
+- **D10 — Read `getIntegratorConfig` with the 5-field ABI.** #362 added `cancelCallbackEnabled` as the
+  third field. A stale 4-field ABI does not revert; it reads `proxyImpl` as `address(0)`, which is
+  exactly the value D5 depends on. Fixed in `deploy-showdown.ts`; confirm any other tool you register
+  with was updated too.
 - **D8 — No genuine on-chain attestation has ever happened.** "Wired end-to-end" on Sepolia meant
   CORS/proxy 200s. The first real `submitLivenessAttestation` from a live face capture is the actual
   proof, and it has not been produced.

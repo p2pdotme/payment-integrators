@@ -19,9 +19,12 @@ import { ethers } from "hardhat";
  *
  * Each of those five numbers is ALSO an immutable MAX_* constant in the
  * bytecode. The constructor and the owner's setters can only ever go at or
- * below them, so the policy holds against a compromised attestor key AND a
- * compromised owner key. Pass lower values here to launch tighter than policy;
- * the owner can lower further later, never raise.
+ * below the CEILING, so the policy holds against a compromised attestor key AND
+ * a compromised owner key. Pass lower values here to launch tighter than policy.
+ * NB (#54): the setters compare only against the immutable ceiling, NOT the
+ * current value — so an owner who launches tight can still move a cap back UP to
+ * the ceiling later (and un-zero a killed lane). The guarantee is "never above
+ * MAX_*", not "monotonically down". Un-raisable policy is the ceiling itself.
  *
  * ── CCTP / token caveat on Base Sepolia ────────────────────────────────────
  * CCTP burns only Circle-issued USDC. The Base Sepolia Diamond settles in a
@@ -120,7 +123,13 @@ const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 
 const REGISTER_ABI = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, uint256 activeOrderCount, address proxyImpl))",
+  // 5 fields, not 4: contracts-v4 #362 (merged + deployed to Base mainnet
+  // 2026-08-05) added `cancelCallbackEnabled`. A stale 4-field ABI does NOT
+  // revert — it silently reads `proxyImpl` off `activeOrderCount`, i.e. always
+  // address(0), which both kills the re-register guard below and prints a bogus
+  // proxyImpl in the registration log (the value WHITELISTING.md treats as the
+  // security gate).
+  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, bool cancelCallbackEnabled, uint256 activeOrderCount, address proxyImpl))",
 ];
 const MINTER_ABI = ["function burnLimitsPerMessage(address) view returns (uint256)"];
 const TM_ABI = ["function localMinter() view returns (address)"];
@@ -221,6 +230,27 @@ async function main() {
         ? "Owner check:          ✅ DEPLOY_OWNER set (signer identity skipped under DRY_RUN)"
         : "Owner check:          ✅ signer matches DEPLOY_OWNER"
     );
+
+    // Neither attestor may be the deploy key on mainnet. `owner` IS the deployer
+    // (immutable), so an attestor equal to it means that single key can both sign
+    // attestations and spend against them — a self-attestable lane at the tier's
+    // full ceiling, paying no fiat. `set-showdown-attestors.ts` enforces this too,
+    // but that script is optional and this one is not: the property has to live on
+    // the path nobody can skip, not only in the tool they might remember to run.
+    for (const [label, attestor] of [
+      ["LIVENESS_ATTESTOR", LIVENESS_ATTESTOR],
+      ["KYC_ATTESTOR", KYC_ATTESTOR],
+    ] as const) {
+      if (attestor.toLowerCase() === me.toLowerCase()) {
+        throw new Error(
+          `${label} is the deploy key (${me}). On mainnet that ships a SELF-ATTESTABLE tier: ` +
+            `owner is immutable and equals the deployer, so one key could sign its own ` +
+            `attestations up to the tier ceiling. Take each attestor from its service's own ` +
+            `/v1/attestor endpoint.`
+        );
+      }
+    }
+    console.log("Attestor check:       ✅ neither attestor is the deploy key");
   }
 
   // solanaDomain is immutable and CCTP domain IDs are network-agnostic — Solana
