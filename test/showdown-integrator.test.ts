@@ -348,6 +348,58 @@ describe("ShowdownCheckoutIntegrator", function () {
 
   // ─── Immutable policy ceilings ──────────────────────────────────────
 
+  // #75: this was the one owner setter with no bytecode bound, which contradicted
+  // the contract's own governance story. CCTP does not reject an arbitrary value
+  // — the attestation service silently normalises it, so e.g. 500 becomes a Fast
+  // transfer that charges a fee while bridgeMaxFeeBps defaults to 0, turning
+  // every burn into a fail-closed retry that reads like a CCTP outage.
+  describe("bridge finality threshold is bounded (#75)", function () {
+    it("accepts only the two values CCTP V2 defines", async function () {
+      await expect(integrator.connect(owner).setBridgeMinFinalityThreshold(1000)).to.emit(
+        integrator,
+        "BridgeFinalityThresholdUpdated"
+      );
+      expect(await integrator.bridgeMinFinalityThreshold()).to.equal(1000);
+      await integrator.connect(owner).setBridgeMinFinalityThreshold(2000);
+      expect(await integrator.bridgeMinFinalityThreshold()).to.equal(2000);
+    });
+
+    it("rejects anything else, including the silently-normalised 500", async function () {
+      for (const bad of [0, 500, 999, 1500, 2001, 4294967295]) {
+        await expect(
+          integrator.connect(owner).setBridgeMinFinalityThreshold(bad)
+        ).to.be.revertedWithCustomError(integrator, "InvalidFinalityThreshold");
+      }
+    });
+
+    it("is still owner-only", async function () {
+      await expect(
+        integrator.connect(stranger).setBridgeMinFinalityThreshold(1000)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    // _maxFeeFor(0) used to underflow on `amount - 1`. Newly reachable once the
+    // delivery clamp (#73) can pin a session to zero — a panic there would take
+    // down onOrderComplete instead of failing closed into BridgeFailed.
+    it("a zero-pinned session does not panic in _maxFeeFor", async function () {
+      await verify(user, "kyc", KYC_CAP);
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userBuyUsdcToSolana(USDC(50), INR, SOLANA_ATA, 1, "", 0, 0);
+      // Reports $50, transfers nothing -> clamp pins the session to 0.
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          integratorAddr,
+          orderId,
+          user.address,
+          USDC(50),
+          integratorAddr
+        )
+      ).to.not.be.reverted;
+      expect((await integrator.getSession(orderId)).amount).to.equal(0);
+      expect(await integrator.unbridgedTotal()).to.equal(0);
+    });
+  });
+
   describe("immutable ceilings", function () {
     const CEILINGS: [number, number, bigint][] = [
       [TIER.LIVENESS, REGION.INDIA, USDC(20)],
