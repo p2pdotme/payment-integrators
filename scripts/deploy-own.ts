@@ -1,4 +1,5 @@
 import { ethers } from "hardhat";
+import { getIntegratorConfig } from "./lib/diamond";
 
 /**
  * Deploy + whitelist OwnCheckoutIntegrator — the fiat -> Base USDC onramp for
@@ -73,30 +74,22 @@ const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 
 const REGISTER_ABI = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-  /*
-   * This struct has grown twice, and BOTH times the new field landed in the
-   * middle rather than at the end — so every stale copy of this ABI decodes
-   * `proxyImpl` off the wrong word and gets 0. ethers does not complain: a
-   * short tuple spec against a longer return silently drops the trailing
-   * words.
-   *
-   * The damage is specific and nasty. `registerIntegrator` has already been
-   * mined by the time the post-check runs, so the mis-read turns a perfectly
-   * good registration into `registered proxyImpl does not match the deployed
-   * one` — and an operator who reruns finds the "already locked" guard reading
-   * 0 too, so it does not fire. Verified against Base mainnet 2026-08-14.
-   *
-   * Deployed layout (contracts-v4 #362, the onOrderCancel opt-in):
-   *   w0 isActive · w1 usdcThroughIntegrator · w2 cancelCallbackEnabled
-   *   w3 activeOrderCount · w4 proxyImpl
-   *
-   * Before trusting this on a new deployment, count the words:
-   *   cast call $DIAMOND "getIntegratorConfig(address)" $INTEGRATOR
-   * Five 32-byte words is the shape below. Anything else means the struct has
-   * moved again — fix it here BEFORE deploying, not after.
-   */
-  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, bool cancelCallbackEnabled, uint256 activeOrderCount, address proxyImpl))",
 ];
+
+/*
+ * Reading the registration back goes through scripts/lib/diamond.ts (#60),
+ * which decodes by SHAPE rather than by a hardcoded ABI literal.
+ *
+ * This script used to carry its own literal. That is wrong in a way worth
+ * naming, because it looked fine: `IntegratorConfig` grew a third field in
+ * contracts-v4 #362, mainnet and Sepolia upgraded on different days, and
+ * during that window NO single literal was correct on both. A 4-field literal
+ * against a 5-field Diamond does not even revert — ethers reads `proxyImpl`
+ * off the `activeOrderCount` slot and hands back address(0), which then fails
+ * the post-registration assertion on a registration that was perfectly good.
+ * A selector check cannot catch it either; return types are not part of the
+ * selector.
+ */
 
 const ERC20_ABI = [
   "function symbol() view returns (string)",
@@ -243,7 +236,7 @@ async function main() {
   if (!SKIP_REGISTER) {
     console.log("\nRegistering on the Diamond (usdcThroughIntegrator=false)…");
     const b2b = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI, deployer);
-    const before = await b2b.getIntegratorConfig(integratorAddr);
+    const before = await getIntegratorConfig(ethers.provider, DIAMOND_ADDRESS, integratorAddr);
     if (
       before.proxyImpl !== ethers.ZeroAddress &&
       before.proxyImpl.toLowerCase() !== proxyImpl.toLowerCase()
@@ -254,7 +247,7 @@ async function main() {
     await tx.wait(1);
     console.log("  registerIntegrator tx:", tx.hash);
 
-    const cfg = await b2b.getIntegratorConfig(integratorAddr);
+    const cfg = await getIntegratorConfig(ethers.provider, DIAMOND_ADDRESS, integratorAddr);
     console.log(
       `  config: isActive=${cfg.isActive} usdcThroughIntegrator=${cfg.usdcThroughIntegrator} proxyImpl=${cfg.proxyImpl}`
     );
