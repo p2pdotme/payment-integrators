@@ -779,23 +779,49 @@ describe("OwnCheckoutIntegrator", function () {
     it("restricts every setter to the owner", async function () {
       await expect(
         integrator.connect(stranger).setAttestor(stranger.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       await expect(
         integrator.connect(stranger).setRegionCap(REGION.INDIA, 1)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       await expect(
         integrator.connect(stranger).setDailyTxCountLimit(1)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       await expect(
         integrator.connect(stranger).setBlocked(user.address, true)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       await expect(integrator.connect(stranger).pause()).to.be.revertedWithCustomError(
         integrator,
-        "OnlyOwner"
+        "OwnableUnauthorizedAccount"
       );
       await expect(
         integrator.connect(stranger).sweepUsdc(stranger.address, 1)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
+    });
+
+    it("transfers ownership", async function () {
+      await expect(integrator.connect(owner).transferOwnership(stranger.address))
+        .to.emit(integrator, "OwnershipTransferred")
+        .withArgs(owner.address, stranger.address);
+      expect(await integrator.owner()).to.equal(stranger.address);
+
+      // The old key is out; the new one holds the levers.
+      await expect(integrator.connect(owner).pause()).to.be.revertedWithCustomError(
+        integrator,
+        "OwnableUnauthorizedAccount"
+      );
+      await expect(integrator.connect(stranger).pause()).to.not.be.reverted;
+    });
+
+    it("restricts ownership transfer to the owner", async function () {
+      await expect(
+        integrator.connect(stranger).transferOwnership(stranger.address)
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
+    });
+
+    it("rejects transferring ownership to the zero address", async function () {
+      await expect(
+        integrator.connect(owner).transferOwnership(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "OwnableInvalidOwner");
     });
 
     it("pauses and resumes the onramp", async function () {
@@ -910,7 +936,7 @@ describe("OwnCheckoutIntegrator", function () {
           CAP_ABROAD,
           DAILY_COUNT
         )
-      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      ).to.be.revertedWithCustomError(integrator, "OwnableInvalidOwner");
     });
 
     it("deploys its own canonical UserProxy master", async function () {
@@ -1182,7 +1208,7 @@ describe("OwnCheckoutIntegrator", function () {
       await verify(user, CAP_INDIA, "owner-only");
       await expect(
         integrator.connect(stranger).revokeEnrolment(nullifier, user.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
     });
 
     it("refuses a nullifier that was never spent", async function () {

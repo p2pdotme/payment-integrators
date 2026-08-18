@@ -125,23 +125,16 @@ async function main() {
   }
 
   // ── Owner ───────────────────────────────────────────────────────────────
-  // `owner` is `address public immutable` with no transfer path, so this is
-  // the one input on this whole script that cannot be corrected afterwards.
-  // Getting it wrong costs a redeploy, a fresh P2P whitelist request, a new
-  // tenant, and every already-verified user re-attesting — the EIP-712 domain
-  // binds `verifyingContract`, so their grants do not carry over.
-  //
-  // It defaulted silently to the deployer EOA, while the RECOVERABLE mistake
-  // next to it (a wrong attestor, fixable with setAttestor) hard-throws on
-  // mainnet. That is exactly backwards, and the documented mainnet command
-  // does not pass DEPLOY_OWNER at all — so the copy-pasteable path was the
-  // one that burned the owner key.
+  // `owner` is OZ `Ownable` and transferable after deploy, so a wrong value
+  // is recoverable — but only by whoever holds the wrongly-set key. Defaulting
+  // silently to the deployer EOA would still put pause/setBlocked/setRegionCap/
+  // sweepUsdc on a hot key until someone notices and transfers, so mainnet
+  // must name the Own multisig explicitly.
   if (isMainnet && !process.env.DEPLOY_OWNER) {
     throw new Error(
-      "DEPLOY_OWNER is required on mainnet. `owner` is immutable with no " +
-        "transfer path — pass the Own multisig. Defaulting to the deployer " +
-        "EOA would hand pause/setBlocked/setRegionCap/sweepUsdc to a hot key " +
-        "permanently."
+      "DEPLOY_OWNER is required on mainnet — pass the Own multisig. " +
+        "Defaulting to the deployer EOA would hand pause/setBlocked/" +
+        "setRegionCap/sweepUsdc to a hot key until ownership is transferred."
     );
   }
 
