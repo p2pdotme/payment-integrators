@@ -43,68 +43,48 @@ The alternatives were weighed and rejected:
 
 ## What stops it being a free ETH tap
 
-A wallet is funded only when a real human is established behind it:
+A wallet is funded only when it is **verified on chain**:
 
-- **A passport attestation**, verified here against the identical EIP-712
-  message the contract checks — same `KycVerifier` domain, same typehash,
-  `verifyingContract` pinned to the integrator, same low-`s` rejection, and a
-  refusal of `limit: 0` (a wallet that could never buy). This is the cold-start
-  path: the wallet has no gas, so it cannot have submitted on chain yet.
+- **`verified(wallet)` true on the integrator** is the one drip gate. There is
+  no off-chain credential and no attestation in the drip request — the chain
+  is the authority.
+- **`blocked(wallet)`** is refused, and that read fails **closed**: an RPC
+  fault refuses rather than funding through it. It is the operator's only
+  revocation lever, so it does not get to be best-effort.
 
-  The signer it verifies against is **the contract's own `attestor()`**, read
-  from chain and cached five minutes — because that is the signer the funded
-  submit will be held to. The configured value is only the fallback when the
-  chain cannot be read, and any disagreement between the two is logged as
-  `event=attestor_mismatch`: it means either the config or the deployment is
-  wrong, and every operator believes the other one. A config-only attestor
-  silently rejecting every cold start has bitten two prior integrations.
+Verification itself is landed by this service — `POST /v1/attestation` — which
+is what dissolved the cold start rather than funding around it. Since the
+contract's `submitPassportAttestation` takes the wallet as a parameter, anyone
+may submit, so the service pays the gas to land it. It does **not** verify the
+attestation: it simulates the exact call first (an invalid signature, a spent
+nullifier, an expired attestation all revert in the free `eth_call` and are
+refused for the price of a rate slot), then broadcasts. The chain is the only
+verifier, so the class of bug where an off-chain EIP-712 copy drifts from the
+contract — wrong attestor, wrong canonicalisation — cannot exist. There is no
+attestor config anywhere.
 
-  An attestation whose nullifier is already spent on chain is refused too —
-  one passport verifies exactly one wallet, ever, so funding a second cold
-  start on the same identity pays for a submit that must revert.
-- **`verified(wallet)` already true** on the integrator. Every later drip
-  takes this path and needs no bearer credential at all.
-
-`blocked(wallet)` is refused on both paths, and that read fails **closed** — an
-RPC fault refuses the request rather than funding through it. It is the
-operator's only revocation lever, so it does not get to be best-effort.
-
-Then three ceilings, all per UTC day:
+Then the caps, all per UTC day:
 
 | cap | default | why |
 |---|---|---|
 | per wallet, count | 4 drips | bounds a loop |
 | per wallet, value | 8×10¹⁴ wei | bounds one wallet |
-| **per nullifier, value** | 1.6×10¹⁵ wei | a nullifier is per-(tenant, human), so one person spreading across many wallets shares one budget |
-| global | 2×10¹⁷ wei | circuit breaker over the float (unscoped by chain — one process, one key, one float) |
+| **per nullifier, value** | 1.6×10¹⁵ wei | a nullifier is per-(tenant, human); a sponsored submit records it, and drips are booked against it |
+| global | 2×10¹⁵ wei | circuit breaker over the float (unscoped by chain — one process, one key, one float), enforced on the drip AND sponsor paths |
 
-A drip is **booked before it is sent**, not after. Every cap is a SUM or
-COUNT over the ledger, so the row that feeds those caps is written before the
-ETH moves — and if that write fails (a full disk, a volume remounted
-read-only) the request refuses with `503 ledger_unavailable` having spent
-nothing, rather than paying out while the caps silently read stale zeros. An
-uncapped faucet is worse than an unavailable one. A send that then fails
-releases the reservation; a send that succeeds links its tx to the row.
+A drip is **booked before it is sent**, not after. Every cap is a SUM or COUNT
+over the ledger, so the row that feeds those caps is written before the ETH
+moves — and if that write fails (a full disk, a volume remounted read-only)
+the request refuses with `503 ledger_unavailable` having spent nothing, rather
+than paying out while the caps silently read stale zeros. An uncapped faucet
+is worse than an unavailable one. A send that then fails releases the
+reservation; a send that succeeds links its tx to the row.
 
 Sums meter **amount sent plus the transaction's actual fee** (booked from the
-receipt), and the per-wallet/per-identity sums are scoped per chain. The
-funder-balance check provisions a worst-case fee ceiling before agreeing to a
-drip, so the float cannot be drained below what the ledger claims by fees
-nobody counted.
-
-The per-nullifier cap is defence in depth. The primary control is now on
-chain: the faucet reads `nullifierSpent` and refuses an attestation whose
-identity has already verified a wallet, because the contract makes a nullifier
-globally single-use and one passport therefore verifies exactly one wallet
-ever. Without that read the faucet paid for cold start after cold start on the
-same identity, each into a `submitPassportAttestation` that reverts — money
-out, user still stuck.
-
-The nullifier is canonicalised before it is used as a ledger key (`bytes.fromhex`
-ignores whitespace and case, so one identity had many spellings), and on the
-`verified()` path — where the caller sends no attestation — it is recalled from
-the ledger. Otherwise omitting one optional field bought a second, uncounted
-wallet allowance.
+receipt), scoped per chain for the per-wallet/per-identity sums. The nullifier
+is stored canonically (`bytes.fromhex` ignores whitespace and case, so one
+identity would otherwise hold several spellings) and recalled on the drip path
+so the per-identity budget binds.
 
 ### What the caps do and do not bound
 
@@ -181,14 +161,14 @@ event=refused   reason=invalid_attestation wallet=0x60907330… integrator=own d
 event=declined  reason=sufficient_balance wallet=0x… balance_wei=… target_wei=…
 event=funding   wallet=0x… amount_wei=30000000000000
 event=funded    wallet=0x… tx=0x3fb6033e… fee_wei=… outcome=success
-event=attestor_mismatch integrator=own configured=0x… onchain=0x…
+event=refused   reason=invalid_signature wallet=0x… (a submission the chain rejected)
 event=low_balance funder_balance_wei=… drips_left=42
 event=rate_limited scope=wallet wallet=0x…
 ```
 
 Alert on `event=low_balance` (the float is running out; heal by sending ETH)
-and on `event=attestor_mismatch` (cold starts are about to fail for whichever
-side is wrong).
+and on a run of `event=chain_unreachable` (the RPC is down; every request
+fails until it recovers).
 ```
 
 The service had none of this. It matters for one failure in particular: a
@@ -217,11 +197,12 @@ POST /v1/gas/request
 {
   "chainId": 8453,
   "integrator": "0x…",
-  "wallet": "0x…",
-  // Only on the first request, before the wallet can afford to submit it.
-  "attestation": { "nullifier": "0x…", "limit": 100000000,
-                   "expiry": 1786614997, "signature": "0x…" }
+  "wallet": "0x…"
 }
+// Verification is a SEPARATE endpoint — POST /v1/attestation with
+// {chainId, integrator, wallet, nullifier, limit, expiry, signature} — which
+// the service submits on-chain for the wallet. The drip request carries no
+// attestation; its only gate is verified(wallet).
 ```
 
 ```jsonc

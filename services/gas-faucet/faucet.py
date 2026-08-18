@@ -212,6 +212,14 @@ _ACCOUNT = (
 #: One key, one nonce sequence. Every send is serialised behind this.
 _SEND_LOCK = threading.Lock()
 
+#: Canonical nullifiers whose sponsored submit is broadcast but not yet
+#: confirmed. Checked and mutated only under _SEND_LOCK, but membership spans
+#: the receipt wait — so two requests carrying one attestation cannot both
+#: broadcast (the on-chain nullifier is not spent until the first MINES, after
+#: both would otherwise have sent, so re-simulating inside the lock cannot
+#: catch it; an in-process marker can). Single worker, so this is authoritative.
+_SUBMITS_IN_FLIGHT: set[str] = set()
+
 # ── on-chain reconciliation ──────────────────────────────────────────────────
 _PAUSED_TTL_S = 60
 _PAUSED_CACHE: dict[tuple[int, str], tuple[bool, float]] = {}
@@ -530,6 +538,21 @@ def _submit_reason(detail: str) -> str:
     return "simulation_reverted"
 
 
+def _canonical_nullifier(nullifier: str) -> str:
+    """One spelling of a nullifier, for use as the ledger's per-human key.
+
+    `bytes.fromhex` ignores ASCII whitespace and is case-insensitive, so many
+    request spellings ("ab"*32, "0x"+"AB"*32, whitespace-separated) decode to
+    the same 32 bytes and the same on-chain nullifier. Storing the raw request
+    string meant two spellings became two ledger rows for one identity — which
+    no longer evades a cap, but is the only per-human key an incident review
+    has, so it must be canonical. `attestation.py` did this before it was
+    deleted; this is the one line of it the ledger still needs.
+    """
+    raw = nullifier[2:] if nullifier.lower().startswith("0x") else nullifier
+    return "0x" + bytes.fromhex(raw).hex()
+
+
 def _encode_submit(wallet: str, nullifier: str, limit: int, expiry: int, signature: str) -> str:
     """ABI-encode submitPassportAttestation(address,bytes32,uint256,uint256,bytes).
 
@@ -619,6 +642,29 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
         )
         raise HTTPException(409, "integrator_paused")
 
+    # The sponsor path spends the float too (gas per submit), so it honours the
+    # two guards that bound the float: the denylist and the global breaker. It
+    # does NOT run the per-wallet drip caps — a submit is not a drip, and one
+    # wallet verifies exactly once on chain anyway — but a blocked wallet gets
+    # no gas spent on its behalf, and a tripped global breaker stops sponsored
+    # submits as it stops drips. Without these the endpoint could drain the
+    # float on gas while the breaker only watched.
+    try:
+        if rpc.read_bool(integrator.address, SEL_BLOCKED, wallet):
+            log.warning(
+                _event("refused", reason="wallet_blocked", wallet=_short(wallet),
+                       integrator=integrator.label)
+            )
+            raise HTTPException(403, "wallet_blocked")
+    except ChainError as exc:
+        log.error(_event("chain_unreachable", detail=str(exc)))
+        raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+
+    if STORE.usage(wallet="0x", nullifier=None).global_wei >= LIMITS.max_wei_global:
+        log.warning(_event("refused", reason="global_daily_budget_reached",
+                           wallet=_short(wallet), integrator=integrator.label))
+        raise HTTPException(429, "global_daily_budget_reached")
+
     data = _encode_submit(wallet, req.nullifier, req.limit, req.expiry, req.signature)
 
     # The chain's answer, for free, before any gas is spent. Everything the
@@ -642,12 +688,24 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
         )
         raise HTTPException(400, reason) from exc
 
+    canon = _canonical_nullifier(req.nullifier)
     with _SEND_LOCK:
+        if canon in _SUBMITS_IN_FLIGHT:
+            # A concurrent request is already submitting this exact
+            # attestation (double-click, two tabs). The loser used to also
+            # broadcast, and its tx reverted NullifierAlreadySpent once the
+            # winner mined — a wasted fee. Refuse instead.
+            log.info(_event("refused", reason="submit_in_flight",
+                            wallet=_short(wallet), integrator=integrator.label))
+            raise HTTPException(409, "submit_in_flight")
+
         try:
             base_fee = rpc.base_fee()
         except ChainError as exc:
             log.error(_event("chain_unreachable", detail=str(exc)))
             raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+
+        _SUBMITS_IN_FLIGHT.add(canon)
 
         # Reserve first here too: the sponsored row's FEE feeds the same
         # global breaker, so a write failure must refuse before spending gas,
@@ -658,7 +716,7 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
             drip_id = STORE.reserve(
                 chain_id=integrator.chain_id,
                 wallet=wallet,
-                nullifier=req.nullifier.lower(),
+                nullifier=_canonical_nullifier(req.nullifier),
                 amount_wei=0,
             )
         except Exception as exc:
@@ -682,6 +740,7 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
                 STORE.release(drip_id)
             except Exception:
                 pass
+            _SUBMITS_IN_FLIGHT.discard(canon)
             log.error(
                 _event("sponsor_send_failed", wallet=_short(wallet),
                        integrator=integrator.label, detail=str(exc))
@@ -697,6 +756,8 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
             )
 
     outcome, fee_wei = _await_receipt(rpc, tx_hash)
+    with _SEND_LOCK:
+        _SUBMITS_IN_FLIGHT.discard(canon)
     if fee_wei:
         try:
             STORE.record_fee(drip_id, fee_wei)

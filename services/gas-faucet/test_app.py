@@ -24,13 +24,13 @@ from eth_account.messages import encode_typed_data
 
 INTEG = "0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032"
 CHAIN = 84532
+_SIGNER = Account.from_key("0x" + "11" * 32)  # produces well-formed sigs; the fake does not verify
 TARGET = 15_000_000_000_000
-ATTESTOR = Account.from_key("0x" + "11" * 32)
 
 os.environ["FAUCET_ALLOW_EPHEMERAL_DB"] = "1"
 os.environ["FAUCET_PRIVATE_KEY"] = "0x" + "22" * 32
 os.environ["FAUCET_INTEGRATORS"] = json.dumps(
-    [{"chainId": CHAIN, "address": INTEG, "attestor": ATTESTOR.address, "label": "t"}]
+    [{"chainId": CHAIN, "address": INTEG, "label": "t"}]
 )
 os.environ["FAUCET_RPC_URLS"] = json.dumps({str(CHAIN): "http://127.0.0.1:1/unused"})
 os.environ["FAUCET_DB_PATH"] = f"/tmp/faucet-app-{secrets.token_hex(4)}.db"
@@ -50,19 +50,10 @@ class FakeRpc:
         self.sent: list[tuple[str, int]] = []
         self.fail_reads = False
         self.receipt_status = "0x1"
-        # The attestor the CHAIN reports. Defaults to the configured one;
-        # tests steer it to exercise the mismatch paths.
-        self.chain_attestor = ATTESTOR.address
-        self.attestor_unreadable = False
         self.paused = False
         self.receipt_gas_used = "0x5208"          # 21_000
         self.receipt_gas_price = "0x2d4b370"      # ~0.047 gwei
         self.lock = threading.Lock()
-
-    def read_address(self, contract, selector):
-        if self.attestor_unreadable or self.fail_reads:
-            raise faucet.ChainError("rpc down")
-        return self.chain_attestor
 
     def read_flag(self, contract, selector):
         if self.fail_reads:
@@ -84,11 +75,6 @@ class FakeRpc:
         if selector == faucet.SEL_BLOCKED:
             return a in self.blocked
         return a in self.verified
-
-    def read_bool32(self, contract, selector, word):
-        if self.fail_reads:
-            raise faucet.ChainError("rpc down")
-        return word.lower() in self.spent_nullifiers
 
     def call(self, method, params):
         if method == "eth_getTransactionReceipt":
@@ -162,7 +148,7 @@ def client():
     return TestClient(faucet.app)
 
 
-def sign(wallet, *, nullifier=None, limit=100_000_000, expiry=None, signer=ATTESTOR,
+def sign(wallet, *, nullifier=None, limit=100_000_000, expiry=None, signer=_SIGNER,
          integrator=INTEG, chain_id=CHAIN):
     nullifier = nullifier or secrets.token_bytes(32)
     expiry = expiry or int(time.time()) + 3600
@@ -746,3 +732,109 @@ class TestRecordFeeByRow:
         fees = {r[0]: r[1] for r in rows}
         assert fees[a] == "5"
         assert fees[b] is None, "the other row must not inherit the fee"
+
+
+# ── review round 4 ──────────────────────────────────────────────────────────
+
+
+class TestSubmitGasBounds:
+    def test_gas_is_clamped_to_the_submit_ceiling(self):
+        import chain as chain_mod
+
+        # A hostile/broken node returning a huge estimate must not size the tx.
+        rpc = chain_mod.Rpc("http://x")
+        rpc.call = lambda m, p: (
+            "0x1" if m == "eth_getTransactionCount"
+            else hex(50_000_000) if m == "eth_estimateGas"
+            else "0x1"
+        )
+        sent = {}
+        def cap(raw): sent["raw"] = raw; return "0x" + "ab" * 32
+        rpc.call = lambda m, p: (
+            "0x5" if m == "eth_getTransactionCount"
+            else hex(50_000_000) if m == "eth_estimateGas"
+            else cap(p[0]) if m == "eth_sendRawTransaction"
+            else "0x0"
+        )
+        data = faucet.SEL_SUBMIT_ATTESTATION + "00" * 100
+        rpc.send_call(account=faucet._ACCOUNT, to=INTEG, data=data, chain_id=CHAIN, base_fee=5_000_000)
+        from eth_account._utils.legacy_transactions import Transaction  # noqa
+        # decode the signed tx's gas limit
+        import rlp
+        raw = bytes.fromhex(sent["raw"][2:])
+        # type-2 tx: 0x02 || rlp([...]); gas is field index 4
+        decoded = rlp.decode(raw[1:])
+        gas_limit = int.from_bytes(decoded[4], "big")
+        assert gas_limit == chain_mod.SUBMIT_GAS_CEILING, f"got {gas_limit}"
+
+    def test_gas_is_raised_to_the_floor_for_a_bogus_low_estimate(self):
+        import chain as chain_mod, rlp
+        rpc = chain_mod.Rpc("http://x")
+        sent = {}
+        rpc.call = lambda m, p: (
+            "0x5" if m == "eth_getTransactionCount"
+            else hex(21_000) if m == "eth_estimateGas"
+            else (sent.__setitem__("raw", p[0]) or "0x" + "ab" * 32) if m == "eth_sendRawTransaction"
+            else "0x0"
+        )
+        data = faucet.SEL_SUBMIT_ATTESTATION + "00" * 100
+        rpc.send_call(account=faucet._ACCOUNT, to=INTEG, data=data, chain_id=CHAIN, base_fee=5_000_000)
+        decoded = rlp.decode(bytes.fromhex(sent["raw"][2:])[1:])
+        assert int.from_bytes(decoded[4], "big") == chain_mod.SUBMIT_GAS_FLOOR
+
+
+class TestSponsorHonoursTheFloatGuards:
+    def test_a_blocked_wallet_is_not_sponsored(self, client, rpc):
+        w = Account.create().address
+        rpc.blocked.add(w.lower())
+        r = submit(client, w, sign(w))
+        assert r.status_code == 403
+        assert getattr(rpc, "sent_calls", []) == [], "no gas spent for a blocked wallet"
+
+    def test_the_global_breaker_stops_sponsorship(self, client, rpc, monkeypatch):
+        # Trip the breaker, then a sponsor must refuse rather than spend float.
+        monkeypatch.setattr(faucet, "LIMITS", faucet.LIMITS.__class__(
+            **{**faucet.LIMITS.__dict__, "max_wei_global": 0}))
+        r = submit(client, Account.create().address, sign(Account.create().address))
+        assert r.status_code == 429
+        assert r.json()["detail"] == "global_daily_budget_reached"
+
+
+class TestSubmitInFlightDedup:
+    def test_a_second_concurrent_submit_of_one_attestation_is_refused(self, client, rpc, monkeypatch):
+        import threading
+        w = Account.create().address
+        att = sign(w)
+        # hold the first submit inside the lock long enough for the second to race
+        gate = threading.Event()
+        orig = rpc.send_call
+        def slow_send(**k):
+            gate.set()
+            time.sleep(0.3)
+            return orig(**k)
+        monkeypatch.setattr(rpc, "send_call", slow_send)
+
+        results = []
+        def fire(): results.append(submit(client, w, att).status_code)
+        t1 = threading.Thread(target=fire); t1.start()
+        gate.wait(1)
+        # second request while the first is mid-send
+        fire()
+        t1.join()
+        assert sorted(results) == [200, 409], f"{results}"
+
+
+class TestCanonicalNullifierInLedger:
+    @pytest.mark.parametrize("spelling", ["ab" * 32, "0x" + ("ab" * 32).upper()])
+    def test_a_submit_stores_the_canonical_nullifier_whatever_the_spelling(self, client, rpc, spelling):
+        # One nullifier is single-use on chain, so two spellings never both
+        # succeed. What matters is that the ONE row a submit writes holds the
+        # canonical key — an incident review and the per-identity cap both
+        # correlate on it.
+        w = Account.create().address
+        r = submit(client, w, {**sign(w), "nullifier": spelling})
+        assert r.status_code == 200
+        stored = faucet.STORE._conn.execute(
+            "SELECT nullifier FROM drips WHERE wallet = ?", (w.lower(),)
+        ).fetchone()[0]
+        assert stored == "0x" + "ab" * 32, f"stored {stored}"

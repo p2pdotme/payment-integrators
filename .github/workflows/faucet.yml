@@ -46,4 +46,4 @@ jobs:
       - name: Import check
         env:
           FAUCET_ALLOW_EPHEMERAL_DB: "1"
-        run: python -c "import faucet, policy, store, chain, attestation"
+        run: python -c "import faucet, policy, store, chain"

@@ -1,8 +1,10 @@
-"""Just enough JSON-RPC to read a balance and send a plain ETH transfer.
+"""Just enough JSON-RPC for what the faucet does on chain.
 
-Deliberately not web3.py. The faucet does four things on chain — read a
-balance, read a base fee, call one boolean getter, send value — and a thin
-client keeps the dependency surface of a key-holding service small.
+Deliberately not web3.py — a thin client keeps the dependency surface of a
+key-holding service small. It reads balances and the base fee, reads the
+integrator's boolean getters (verified, blocked, paused), simulates a submit
+via eth_call, sends a plain ETH transfer (the drip), and signs one contract
+call (the sponsored submit).
 """
 
 from __future__ import annotations
@@ -16,10 +18,6 @@ from eth_utils import keccak, to_checksum_address
 #: `verified(address)` / `blocked(address)` on the integrator.
 SEL_VERIFIED = "0x" + keccak(text="verified(address)")[:4].hex()
 SEL_BLOCKED = "0x" + keccak(text="blocked(address)")[:4].hex()
-#: `nullifierSpent(bytes32)` — the contract's global single-use guard. One
-#: passport verifies exactly one wallet, ever, so an attestation whose
-#: nullifier is already spent describes a submit that will revert.
-SEL_NULLIFIER_SPENT = "0x" + keccak(text="nullifierSpent(bytes32)")[:4].hex()
 #: `submitPassportAttestation(address,bytes32,uint256,uint256,bytes)` — the
 #: ONE state-changing contract call this service's key is allowed to sign.
 SEL_SUBMIT_ATTESTATION = "0x" + keccak(
@@ -36,12 +34,16 @@ SEL_PAUSED = "0x" + keccak(text="paused()")[:4].hex()
 #: times Base's usual base fee.
 MAX_TRANSFER_GAS = int(os.environ.get("FAUCET_MAX_TRANSFER_GAS", 250_000))
 #: The submit call is not a transfer — it verifies a signature and writes
-#: storage — so it gets its own ceiling. Clamping it to the transfer knob
-#: meant an operator tuning MAX_TRANSFER_GAS down for drips would silently ship
-#: every sponsored submit under its own estimate: out-of-gas, fee spent, slot
-#: burned. This ceiling is a floor the estimate is raised TO, never clamped
-#: below.
-MAX_SUBMIT_GAS = int(os.environ.get("FAUCET_MAX_SUBMIT_GAS", 400_000))
+#: storage — so it gets its OWN bounds, not the transfer knob (whose old
+#: min() clamp could ship a submit under estimate if an operator tuned it down
+#: for drips). Both a floor and a ceiling: the floor covers a bogus-low
+#: estimate that would out-of-gas a real submit, and the ceiling stops a
+#: hostile or broken RPC sizing the transaction unbounded — the submit path
+#: has no funder-balance check, so an inflated estimate would fail the send on
+#: gas funds rather than refuse cleanly. A real submit costs ~100k, so the
+#: window comfortably contains it.
+SUBMIT_GAS_FLOOR = int(os.environ.get("FAUCET_SUBMIT_GAS_FLOOR", 120_000))
+SUBMIT_GAS_CEILING = int(os.environ.get("FAUCET_SUBMIT_GAS_CEILING", 400_000))
 MAX_FEE_PER_GAS_WEI = int(os.environ.get("FAUCET_MAX_FEE_PER_GAS_WEI", 5_000_000_000))
 
 #: Tip fallback when eth_maxPriorityFeePerGas is unavailable. Named so the fee
@@ -122,17 +124,6 @@ class Rpc:
             return int(str(block["baseFeePerGas"]), 16)
         return int(str(self.call("eth_gasPrice", [])), 16)
 
-    def read_bool32(self, contract: str, selector: str, word_arg: str) -> bool:
-        """`eth_call` a `f(bytes32) -> bool` getter."""
-        raw = word_arg[2:] if word_arg.startswith(("0x", "0X")) else word_arg
-        if len(raw) != 64:
-            raise ChainError("bytes32 argument must be 32 bytes")
-        result = self.call("eth_call", [{"to": contract, "data": selector + raw.lower()}, "latest"])
-        text = str(result or "0x")
-        if text in ("0x", ""):
-            raise ChainError("empty eth_call result")
-        return int(text, 16) != 0
-
     def read_bool(self, contract: str, selector: str, address_arg: str) -> bool:
         """`eth_call` a `f(address) -> bool` getter.
 
@@ -160,14 +151,6 @@ class Rpc:
         if raw in ("0x", ""):
             raise ChainError("empty eth_call result")
         return int(raw, 16) != 0
-
-    def read_address(self, contract: str, selector: str) -> str:
-        """`eth_call` a no-argument `f() -> address` getter."""
-        result = self.call("eth_call", [{"to": contract, "data": selector}, "latest"])
-        raw = str(result or "0x")
-        if len(raw) < 42:
-            raise ChainError("empty eth_call result")
-        return to_checksum_address("0x" + raw[-40:])
 
     def simulate(self, *, sender: str, to: str, data: str) -> None:
         """eth_call the exact transaction before paying to send it.
@@ -209,9 +192,10 @@ class Rpc:
                 "eth_estimateGas",
                 [{"from": account.address, "to": to_checksum_address(to), "data": data}],
             )
-            # The submit's own ceiling, as a floor the padded estimate is
-            # raised to — never a clamp that could ship the tx under estimate.
-            gas = max(int(int(str(estimate), 16) * 1.5), MAX_SUBMIT_GAS)
+            # Padded estimate, clamped into [floor, ceiling]: never under a
+            # real submit's cost, never sized unbounded by a bad estimate.
+            padded = int(int(str(estimate), 16) * 1.5)
+            gas = min(max(padded, SUBMIT_GAS_FLOOR), SUBMIT_GAS_CEILING)
         except ChainError as exc:
             raise ChainError(f"could not size gas for submit: {exc}") from exc
         tx = {
