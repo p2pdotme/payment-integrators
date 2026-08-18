@@ -436,7 +436,12 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
 
     /**
      * @notice Verify and record a passport + liveness attestation for
-     *         `msg.sender`, unlocking the onramp for that wallet.
+     *         `wallet`, unlocking the onramp for that wallet. Callable by
+     *         ANYONE — the caller's identity plays no part in what is granted.
+     *
+     * @param wallet    The wallet the attestation was minted for. This is the
+     *                  address the signature binds and the only address the
+     *                  call can affect.
      * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
      * @param limit     Attested per-tx USDC ceiling (micro-USDC, 6dp). The
      *                  effective cap is `min(limit, regionCap[region])` —
@@ -444,31 +449,55 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
      * @param expiry    Unix seconds; the attestation must be claimed before this.
      * @param signature 65-byte secp256k1 signature (r ‖ s ‖ v) from the service.
      *
-     * @dev The grant is monotonic and does not lapse: `expiry` is a
+     * @dev ── Why anyone may submit ────────────────────────────────────────
+     *      The signature IS the authorization: the service signed the exact
+     *      tuple `(wallet, nullifier, limit, expiry)`, so no submitter can
+     *      credit any wallet other than the one attested, grant any limit
+     *      other than the one attested, or reuse the nullifier. An earlier
+     *      version hashed `msg.sender` instead of a `wallet` parameter, which
+     *      added no security (the same binding, expressed differently) but
+     *      required the ONE wallet that by definition has no gas — a
+     *      first-time fiat buyer — to send the transaction itself. That
+     *      coupling was the whole cold-start problem: the sponsor service had
+     *      to drip ETH so the wallet could afford this call, and had to
+     *      re-verify attestations off-chain to decide who deserved the drip.
+     *      Untying it lets any funded party — the gas service, a partner
+     *      backend, or the wallet itself if it happens to hold ETH — land the
+     *      attestation on-chain.
+     *
+     *      Front-running is harmless by construction: whoever submits first
+     *      produces the identical state (the attested wallet verified, the
+     *      attested limit granted, the nullifier spent). A user's own
+     *      duplicate submit reverts `NullifierAlreadySpent` having lost
+     *      nothing but its own gas.
+     *
+     *      The grant is monotonic and does not lapse: `expiry` is a
      *      claim-freshness deadline, not an ongoing clock. That is safe
      *      because the nullifier is single-use, so an expired grant could
      *      never be re-claimed anyway — and `setBlocked` is the lever for
      *      revoking a wallet.
      */
     function submitPassportAttestation(
+        address wallet,
         bytes32 nullifier,
         uint256 limit,
         uint256 expiry,
         bytes calldata signature
     ) external {
+        if (wallet == address(0)) revert InvalidAddress();
         address signer = attestor;
         if (signer == address(0)) revert AttestorNotSet();
         if (block.timestamp >= expiry) revert AttestationExpired();
         if (nullifierSpent[nullifier]) revert NullifierAlreadySpent();
 
-        bytes32 digest = _digest(msg.sender, nullifier, limit, expiry);
+        bytes32 digest = _digest(wallet, nullifier, limit, expiry);
         if (_recover(digest, signature) != signer) revert InvalidSignature();
 
         nullifierSpent[nullifier] = true;
-        verified[msg.sender] = true;
-        if (limit > grantedLimit[msg.sender]) grantedLimit[msg.sender] = limit;
+        verified[wallet] = true;
+        if (limit > grantedLimit[wallet]) grantedLimit[wallet] = limit;
 
-        emit PassportVerified(msg.sender, nullifier, limit, grantedLimit[msg.sender]);
+        emit PassportVerified(wallet, nullifier, limit, grantedLimit[wallet]);
     }
 
     // ─── Views ────────────────────────────────────────────────────────
