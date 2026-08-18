@@ -35,6 +35,13 @@ SEL_PAUSED = "0x" + keccak(text="paused()")[:4].hex()
 #: 250k covers a smart-account receive path with room; 5 gwei is a thousand
 #: times Base's usual base fee.
 MAX_TRANSFER_GAS = int(os.environ.get("FAUCET_MAX_TRANSFER_GAS", 250_000))
+#: The submit call is not a transfer — it verifies a signature and writes
+#: storage — so it gets its own ceiling. Clamping it to the transfer knob
+#: meant an operator tuning MAX_TRANSFER_GAS down for drips would silently ship
+#: every sponsored submit under its own estimate: out-of-gas, fee spent, slot
+#: burned. This ceiling is a floor the estimate is raised TO, never clamped
+#: below.
+MAX_SUBMIT_GAS = int(os.environ.get("FAUCET_MAX_SUBMIT_GAS", 400_000))
 MAX_FEE_PER_GAS_WEI = int(os.environ.get("FAUCET_MAX_FEE_PER_GAS_WEI", 5_000_000_000))
 
 #: Tip fallback when eth_maxPriorityFeePerGas is unavailable. Named so the fee
@@ -53,7 +60,20 @@ def fee_ceiling_wei(base_fee: int) -> int:
 
 
 class ChainError(Exception):
-    pass
+    """A chain interaction failed.
+
+    `transport=True` distinguishes "could not reach/parse the node" (an
+    availability fault → 502) from "the node executed and reverted" (which may
+    carry a decodable reason → 400). Without the flag the sponsor path fed a
+    total RPC outage into revert-reason decoding, found no selector, and
+    reported it as `simulation_reverted` — a user error — which is the exact
+    "attestor mismatch looks like an outage" failure this redesign set out to
+    remove, wearing the opposite mask.
+    """
+
+    def __init__(self, message: str, *, transport: bool = False) -> None:
+        super().__init__(message)
+        self.transport = transport
 
 
 class Rpc:
@@ -70,7 +90,7 @@ class Rpc:
             res.raise_for_status()
             body = res.json()
         except httpx.HTTPError as exc:
-            raise ChainError(f"rpc unreachable: {exc}") from exc
+            raise ChainError(f"rpc unreachable: {exc}", transport=True) from exc
 
         if "error" in body:
             # Carry the error's DATA, not just its message. Base's canonical
@@ -189,7 +209,9 @@ class Rpc:
                 "eth_estimateGas",
                 [{"from": account.address, "to": to_checksum_address(to), "data": data}],
             )
-            gas = min(int(int(str(estimate), 16) * 1.5), MAX_TRANSFER_GAS)
+            # The submit's own ceiling, as a floor the padded estimate is
+            # raised to — never a clamp that could ship the tx under estimate.
+            gas = max(int(int(str(estimate), 16) * 1.5), MAX_SUBMIT_GAS)
         except ChainError as exc:
             raise ChainError(f"could not size gas for submit: {exc}") from exc
         tx = {

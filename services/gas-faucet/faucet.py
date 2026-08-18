@@ -234,6 +234,12 @@ def _integrator_paused(integrator: Integrator, rpc: Rpc) -> bool:
     try:
         paused = rpc.read_flag(integrator.address, SEL_PAUSED)
     except ChainError:
+        # Unreadable is treated as not-paused (the money checks already fail
+        # closed) — but CACHE that verdict. A contract without paused() raises
+        # a permanent "empty result", so without caching every drip would pay
+        # for one dead eth_call inside the send lock, forever, and the check
+        # would never once answer.
+        _PAUSED_CACHE[key] = (False, now)
         return False
     _PAUSED_CACHE[key] = (paused, now)
     return paused
@@ -251,6 +257,14 @@ _RATE_LOCK = threading.Lock()
 _RATE_BUCKETS: dict[str, deque] = {}
 
 
+#: Hard cap on distinct rate buckets. A flood of fresh keys (the X-Forwarded-
+#: -For header rotates freely — this is throttling, not a security control)
+#: cannot grow the map without bound, and cannot make eviction an O(n) scan
+#: run inside the lock on every request: the old "evict only 60s-idle buckets"
+#: selected nothing during exactly such a flood while the scan ran anyway.
+_RATE_MAX_BUCKETS = int(os.environ.get("FAUCET_RATE_MAX_BUCKETS", 20_000))
+
+
 def _over_limit(key: str, limit: int) -> bool:
     now = time.time()
     with _RATE_LOCK:
@@ -260,10 +274,14 @@ def _over_limit(key: str, limit: int) -> bool:
         if len(bucket) >= limit:
             return True
         bucket.append(now)
-        # Bound memory: drop idle buckets rather than growing forever.
-        if len(_RATE_BUCKETS) > 10_000:
-            for k in [k for k, q in _RATE_BUCKETS.items() if not q or q[-1] < now - 60]:
-                del _RATE_BUCKETS[k]
+        # O(1) amortised: when full, drop THIS key's own now-stale neighbours
+        # is not enough under a fresh-key flood, so evict in insertion order
+        # (dicts preserve it) until back under the cap. Bounded work per call.
+        while len(_RATE_BUCKETS) > _RATE_MAX_BUCKETS:
+            oldest_key = next(iter(_RATE_BUCKETS))
+            if oldest_key == key:  # never evict the bucket we just touched
+                break
+            del _RATE_BUCKETS[oldest_key]
     return False
 
 
@@ -416,7 +434,13 @@ def ops_health(token: str = "") -> dict:
     default-open operational endpoint is how the previous version leaked.
     """
     expected = os.environ.get("FAUCET_OPS_TOKEN", "")
-    if not expected or not secrets.compare_digest(token, expected):
+    # Compare bytes, not str: secrets.compare_digest raises TypeError on a
+    # non-ASCII str, and that 500 (vs the 404 a wrong ASCII token gets)
+    # confirms FAUCET_OPS_TOKEN is set — an oracle defeating the endpoint's
+    # "unavailable rather than public" intent.
+    if not expected or not secrets.compare_digest(
+        token.encode("utf-8", "ignore"), expected.encode("utf-8", "ignore")
+    ):
         raise HTTPException(404, "not_found")
 
     out: dict = {
@@ -603,6 +627,13 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
     try:
         rpc.simulate(sender=_ACCOUNT.address, to=integrator.address, data=data)
     except ChainError as exc:
+        # An RPC that could not be reached is an OUTAGE (502), not a rejected
+        # attestation (400). Feeding a transport failure into revert decoding
+        # made a total outage read as `simulation_reverted` — a user error —
+        # indistinguishable from every bad signature.
+        if getattr(exc, "transport", False):
+            log.error(_event("chain_unreachable", detail=str(exc)))
+            raise HTTPException(502, f"chain_unreachable: {exc}") from exc
         reason = _submit_reason(str(exc))
         log.info(
             _event("refused", reason=reason, wallet=_short(wallet),
@@ -618,8 +649,24 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
             log.error(_event("chain_unreachable", detail=str(exc)))
             raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
+        # Reserve first here too: the sponsored row's FEE feeds the same
+        # global breaker, so a write failure must refuse before spending gas,
+        # not book blind afterward. amount 0 — nothing is transferred; the fee
+        # lands after the receipt. The nullifier makes this the enrolment row
+        # the drip path recalls the identity from.
+        try:
+            drip_id = STORE.reserve(
+                chain_id=integrator.chain_id,
+                wallet=wallet,
+                nullifier=req.nullifier.lower(),
+                amount_wei=0,
+            )
+        except Exception as exc:
+            log.error(_event("ledger_unavailable", wallet=_short(wallet), detail=str(exc)))
+            raise HTTPException(503, "ledger_unavailable") from exc
+
         log.info(
-            _event("sponsoring", wallet=_short(wallet),
+            _event("sponsoring", wallet=_short(wallet), drip_id=drip_id,
                    nullifier=_short(req.nullifier), integrator=integrator.label)
         )
         try:
@@ -631,6 +678,10 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
                 base_fee=base_fee,
             )
         except ChainError as exc:
+            try:
+                STORE.release(drip_id)
+            except Exception:
+                pass
             log.error(
                 _event("sponsor_send_failed", wallet=_short(wallet),
                        integrator=integrator.label, detail=str(exc))
@@ -638,30 +689,20 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
             raise HTTPException(502, f"send_failed: {exc}") from exc
 
         try:
-            # amount 0: nothing was transferred; the fee lands after the
-            # receipt. The row is what makes sponsored submits visible to the
-            # caps and to an incident review, keyed by the wallet AND the
-            # nullifier it verified.
-            STORE.record(
-                chain_id=integrator.chain_id,
-                wallet=wallet,
-                nullifier=req.nullifier.lower(),
-                amount_wei=0,
-                tx_hash=tx_hash,
-            )
+            STORE.attach_tx(drip_id, tx_hash)
         except Exception as exc:
             log.error(
-                _event("ledger_write_failed", wallet=_short(wallet),
+                _event("ledger_tx_link_failed", drip_id=drip_id,
                        tx=_short(tx_hash, 12), detail=str(exc))
             )
 
     outcome, fee_wei = _await_receipt(rpc, tx_hash)
     if fee_wei:
         try:
-            STORE.record_fee(tx_hash, fee_wei)
+            STORE.record_fee(drip_id, fee_wei)
         except Exception as exc:
             log.error(
-                _event("ledger_write_failed", wallet=_short(wallet),
+                _event("ledger_fee_failed", drip_id=drip_id,
                        fee_wei=fee_wei, tx=_short(tx_hash, 12), detail=str(exc))
             )
     log.info(
@@ -808,8 +849,24 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
                 targetWei=str(target),
             )
 
+        # Claim the cap slot BEFORE the money moves. A failure here means the
+        # ledger is unavailable and NOTHING has been spent, so the request
+        # refuses rather than funding blind — an uncapped faucet is worse than
+        # an unavailable one. (This replaced a post-send record whose failure
+        # silently disabled every cap while the wallet kept paying out.)
+        try:
+            drip_id = STORE.reserve(
+                chain_id=integrator.chain_id,
+                wallet=wallet,
+                nullifier=nullifier,
+                amount_wei=decision.amount,
+            )
+        except Exception as exc:
+            log.error(_event("ledger_unavailable", wallet=_short(wallet), detail=str(exc)))
+            raise HTTPException(503, "ledger_unavailable") from exc
+
         log.info(
-            _event("funding", wallet=_short(wallet),
+            _event("funding", wallet=_short(wallet), drip_id=drip_id,
                    integrator=integrator.label, amount_wei=decision.amount,
                    balance_wei=balance, target_wei=target)
         )
@@ -822,6 +879,11 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
                 base_fee=base_fee,
             )
         except ChainError as exc:
+            # No ETH moved. Free the slot so a failed send does not spend one.
+            try:
+                STORE.release(drip_id)
+            except Exception:
+                pass  # a lingering row over-counts by one — stingy, safe
             log.error(
                 _event("send_failed", wallet=_short(wallet),
                        integrator=integrator.label, amount_wei=decision.amount,
@@ -829,24 +891,14 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
             )
             raise HTTPException(502, f"send_failed: {exc}") from exc
 
+        # Money moved and the slot is already claimed. Linking the tx is
+        # best-effort: a failure costs only the hash and this row's later fee.
         try:
-            STORE.record(
-                chain_id=integrator.chain_id,
-                wallet=wallet,
-                nullifier=nullifier,
-                amount_wei=decision.amount,
-                tx_hash=tx_hash,
-            )
+            STORE.attach_tx(drip_id, tx_hash)
         except Exception as exc:
-            # The ETH has already left. Every cap is a SUM over this table, so
-            # a silent failure here means an uncharged drip and a breaker that
-            # never trips — and a read-only volume would make that EVERY
-            # request. Loud, and the caller still gets its txHash rather than a
-            # 500 for money that did move.
             log.error(
-                _event("ledger_write_failed", wallet=_short(wallet),
-                       amount_wei=decision.amount, tx=_short(tx_hash, 12),
-                       detail=str(exc))
+                _event("ledger_tx_link_failed", drip_id=drip_id,
+                       tx=_short(tx_hash, 12), detail=str(exc))
             )
 
     # Broadcast is booked; confirmation is a courtesy so the caller can send
@@ -859,10 +911,10 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
     outcome, fee_wei = _await_receipt(rpc, tx_hash)
     if fee_wei:
         try:
-            STORE.record_fee(tx_hash, fee_wei)
+            STORE.record_fee(drip_id, fee_wei)
         except Exception as exc:
             log.error(
-                _event("ledger_write_failed", wallet=_short(wallet),
+                _event("ledger_fee_failed", drip_id=drip_id,
                        fee_wei=fee_wei, tx=_short(tx_hash, 12), detail=str(exc))
             )
     log.info(

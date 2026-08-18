@@ -157,28 +157,28 @@ class TestStore:
 
     def test_counts_today_only(self, store):
         now = utc_day_start() + 3_600
-        store.record(chain_id=8453, wallet="0xA", nullifier="0xN",
-                     amount_wei=100, tx_hash=None, now=now)
-        store.record(chain_id=8453, wallet="0xA", nullifier="0xN",
-                     amount_wei=100, tx_hash=None, now=now - 86_400)
+        store.reserve(chain_id=8453, wallet="0xA", nullifier="0xN",
+                     amount_wei=100, now=now)
+        store.reserve(chain_id=8453, wallet="0xA", nullifier="0xN",
+                     amount_wei=100, now=now - 86_400)
         usage = store.usage(wallet="0xA", nullifier="0xN", now=now)
         assert usage.wallet_drips == 1
         assert usage.wallet_wei == 100
 
     def test_sums_one_identity_across_wallets(self, store):
         now = utc_day_start() + 3_600
-        store.record(chain_id=8453, wallet="0xA", nullifier="0xN",
-                     amount_wei=100, tx_hash=None, now=now)
-        store.record(chain_id=8453, wallet="0xB", nullifier="0xN",
-                     amount_wei=250, tx_hash=None, now=now)
+        store.reserve(chain_id=8453, wallet="0xA", nullifier="0xN",
+                     amount_wei=100, now=now)
+        store.reserve(chain_id=8453, wallet="0xB", nullifier="0xN",
+                     amount_wei=250, now=now)
         usage = store.usage(wallet="0xB", nullifier="0xN", now=now)
         assert usage.wallet_wei == 250   # this wallet only
         assert usage.nullifier_wei == 350  # the human, across both
 
     def test_is_case_insensitive_about_addresses(self, store):
         now = utc_day_start() + 60
-        store.record(chain_id=8453, wallet="0xAbCd", nullifier=None,
-                     amount_wei=7, tx_hash=None, now=now)
+        store.reserve(chain_id=8453, wallet="0xAbCd", nullifier=None,
+                     amount_wei=7, now=now)
         assert store.usage(wallet="0xABCD", nullifier=None, now=now).wallet_wei == 7
 
     def test_wallet_and_identity_sums_are_scoped_per_chain(self, store):
@@ -187,10 +187,10 @@ class TestStore:
         # legitimate cross-chain user. The GLOBAL sum stays unscoped on
         # purpose — one process, one key, one float.
         now = utc_day_start() + 60
-        store.record(chain_id=8453, wallet="0xA", nullifier="0xN",
-                     amount_wei=100, tx_hash=None, now=now)
-        store.record(chain_id=84532, wallet="0xA", nullifier="0xN",
-                     amount_wei=40, tx_hash=None, now=now)
+        store.reserve(chain_id=8453, wallet="0xA", nullifier="0xN",
+                     amount_wei=100, now=now)
+        store.reserve(chain_id=84532, wallet="0xA", nullifier="0xN",
+                     amount_wei=40, now=now)
 
         base = store.usage(wallet="0xA", nullifier="0xN", chain_id=8453, now=now)
         assert base.wallet_wei == 100
@@ -206,9 +206,9 @@ class TestStore:
         # exceeds booked spend by a number the recipient's receive() code
         # helps choose.
         now = utc_day_start() + 60
-        store.record(chain_id=8453, wallet="0xA", nullifier="0xN",
-                     amount_wei=100, tx_hash="0xT1", now=now)
-        store.record_fee("0xT1", 7)
+        drip_id = store.reserve(chain_id=8453, wallet="0xA", nullifier="0xN",
+                                amount_wei=100, now=now)
+        store.record_fee(drip_id, 7)
         usage = store.usage(wallet="0xA", nullifier="0xN", chain_id=8453, now=now)
         assert usage.wallet_wei == 107
         assert usage.nullifier_wei == 107
@@ -216,14 +216,14 @@ class TestStore:
 
     def test_a_missing_fee_books_as_zero(self, store):
         now = utc_day_start() + 60
-        store.record(chain_id=8453, wallet="0xA", nullifier=None,
-                     amount_wei=100, tx_hash="0xT2", now=now)
+        store.reserve(chain_id=8453, wallet="0xA", nullifier=None,
+                     amount_wei=100, now=now)
         assert store.usage(wallet="0xA", nullifier=None, chain_id=8453, now=now).wallet_wei == 100
 
     def test_global_total_spans_every_wallet(self, store):
         now = utc_day_start() + 60
-        store.record(chain_id=8453, wallet="0xA", nullifier=None,
-                     amount_wei=10, tx_hash=None, now=now)
-        store.record(chain_id=8453, wallet="0xB", nullifier=None,
-                     amount_wei=20, tx_hash=None, now=now)
+        store.reserve(chain_id=8453, wallet="0xA", nullifier=None,
+                     amount_wei=10, now=now)
+        store.reserve(chain_id=8453, wallet="0xB", nullifier=None,
+                     amount_wei=20, now=now)
         assert store.usage(wallet="0xC", nullifier=None, now=now).global_wei == 30

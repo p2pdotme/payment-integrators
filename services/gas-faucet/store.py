@@ -154,49 +154,76 @@ class Store:
             row = cur.fetchone()
         return row[0] if row else None
 
-    def record_fee(self, tx_hash: str, fee_wei: int) -> None:
-        """Book what a drip's transaction actually cost, once the receipt says.
-
-        Written after the fact because the true fee (gasUsed x
-        effectiveGasPrice) only exists once the transfer is mined. A drip whose
-        receipt never arrives keeps a NULL fee — a bounded gap, one in-flight
-        transaction wide, and always in the conservative direction is wrong:
-        under-booking. The clamps in chain.py bound how far.
-        """
-        with self._lock:
-            self._conn.execute(
-                "UPDATE drips SET fee_wei = ? WHERE tx_hash = ?",
-                (str(fee_wei), tx_hash),
-            )
-            self._conn.commit()
-
-    def record(
+    def reserve(
         self,
         *,
         chain_id: int,
         wallet: str,
         nullifier: str | None,
         amount_wei: int,
-        tx_hash: str | None,
         now: int | None = None,
-    ) -> None:
-        """Book a drip.
+    ) -> int:
+        """Claim a drip's cap slot BEFORE the money moves. Returns its rowid.
 
-        Called even when the receipt wait times out. Recording a transaction
-        that may not have landed only makes the faucet stingier; forgetting one
-        that did lets the caps be walked straight through.
+        This is the whole point of the book-before-send order. Every cap is a
+        SUM or COUNT over this table, so the row that will feed those caps has
+        to exist before the ETH leaves, not after. If this write fails, the
+        caller has learned the ledger is unavailable while nothing has been
+        spent — so it refuses, and the caps stay intact.
+
+        Booking AFTER the send (the old order) meant a write failure left the
+        money gone and the ledger blind: reads kept returning stale sums, the
+        policy saw room under every cap, and a read-only volume turned the
+        faucet into an uncapped tap. An uncapped faucet is worse than an
+        unavailable one, which is why a failure here must reach the caller.
         """
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "INSERT INTO drips (ts, chain_id, wallet, nullifier, amount_wei, tx_hash) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, NULL)",
                 (
                     int(time.time()) if now is None else now,
                     chain_id,
                     wallet.lower(),
                     nullifier.lower() if nullifier else None,
                     str(amount_wei),
-                    tx_hash,
                 ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def release(self, drip_id: int) -> None:
+        """Drop a reservation whose send never happened.
+
+        Best-effort: if this fails the row simply stays, which over-counts by
+        one drip until the UTC rollover — stingy, and stingy is the safe
+        direction to fail.
+        """
+        with self._lock:
+            self._conn.execute("DELETE FROM drips WHERE id = ?", (drip_id,))
+            self._conn.commit()
+
+    def attach_tx(self, drip_id: int, tx_hash: str) -> None:
+        """Link the broadcast tx to its reserved row. The cap is already
+        claimed, so a failure here costs only the hash linkage and the row's
+        later fee."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE drips SET tx_hash = ? WHERE id = ?", (tx_hash, drip_id)
+            )
+            self._conn.commit()
+
+    def record_fee(self, drip_id: int, fee_wei: int) -> None:
+        """Book what a drip's transaction actually cost, keyed by ITS ROW.
+
+        By id, not by tx_hash: a hash-keyed UPDATE credits every row sharing a
+        hash (there is no uniqueness constraint) and silently no-ops after a
+        reservation whose tx was never attached. The fee only exists once the
+        transfer mines; a receipt that never arrives leaves NULL, a bounded
+        under-count the chain.py clamps bound.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE drips SET fee_wei = ? WHERE id = ?", (str(fee_wei), drip_id)
             )
             self._conn.commit()

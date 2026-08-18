@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import secrets
 import threading
 import time
@@ -110,9 +111,11 @@ class FakeRpc:
 
     simulate_error: str | None = None
 
+    simulate_transport = False
+
     def simulate(self, *, sender, to, data):
         if self.simulate_error:
-            raise faucet.ChainError(self.simulate_error)
+            raise faucet.ChainError(self.simulate_error, transport=self.simulate_transport)
         # the nullifier is the second static word after the selector
         nul = "0x" + data[10 + 64 : 10 + 128]
         if nul.lower() in self.spent_nullifiers:
@@ -146,6 +149,12 @@ def rpc(monkeypatch):
     r = FakeRpc()
     monkeypatch.setattr(faucet, "_rpc", lambda cid: r)
     return r
+
+
+@pytest.fixture
+def store_direct(tmp_path):
+    from store import Store
+    return Store(str(tmp_path / "direct.db"))
 
 
 @pytest.fixture
@@ -653,3 +662,87 @@ class TestIdentityBudgetIsAliveAgain:
         submit(client, w, att)     # fee books against the nullifier
         r = req(client, w)
         assert r.json()["reason"] == "identity_daily_budget_reached"
+
+
+# ── review round 3: the fix that was worse than the bug, and its siblings ───
+
+
+class TestLedgerFailsClosed:
+    """The headline finding. A post-send ledger write that swallowed its own
+    failure meant every cap (a SUM/COUNT over that table) silently stopped
+    working while the wallet kept paying out — an uncapped hot wallet, which
+    is worse than an unavailable one. Book-before-send makes a write failure
+    refuse BEFORE the money moves."""
+
+    def test_a_dead_ledger_refuses_rather_than_funding_uncapped(self, client, rpc, monkeypatch):
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+
+        # The exact production trigger: a read-only volume. reserve() raises;
+        # reads still work, so the OLD code saw zeros and kept funding.
+        def dead_reserve(**k):
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+
+        monkeypatch.setattr(faucet.STORE, "reserve", dead_reserve)
+        r = req(client, w)
+        assert r.status_code == 503
+        assert r.json()["detail"] == "ledger_unavailable"
+        assert rpc.sent == [], "no ETH may move when the cap slot cannot be claimed"
+
+    def test_the_cap_actually_binds_across_many_requests(self, client, rpc):
+        # The counterpart: with a healthy ledger the count cap still bites.
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        reasons = []
+        for _ in range(faucet.LIMITS.max_drips_per_wallet + 3):
+            reasons.append(req(client, w).json().get("reason"))
+            rpc.balances[w.lower()] = 0  # spend it so balance never short-circuits
+        assert reasons.count("funded") == faucet.LIMITS.max_drips_per_wallet
+        assert "wallet_daily_count_reached" in reasons
+
+    def test_a_failed_send_frees_the_reserved_slot(self, client, rpc, monkeypatch):
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+
+        def failing_send(**k):
+            raise faucet.ChainError("rpc unreachable: boom", transport=True)
+
+        monkeypatch.setattr(rpc, "send_value", failing_send)
+        assert req(client, w).status_code == 502
+        # The reservation must be released, not left spending a slot.
+        usage = faucet.STORE.usage(wallet=w, nullifier=None, chain_id=CHAIN)
+        assert usage.wallet_drips == 0
+
+
+class TestSubmitOutageIsA502:
+    def test_an_rpc_outage_on_submit_is_502_not_a_user_error(self, client, rpc):
+        w = Account.create().address
+        rpc.simulate_error = "rpc unreachable: connection refused"
+        rpc.simulate_transport = True
+        r = submit(client, w, sign(w))
+        assert r.status_code == 502, "a total outage must not read as a bad attestation"
+        assert "chain_unreachable" in r.json()["detail"]
+
+
+class TestOpsTokenNoOracle:
+    def test_a_non_ascii_token_404s_like_any_other_wrong_token(self, client, monkeypatch):
+        monkeypatch.setenv("FAUCET_OPS_TOKEN", "secret-value")
+        # A non-ASCII guess used to raise TypeError -> 500, confirming the
+        # token is configured. It must 404 exactly like a wrong ASCII guess.
+        assert client.get("/v1/ops/health", params={"token": "wrong"}).status_code == 404
+        assert client.get("/v1/ops/health", params={"token": "wröng"}).status_code == 404
+
+
+class TestRecordFeeByRow:
+    def test_two_rows_sharing_a_hash_do_not_both_take_the_fee(self, store_direct):
+        # record_fee is keyed by id now, not tx_hash — a hash-keyed UPDATE
+        # credited every row sharing a hash.
+        a = store_direct.reserve(chain_id=CHAIN, wallet="0xA", nullifier=None, amount_wei=10)
+        b = store_direct.reserve(chain_id=CHAIN, wallet="0xB", nullifier=None, amount_wei=10)
+        store_direct.attach_tx(a, "0xSAME")
+        store_direct.attach_tx(b, "0xSAME")
+        store_direct.record_fee(a, 5)
+        rows = store_direct._conn.execute("SELECT id, fee_wei FROM drips ORDER BY id").fetchall()
+        fees = {r[0]: r[1] for r in rows}
+        assert fees[a] == "5"
+        assert fees[b] is None, "the other row must not inherit the fee"

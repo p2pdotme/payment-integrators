@@ -78,6 +78,14 @@ Then three ceilings, all per UTC day:
 | **per nullifier, value** | 1.6×10¹⁵ wei | a nullifier is per-(tenant, human), so one person spreading across many wallets shares one budget |
 | global | 2×10¹⁷ wei | circuit breaker over the float (unscoped by chain — one process, one key, one float) |
 
+A drip is **booked before it is sent**, not after. Every cap is a SUM or
+COUNT over the ledger, so the row that feeds those caps is written before the
+ETH moves — and if that write fails (a full disk, a volume remounted
+read-only) the request refuses with `503 ledger_unavailable` having spent
+nothing, rather than paying out while the caps silently read stale zeros. An
+uncapped faucet is worse than an unavailable one. A send that then fails
+releases the reservation; a send that succeeds links its tx to the row.
+
 Sums meter **amount sent plus the transaction's actual fee** (booked from the
 receipt), and the per-wallet/per-identity sums are scoped per chain. The
 funder-balance check provisions a worst-case fee ceiling before agreeing to a
