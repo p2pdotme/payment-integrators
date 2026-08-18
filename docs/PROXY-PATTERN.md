@@ -32,9 +32,9 @@ Practical implication: if your integrator strands USDC on a proxy (e.g. because 
 
 `UserProxy` distinguishes two addresses, both stored as immutable args inside the clone:
 
-| Role | Returned by | Who is it? | What can they do? |
-|---|---|---|---|
-| **owner** | `owner()` | The **end-user EOA** | Call `sweepERC20/721/1155` to recover non-USDC assets stuck on the proxy. |
+| Role           | Returned by    | Who is it?                                           | What can they do?                                                                           |
+| -------------- | -------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| **owner**      | `owner()`      | The **end-user EOA**                                 | Call `sweepERC20/721/1155` to recover non-USDC assets stuck on the proxy.                   |
 | **integrator** | `integrator()` | The **integrator contract** that deployed this proxy | Call `execute` and `transferERC20ToIntegrator` to drive USDC through the upstream protocol. |
 
 Confusing these is a security-relevant bug. `execute` is gated on `msg.sender == integrator()`, **not** on the user EOA. Sweep functions are gated on `msg.sender == owner()`, **not** on the integrator.
@@ -60,10 +60,10 @@ This means:
 
 ```solidity
 function execute(
-    address target,
-    bytes calldata data,
-    address usdc,
-    uint256 usdcAllowance
+  address target,
+  bytes calldata data,
+  address usdc,
+  uint256 usdcAllowance
 ) external nonReentrant returns (bytes memory result);
 ```
 
