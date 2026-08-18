@@ -98,6 +98,31 @@ const ERC20_ABI = [
 
 const usd = (raw: string) => `$${(Number(raw) / 1e6).toLocaleString()}`;
 
+/**
+ * Require `addr` to be exactly its EIP-55 checksummed form. A checksum cannot
+ * be validated on-chain — an address is 20 opaque bytes by the time it reaches
+ * the constructor — so this script is the last place a single mutated
+ * character can still be caught. Rejecting all-lowercase input is deliberate:
+ * lowercase carries no checksum, so "valid but unchecksummable" is
+ * indistinguishable from "mutated".
+ */
+function requireChecksummed(label: string, addr: string): string {
+  let checksummed: string;
+  try {
+    checksummed = ethers.getAddress(addr.toLowerCase());
+  } catch {
+    throw new Error(`${label} is not an address: ${addr}`);
+  }
+  if (addr !== checksummed) {
+    throw new Error(
+      `${label} fails its EIP-55 checksum: got ${addr}. A mutated character is ` +
+        `exactly what the checksum exists to catch — re-copy the address from ` +
+        `the source of truth rather than "fixing" the casing.`
+    );
+  }
+  return checksummed;
+}
+
 async function main() {
   const [deployer] = await ethers.getSigners();
   const net = await ethers.provider.getNetwork();
@@ -125,25 +150,20 @@ async function main() {
   }
 
   // ── Owner ───────────────────────────────────────────────────────────────
-  // `owner` is `address public immutable` with no transfer path, so this is
-  // the one input on this whole script that cannot be corrected afterwards.
-  // Getting it wrong costs a redeploy, a fresh P2P whitelist request, a new
-  // tenant, and every already-verified user re-attesting — the EIP-712 domain
-  // binds `verifyingContract`, so their grants do not carry over.
-  //
-  // It defaulted silently to the deployer EOA, while the RECOVERABLE mistake
-  // next to it (a wrong attestor, fixable with setAttestor) hard-throws on
-  // mainnet. That is exactly backwards, and the documented mainnet command
-  // does not pass DEPLOY_OWNER at all — so the copy-pasteable path was the
-  // one that burned the owner key.
+  // `owner` is OZ `Ownable2Step`, so a wrong value is recoverable — but only
+  // by whoever holds the wrongly-set key, via transferOwnership plus an
+  // acceptOwnership from the corrected one. Defaulting silently to the
+  // deployer EOA would still put pause/setBlocked/setRegionCap/sweepUsdc on a
+  // hot key until that handshake completes, so mainnet must name the Own
+  // multisig explicitly.
   if (isMainnet && !process.env.DEPLOY_OWNER) {
     throw new Error(
-      "DEPLOY_OWNER is required on mainnet. `owner` is immutable with no " +
-        "transfer path — pass the Own multisig. Defaulting to the deployer " +
-        "EOA would hand pause/setBlocked/setRegionCap/sweepUsdc to a hot key " +
-        "permanently."
+      "DEPLOY_OWNER is required on mainnet — pass the Own multisig. " +
+        "Defaulting to the deployer EOA would hand pause/setBlocked/" +
+        "setRegionCap/sweepUsdc to a hot key until ownership is transferred."
     );
   }
+  if (process.env.DEPLOY_OWNER) requireChecksummed("DEPLOY_OWNER", DEPLOY_OWNER);
 
   // ── Attestor ────────────────────────────────────────────────────────────
   if (!ATTESTOR) {
@@ -160,7 +180,7 @@ async function main() {
         "    to the real service signer before any real traffic."
     );
   }
-  if (!ethers.isAddress(ATTESTOR)) throw new Error(`ATTESTOR is not an address: ${ATTESTOR}`);
+  requireChecksummed("ATTESTOR", ATTESTOR);
 
   // ── Preflight ───────────────────────────────────────────────────────────
   for (const [label, addr] of [
@@ -190,10 +210,11 @@ async function main() {
   console.log("\nConfig:");
   // Marked for the same reason the attestor is: an unmarked address in a
   // DRY_RUN print reads as "configured" whether or not anyone chose it. This
-  // one is permanent, so it gets the louder marker.
+  // one holds every admin lever until a two-step transfer completes, so it
+  // gets the louder marker.
   console.log(
     `  owner:            ${DEPLOY_OWNER}${
-      DEPLOY_OWNER === deployer.address ? "  (⚠️ DEPLOYER EOA — IMMUTABLE, use a multisig)" : ""
+      DEPLOY_OWNER === deployer.address ? "  (⚠️ DEPLOYER EOA — use a multisig)" : ""
     }`
   );
   console.log(

@@ -17,7 +17,9 @@ surface is small and, critically, **the bridge is not part of it**:
 ```
 buyUsdc · submitPassportAttestation · validateOrder · onOrderComplete
 onOrderCancel · setAttestor · setRegionCap · setDailyTxCountLimit
-setBlocked · pause · unpause · sweepUsdc  + views
+setBlocked · revokeEnrolment · pause · unpause · sweepUsdc
+transferOwnership · acceptOwnership · renounceOwnership (always reverts)
++ views (incl. owner, pendingOwner)
 ```
 
 Zero lines of code in `OwnCheckoutIntegrator.sol` mention bridging, Relay, USDG
@@ -33,7 +35,7 @@ own wallet and the contract's job ends.
 | Lower a region cap or the daily count                                                                                        | **No.** `setRegionCap` / `setDailyTxCountLimit`. |
 | Block a wallet, pause the ramp                                                                                               | **No.** `setBlocked` / `pause`.                  |
 | **Raise** a cap above its `MAX_*` ceiling                                                                                    | **Yes** — ceilings are immutable.                |
-| Change the owner                                                                                                             | **Yes** — `owner` is immutable.                  |
+| Change the owner                                                                                                             | **No.** `transferOwnership` + `acceptOwnership`. |
 | Any contract logic change                                                                                                    | **Yes** — plus a fresh whitelist request.        |
 
 So the bridge leg, which is the least-tested part of the system, is also the
@@ -89,6 +91,14 @@ Assert after deploying:
 cast call $INTEGRATOR "attestor()(address)" --rpc-url $BASE_RPC
 ```
 
+```bash
+cast call $INTEGRATOR "pendingOwner()(address)" --rpc-url $BASE_RPC
+```
+
+The second must return the zero address — and keep returning it in steady
+state; a non-zero `pendingOwner` is a standing grant anyone holding that key
+can accept at any later time (see §5).
+
 ### 2.3 A mainnet tenant, distinct from Sepolia
 
 The EIP-712 domain carries `chainId` **and** `verifyingContract`, so a Sepolia
@@ -105,9 +115,11 @@ is mandatory, not housekeeping.
 
 ### 2.4 Deploy from a multisig
 
-`owner` is immutable. Whatever signs the constructor owns `pause`, `setBlocked`,
-`setRegionCap` and `sweepUsdc` forever. Deploy from the Own multisig, not a
-deployer EOA — there is no transfer path afterwards.
+`DEPLOY_OWNER` — not the deploy signer — owns `pause`, `setBlocked`,
+`setRegionCap` and `sweepUsdc` from block one: the constructor takes `_owner`
+as an argument, and the wiring tests pin `owner()` to that argument rather
+than the deployer. So name the Own multisig as `DEPLOY_OWNER` and the levers
+never touch a hot key at all, no post-deploy transfer needed.
 
 ### 2.5 Whitelist request
 
@@ -194,7 +206,8 @@ some fraction of real users' resolvers will do the same thing.
 2. `GET /v1/attestor`; record the value.
 3. `DRY_RUN=1` deploy on mainnet — prints resolved config, deploys nothing.
 4. Deploy from the multisig with `ATTESTOR` set. Verify on Basescan.
-5. Assert `attestor()`, `owner()`, `maxRegionCap()`, `usdcThroughIntegrator=false`.
+5. Assert `attestor()`, `owner()`, `pendingOwner() == 0`, `maxRegionCap()`,
+   `usdcThroughIntegrator=false`.
 6. Whitelist request; confirm registration reads back correctly with the fixed ABI.
 7. Create the mainnet tenant (§2.3). Confirm `domainSeparator()` matches what the
    service signs for.
@@ -215,18 +228,27 @@ some fraction of real users' resolvers will do the same thing.
 **Watch:** faucet `/healthz` (`funderBalanceWei`, `spentTodayWei` against the
 cap) · `SettlementRoutingAnomaly` on the integrator — it can only fire on a
 mis-registration or a mis-described completion, so any occurrence is an
-incident, and since 2026-08-17 it reads this contract's USDC balance rather
-than the callback's `recipientAddr`, which the Diamond passes unchanged in
-both routing branches and which therefore could never have caught one · completion rate versus the
-1.57% organic baseline.
+incident. It keys on the Diamond's own `usdcThroughIntegrator` routing flag
+(the cause), falling back to this contract's USDC balance only when the
+Diamond's config cannot be read at all; the callback's `recipientAddr`, which
+the Diamond passes unchanged in both routing branches, was never a usable
+signal · `OwnershipTransferStarted` / `OwnershipTransferred` on the
+integrator — neither should ever appear outside a planned handover. An
+unplanned `Started` means the owner key is compromised; an unplanned
+`Transferred` with no recent `Started` means a **stale pending grant** fired —
+the multisig did nothing, the pending key (or whoever compromised it) accepted
+a transfer someone forgot to cancel. The two burn different keys, so check
+`pendingOwner()` history before deciding which. Steady state is
+`pendingOwner() == 0`; a pending owner exists only during an active handover ·
+completion rate versus the 1.57% organic baseline.
 
 **Levers, in escalating order:** `setBlocked` one wallet · `setRegionCap(region, lower)`
 · `setRegionCap(region, 0)` to stop one region · `pause()` to stop all new
 placements. None affect orders already in flight, and none can move user funds.
 
-**What you cannot do:** raise a cap above its ceiling, change the owner, or
-recover a user's funds — by construction. Settlement goes directly to the buyer,
-so there is nothing to recover and no key that could.
+**What you cannot do:** raise a cap above its ceiling or recover a user's
+funds — by construction. Settlement goes directly to the buyer, so there is
+nothing to recover and no key that could.
 
 **Expect a low completion rate.** Every integrator on mainnet loses 8–87% of
 paid orders against a 1.57% organic baseline; Investabl's first two days ran

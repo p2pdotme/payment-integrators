@@ -220,6 +220,14 @@ likes; the per-tx and per-day-per-wallet limits survive, but nothing caps the
 number of wallets. **Owner compromise is a superset of attestor compromise** —
 which is the real reason `owner` must be a multisig, more than `sweepUsdc` is.
 
+Ownership being transferable sharpens what "compromise" means: an attacker
+holding the owner key can make `transferOwnership` its first move and accept
+from an address it controls, after which recovering the original multisig
+recovers nothing — the seizure is permanent. The two-step handshake protects
+against a *mistyped* transfer, not a *malicious* one. The ceilings still bound
+what a seized owner can do per transaction, but treat any owner-key incident
+as a permanent loss of the contract, not a recoverable one.
+
 ### Attestation binding
 
 EIP-712, domain `KycVerifier` / version `1`, **`verifyingContract = address(this)`**.
@@ -240,11 +248,25 @@ not an ongoing clock. Revocation is `setBlocked`.
 | `setRegionCap`         | `MAX_REGION_CAP_*` — anywhere at or below it, either direction |
 | `setDailyTxCountLimit` | `MAX_DAILY_TX_COUNT_LIMIT` — anywhere at or below it, never 0  |
 | `setBlocked`           | — (denylist a wallet)                                          |
-| `pause` / `unpause`    | — (stops new placements)                                       |
+| `revokeEnrolment`      | nullifier must be spent (undo a mis-bound enrolment)           |
+| `pause` / `unpause`    | — (stops new placements and new enrolments)                    |
 | `sweepUsdc`            | see below                                                      |
+| `transferOwnership`    | two-step: only names a `pendingOwner`, moves nothing yet       |
+| `acceptOwnership`      | pending owner only — completes the transfer from its own key   |
 
-`owner` is **immutable** — set at construction, never transferable. Use a
-multisig.
+`owner` is set at construction and transferable via OpenZeppelin
+`Ownable2Step`: the owner names a pending owner, and the transfer completes
+only when that address calls `acceptOwnership` itself — so control can never
+land on an address nobody holds, and a mistyped pending owner is cancelled by
+naming a replacement (or `address(0)`). Use a multisig. `renounceOwnership`
+is overridden to revert — an ownerless contract would permanently lose every
+lever above, so ownership can be handed over but never burned.
+
+A pending grant has **no expiry**, so `pendingOwner() == 0` is a standing
+operational invariant, not a post-deploy check: an abandoned handover leaves a
+grant that whoever holds (or later compromises) that key can accept months on,
+without ever touching the multisig. Cancel any aborted transfer immediately
+with `transferOwnership(address(0))`.
 
 **`sweepUsdc` does not touch user funds.** By construction this contract's USDC
 balance is always zero, because settlement goes straight to the buyer. A
@@ -288,13 +310,13 @@ DEPLOY_OWNER=0x... ATTESTOR=0x... \
   npx hardhat run scripts/deploy-own.ts --network base
 ```
 
-**`DEPLOY_OWNER` must be the Own multisig.** `owner` is `immutable` with no
-transfer path, so it is the one input here that cannot be corrected afterwards
-— getting it wrong costs a redeploy, a fresh whitelist request, a new tenant,
-and every verified user re-attesting, because the EIP-712 domain binds
-`verifyingContract` and their grants do not carry over. It used to default
-silently to the deployer EOA; on mainnet the script now refuses to run without
-it.
+**`DEPLOY_OWNER` must be the Own multisig.** `owner` is transferable
+(two-step: `transferOwnership` + `acceptOwnership` from the new key), so a
+wrong constructor value is recoverable — but only by whoever holds the
+wrongly-set key, and until a transfer completes that key holds `pause`,
+`setBlocked`, `setRegionCap` and `sweepUsdc`. It used to default silently to
+the deployer EOA; on mainnet the script now refuses to run without it, and
+rejects any `DEPLOY_OWNER` or `ATTESTOR` that fails its EIP-55 checksum.
 
 Add `DRY_RUN=1` to run every preflight check and print the resolved config
 without deploying. Base mainnet Diamond/USDC are presets; Base Sepolia needs
@@ -325,7 +347,7 @@ integrator, which has no forwarding path — the funds would strand.
 | `proxyImpl`      | `0xF7dC3a639bc7d7500a4D1B93D7877DbbA008A6D3`                                                                                    |
 | Diamond          | `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9`                                                                                    |
 | Settlement token | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` (GG mock, 6dp)                                                                     |
-| Owner            | `0x9DE9772AfCdf3AFa03CC689fE7AFA5b631088aB9` (deployer; immutable)                                                              |
+| Owner            | `0x9DE9772AfCdf3AFa03CC689fE7AFA5b631088aB9` (deployer; immutable in that deployment's pre-`Ownable2Step` bytecode)             |
 | Attestor         | `0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda` ✅ the live service's signer                                                       |
 | Registered       | `isActive=true`, `usdcThroughIntegrator=false` ✅                                                                               |
 | Caps             | $100 India / $200 Abroad / 5 per day — all at their ceilings                                                                    |
@@ -543,7 +565,7 @@ key-holding proxy exposes only the two widget endpoints, so that lookup goes to
       Note: the attested limit is **per-identity**, not per-tenant — raising a
       tenant's `limit_usdc` does nothing for already-enrolled users, so get it
       right before onboarding anyone real.
-- [ ] Deploy on Base mainnet from an Own multisig (`owner` is immutable),
+- [ ] Deploy on Base mainnet with the Own multisig as `DEPLOY_OWNER`,
       verify on Basescan, and open a whitelist request (`docs/WHITELISTING.md`).
 - [ ] Create the **mainnet** tenant bound to that deployment. The EIP-712 domain
       carries `chainId` + `verifyingContract`, so a Sepolia attestation cannot be
