@@ -262,6 +262,12 @@ naming a replacement (or `address(0)`). Use a multisig. `renounceOwnership`
 is overridden to revert — an ownerless contract would permanently lose every
 lever above, so ownership can be handed over but never burned.
 
+A pending grant has **no expiry**, so `pendingOwner() == 0` is a standing
+operational invariant, not a post-deploy check: an abandoned handover leaves a
+grant that whoever holds (or later compromises) that key can accept months on,
+without ever touching the multisig. Cancel any aborted transfer immediately
+with `transferOwnership(address(0))`.
+
 **`sweepUsdc` does not touch user funds.** By construction this contract's USDC
 balance is always zero, because settlement goes straight to the buyer. A
 non-zero balance means a stray transfer or a mis-registration, and in both cases
