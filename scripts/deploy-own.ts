@@ -186,7 +186,7 @@ async function main() {
   // one is permanent, so it gets the louder marker.
   console.log(
     `  owner:            ${DEPLOY_OWNER}${
-      DEPLOY_OWNER === deployer.address ? "  (⚠️ DEPLOYER EOA — IMMUTABLE, use a multisig)" : ""
+      DEPLOY_OWNER === deployer.address ? "  (⚠️ DEPLOYER EOA — use a multisig)" : ""
     }`
   );
   console.log(
