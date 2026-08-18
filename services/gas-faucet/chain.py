@@ -41,7 +41,8 @@ MAX_TRANSFER_GAS = int(os.environ.get("FAUCET_MAX_TRANSFER_GAS", 250_000))
 #: hostile or broken RPC sizing the transaction unbounded — the submit path
 #: has no funder-balance check, so an inflated estimate would fail the send on
 #: gas funds rather than refuse cleanly. A real submit costs ~100k, so the
-#: window comfortably contains it.
+#: window comfortably contains it, and `submit_fee_ceiling_wei` provisions the
+#: top of that window against the funder before a submit is signed.
 SUBMIT_GAS_FLOOR = int(os.environ.get("FAUCET_SUBMIT_GAS_FLOOR", 120_000))
 SUBMIT_GAS_CEILING = int(os.environ.get("FAUCET_SUBMIT_GAS_CEILING", 400_000))
 MAX_FEE_PER_GAS_WEI = int(os.environ.get("FAUCET_MAX_FEE_PER_GAS_WEI", 5_000_000_000))
@@ -59,6 +60,18 @@ def fee_ceiling_wei(base_fee: int) -> int:
     ledger says it should hold.
     """
     return MAX_TRANSFER_GAS * min(base_fee * 2 + DEFAULT_TIP_WEI, MAX_FEE_PER_GAS_WEI)
+
+
+def submit_fee_ceiling_wei(base_fee: int) -> int:
+    """The most one sponsored SUBMIT can cost, given the current base fee.
+
+    A submit spends the float exactly as a drip does, only entirely on gas, so
+    it owes the same provisioning: check the funder can cover the worst case
+    before signing, rather than discovering it when the send fails for want of
+    gas funds. Uses the submit's own ceiling, so tuning the transfer knob for
+    drips cannot silently change what a submit reserves.
+    """
+    return SUBMIT_GAS_CEILING * min(base_fee * 2 + DEFAULT_TIP_WEI, MAX_FEE_PER_GAS_WEI)
 
 
 class ChainError(Exception):

@@ -19,6 +19,7 @@ import threading
 import time
 
 import pytest
+from fastapi import HTTPException
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
@@ -53,6 +54,9 @@ class FakeRpc:
         self.paused = False
         self.receipt_gas_used = "0x5208"          # 21_000
         self.receipt_gas_price = "0x2d4b370"      # ~0.047 gwei
+        #: Steerable so a test can put the float on the floor. Both spend paths
+        #: provision their worst-case fee against this before signing.
+        self.funder_wei = 10**18
         self.lock = threading.Lock()
 
     def read_flag(self, contract, selector):
@@ -62,7 +66,7 @@ class FakeRpc:
 
     def balance(self, addr):
         if addr.lower() == faucet._ACCOUNT.address.lower():
-            return 10**18
+            return self.funder_wei
         return self.balances.get(addr.lower(), 0)
 
     def base_fee(self):
@@ -127,6 +131,7 @@ def _fresh_state():
     inherited another's would assert against the wrong world."""
     faucet._RATE_BUCKETS.clear()
     faucet._PAUSED_CACHE.clear()
+    faucet._SUBMITS_IN_FLIGHT.clear()
     yield
 
 
@@ -324,10 +329,10 @@ class TestLogging:
     """There was no logging at all, and two documented failures are the kind
     you cannot tell apart without it.
 
-    `Integrator.attestor` warns that a wrong value "silently rejects every
-    cold-start request, which looks identical to the faucet being down" — and
-    it has bitten two prior integrations. These assert the line that
-    distinguishes them exists, and that nothing secret rides along with it.
+    The client fails open by contract, so a refused sponsor, a dead RPC and an
+    empty float all look like nothing happening from outside. These assert the
+    line that tells them apart exists, and that nothing secret rides along
+    with it.
     """
 
     def test_a_refused_submission_names_the_chain_reason(self, client, rpc, caplog):
@@ -857,3 +862,112 @@ class TestLimitZeroRejected:
     def test_a_positive_limit_still_sponsors(self, client, rpc):
         w = Account.create().address
         assert submit(client, w, sign(w)).json()["submitted"] is True
+
+
+class TestInFlightMarkerIsReleased:
+    """A submit that never broadcast must not hold its nullifier forever.
+
+    `_SUBMITS_IN_FLIGHT` stops two concurrent requests broadcasting one
+    attestation. It is added to before the ledger reservation, and the
+    reservation is the thing that fails when the volume is full or read-only.
+    If that path does not release the marker, the nullifier is held for the
+    life of the process: a nullifier is per-human and single-use on chain, and
+    sponsored submit is the only enrolment path, so the person can never
+    verify any wallet again until someone restarts the container.
+    """
+
+    def test_a_ledger_failure_releases_the_nullifier(self, client, rpc):
+        wallet = Account.create().address
+        att = sign(wallet)
+
+        def refuse(**kwargs):
+            raise Exception("attempt to write a readonly database")
+
+        # Swap only the ledger write. monkeypatch.undo() would also revert the
+        # rpc fixture, and the retry would then fail on an unreachable node
+        # rather than on the thing under test.
+        healthy = faucet.STORE.reserve
+        faucet.STORE.reserve = refuse
+        try:
+            first = submit(client, wallet, att)
+            assert first.status_code == 503
+            assert first.json()["detail"] == "ledger_unavailable"
+            assert getattr(rpc, "sent_calls", []) == [], "nothing may be broadcast"
+        finally:
+            faucet.STORE.reserve = healthy  # the volume comes back
+
+        second = submit(client, wallet, att)
+        assert second.status_code != 409, "the marker outlived the failed attempt"
+        assert second.json()["submitted"] is True
+
+    def test_the_marker_is_empty_once_a_submit_settles(self, client, rpc):
+        wallet = Account.create().address
+        assert submit(client, wallet, sign(wallet)).json()["submitted"] is True
+        assert faucet._SUBMITS_IN_FLIGHT == set()
+
+    def test_a_send_failure_also_releases_it(self, client, rpc, monkeypatch):
+        wallet = Account.create().address
+        att = sign(wallet)
+
+        def boom(**kwargs):
+            raise faucet.ChainError("broadcast refused")
+
+        monkeypatch.setattr(rpc, "send_call", boom)
+        assert submit(client, wallet, att).status_code == 502
+        assert faucet._SUBMITS_IN_FLIGHT == set()
+
+
+class TestNullifierIsValidatedInTheFormItIsUsed:
+    """`bytes.fromhex` ignores ASCII whitespace, so 64 characters is not 32 bytes.
+
+    The length check counts characters and the decode check only asserts the
+    string parses. A 64-character value carrying whitespace passes both, then
+    the RAW string is concatenated into the calldata and the short decode
+    becomes the ledger's per-human key.
+    """
+
+    SHORT = "ab" * 31 + "  "  # 64 chars, decodes to 31 bytes
+
+    def test_whitespace_padding_is_refused(self, client, rpc):
+        wallet = Account.create().address
+        att = sign(wallet)
+        att["nullifier"] = self.SHORT
+        res = submit(client, wallet, att)
+        assert res.status_code == 400
+        assert "nullifier" in res.json()["detail"]
+        assert getattr(rpc, "sent_calls", []) == []
+
+    def test_the_encoder_refuses_it_directly(self):
+        with pytest.raises(HTTPException) as caught:
+            faucet._encode_submit(
+                Account.create().address, self.SHORT, 1, 2, "0x" + "11" * 65
+            )
+        assert caught.value.status_code == 400
+
+    def test_calldata_is_always_hex(self, rpc):
+        data = faucet._encode_submit(
+            Account.create().address, "0x" + "ab" * 32, 1, 2, "0x" + "11" * 65
+        )
+        assert all(c in "0123456789abcdefx" for c in data), "non-hex reached the calldata"
+
+
+class TestSponsorRespectsTheFloat:
+    """The sponsor path spends gas, so it owes the same float guards as a drip.
+
+    The drip provisions the worst-case fee before deciding the funder can
+    afford it. A submit that skips that check keeps signing until the sends
+    themselves fail for want of gas, which is a 502 where a clean refusal was
+    available.
+    """
+
+    def test_an_empty_funder_refuses_before_signing(self, client, rpc):
+        rpc.funder_wei = 1
+        wallet = Account.create().address
+        res = submit(client, wallet, sign(wallet))
+        assert res.status_code == 503
+        assert res.json()["detail"] == "faucet_empty"
+        assert getattr(rpc, "sent_calls", []) == []
+
+    def test_a_funded_float_still_sponsors(self, client, rpc):
+        wallet = Account.create().address
+        assert submit(client, wallet, sign(wallet)).json()["submitted"] is True

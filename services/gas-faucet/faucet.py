@@ -73,6 +73,7 @@ from chain import (
     Rpc,
     account_from_key,
     fee_ceiling_wei,
+    submit_fee_ceiling_wei,
 )
 from policy import Decision, Limits, decide, drip_target_wei, floor_wei
 from store import Store
@@ -562,13 +563,22 @@ def _encode_submit(wallet: str, nullifier: str, limit: int, expiry: int, signatu
     the tail: length word + the 65 signature bytes padded to 96.
     """
     wal = to_checksum_address(wallet)[2:].lower().rjust(64, "0")
-    nul = (nullifier[2:] if nullifier.lower().startswith("0x") else nullifier).lower()
-    if len(nul) != 64:
-        raise HTTPException(400, "bad_nullifier: must be 32 bytes")
+    # Validate the DECODED value and embed that same decoded value. Counting
+    # characters is not counting bytes: `bytes.fromhex` ignores ASCII
+    # whitespace, so "ab"*31 + "  " is 64 characters, decodes to 31 bytes, and
+    # under the old character check it passed — then the raw string, spaces and
+    # all, was concatenated into the calldata while a 31-byte value became the
+    # ledger's per-human key. Validate one form, use the other, and the two
+    # disagree exactly where it is hardest to notice.
     try:
-        bytes.fromhex(nul)
+        nul_bytes = bytes.fromhex(
+            nullifier[2:] if nullifier.lower().startswith("0x") else nullifier
+        )
     except ValueError as exc:
         raise HTTPException(400, f"bad_nullifier: {exc}") from exc
+    if len(nul_bytes) != 32:
+        raise HTTPException(400, "bad_nullifier: must be 32 bytes")
+    nul = nul_bytes.hex()
     if limit == 0:
         # A limit-0 attestation verifies a wallet whose effective cap is
         # min(0, regionCap) = 0 — verified, but unable to buy anything. The
@@ -709,51 +719,83 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
 
         try:
             base_fee = rpc.base_fee()
+            funder_balance = rpc.balance(_ACCOUNT.address)
         except ChainError as exc:
             log.error(_event("chain_unreachable", detail=str(exc)))
             raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
+        # The breaker again, now that the lock is held. The read above the
+        # simulate is a fast path that saves an eth_call; this one is the
+        # authoritative check, because between them another request can book a
+        # fee. Reading a budget outside the lock and spending against it inside
+        # is the same shape as the drip-path balance race.
+        if STORE.usage(wallet="0x", nullifier=None).global_wei >= LIMITS.max_wei_global:
+            log.warning(_event("refused", reason="global_daily_budget_reached",
+                               wallet=_short(wallet), integrator=integrator.label))
+            raise HTTPException(429, "global_daily_budget_reached")
+
+        # A submit spends the float too, all of it on gas, so it owes the same
+        # provisioning the drip does: refuse cleanly now rather than let the
+        # broadcast fail for want of gas funds and report that as an outage.
+        if funder_balance <= submit_fee_ceiling_wei(base_fee):
+            log.warning(
+                _event("refused", reason="faucet_empty", wallet=_short(wallet),
+                       funder_balance_wei=funder_balance, integrator=integrator.label)
+            )
+            raise HTTPException(503, "faucet_empty")
+
         _SUBMITS_IN_FLIGHT.add(canon)
-
-        # Reserve first here too: the sponsored row's FEE feeds the same
-        # global breaker, so a write failure must refuse before spending gas,
-        # not book blind afterward. amount 0 — nothing is transferred; the fee
-        # lands after the receipt. The nullifier makes this the enrolment row
-        # the drip path recalls the identity from.
         try:
-            drip_id = STORE.reserve(
-                chain_id=integrator.chain_id,
-                wallet=wallet,
-                nullifier=_canonical_nullifier(req.nullifier),
-                amount_wei=0,
-            )
-        except Exception as exc:
-            log.error(_event("ledger_unavailable", wallet=_short(wallet), detail=str(exc)))
-            raise HTTPException(503, "ledger_unavailable") from exc
-
-        log.info(
-            _event("sponsoring", wallet=_short(wallet), drip_id=drip_id,
-                   nullifier=_short(req.nullifier), integrator=integrator.label)
-        )
-        try:
-            tx_hash = rpc.send_call(
-                account=_ACCOUNT,
-                to=integrator.address,
-                data=data,
-                chain_id=integrator.chain_id,
-                base_fee=base_fee,
-            )
-        except ChainError as exc:
+            # Reserve first here too: the sponsored row's FEE feeds the same
+            # global breaker, so a write failure must refuse before spending
+            # gas, not book blind afterward. amount 0 — nothing is transferred;
+            # the fee lands after the receipt. The nullifier makes this the
+            # enrolment row the drip path recalls the identity from.
             try:
-                STORE.release(drip_id)
-            except Exception:
-                pass
-            _SUBMITS_IN_FLIGHT.discard(canon)
-            log.error(
-                _event("sponsor_send_failed", wallet=_short(wallet),
-                       integrator=integrator.label, detail=str(exc))
+                drip_id = STORE.reserve(
+                    chain_id=integrator.chain_id,
+                    wallet=wallet,
+                    nullifier=canon,
+                    amount_wei=0,
+                )
+            except Exception as exc:
+                log.error(
+                    _event("ledger_unavailable", wallet=_short(wallet), detail=str(exc))
+                )
+                raise HTTPException(503, "ledger_unavailable") from exc
+
+            log.info(
+                _event("sponsoring", wallet=_short(wallet), drip_id=drip_id,
+                       nullifier=_short(req.nullifier), integrator=integrator.label)
             )
-            raise HTTPException(502, f"send_failed: {exc}") from exc
+            try:
+                tx_hash = rpc.send_call(
+                    account=_ACCOUNT,
+                    to=integrator.address,
+                    data=data,
+                    chain_id=integrator.chain_id,
+                    base_fee=base_fee,
+                )
+            except ChainError as exc:
+                try:
+                    STORE.release(drip_id)
+                except Exception:
+                    pass
+                log.error(
+                    _event("sponsor_send_failed", wallet=_short(wallet),
+                           integrator=integrator.label, detail=str(exc))
+                )
+                raise HTTPException(502, f"send_failed: {exc}") from exc
+        except BaseException:
+            # Nothing was broadcast, so the marker must not outlive the attempt.
+            # It used to be released only on a send failure, which left the
+            # ledger-unavailable path holding it for the life of the process:
+            # a nullifier is per-human and single-use on chain, and sponsored
+            # submit is the only enrolment path, so one transient disk fault
+            # locked that person out of verification entirely, with no retry
+            # able to clear it and nothing logging that it was stuck.
+            _SUBMITS_IN_FLIGHT.discard(canon)
+            raise
 
         try:
             STORE.attach_tx(drip_id, tx_hash)

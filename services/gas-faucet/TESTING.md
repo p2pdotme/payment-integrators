@@ -23,29 +23,31 @@ bridge card correctly says so rather than offering a dead link.
 Bridging and the gas top-up are therefore **mainnet-only tests**, and they are
 cheap: bridging $5 with a $0.25 top-up costs about $0.33 all-in.
 
-## Before anything: the attestor
+## Before anything: the integrator must accept a sponsored submit
 
-The Sepolia integrator's on-chain attestor is
-**`0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda`**, which matches
-`GET https://passport-api.p2p.cool/v1/attestor` exactly. It is no longer the
-deployer placeholder the older docs described.
+The service no longer carries an attestor address and no longer verifies
+attestations off chain. The chain does both, so there is nothing here to keep
+reconciled with a deployment. What replaced that as the single most common way
+this fails is the function signature.
 
-Two consequences:
+`POST /v1/attestation` encodes
+`submitPassportAttestation(address,bytes32,uint256,uint256,bytes)`. An
+integrator deployed before the sponsored-attestation change declares the
+four-argument form without the leading `wallet`, which is a different selector.
+Every submit then reverts in simulation and returns `400 simulation_reverted`,
+which reads exactly like a bad signature.
 
-- `FAUCET_INTEGRATORS` must carry **that** attestor. Configure the deployer and
-  every cold-start request fails `invalid_attestation`, which looks exactly
-  like the faucet being broken.
-- `scripts/local/e2e-own-sepolia.ts` can no longer mint its own attestations —
-  it refuses loudly, which is correct. Sepolia end-to-end now runs through the
-  real passport flow in own-app.
-
-Re-check both before testing; they are the single most common way this fails:
+Check the deployed integrator carries the five-argument selector before
+testing anything else:
 
 ```bash
-curl -s https://passport-api.p2p.cool/v1/attestor
-cast call 0x17DbCD059d0Ed2056aB1acD4DB4F29e61B78985d "attestor()(address)" \
-  --rpc-url https://sepolia.base.org
+cast sig "submitPassportAttestation(address,bytes32,uint256,uint256,bytes)"
+cast code <integrator> --rpc-url https://sepolia.base.org | grep -o ed740260
 ```
+
+No output from the second command means the contract predates the change and
+no cold start can succeed. Redeploy the integrator first, then point
+`FAUCET_INTEGRATORS` at the new address.
 
 ## Path A — everything local (fastest, no deploy)
 
@@ -195,6 +197,5 @@ Base Sepolia, 2026-08-13, against `0x6e2Feec8…`:
 - virgin wallet 0 wei → funded 3×10¹³ wei, tx
   [`0x3fb6033e…`](https://sepolia.basescan.org/tx/0x3fb6033e8078be42f6360c9e3cee367311cca1860dca2a7f9f1bcc8b28f083d4)
 - immediate repeat request → `sufficient_balance`, no second payment
-- attestation signed by anyone but the attestor → `403`
-- unverified wallet, no attestation → `403`
+- unverified wallet → `403`
 - preview-style origin passes CORS, a foreign origin is refused `400`
