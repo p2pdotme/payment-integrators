@@ -23,16 +23,20 @@ wallet, so their wallet has to have gas.
 A wallet is funded only if a real human is behind it, established one of two
 ways:
 
-  * A passport attestation signed by the integrator's attestor, verified here
-    against the identical EIP-712 message the contract checks. This is the
-    cold-start path — the wallet has no gas, so it cannot have submitted yet.
-  * `verified(wallet)` already true on the integrator. Every drip after the
-    first takes this path.
+  * `verified(wallet)` true on the integrator — the only drip gate. Since the
+    sponsored-submit contract change, verification itself is landed by THIS
+    service (POST /v1/attestation): the contract accepts a submission from
+    anyone because the service-signed message binds the wallet, so this
+    process simulates the exact call, pays to send it, and lets the CHAIN be
+    the only verifier. No off-chain EIP-712 re-implementation, no attestor
+    config to disagree with the deployment.
 
-On top of that, three ceilings, all per UTC day: per wallet, per **nullifier**
-(the per-(tenant, human) id, so one person spreading over many wallets shares
-one budget), and one global circuit breaker. Worst case for a determined,
-genuinely-KYC'd attacker is their own per-identity cap — cents.
+On top of that, ceilings per UTC day: per wallet and one global circuit
+breaker. The contract enforces one-wallet-per-human (the nullifier is globally
+single-use), so the per-wallet cap IS the per-identity cap; the separate
+per-nullifier knob survives as defence in depth on submit rows but no longer
+carries the argument. Worst case for a determined, genuinely-KYC'd attacker is
+their own per-wallet cap — cents.
 
 ── Not in the funds path ────────────────────────────────────────────────────
 
@@ -60,17 +64,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from attestation import (
-    Attestation,
-    InvalidAttestation,
-    canonical_nullifier,
-    check_attestation,
-)
 from chain import (
-    SEL_ATTESTOR,
     SEL_BLOCKED,
-    SEL_NULLIFIER_SPENT,
     SEL_PAUSED,
+    SEL_SUBMIT_ATTESTATION,
     SEL_VERIFIED,
     ChainError,
     Rpc,
@@ -92,13 +89,11 @@ log = logging.getLogger("faucet")
 def _event(event: str, **fields: object) -> str:
     """One key=value line per decision, greppable and cheap to read.
 
-    There was no logging at all, and two failures this service documents are
-    specifically the kind you cannot tell apart without it. A wrong `attestor`
-    rejects every cold-start request — `Integrator.attestor` says so, and it
-    has bitten two prior integrations — and from the outside that looks exactly
-    like the faucet being down. The client fails open by contract, so a user
-    sees nothing either way. Without a line naming the reason there is no
-    signal anywhere in the system.
+    There was no logging at all, and the failures here are specifically the
+    kind you cannot tell apart without it: the client fails open by contract,
+    so a refused sponsor, a dead RPC and an empty float all look, from the
+    outside, like nothing happening. Every decision logs one line naming its
+    reason.
 
     NEVER log a signature, a private key, or a full attestation. The nullifier
     is a per-(tenant, human) pseudonym and is logged truncated: enough to
@@ -127,26 +122,31 @@ def _int_env(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Integrator:
-    """One fundable deployment."""
+    """One fundable deployment.
+
+    No attestor field any more, and that is the point of the sponsored-submit
+    contract change: this service used to re-implement the contract's EIP-712
+    check and therefore had to know (and keep reconciled) the signer — a
+    misconfiguration that rejected every cold start while looking like an
+    outage, twice. Now the CHAIN verifies every attestation, via simulation
+    before paying and revert after, and there is no signer config to get
+    wrong.
+    """
 
     chain_id: int
     address: str
-    #: Signer of that integrator's attestations. MUST come from the service's
-    #: own /v1/attestor — a wrong value here silently rejects every cold-start
-    #: request, which looks identical to the faucet being down.
-    attestor: str
     label: str
 
 
 def _load_integrators() -> dict[tuple[int, str], Integrator]:
-    """FAUCET_INTEGRATORS, a JSON array of {chainId, address, attestor, label}."""
+    """FAUCET_INTEGRATORS, a JSON array of {chainId, address, label}."""
     raw = os.environ.get("FAUCET_INTEGRATORS", "[]")
     out: dict[tuple[int, str], Integrator] = {}
     for entry in json.loads(raw):
         integrator = Integrator(
             chain_id=int(entry["chainId"]),
             address=to_checksum_address(entry["address"]),
-            attestor=to_checksum_address(entry["attestor"]),
+            # An `attestor` key in old configs is deliberately ignored.
             label=entry.get("label", entry["address"][:10]),
         )
         out[(integrator.chain_id, integrator.address.lower())] = integrator
@@ -212,44 +212,9 @@ _ACCOUNT = (
 #: One key, one nonce sequence. Every send is serialised behind this.
 _SEND_LOCK = threading.Lock()
 
-# ── on-chain reconciliation caches ───────────────────────────────────────────
-# The configured attestor has bitten two integrations by silently disagreeing
-# with the chain. The contract's own attestor() is what decides whether a
-# funded submit succeeds, so it is what this service verifies against; the
-# config value is the availability fallback, and a disagreement is an alarm.
-_ATTESTOR_TTL_S = 300
-_ATTESTOR_CACHE: dict[tuple[int, str], tuple[str, float]] = {}
+# ── on-chain reconciliation ──────────────────────────────────────────────────
 _PAUSED_TTL_S = 60
 _PAUSED_CACHE: dict[tuple[int, str], tuple[bool, float]] = {}
-
-
-def _effective_attestor(integrator: Integrator, rpc: Rpc) -> str:
-    """The signer cold-start attestations are verified against.
-
-    Chain first, config as fallback. If the two disagree, the chain wins —
-    it is the one the contract will hold the submit to — and the mismatch is
-    logged as an alarm, because it means either the config or the deployment
-    is wrong and every operator believes the other one.
-    """
-    key = (integrator.chain_id, integrator.address.lower())
-    hit = _ATTESTOR_CACHE.get(key)
-    now = time.time()
-    if hit and now - hit[1] < _ATTESTOR_TTL_S:
-        return hit[0]
-    try:
-        onchain = rpc.read_address(integrator.address, SEL_ATTESTOR)
-    except ChainError as exc:
-        log.warning(
-            _event("attestor_unreadable", integrator=integrator.label, detail=str(exc))
-        )
-        return integrator.attestor
-    if onchain.lower() != integrator.attestor.lower():
-        log.error(
-            _event("attestor_mismatch", integrator=integrator.label,
-                   configured=integrator.attestor, onchain=onchain)
-        )
-    _ATTESTOR_CACHE[key] = (onchain, now)
-    return onchain
 
 
 def _integrator_paused(integrator: Integrator, rpc: Rpc) -> bool:
@@ -331,9 +296,9 @@ def _rpc(chain_id: int) -> Rpc:
 def _announce() -> None:
     """What this process actually resolved its config to.
 
-    Most failures here are wiring, not logic — an attestor that does not match
-    the service, a DB path that is not persistent, a missing key — and none of
-    them is visible from a request. Printing the resolved config once turns a
+    Most failures here are wiring, not logic — a DB path that is not
+    persistent, a missing key, a wrong integrator address — and none of them
+    is visible from a request. Printing the resolved config once turns a
     confusing "every request is a 403" into an obvious one, and gives an
     incident a fixed point to compare against.
 
@@ -351,12 +316,8 @@ def _announce() -> None:
         )
     )
     for i in INTEGRATORS.values():
-        # The attestor especially. A wrong one here rejects every cold start
-        # and is otherwise indistinguishable from an outage — compare this
-        # against the service's own GET /v1/attestor when cold starts fail.
         log.info(
-            _event("integrator", label=i.label, chain=i.chain_id,
-                   address=i.address, attestor=i.attestor)
+            _event("integrator", label=i.label, chain=i.chain_id, address=i.address)
         )
     if not _ACCOUNT:
         log.error(_event("misconfigured", detail="FAUCET_PRIVATE_KEY unset; every request 503s"))
@@ -390,20 +351,37 @@ if ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX:
     )
 
 
-class AttestationIn(BaseModel):
+class SubmitRequest(BaseModel):
+    """POST /v1/attestation — sponsor a verification on-chain.
+
+    The service pays the gas to land `submitPassportAttestation(wallet, …)`.
+    It does NOT verify the signature: the contract does, first in simulation
+    (free, before any gas is spent) and then for real. There is nothing here
+    an attacker can abuse that the chain would accept — a bad signature, a
+    spent nullifier, an expired attestation all die in simulation for the
+    price of a rate-limit slot.
+    """
+
+    chainId: int
+    integrator: str
+    wallet: str
     nullifier: str
     limit: int
     expiry: int
     signature: str
 
 
+class SubmitResponse(BaseModel):
+    submitted: bool
+    reason: str
+    txHash: str | None = None
+    pending: bool = False
+
+
 class GasRequest(BaseModel):
     chainId: int
     integrator: str
     wallet: str
-    #: Present on the very first request, before the wallet can afford to
-    #: submit it on chain. Omitted afterwards, when `verified()` answers.
-    attestation: AttestationIn | None = None
 
 
 class GasResponse(BaseModel):
@@ -463,74 +441,19 @@ def ops_health(token: str = "") -> dict:
     return out
 
 
-def _recall_nullifier(wallet: str) -> str | None:
-    """The identity a verified wallet was funded under, from the ledger.
+def _authorise(integrator: Integrator, rpc: Rpc, wallet: str) -> None:
+    """Establish that `wallet` may be funded. Raises 403/502 otherwise.
 
-    See `Store.nullifier_for`. Returns None for a wallet the faucet has never
-    funded — which is a genuine unknown, not a licence: that wallet has its own
-    per-wallet caps, and the first drip it ever takes goes through the
-    attestation path and records the identity for every drip after.
+    One gate: `verified(wallet)` on the integrator. The contract enforces
+    one-wallet-per-human via the globally single-use nullifier, so a verified
+    wallet IS an identity, and the off-chain re-verification this function
+    used to do — EIP-712 checks, attestor reconciliation, spent-nullifier
+    reads — is gone with the cold-start path that needed it. A wallet that is
+    not yet verified gets verified through POST /v1/attestation, where the
+    CHAIN does all of the checking.
     """
-    return STORE.nullifier_for(wallet)
-
-
-def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -> str | None:
-    """Establish a human is behind `wallet`. Returns their nullifier, if known.
-
-    Raises 403 when it cannot be established — never funds on the benefit of
-    the doubt, because the doubt is exactly what an attacker supplies.
-
-    Ordered cheapest-first on purpose. Signature verification is free and
-    local; every chain read costs an RPC call this service pays for. Doing the
-    `blocked` read before looking at the attestation meant an unauthenticated
-    caller could bill us an `eth_call` per request with a junk body, which is
-    the opposite of what `policy.decide` documents as the intended order.
-    """
-    nullifier: str | None = None
-
-    if req.attestation is not None:
-        # Free and local. Anything malformed or unsigned dies here, before a
-        # single RPC call is spent on it.
-        try:
-            check_attestation(
-                Attestation(
-                    wallet=wallet,
-                    nullifier=req.attestation.nullifier,
-                    limit=req.attestation.limit,
-                    expiry=req.attestation.expiry,
-                    signature=req.attestation.signature,
-                ),
-                chain_id=integrator.chain_id,
-                integrator=integrator.address,
-                # The chain's attestor(), not the config: it is the signer the
-                # CONTRACT will hold the funded submit to. Config is only the
-                # fallback when the chain cannot be read.
-                attestor=_effective_attestor(integrator, rpc),
-                now=int(time.time()),
-            )
-            # Canonical form only — the raw request string is attacker-chosen
-            # and has many spellings that decode identically.
-            nullifier = canonical_nullifier(req.attestation.nullifier)
-        except InvalidAttestation as exc:
-            # The single most valuable line here. A wrong `attestor` makes
-            # EVERY cold start fail exactly like this, and without the reason
-            # spelled out it is indistinguishable from the faucet being down.
-            log.warning(
-                _event("refused", reason="invalid_attestation", wallet=_short(wallet),
-                       integrator=integrator.label, detail=str(exc))
-            )
-            raise HTTPException(403, f"invalid_attestation: {exc}") from exc
-
-    # Denylisted wallets get nothing, on either path — this is the operator's
-    # only revocation lever, so it fails CLOSED.
-    #
-    # It used to swallow ChainError and continue, on the theory that an
-    # integrator might not expose the getter. That theory was empty: `blocked`
-    # and `verified` are declared together on every integrator using this
-    # faucet, so anything missing one is missing both and would 502 below
-    # anyway. What the except actually caught was RPC faults — a timeout, a
-    # 429, an empty result — each of which turned a denylisted wallet into a
-    # funded one, silently.
+    # Denylisted wallets get nothing. This is the operator's only revocation
+    # lever, so it fails CLOSED: any RPC fault refuses rather than funds.
     try:
         is_blocked = rpc.read_bool(integrator.address, SEL_BLOCKED, wallet)
     except ChainError as exc:
@@ -543,36 +466,9 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
         )
         raise HTTPException(403, "wallet_blocked")
 
-    if nullifier is not None:
-        # Has this passport already verified a wallet?
-        #
-        # The nullifier is GLOBALLY single-use in the contract
-        # (`nullifierSpent`), so one passport verifies exactly one wallet ever.
-        # Without this read the faucet happily funded the cold start for wallet
-        # after wallet on the same identity, each into a
-        # `submitPassportAttestation` that reverts `NullifierAlreadySpent` —
-        # money out, user still stuck, which is the exact outcome this module
-        # exists to prevent.
-        try:
-            if rpc.read_bool32(integrator.address, SEL_NULLIFIER_SPENT, nullifier):
-                log.info(
-                    _event("refused", reason="nullifier_already_spent",
-                           wallet=_short(wallet), nullifier=_short(nullifier),
-                           integrator=integrator.label)
-                )
-                raise HTTPException(403, "nullifier_already_spent")
-        except ChainError as exc:
-            log.error(_event("chain_unreachable", detail=str(exc)))
-            raise HTTPException(502, f"chain_unreachable: {exc}") from exc
-        return nullifier
-
     try:
         if rpc.read_bool(integrator.address, SEL_VERIFIED, wallet):
-            # No nullifier on this path — the wallet is verified on chain and
-            # the caller sent no attestation. `_recall_nullifier` recovers it
-            # from the ledger so the per-identity cap still applies; see there
-            # for why omitting the field must not be a way to opt out of it.
-            return _recall_nullifier(wallet)
+            return
     except ChainError as exc:
         log.error(_event("chain_unreachable", detail=str(exc)))
         raise HTTPException(502, f"chain_unreachable: {exc}") from exc
@@ -582,6 +478,189 @@ def _authorise(req: GasRequest, integrator: Integrator, rpc: Rpc, wallet: str) -
                integrator=integrator.label)
     )
     raise HTTPException(403, "not_verified")
+
+
+# Custom-error selectors from OwnCheckoutIntegrator, so a simulation revert
+# maps to a reason a client can show. keccak(text=...)[:4].
+from eth_utils import keccak as _keccak  # noqa: E402  (grouped with its use)
+
+_SUBMIT_ERRORS = {
+    "0x" + _keccak(text=err + "()")[:4].hex(): name
+    for err, name in [
+        ("NullifierAlreadySpent", "nullifier_already_spent"),
+        ("AttestationExpired", "attestation_expired"),
+        ("InvalidSignature", "invalid_signature"),
+        ("AttestorNotSet", "attestor_not_set"),
+        ("InvalidAddress", "invalid_wallet"),
+        ("ContractPaused", "contract_paused"),
+    ]
+}
+
+
+def _submit_reason(detail: str) -> str:
+    """Map a revert's error selector, if present in the RPC message, to a name."""
+    lowered = detail.lower()
+    for selector, name in _SUBMIT_ERRORS.items():
+        if selector[2:] in lowered:
+            return name
+    return "simulation_reverted"
+
+
+def _encode_submit(wallet: str, nullifier: str, limit: int, expiry: int, signature: str) -> str:
+    """ABI-encode submitPassportAttestation(address,bytes32,uint256,uint256,bytes).
+
+    Hand-rolled like every other encoding here — one dynamic argument, a
+    fixed layout, and no ABI machinery inside a key-holding service. Layout:
+    4 words of static args, a word pointing at the bytes tail (0xa0), then
+    the tail: length word + the 65 signature bytes padded to 96.
+    """
+    wal = to_checksum_address(wallet)[2:].lower().rjust(64, "0")
+    nul = (nullifier[2:] if nullifier.lower().startswith("0x") else nullifier).lower()
+    if len(nul) != 64:
+        raise HTTPException(400, "bad_nullifier: must be 32 bytes")
+    try:
+        bytes.fromhex(nul)
+    except ValueError as exc:
+        raise HTTPException(400, f"bad_nullifier: {exc}") from exc
+    if limit < 0 or expiry < 0:
+        raise HTTPException(400, "bad_attestation: negative field")
+    sig = (signature[2:] if signature.lower().startswith("0x") else signature).lower()
+    try:
+        sig_bytes = bytes.fromhex(sig)
+    except ValueError as exc:
+        raise HTTPException(400, f"bad_signature: {exc}") from exc
+    if len(sig_bytes) != 65:
+        raise HTTPException(400, "bad_signature: must be 65 bytes")
+
+    head = (
+        wal
+        + nul
+        + format(limit, "064x")
+        + format(expiry, "064x")
+        + format(0xA0, "064x")
+    )
+    tail = format(len(sig_bytes), "064x") + sig_bytes.hex().ljust(96 * 2, "0")
+    return SEL_SUBMIT_ATTESTATION + head + tail
+
+
+@app.post("/v1/attestation", response_model=SubmitResponse)
+def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
+    """Land a verification on-chain, with the service paying the gas.
+
+    This endpoint is why the cold-start drip no longer exists: the contract
+    accepts a submission from anyone, so the one transaction a gasless wallet
+    could never afford is simply sent for them. The chain is the only
+    verifier — the exact call is simulated first, so nothing invalid ever
+    costs this service more than the eth_call, and the same rate limits that
+    guard the drip guard this.
+    """
+    if _ACCOUNT is None:
+        raise HTTPException(503, "faucet_not_configured")
+
+    ip = _client_ip(request)
+    if _over_limit(f"ip:{ip}", RATE_IP_PER_MIN):
+        log.info(_event("rate_limited", scope="ip", ip=ip))
+        raise HTTPException(429, "rate_limited")
+
+    try:
+        wallet = to_checksum_address(req.wallet)
+        integrator_addr = to_checksum_address(req.integrator)
+    except Exception as exc:
+        raise HTTPException(400, f"bad_address: {exc}") from exc
+
+    if _over_limit(f"wallet:{wallet.lower()}", RATE_WALLET_PER_MIN):
+        log.info(_event("rate_limited", scope="wallet", wallet=_short(wallet)))
+        raise HTTPException(429, "rate_limited")
+
+    integrator = INTEGRATORS.get((req.chainId, integrator_addr.lower()))
+    if integrator is None:
+        log.warning(
+            _event("refused", reason="integrator_not_allowed",
+                   integrator=_short(integrator_addr), chain=req.chainId)
+        )
+        raise HTTPException(403, "integrator_not_allowed")
+
+    rpc = _rpc(integrator.chain_id)
+    data = _encode_submit(wallet, req.nullifier, req.limit, req.expiry, req.signature)
+
+    # The chain's answer, for free, before any gas is spent. Everything the
+    # old off-chain verifier checked — signature, signer, expiry, nullifier
+    # reuse, the wallet binding — reverts here if wrong.
+    try:
+        rpc.simulate(sender=_ACCOUNT.address, to=integrator.address, data=data)
+    except ChainError as exc:
+        reason = _submit_reason(str(exc))
+        log.info(
+            _event("refused", reason=reason, wallet=_short(wallet),
+                   nullifier=_short(req.nullifier), integrator=integrator.label,
+                   detail=str(exc)[:200])
+        )
+        raise HTTPException(400, reason) from exc
+
+    with _SEND_LOCK:
+        try:
+            base_fee = rpc.base_fee()
+        except ChainError as exc:
+            log.error(_event("chain_unreachable", detail=str(exc)))
+            raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+
+        log.info(
+            _event("sponsoring", wallet=_short(wallet),
+                   nullifier=_short(req.nullifier), integrator=integrator.label)
+        )
+        try:
+            tx_hash = rpc.send_call(
+                account=_ACCOUNT,
+                to=integrator.address,
+                data=data,
+                chain_id=integrator.chain_id,
+                base_fee=base_fee,
+            )
+        except ChainError as exc:
+            log.error(
+                _event("sponsor_send_failed", wallet=_short(wallet),
+                       integrator=integrator.label, detail=str(exc))
+            )
+            raise HTTPException(502, f"send_failed: {exc}") from exc
+
+        try:
+            # amount 0: nothing was transferred; the fee lands after the
+            # receipt. The row is what makes sponsored submits visible to the
+            # caps and to an incident review, keyed by the wallet AND the
+            # nullifier it verified.
+            STORE.record(
+                chain_id=integrator.chain_id,
+                wallet=wallet,
+                nullifier=req.nullifier.lower(),
+                amount_wei=0,
+                tx_hash=tx_hash,
+            )
+        except Exception as exc:
+            log.error(
+                _event("ledger_write_failed", wallet=_short(wallet),
+                       tx=_short(tx_hash, 12), detail=str(exc))
+            )
+
+    outcome, fee_wei = _await_receipt(rpc, tx_hash)
+    if fee_wei:
+        try:
+            STORE.record_fee(tx_hash, fee_wei)
+        except Exception as exc:
+            log.error(
+                _event("ledger_write_failed", wallet=_short(wallet),
+                       fee_wei=fee_wei, tx=_short(tx_hash, 12), detail=str(exc))
+            )
+    log.info(
+        _event("sponsored" if outcome != "failed" else "sponsor_reverted",
+               wallet=_short(wallet), integrator=integrator.label,
+               fee_wei=fee_wei, tx=_short(tx_hash, 12), outcome=outcome)
+    )
+    return SubmitResponse(
+        submitted=outcome != "failed",
+        reason="sponsored" if outcome != "failed" else "send_reverted",
+        txHash=tx_hash,
+        pending=outcome == "pending",
+    )
 
 
 @app.post("/v1/gas/request", response_model=GasResponse)
@@ -615,7 +694,7 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
         raise HTTPException(403, "integrator_not_allowed")
 
     rpc = _rpc(integrator.chain_id)
-    nullifier = _authorise(req, integrator, rpc, wallet)
+    _authorise(integrator, rpc, wallet)
 
     # Serialise the WHOLE decision — the chain reads included, not just the
     # ledger read.
@@ -680,7 +759,7 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
                        target_wei=target, drips_left=funder_balance // max(target, 1))
             )
 
-        usage = STORE.usage(wallet=wallet, nullifier=nullifier, chain_id=integrator.chain_id)
+        usage = STORE.usage(wallet=wallet, nullifier=None, chain_id=integrator.chain_id)
         decision: Decision = decide(
             balance=balance,
             target=target,
@@ -702,7 +781,7 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
             # the body by contract.
             log.info(
                 _event("declined", reason=decision.reason, wallet=_short(wallet),
-                       nullifier=_short(nullifier), integrator=integrator.label,
+                       integrator=integrator.label,
                        balance_wei=balance, target_wei=target)
             )
             return GasResponse(
@@ -713,7 +792,7 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
             )
 
         log.info(
-            _event("funding", wallet=_short(wallet), nullifier=_short(nullifier),
+            _event("funding", wallet=_short(wallet),
                    integrator=integrator.label, amount_wei=decision.amount,
                    balance_wei=balance, target_wei=target)
         )
@@ -737,7 +816,7 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
             STORE.record(
                 chain_id=integrator.chain_id,
                 wallet=wallet,
-                nullifier=nullifier,
+                nullifier=None,
                 amount_wei=decision.amount,
                 tx_hash=tx_hash,
             )
@@ -861,8 +940,7 @@ def status(chainId: int, integrator: str, wallet: str, request: Request) -> dict
         log.error(_event("chain_unreachable", detail=str(exc)))
         raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
-    nullifier = STORE.nullifier_for(wallet)
-    usage = STORE.usage(wallet=wallet, nullifier=nullifier, chain_id=chainId)
+    usage = STORE.usage(wallet=wallet, nullifier=None, chain_id=chainId)
     decision = decide(
         balance=balance,
         target=target,

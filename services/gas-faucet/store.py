@@ -127,29 +127,6 @@ class Store:
             global_wei=int(global_wei),
         )
 
-    def nullifier_for(self, wallet: str) -> str | None:
-        """The identity this wallet was last funded under, if we ever knew it.
-
-        The per-identity cap is only enforced when a request carries an
-        attestation — and `attestation` is optional, chosen by the caller. So
-        omitting one field was a way to opt out of the cap entirely and spend a
-        second, uncounted wallet allowance.
-
-        The ledger already holds the mapping, written by the cold-start drip
-        that was paid for under that very nullifier. Carrying it forward costs
-        one indexed lookup and closes the hole.
-        """
-        wallet = wallet.lower()
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT nullifier FROM drips "
-                "WHERE wallet = ? AND nullifier IS NOT NULL "
-                "ORDER BY id DESC LIMIT 1",
-                (wallet,),
-            )
-            row = cur.fetchone()
-        return row[0] if row else None
-
     def record_fee(self, tx_hash: str, fee_wei: int) -> None:
         """Book what a drip's transaction actually cost, once the receipt says.
 

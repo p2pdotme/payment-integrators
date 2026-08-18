@@ -20,9 +20,11 @@ SEL_BLOCKED = "0x" + keccak(text="blocked(address)")[:4].hex()
 #: passport verifies exactly one wallet, ever, so an attestation whose
 #: nullifier is already spent describes a submit that will revert.
 SEL_NULLIFIER_SPENT = "0x" + keccak(text="nullifierSpent(bytes32)")[:4].hex()
-#: `attestor()` — the signer the CONTRACT will verify a submitted attestation
-#: against, which is therefore the one this service should verify against too.
-SEL_ATTESTOR = "0x" + keccak(text="attestor()")[:4].hex()
+#: `submitPassportAttestation(address,bytes32,uint256,uint256,bytes)` — the
+#: ONE state-changing contract call this service's key is allowed to sign.
+SEL_SUBMIT_ATTESTATION = "0x" + keccak(
+    text="submitPassportAttestation(address,bytes32,uint256,uint256,bytes)"
+)[:4].hex()
 #: `paused()` — funding a wallet while the integrator is paused spends a drip
 #: on a purchase that cannot currently happen.
 SEL_PAUSED = "0x" + keccak(text="paused()")[:4].hex()
@@ -133,7 +135,62 @@ class Rpc:
             raise ChainError("empty eth_call result")
         return to_checksum_address("0x" + raw[-40:])
 
+    def simulate(self, *, sender: str, to: str, data: str) -> None:
+        """eth_call the exact transaction before paying to send it.
+
+        The chain is the verifier now — this service no longer re-implements
+        the contract's EIP-712 check. A submission that would revert is
+        refused here for the price of a read, so spam costs the caller a rate
+        slot and costs this service no gas.
+        """
+        self.call("eth_call", [{"from": sender, "to": to, "data": data}, "latest"])
+
     # ── writes ───────────────────────────────────────────────────────────
+
+    def send_call(
+        self, *, account, to: str, data: str, chain_id: int, base_fee: int
+    ) -> str:
+        """Sign and broadcast ONE kind of contract call from the faucet key.
+
+        This widens the key's power — it used to sign only bare transfers, and
+        "the key cannot sign a contract call" was a verified property. The
+        widening is bounded at this choke point instead: callers may only
+        reach allowlisted integrators, and this function refuses any calldata
+        that is not a submitPassportAttestation, carries no value, and clamps
+        gas like every other send. Worst case for a compromised key is
+        unchanged: the float, plus submitting valid attestations that the
+        contract would accept from anyone anyway.
+        """
+        if not data.lower().startswith(SEL_SUBMIT_ATTESTATION):
+            raise ChainError("send_call only signs submitPassportAttestation")
+        nonce = int(
+            str(self.call("eth_getTransactionCount", [account.address, "pending"])), 16
+        )
+        try:
+            tip = int(str(self.call("eth_maxPriorityFeePerGas", [])), 16)
+        except ChainError:
+            tip = DEFAULT_TIP_WEI
+        try:
+            estimate = self.call(
+                "eth_estimateGas",
+                [{"from": account.address, "to": to_checksum_address(to), "data": data}],
+            )
+            gas = min(int(int(str(estimate), 16) * 1.5), MAX_TRANSFER_GAS)
+        except ChainError as exc:
+            raise ChainError(f"could not size gas for submit: {exc}") from exc
+        tx = {
+            "type": 2,
+            "chainId": chain_id,
+            "nonce": nonce,
+            "to": to_checksum_address(to),
+            "value": 0,
+            "data": data,
+            "gas": gas,
+            "maxFeePerGas": min(base_fee * 2 + tip, MAX_FEE_PER_GAS_WEI),
+            "maxPriorityFeePerGas": tip,
+        }
+        signed = account.sign_transaction(tx)
+        return str(self.call("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()]))
 
     def send_value(
         self, *, account, to: str, amount_wei: int, chain_id: int, base_fee: int

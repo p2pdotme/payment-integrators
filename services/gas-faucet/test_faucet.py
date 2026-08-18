@@ -12,13 +12,6 @@ import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-from attestation import (
-    Attestation,
-    InvalidAttestation,
-    canonical_nullifier,
-    check_attestation,
-    recover_attestor,
-)
 from policy import Limits, decide, drip_target_wei, floor_wei
 from store import Store, utc_day_start
 
@@ -145,180 +138,14 @@ class TestDecide:
 
 
 # ── attestation ─────────────────────────────────────────────────────────────
-
-# Base Sepolia — matching the deployment INTEGRATOR below actually lives on.
-# This used to say 8453 (mainnet) against the Sepolia address, which made every
-# signature-domain test assert a (chainId, verifyingContract) pair that exists
-# on no chain. The tests passed anyway because both sides used the same wrong
-# pair — worth remembering when reading any "parity" test. (#83)
-CHAIN_ID = 84532
-INTEGRATOR = "0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032"
-TYPES = {
-    "KycAttestation": [
-        {"name": "wallet", "type": "address"},
-        {"name": "nullifier", "type": "bytes32"},
-        {"name": "limit", "type": "uint256"},
-        {"name": "expiry", "type": "uint256"},
-    ]
-}
-
-
-def _sign(signer, *, wallet, nullifier=b"\x11" * 32, limit=100_000_000, expiry=None,
-          chain_id=CHAIN_ID, integrator=INTEGRATOR):
-    expiry = expiry if expiry is not None else int(time.time()) + 3600
-    signable = encode_typed_data(
-        domain_data={
-            "name": "KycVerifier",
-            "version": "1",
-            "chainId": chain_id,
-            "verifyingContract": integrator,
-        },
-        message_types=TYPES,
-        message_data={
-            "wallet": wallet,
-            "nullifier": nullifier,
-            "limit": limit,
-            "expiry": expiry,
-        },
-    )
-    signed = signer.sign_message(signable)
-    return Attestation(
-        wallet=wallet,
-        nullifier="0x" + nullifier.hex(),
-        limit=limit,
-        expiry=expiry,
-        signature="0x" + signed.signature.hex(),
-    )
-
-
-class TestAttestation:
-    @pytest.fixture
-    def attestor(self):
-        return Account.from_key("0x" + "11" * 32)
-
-    @pytest.fixture
-    def user(self):
-        return Account.from_key("0x" + "22" * 32)
-
-    def test_recovers_the_signer(self, attestor, user):
-        att = _sign(attestor, wallet=user.address)
-        assert recover_attestor(att, chain_id=CHAIN_ID, integrator=INTEGRATOR) == attestor.address
-
-    def test_accepts_a_good_attestation(self, attestor, user):
-        att = _sign(attestor, wallet=user.address)
-        check_attestation(
-            att,
-            chain_id=CHAIN_ID,
-            integrator=INTEGRATOR,
-            attestor=attestor.address,
-            now=int(time.time()),
-        )
-
-    def test_rejects_a_signature_from_anyone_else(self, attestor, user):
-        impostor = Account.from_key("0x" + "33" * 32)
-        att = _sign(impostor, wallet=user.address)
-        with pytest.raises(InvalidAttestation, match="attestor"):
-            check_attestation(
-                att, chain_id=CHAIN_ID, integrator=INTEGRATOR,
-                attestor=attestor.address, now=int(time.time()),
-            )
-
-    def test_rejects_one_minted_for_a_different_integrator(self, attestor, user):
-        # verifyingContract binding. Without it, an attestation issued for any
-        # other P2P integrator would unlock this faucet's budget.
-        other = "0x9c64B3B4e0F0C4A0E8b0F1A2B3c4D5e6F7080910"
-        att = _sign(attestor, wallet=user.address, integrator=other)
-        with pytest.raises(InvalidAttestation):
-            check_attestation(
-                att, chain_id=CHAIN_ID, integrator=INTEGRATOR,
-                attestor=attestor.address, now=int(time.time()),
-            )
-
-    def test_rejects_one_minted_for_a_different_chain(self, attestor, user):
-        att = _sign(attestor, wallet=user.address, chain_id=8453)
-        with pytest.raises(InvalidAttestation):
-            check_attestation(
-                att, chain_id=CHAIN_ID, integrator=INTEGRATOR,
-                attestor=attestor.address, now=int(time.time()),
-            )
-
-    def test_rejects_a_wallet_swap(self, attestor, user):
-        # The signature binds the wallet, so redirecting the drip means
-        # re-signing — which the attacker cannot do.
-        att = _sign(attestor, wallet=user.address)
-        swapped = Attestation(
-            wallet="0x000000000000000000000000000000000000dEaD",
-            nullifier=att.nullifier,
-            limit=att.limit,
-            expiry=att.expiry,
-            signature=att.signature,
-        )
-        with pytest.raises(InvalidAttestation):
-            check_attestation(
-                swapped, chain_id=CHAIN_ID, integrator=INTEGRATOR,
-                attestor=attestor.address, now=int(time.time()),
-            )
-
-    def test_rejects_a_limit_zero_attestation(self, attestor, user):
-        # The attestor should never sign limit 0 — the funded wallet could
-        # never buy. Reaching the contract would only surface it when the user
-        # first tries to purchase; refusing here surfaces it at the source. (#80)
-        att = _sign(attestor, wallet=user.address, limit=0)
-        with pytest.raises(InvalidAttestation, match="limit"):
-            check_attestation(
-                att, chain_id=CHAIN_ID, integrator=INTEGRATOR,
-                attestor=attestor.address, now=int(time.time()),
-            )
-
-    def test_rejects_an_expired_attestation(self, attestor, user):
-        att = _sign(attestor, wallet=user.address, expiry=1_000)
-        with pytest.raises(InvalidAttestation, match="expired"):
-            check_attestation(
-                att, chain_id=CHAIN_ID, integrator=INTEGRATOR,
-                attestor=attestor.address, now=int(time.time()),
-            )
-
-    def test_treats_expiry_exactly_as_the_contract_does(self, attestor, user):
-        # The contract reverts on `block.timestamp >= expiry`, so the instant
-        # of expiry is already too late. Funding inside a window the contract
-        # has closed spends money on a submit that will revert.
-        expiry = 2_000_000_000
-        att = _sign(attestor, wallet=user.address, expiry=expiry)
-        with pytest.raises(InvalidAttestation, match="expired"):
-            check_attestation(
-                att, chain_id=CHAIN_ID, integrator=INTEGRATOR,
-                attestor=attestor.address, now=expiry,
-            )
-        check_attestation(
-            att, chain_id=CHAIN_ID, integrator=INTEGRATOR,
-            attestor=attestor.address, now=expiry - 1,
-        )
-
-    def test_rejects_a_malleated_signature(self, attestor, user):
-        # The contract refuses high-s signatures, so accepting one here would
-        # fund a wallet whose submit then reverts InvalidSignature.
-        att = _sign(attestor, wallet=user.address)
-        raw = bytes.fromhex(att.signature[2:])
-        n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-        s = int.from_bytes(raw[32:64], "big")
-        flipped = raw[:32] + (n - s).to_bytes(32, "big") + bytes([raw[64] ^ 1])
-        with pytest.raises(InvalidAttestation, match="high s"):
-            check_attestation(
-                Attestation(att.wallet, att.nullifier, att.limit, att.expiry,
-                            "0x" + flipped.hex()),
-                chain_id=CHAIN_ID, integrator=INTEGRATOR,
-                attestor=attestor.address, now=int(time.time()),
-            )
-
-    def test_rejects_a_truncated_signature(self, attestor, user):
-        att = _sign(attestor, wallet=user.address)
-        with pytest.raises(InvalidAttestation, match="65 bytes"):
-            check_attestation(
-                Attestation(att.wallet, att.nullifier, att.limit, att.expiry, "0xdead"),
-                chain_id=CHAIN_ID, integrator=INTEGRATOR,
-                attestor=attestor.address, now=int(time.time()),
-            )
-
+# Gone, deliberately. This file used to re-test an off-chain EIP-712
+# verifier (attestation.py) that duplicated the contract's checks — domain,
+# typehash, expiry, low-s, wallet binding, canonical nullifier spelling. The
+# sponsored-submission contract change deleted that module: the faucet now
+# submits attestations to the CHAIN, which is the only verifier, simulating
+# first so invalid ones cost nothing. The behavioural coverage lives in
+# test_app.py::TestSubmitEndpoint against the service, and in
+# test/own-integrator.test.ts against the contract itself.
 
 # ── the ledger ──────────────────────────────────────────────────────────────
 
@@ -400,46 +227,3 @@ class TestStore:
         store.record(chain_id=8453, wallet="0xB", nullifier=None,
                      amount_wei=20, tx_hash=None, now=now)
         assert store.usage(wallet="0xC", nullifier=None, now=now).global_wei == 30
-
-
-# ── the per-identity ledger key ─────────────────────────────────────────────
-
-
-class TestCanonicalNullifier:
-    """`bytes.fromhex` is permissive enough that the raw request string is not
-    a safe ledger key: whitespace is ignored and case does not matter, so one
-    identity could hold unlimited distinct budget rows just by respelling its
-    own nullifier — and the per-human cap would never bind."""
-
-    CANON = "0x" + "ab" * 32
-
-    @pytest.mark.parametrize(
-        "spelling",
-        [
-            "ab" * 32,
-            "0x" + "ab" * 32,
-            "0X" + "ab" * 32,
-            "AB" * 32,
-            "0x" + "Ab" * 32,
-            " ".join(["ab"] * 32),
-            "\t".join(["ab"] * 32),
-        ],
-    )
-    def test_every_spelling_collapses_to_one_key(self, spelling):
-        assert canonical_nullifier(spelling) == self.CANON
-
-    def test_the_permissiveness_this_defends_against_is_real(self):
-        # Guard the premise: if bytes.fromhex ever stops ignoring whitespace,
-        # this test should be the thing that notices.
-        assert bytes.fromhex(" ".join(["ab"] * 32)) == bytes.fromhex("ab" * 32)
-
-    def test_rejects_the_wrong_length(self):
-        with pytest.raises(InvalidAttestation, match="32 bytes"):
-            canonical_nullifier("0xabcd")
-
-    def test_rejects_non_hex(self):
-        with pytest.raises(InvalidAttestation, match="not hex"):
-            canonical_nullifier("0x" + "zz" * 32)
-
-    def test_distinct_identities_stay_distinct(self):
-        assert canonical_nullifier("ab" * 32) != canonical_nullifier("cd" * 32)

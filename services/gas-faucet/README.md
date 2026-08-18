@@ -142,6 +142,24 @@ refill it, rather than funding it once and forgetting.
 still work for anyone already holding gas. A client that blocks its ramp on a
 faucet error has made a convenience into a dependency.
 
+## Sponsoring verification — POST /v1/attestation
+
+The service lands `submitPassportAttestation(wallet, …)` on-chain itself,
+paying the gas. It does **not** verify the attestation: the contract does,
+first in a free simulation (an invalid submission is refused for the price of
+a rate-limit slot, costing this service nothing) and then for real. This is
+what deleted the entire off-chain verifier — the EIP-712 re-implementation,
+the attestor config, the reconciliation machinery — and with it the
+misconfiguration class where the faucet and the contract disagreed about the
+signer.
+
+The key therefore now signs ONE kind of contract call. That widens what it
+used to be able to do (bare transfers only), and the widening is bounded at a
+single choke point: `send_call` refuses any calldata that is not a
+`submitPassportAttestation`, targets only allowlisted integrators, carries no
+value, and clamps gas. Worst case for a leaked key is unchanged — the float,
+plus submitting valid attestations the contract accepts from anyone anyway.
+
 ## Observability
 
 One structured line per decision, on stdout, which is where Railway collects
