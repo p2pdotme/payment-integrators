@@ -96,7 +96,9 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
 
     error AttestorNotSet();
     error AttestationExpired();
+    error AttestationWindowTooLong();
     error NullifierAlreadySpent();
+    error NullifierNotSpent();
     error InvalidSignature();
 
     error NotVerified();
@@ -120,9 +122,15 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
     event PassportVerified(
         address indexed user,
         bytes32 indexed nullifier,
+        address indexed submitter,
         uint256 attestedLimit,
         uint256 grantedLimit
     );
+
+    /// @notice An enrolment was undone: the nullifier is spendable again and
+    ///         the wallet is back to unverified. The owner's only remedy for a
+    ///         nullifier bound to the wrong wallet.
+    event EnrolmentRevoked(address indexed user, bytes32 indexed nullifier, address indexed by);
 
     event OrderValidated(
         address indexed user,
@@ -199,6 +207,12 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
     uint256 public constant MAX_REGION_CAP_ABROAD = 200e6;
     /// @notice At most 5 onramp placements per user per day.
     uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5;
+    /// @notice How far ahead of now an attestation's `expiry` may sit. The
+    ///         service issues one-hour windows today, so this is generous
+    ///         headroom rather than a constraint on it. It exists because the
+    ///         signature is a bearer capability once submission is untied from
+    ///         the wallet, and an unbounded window is an unbounded one.
+    uint256 public constant MAX_ATTESTATION_WINDOW = 2 hours;
 
     // ─── EIP-712 (simple-kyc service) ─────────────────────────────────
     // Domain and typehash match the passport+liveness ("KYC") service exactly
@@ -386,6 +400,43 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
         emit UserBlocked(user, isBlocked);
     }
 
+    /**
+     * @notice Undo an enrolment: free the nullifier and unverify the wallet.
+     *
+     * @dev The cost of untying submission from the wallet. The user used to
+     *      hold a veto — a signature naming a wallet they could not use simply
+     *      never landed, and the service re-issued for the right one. Now any
+     *      holder of the signature lands it, so a retry, a stale queue entry,
+     *      an abandoned flow or a wrong address from the client permanently
+     *      binds that human's single nullifier to a wallet they may not
+     *      control. Without this the only remedies are redeploying an
+     *      immutable contract, which invalidates every existing grant, or
+     *      minting a second nullifier for one human, which is the Sybil
+     *      property the nullifier exists to provide.
+     *
+     *      `blocked` is not the same lever: it zeroes an effective limit and
+     *      leaves the nullifier spent forever.
+     *
+     *      The pairing is not stored on chain, because one SSTORE per enrolment
+     *      is a real cost on every sponsored submit for a remedy used almost
+     *      never. `PassportVerified` records the true (wallet, nullifier) pair,
+     *      so the caller reads it from the log and passes both back here, and
+     *      `EnrolmentRevoked` records what was actually undone.
+     *
+     * @param nullifier The nullifier to free. Must currently be spent.
+     * @param wallet    The wallet it was bound to, which loses its grant.
+     */
+    function revokeEnrolment(bytes32 nullifier, address wallet) external onlyOwner {
+        if (wallet == address(0)) revert InvalidAddress();
+        if (!nullifierSpent[nullifier]) revert NullifierNotSpent();
+
+        nullifierSpent[nullifier] = false;
+        verified[wallet] = false;
+        grantedLimit[wallet] = 0;
+
+        emit EnrolmentRevoked(wallet, nullifier, msg.sender);
+    }
+
     function pause() external onlyOwner {
         if (paused) return;
         paused = true;
@@ -507,6 +558,14 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
         address signer = attestor;
         if (signer == address(0)) revert AttestorNotSet();
         if (block.timestamp >= expiry) revert AttestationExpired();
+        // Untying submission from the wallet made the signature a bearer
+        // capability: whoever holds it can land it. An unbounded `expiry` then
+        // makes that capability live for as long as an off-chain service chose,
+        // and every other policy input here carries an immutable ceiling for
+        // exactly that reason. This is the one that now matters most.
+        if (expiry > block.timestamp + MAX_ATTESTATION_WINDOW) {
+            revert AttestationWindowTooLong();
+        }
         if (nullifierSpent[nullifier]) revert NullifierAlreadySpent();
 
         bytes32 digest = _digest(wallet, nullifier, limit, expiry);
@@ -516,7 +575,11 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
         verified[wallet] = true;
         if (limit > grantedLimit[wallet]) grantedLimit[wallet] = limit;
 
-        emit PassportVerified(wallet, nullifier, limit, grantedLimit[wallet]);
+        // `msg.sender` is the whole new degree of freedom, so it belongs in the
+        // log. Without it nothing on chain separates "our sponsor enrolled this
+        // wallet" from "a third party front-ran it", which is the difference an
+        // incident turns on.
+        emit PassportVerified(wallet, nullifier, msg.sender, limit, grantedLimit[wallet]);
     }
 
     // ─── Views ────────────────────────────────────────────────────────

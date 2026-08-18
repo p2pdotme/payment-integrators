@@ -259,10 +259,6 @@ const KNOWN: Record<string, Record<string, string>> = {
     "value-movers-are-nonreentrant": "No reentrancy guards anywhere in this contract.",
     "tolerates-repeat-cancel": "Reverts `OrderAlreadyCancelled` on a repeat.",
   },
-  OwnCheckoutIntegrator: {
-    "attestor-setters-reject-zero":
-      "`setAttestor` takes any address including zero, which bricks the tier. Same gap as UsdcDirect and Investabl. Merged to main in #64; tracked as #92.",
-  },
   UsdcDirectCheckoutIntegrator: {
     "value-movers-are-nonreentrant":
       "Value moves inside `_placeOrder`, reached from unguarded external entrypoints; zero nonReentrant in the file. Surfaced by the transitive tracing (#95) — the flat scan reported this as not-applicable.",

@@ -202,7 +202,13 @@ describe("OwnCheckoutIntegrator", function () {
     it("grants the attested limit and marks the wallet verified", async function () {
       await expect(verify(user, USDC(60)))
         .to.emit(integrator, "PassportVerified")
-        .withArgs(user.address, nullifierFor(`kyc:${user.address}`), USDC(60), USDC(60));
+        .withArgs(
+          user.address,
+          nullifierFor(`kyc:${user.address}`),
+          user.address, // self-submit: the wallet is its own submitter
+          USDC(60),
+          USDC(60)
+        );
 
       expect(await integrator.verified(user.address)).to.equal(true);
       expect(await integrator.grantedLimit(user.address)).to.equal(USDC(60));
@@ -326,7 +332,13 @@ describe("OwnCheckoutIntegrator", function () {
           .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
       )
         .to.emit(integrator, "PassportVerified")
-        .withArgs(user.address, nullifier, CAP_INDIA, CAP_INDIA);
+        .withArgs(
+          user.address,
+          nullifier,
+          stranger.address, // the sponsor, which is the whole point of the log line
+          CAP_INDIA,
+          CAP_INDIA
+        );
 
       expect(await integrator.verified(user.address)).to.equal(true);
       expect(await integrator.grantedLimit(user.address)).to.equal(CAP_INDIA);
@@ -1103,6 +1115,89 @@ describe("OwnCheckoutIntegrator", function () {
         "SettlementRoutingAnomaly"
       );
       expect((await integrator.getSession(orderId)).settled).to.equal(false);
+    });
+  });
+  describe("the attestation window is bounded", function () {
+    it("refuses an expiry further ahead than MAX_ATTESTATION_WINDOW", async function () {
+      const window = await integrator.MAX_ATTESTATION_WINDOW();
+      const nullifier = nullifierFor("too-long");
+      const expiry = (await futureExpiry(0)) + window + 60n;
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "AttestationWindowTooLong");
+
+      // Refused before the nullifier is touched, so a correctly scoped
+      // re-issue for the same human still lands.
+      expect(await integrator.nullifierSpent(nullifier)).to.equal(false);
+    });
+
+    it("accepts the one-hour window the service actually issues", async function () {
+      const nullifier = nullifierFor("normal-window");
+      const expiry = await futureExpiry(3600);
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig);
+      expect(await integrator.verified(user.address)).to.equal(true);
+    });
+  });
+
+  describe("an enrolment can be undone", function () {
+    it("frees the nullifier and unverifies the wallet, so the human can re-enrol", async function () {
+      const nullifier = nullifierFor("wrong-wallet");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, stranger.address, nullifier, CAP_INDIA, expiry);
+
+      // The sponsor lands it against a wallet the human does not control.
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(stranger.address, nullifier, CAP_INDIA, expiry, sig);
+      expect(await integrator.verified(stranger.address)).to.equal(true);
+      expect(await integrator.nullifierSpent(nullifier)).to.equal(true);
+
+      await expect(integrator.connect(owner).revokeEnrolment(nullifier, stranger.address))
+        .to.emit(integrator, "EnrolmentRevoked")
+        .withArgs(stranger.address, nullifier, owner.address);
+
+      expect(await integrator.verified(stranger.address)).to.equal(false);
+      expect(await integrator.grantedLimit(stranger.address)).to.equal(0);
+      expect(await integrator.nullifierSpent(nullifier)).to.equal(false);
+
+      // The whole point: the same human, same nullifier, correct wallet.
+      const reissue = await futureExpiry();
+      const sig2 = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, reissue);
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(user.address, nullifier, CAP_INDIA, reissue, sig2);
+      expect(await integrator.verified(user.address)).to.equal(true);
+    });
+
+    it("is owner-only", async function () {
+      const nullifier = nullifierFor("owner-only");
+      await verify(user, CAP_INDIA, "owner-only");
+      await expect(
+        integrator.connect(stranger).revokeEnrolment(nullifier, user.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    it("refuses a nullifier that was never spent", async function () {
+      await expect(
+        integrator.connect(owner).revokeEnrolment(nullifierFor("never"), user.address)
+      ).to.be.revertedWithCustomError(integrator, "NullifierNotSpent");
+    });
+
+    it("refuses the zero wallet", async function () {
+      await verify(user, CAP_INDIA, "zero-wallet");
+      await expect(
+        integrator
+          .connect(owner)
+          .revokeEnrolment(nullifierFor("kyc:zero-wallet"), ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
   });
 });
