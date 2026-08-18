@@ -209,7 +209,8 @@ async function main() {
   console.log("\nConfig:");
   // Marked for the same reason the attestor is: an unmarked address in a
   // DRY_RUN print reads as "configured" whether or not anyone chose it. This
-  // one is permanent, so it gets the louder marker.
+  // one holds every admin lever until a two-step transfer completes, so it
+  // gets the louder marker.
   console.log(
     `  owner:            ${DEPLOY_OWNER}${
       DEPLOY_OWNER === deployer.address ? "  (⚠️ DEPLOYER EOA — use a multisig)" : ""

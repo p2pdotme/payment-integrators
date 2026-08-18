@@ -17,7 +17,9 @@ surface is small and, critically, **the bridge is not part of it**:
 ```
 buyUsdc · submitPassportAttestation · validateOrder · onOrderComplete
 onOrderCancel · setAttestor · setRegionCap · setDailyTxCountLimit
-setBlocked · pause · unpause · sweepUsdc  + views
+setBlocked · revokeEnrolment · pause · unpause · sweepUsdc
+transferOwnership · acceptOwnership · renounceOwnership (always reverts)
++ views (incl. owner, pendingOwner)
 ```
 
 Zero lines of code in `OwnCheckoutIntegrator.sol` mention bridging, Relay, USDG
@@ -33,7 +35,7 @@ own wallet and the contract's job ends.
 | Lower a region cap or the daily count                                                                                        | **No.** `setRegionCap` / `setDailyTxCountLimit`. |
 | Block a wallet, pause the ramp                                                                                               | **No.** `setBlocked` / `pause`.                  |
 | **Raise** a cap above its `MAX_*` ceiling                                                                                    | **Yes** — ceilings are immutable.                |
-| Change the owner                                                                                                             | **No.** `transferOwnership` (OZ `Ownable`).      |
+| Change the owner                                                                                                             | **No.** `transferOwnership` + `acceptOwnership`. |
 | Any contract logic change                                                                                                    | **Yes** — plus a fresh whitelist request.        |
 
 So the bridge leg, which is the least-tested part of the system, is also the
@@ -106,9 +108,10 @@ is mandatory, not housekeeping.
 ### 2.4 Deploy from a multisig
 
 Whatever signs the constructor owns `pause`, `setBlocked`, `setRegionCap` and
-`sweepUsdc` until ownership is transferred (`transferOwnership`). Deploy with
-the Own multisig as `DEPLOY_OWNER` anyway — a hot deployer key should never
-hold the levers, even briefly.
+`sweepUsdc` until a two-step transfer completes (`transferOwnership`, then
+`acceptOwnership` from the new key). Deploy with the Own multisig as
+`DEPLOY_OWNER` anyway — a hot deployer key should never hold the levers, even
+briefly.
 
 ### 2.5 Whitelist request
 
@@ -218,8 +221,11 @@ cap) · `SettlementRoutingAnomaly` on the integrator — it can only fire on a
 mis-registration or a mis-described completion, so any occurrence is an
 incident, and since 2026-08-17 it reads this contract's USDC balance rather
 than the callback's `recipientAddr`, which the Diamond passes unchanged in
-both routing branches and which therefore could never have caught one · completion rate versus the
-1.57% organic baseline.
+both routing branches and which therefore could never have caught one ·
+`OwnershipTransferStarted` / `OwnershipTransferred` on the integrator — no one
+should ever see these outside a planned handover, so an unplanned occurrence
+means the owner key is compromised and the contract is being seized ·
+completion rate versus the 1.57% organic baseline.
 
 **Levers, in escalating order:** `setBlocked` one wallet · `setRegionCap(region, lower)`
 · `setRegionCap(region, 0)` to stop one region · `pause()` to stop all new
