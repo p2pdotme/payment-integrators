@@ -1,5 +1,10 @@
 # Testing the gas sponsorship
 
+> The Sepolia integrator below is the **sponsored-attestation** deployment
+> (5-param submit, PR #91). Pointing this service at a 4-param contract makes
+> every sponsorship fail as a generic revert — if every submission returns
+> simulation_reverted, check the integrator address before anything else.
+
 ## What can and cannot be tested where
 
 | | Base Sepolia | Base mainnet |
@@ -38,7 +43,7 @@ Re-check both before testing; they are the single most common way this fails:
 
 ```bash
 curl -s https://passport-api.p2p.cool/v1/attestor
-cast call 0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032 "attestor()(address)" \
+cast call 0x17DbCD059d0Ed2056aB1acD4DB4F29e61B78985d "attestor()(address)" \
   --rpc-url https://sepolia.base.org
 ```
 
@@ -52,7 +57,7 @@ bridging.
 cd payment-integrators/services/gas-faucet
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 FAUCET_PRIVATE_KEY=0x<funded key> \
-FAUCET_INTEGRATORS='[{"chainId":84532,"address":"0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032","attestor":"0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda","label":"own-sepolia"}]' \
+FAUCET_INTEGRATORS='[{"chainId":84532,"address":"0x17DbCD059d0Ed2056aB1acD4DB4F29e61B78985d","label":"own-sepolia"}]' \
 FAUCET_RPC_URLS='{"84532":"https://sepolia.base.org"}' \
 ALLOWED_ORIGINS=http://localhost:3000 \
 FAUCET_DB_PATH=./faucet.db \
@@ -73,7 +78,7 @@ Watch it happen:
 
 ```bash
 curl "http://localhost:8788/v1/gas/status?chainId=84532\
-&integrator=0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032&wallet=0x<your wallet>"
+&integrator=0x17DbCD059d0Ed2056aB1acD4DB4F29e61B78985d&wallet=0x<your wallet>"
 ```
 
 `wouldFund: true` before, `false` after.
@@ -141,7 +146,7 @@ railway variables --set "FAUCET_PRIVATE_KEY=$(python3 -c \
   "from eth_account import Account; print(Account.create().key.hex())")"
 
 railway variables \
-  --set 'FAUCET_INTEGRATORS=[{"chainId":84532,"address":"0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032","attestor":"0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda","label":"own-sepolia"}]' \
+  --set 'FAUCET_INTEGRATORS=[{"chainId":84532,"address":"0x17DbCD059d0Ed2056aB1acD4DB4F29e61B78985d","label":"own-sepolia"}]' \
   --set 'FAUCET_RPC_URLS={"84532":"https://sepolia.base.org"}' \
   --set 'FAUCET_DB_PATH=/data/faucet.db' \
   --set 'ALLOWED_ORIGIN_REGEX=^https://own-app-[a-z0-9-]+\.vercel\.app$'

@@ -522,8 +522,10 @@ def _encode_submit(wallet: str, nullifier: str, limit: int, expiry: int, signatu
         bytes.fromhex(nul)
     except ValueError as exc:
         raise HTTPException(400, f"bad_nullifier: {exc}") from exc
-    if limit < 0 or expiry < 0:
-        raise HTTPException(400, "bad_attestation: negative field")
+    if not (0 <= limit < 2**256) or not (0 <= expiry < 2**256):
+        # format(x, "064x") pads but does NOT truncate: a value >= 2^256
+        # yields >64 hex chars and nibble-shifts every field after it.
+        raise HTTPException(400, "bad_attestation: field out of uint256 range")
     sig = (signature[2:] if signature.lower().startswith("0x") else signature).lower()
     try:
         sig_bytes = bytes.fromhex(sig)
@@ -581,6 +583,18 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
         raise HTTPException(403, "integrator_not_allowed")
 
     rpc = _rpc(integrator.chain_id)
+
+    # Same economy check the drip applies: sponsoring an enrolment while the
+    # operator has said "stop" spends gas against their decision. The contract
+    # now enforces this too (submit is pause-gated), so this is belt over a
+    # real brace rather than over nothing.
+    if _integrator_paused(integrator, rpc):
+        log.info(
+            _event("refused", reason="integrator_paused", wallet=_short(wallet),
+                   integrator=integrator.label)
+        )
+        raise HTTPException(409, "integrator_paused")
+
     data = _encode_submit(wallet, req.nullifier, req.limit, req.expiry, req.signature)
 
     # The chain's answer, for free, before any gas is spent. Everything the
@@ -759,7 +773,10 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
                        target_wei=target, drips_left=funder_balance // max(target, 1))
             )
 
-        usage = STORE.usage(wallet=wallet, nullifier=None, chain_id=integrator.chain_id)
+        # Recalled from the sponsor row, so the per-identity budget actually
+        # binds — with nullifier=None it was dead code and its env knob inert.
+        nullifier = STORE.nullifier_for(wallet)
+        usage = STORE.usage(wallet=wallet, nullifier=nullifier, chain_id=integrator.chain_id)
         decision: Decision = decide(
             balance=balance,
             target=target,
@@ -816,7 +833,7 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
             STORE.record(
                 chain_id=integrator.chain_id,
                 wallet=wallet,
-                nullifier=None,
+                nullifier=nullifier,
                 amount_wei=decision.amount,
                 tx_hash=tx_hash,
             )
@@ -940,7 +957,7 @@ def status(chainId: int, integrator: str, wallet: str, request: Request) -> dict
         log.error(_event("chain_unreachable", detail=str(exc)))
         raise HTTPException(502, f"chain_unreachable: {exc}") from exc
 
-    usage = STORE.usage(wallet=wallet, nullifier=None, chain_id=chainId)
+    usage = STORE.usage(wallet=wallet, nullifier=STORE.nullifier_for(wallet), chain_id=chainId)
     decision = decide(
         balance=balance,
         target=target,

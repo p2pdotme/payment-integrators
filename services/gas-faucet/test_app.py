@@ -557,3 +557,99 @@ class TestKeyBlastRadius:
         assert data.startswith(faucet.SEL_SUBMIT_ATTESTATION)
         # 4-byte selector + 5 head words + length word + 96-byte padded sig
         assert len(data) == 10 + 64 * 5 + 64 + 96 * 2
+
+
+# ── review-round fixes, each pinned ─────────────────────────────────────────
+
+
+class TestRevertDataDecoding:
+    """Base's canonical nodes put a custom-error selector in error.DATA with
+    message="execution reverted". The old ChainError carried only the message,
+    so every friendly reason was undecodable — the client's
+    nullifier_already_spent recovery could never fire."""
+
+    def test_a_real_node_shaped_revert_decodes_to_its_reason(self, client, rpc):
+        w = Account.create().address
+        att = sign(w)
+        # Exactly what op-geth returns: selector nowhere but in data.
+        selector = list(faucet._SUBMIT_ERRORS)[0]  # NullifierAlreadySpent
+        rpc.simulate_error = f"eth_call: execution reverted data={selector}"
+        r = submit(client, w, att)
+        assert r.status_code == 400
+        assert r.json()["detail"] == "nullifier_already_spent"
+
+    def test_chain_error_carries_the_data_field(self):
+        import chain as chain_mod
+        import httpx
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"jsonrpc": "2.0", "id": 1,
+                        "error": {"code": 3, "message": "execution reverted",
+                                  "data": "0xdeadbeef"}}
+
+        rpc = chain_mod.Rpc("http://x")
+        rpc._client = type("C", (), {"post": lambda self, url, json: FakeResp()})()
+        with pytest.raises(chain_mod.ChainError, match="data=0xdeadbeef"):
+            rpc.call("eth_call", [])
+
+
+class TestSponsorRespectsPause:
+    def test_a_paused_integrator_refuses_sponsorship(self, client, rpc):
+        rpc.paused = True
+        w = Account.create().address
+        r = submit(client, w, sign(w))
+        assert r.status_code == 409
+        assert r.json()["detail"] == "integrator_paused"
+        assert getattr(rpc, "sent_calls", []) == []
+
+
+class TestSubmitBounds:
+    @pytest.mark.parametrize("field,value", [("limit", 2**256), ("expiry", 2**256)])
+    def test_word_overflow_is_a_400_not_shifted_calldata(self, client, rpc, field, value):
+        # format(x, "064x") pads but does not truncate — an overlong field
+        # nibble-shifts everything after it in the calldata.
+        w = Account.create().address
+        att = sign(w)
+        att[field] = value
+        assert submit(client, w, att).status_code == 400
+
+
+class TestSponsoredRowsAndDripSlots:
+    def test_a_sponsored_submit_does_not_consume_a_drip_slot(self, client, rpc):
+        # The amount-0 sponsor row counted in wallet_drips, so every sponsored
+        # user started the day one slot down.
+        w = Account.create().address
+        submit(client, w, sign(w))
+        usage = faucet.STORE.usage(wallet=w, nullifier=None, chain_id=CHAIN)
+        assert usage.wallet_drips == 0, "the sponsor row must not count as a drip"
+        req(client, w)
+        usage = faucet.STORE.usage(wallet=w, nullifier=None, chain_id=CHAIN)
+        assert usage.wallet_drips == 1
+
+
+class TestIdentityBudgetIsAliveAgain:
+    def test_drips_are_booked_against_the_enrolling_identity(self, client, rpc):
+        # Regression guard: after the cold-start deletion every usage() call
+        # passed nullifier=None, so identity_daily_budget_reached was dead code
+        # and its env knob silently inert. The sponsor row holds the mapping;
+        # the drip path must recall it.
+        w = Account.create().address
+        att = sign(w)
+        submit(client, w, att)
+        req(client, w)
+        row = faucet.STORE._conn.execute(
+            "SELECT nullifier FROM drips WHERE wallet = ? AND CAST(amount_wei AS INTEGER) > 0",
+            (w.lower(),),
+        ).fetchone()
+        assert row[0] == att["nullifier"].lower(), "the drip must carry the identity"
+
+    def test_the_identity_cap_can_actually_fire(self, client, rpc, monkeypatch):
+        monkeypatch.setattr(faucet, "LIMITS", faucet.LIMITS.__class__(
+            **{**faucet.LIMITS.__dict__, "max_wei_per_nullifier": 1}))
+        w = Account.create().address
+        att = sign(w)
+        submit(client, w, att)     # fee books against the nullifier
+        r = req(client, w)
+        assert r.json()["reason"] == "identity_daily_budget_reached"

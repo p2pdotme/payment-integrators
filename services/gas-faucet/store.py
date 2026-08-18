@@ -98,8 +98,14 @@ class Store:
         chain_filter = " AND chain_id = ?" if chain_id is not None else ""
         chain_args: tuple = (chain_id,) if chain_id is not None else ()
         with self._lock:
+            # COUNT only rows that MOVED value. A sponsored submission books
+            # amount_wei=0 (its fee still sums below), and counting it against
+            # max_drips_per_wallet meant every sponsored user started the day
+            # with 3 of their documented 4 drips.
             cur = self._conn.execute(
-                f"SELECT COUNT(*), COALESCE(SUM({self._SPENT}), 0) "
+                f"SELECT "
+                f"COALESCE(SUM(CASE WHEN CAST(amount_wei AS INTEGER) > 0 THEN 1 ELSE 0 END), 0), "
+                f"COALESCE(SUM({self._SPENT}), 0) "
                 f"FROM drips WHERE wallet = ? AND ts >= ?{chain_filter}",
                 (wallet, since, *chain_args),
             )
@@ -126,6 +132,27 @@ class Store:
             nullifier_wei=int(nullifier_wei),
             global_wei=int(global_wei),
         )
+
+    def nullifier_for(self, wallet: str) -> str | None:
+        """The identity this wallet was enrolled under, from its sponsor row.
+
+        The per-identity budget in policy.decide was severed when the
+        cold-start drip path was deleted — every usage() call passed
+        nullifier=None, making identity_daily_budget_reached unreachable and
+        its env knob a silently inert setting. Sponsored submissions DO record
+        the nullifier, so the mapping exists; this recalls it for the drip
+        path, and the knob means what it says again.
+        """
+        wallet = wallet.lower()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT nullifier FROM drips "
+                "WHERE wallet = ? AND nullifier IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (wallet,),
+            )
+            row = cur.fetchone()
+        return row[0] if row else None
 
     def record_fee(self, tx_hash: str, fee_wei: int) -> None:
         """Book what a drip's transaction actually cost, once the receipt says.

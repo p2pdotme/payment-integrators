@@ -73,7 +73,21 @@ class Rpc:
             raise ChainError(f"rpc unreachable: {exc}") from exc
 
         if "error" in body:
-            raise ChainError(f"{method}: {body['error'].get('message', body['error'])}")
+            # Carry the error's DATA, not just its message. Base's canonical
+            # nodes (op-geth lineage) report a custom-error revert as
+            # message="execution reverted" with the 4-byte selector ONLY in
+            # the data field — so a ChainError built from the message alone
+            # made every revert reason undecodable downstream: the sponsor
+            # endpoint's friendly reasons (nullifier_already_spent,
+            # invalid_signature, …) could never fire, and an attestor
+            # mismatch was indistinguishable from any user error. The alarm
+            # that cannot fire, once more.
+            err = body["error"]
+            detail = str(err.get("message", err))
+            data = err.get("data")
+            if data:
+                detail = f"{detail} data={data}"
+            raise ChainError(f"{method}: {detail}")
         return body.get("result")
 
     # ── reads ────────────────────────────────────────────────────────────
