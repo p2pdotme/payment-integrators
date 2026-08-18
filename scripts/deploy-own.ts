@@ -150,11 +150,12 @@ async function main() {
   }
 
   // ── Owner ───────────────────────────────────────────────────────────────
-  // `owner` is OZ `Ownable` and transferable after deploy, so a wrong value
-  // is recoverable — but only by whoever holds the wrongly-set key. Defaulting
-  // silently to the deployer EOA would still put pause/setBlocked/setRegionCap/
-  // sweepUsdc on a hot key until someone notices and transfers, so mainnet
-  // must name the Own multisig explicitly.
+  // `owner` is OZ `Ownable2Step`, so a wrong value is recoverable — but only
+  // by whoever holds the wrongly-set key, via transferOwnership plus an
+  // acceptOwnership from the corrected one. Defaulting silently to the
+  // deployer EOA would still put pause/setBlocked/setRegionCap/sweepUsdc on a
+  // hot key until that handshake completes, so mainnet must name the Own
+  // multisig explicitly.
   if (isMainnet && !process.env.DEPLOY_OWNER) {
     throw new Error(
       "DEPLOY_OWNER is required on mainnet — pass the Own multisig. " +

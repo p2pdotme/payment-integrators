@@ -796,6 +796,13 @@ describe("OwnCheckoutIntegrator", function () {
       await expect(
         integrator.connect(stranger).sweepUsdc(stranger.address, 1)
       ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
+      // unpause too: stripped of onlyOwner, anyone could lift an incident pause.
+      await integrator.connect(owner).pause();
+      await expect(integrator.connect(stranger).unpause()).to.be.revertedWithCustomError(
+        integrator,
+        "OwnableUnauthorizedAccount"
+      );
+      await integrator.connect(owner).unpause();
     });
 
     it("transfers ownership in two steps — the new owner must accept", async function () {
