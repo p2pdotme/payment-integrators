@@ -98,6 +98,31 @@ const ERC20_ABI = [
 
 const usd = (raw: string) => `$${(Number(raw) / 1e6).toLocaleString()}`;
 
+/**
+ * Require `addr` to be exactly its EIP-55 checksummed form. A checksum cannot
+ * be validated on-chain — an address is 20 opaque bytes by the time it reaches
+ * the constructor — so this script is the last place a single mutated
+ * character can still be caught. Rejecting all-lowercase input is deliberate:
+ * lowercase carries no checksum, so "valid but unchecksummable" is
+ * indistinguishable from "mutated".
+ */
+function requireChecksummed(label: string, addr: string): string {
+  let checksummed: string;
+  try {
+    checksummed = ethers.getAddress(addr.toLowerCase());
+  } catch {
+    throw new Error(`${label} is not an address: ${addr}`);
+  }
+  if (addr !== checksummed) {
+    throw new Error(
+      `${label} fails its EIP-55 checksum: got ${addr}. A mutated character is ` +
+        `exactly what the checksum exists to catch — re-copy the address from ` +
+        `the source of truth rather than "fixing" the casing.`
+    );
+  }
+  return checksummed;
+}
+
 async function main() {
   const [deployer] = await ethers.getSigners();
   const net = await ethers.provider.getNetwork();
@@ -137,6 +162,7 @@ async function main() {
         "setRegionCap/sweepUsdc to a hot key until ownership is transferred."
     );
   }
+  if (process.env.DEPLOY_OWNER) requireChecksummed("DEPLOY_OWNER", DEPLOY_OWNER);
 
   // ── Attestor ────────────────────────────────────────────────────────────
   if (!ATTESTOR) {
@@ -153,7 +179,7 @@ async function main() {
         "    to the real service signer before any real traffic."
     );
   }
-  if (!ethers.isAddress(ATTESTOR)) throw new Error(`ATTESTOR is not an address: ${ATTESTOR}`);
+  requireChecksummed("ATTESTOR", ATTESTOR);
 
   // ── Preflight ───────────────────────────────────────────────────────────
   for (const [label, addr] of [

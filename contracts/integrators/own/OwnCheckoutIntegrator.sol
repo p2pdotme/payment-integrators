@@ -91,6 +91,7 @@ contract OwnCheckoutIntegrator is IP2PIntegrator, Ownable {
     error InvalidLimit();
     /// @notice A limit was set above its immutable `MAX_*` policy ceiling.
     error CapExceedsCeiling();
+    error RenounceDisabled();
     error ContractPaused();
     error Reentrancy();
 
@@ -429,6 +430,14 @@ contract OwnCheckoutIntegrator is IP2PIntegrator, Ownable {
         grantedLimit[wallet] = 0;
 
         emit EnrolmentRevoked(wallet, nullifier, msg.sender);
+    }
+
+    /// @notice Disabled. Burning ownership would permanently disable pause,
+    ///         `setBlocked`, cap changes, `setAttestor`, `revokeEnrolment` and
+    ///         `sweepUsdc` — levers this contract must never lose. Hand over
+    ///         control with `transferOwnership` instead.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     function pause() external onlyOwner {

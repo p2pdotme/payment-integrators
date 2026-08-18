@@ -824,6 +824,18 @@ describe("OwnCheckoutIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "OwnableInvalidOwner");
     });
 
+    it("cannot renounce ownership — even the owner", async function () {
+      await expect(integrator.connect(owner).renounceOwnership()).to.be.revertedWithCustomError(
+        integrator,
+        "RenounceDisabled"
+      );
+      await expect(integrator.connect(stranger).renounceOwnership()).to.be.revertedWithCustomError(
+        integrator,
+        "RenounceDisabled"
+      );
+      expect(await integrator.owner()).to.equal(owner.address);
+    });
+
     it("pauses and resumes the onramp", async function () {
       await verify(user, CAP_INDIA);
       await integrator.connect(owner).pause();

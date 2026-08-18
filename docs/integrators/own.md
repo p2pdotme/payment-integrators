@@ -240,11 +240,15 @@ not an ongoing clock. Revocation is `setBlocked`.
 | `setRegionCap`         | `MAX_REGION_CAP_*` — anywhere at or below it, either direction |
 | `setDailyTxCountLimit` | `MAX_DAILY_TX_COUNT_LIMIT` — anywhere at or below it, never 0  |
 | `setBlocked`           | — (denylist a wallet)                                          |
-| `pause` / `unpause`    | — (stops new placements)                                       |
+| `revokeEnrolment`      | nullifier must be spent (undo a mis-bound enrolment)           |
+| `pause` / `unpause`    | — (stops new placements and new enrolments)                    |
 | `sweepUsdc`            | see below                                                      |
+| `transferOwnership`    | non-zero recipient (OZ `Ownable`)                              |
 
 `owner` is set at construction and transferable via OpenZeppelin `Ownable`'s
-`transferOwnership`. Use a multisig.
+`transferOwnership`. Use a multisig. `renounceOwnership` is overridden to
+revert — an ownerless contract would permanently lose every lever above, so
+ownership can be handed over but never burned.
 
 **`sweepUsdc` does not touch user funds.** By construction this contract's USDC
 balance is always zero, because settlement goes straight to the buyer. A
