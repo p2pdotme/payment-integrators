@@ -44,17 +44,17 @@ whole class of stranded-funds failures (`unbridgedTotal`, `retryBridge`,
 So leg 2 runs from the user's own wallet, through **Relay** — the same router
 Own's perps-margin bridge already uses. Verified live (Aug 2026):
 
-| | |
-|---|---|
-| Route | Base `8453` USDC `0x8335…2913` → Robinhood `4663` USDG `0x5fc5…d168` |
-| Both legs | `supportsBridging: true` on Relay's `/chains` feed |
-| Live quote | 100 USDC in → **99.82 USDG** out, ETA ~2s, impact −0.15% |
-| Steps | one signature — see below |
-| Recipient | a parameter — set to the user's own address |
+|            |                                                                      |
+| ---------- | -------------------------------------------------------------------- |
+| Route      | Base `8453` USDC `0x8335…2913` → Robinhood `4663` USDG `0x5fc5…d168` |
+| Both legs  | `supportsBridging: true` on Relay's `/chains` feed                   |
+| Live quote | 100 USDC in → **99.82 USDG** out, ETA ~2s, impact −0.15%             |
+| Steps      | one signature — see below                                            |
+| Recipient  | a parameter — set to the user's own address                          |
 
 > Relay does **not** list Base Sepolia (84532) or Robinhood testnet (46630), so
 > the bridge leg cannot run on testnet. This is expected, and it is why the
-> Sepolia E2E asserts only the settlement leg. Relay's *testnet* API carries
+> Sepolia E2E asserts only the settlement leg. Relay's _testnet_ API carries
 > only two chains, and Base Sepolia lists neither USDC nor a Robinhood
 > destination — so there is nothing to configure here, and the bridge and its
 > gas top-up are mainnet-only tests.
@@ -96,12 +96,12 @@ buyer's balance on 4663 and, when it is under five transactions' worth, offers
 a top-up as a visible line item on the bridge they are already making —
 pre-ticked only when they are short, and always declinable:
 
-| top-up | ETH delivered | ≈ platform txs | Relay fee | user receives (on $100) |
-|---|---|---|---|---|
-| none | – | – | $0.050 | 99.823 USDG |
-| $0.10 | 0.0000530 | ~4 | $0.179 | 99.694 USDG |
-| **$0.25** (default) | 0.0001325 | **~11** | $0.329 | 99.494 USDG |
-| $2.00 | 0.0010605 | ~86 | $2.079 | 97.793 USDG |
+| top-up              | ETH delivered | ≈ platform txs | Relay fee | user receives (on $100) |
+| ------------------- | ------------- | -------------- | --------- | ----------------------- |
+| none                | –             | –              | $0.050    | 99.823 USDG             |
+| $0.10               | 0.0000530     | ~4             | $0.179    | 99.694 USDG             |
+| **$0.25** (default) | 0.0001325     | **~11**        | $0.329    | 99.494 USDG             |
+| $2.00               | 0.0010605     | ~86            | $2.079    | 97.793 USDG             |
 
 Overhead is roughly $0.03–0.08 flat on top of the amount delivered.
 
@@ -127,12 +127,12 @@ path, no unverified path.
 stitched together: simple-kyc's own pipeline runs the document check, an active
 liveness challenge, a 1:1 face match against the passport portrait, and a 1:N
 dedup, then signs a single `KycVerifier` attestation covering all of it. There
-is a *separate* liveness-only service signing `LivenessVerifier` for the $20
+is a _separate_ liveness-only service signing `LivenessVerifier` for the $20
 tier — this contract has nothing to do with it, and conflating the two is the
 single most common integration failure here (see §6).
 
-| tier | India (INR) | Abroad |
-|---|---|---|
+| tier                | India (INR)   | Abroad        |
+| ------------------- | ------------- | ------------- |
 | passport + liveness | **$100** / tx | **$200** / tx |
 
 plus **5 orders per wallet per day**. Maximum exposure per wallet per day is
@@ -146,7 +146,7 @@ is not a rounding detail.
 
 `buyUsdc` forwards `fiatAmountLimit`, `circleId` and
 `preferredPaymentChannelConfigId` from the caller without validating them. On a
-BUY the Diamond does not treat `fiatAmountLimit` as a ceiling — it *substitutes*
+BUY the Diamond does not treat `fiatAmountLimit` as a ceiling — it _substitutes_
 it. `OrderFlowFacet` reverts only when the computed fiat exceeds the limit and
 otherwise assigns `fiatAmount = _fiatAmountLimit`, with the favourable-price
 delta accruing to the merchant. So the figure a caller passes is the figure the
@@ -206,7 +206,7 @@ Own.
 
 Note precisely what that does and does not say.
 
-Movement *below* a ceiling is free in both directions. An owner who lowers
+Movement _below_ a ceiling is free in both directions. An owner who lowers
 India to $25 can restore it to $100 in the next block — the setters are not a
 one-way ratchet, and deliberately so: a cap tightened during an incident has to
 be restorable without redeploying. Earlier drafts of this doc and the contract
@@ -234,14 +234,14 @@ not an ongoing clock. Revocation is `setBlocked`.
 
 ## 3. Owner powers (the complete list)
 
-| Power | Bounded by |
-|---|---|
-| `setAttestor` | — (rotate the service signer; existing grants stand) |
-| `setRegionCap` | `MAX_REGION_CAP_*` — anywhere at or below it, either direction |
-| `setDailyTxCountLimit` | `MAX_DAILY_TX_COUNT_LIMIT` — anywhere at or below it, never 0 |
-| `setBlocked` | — (denylist a wallet) |
-| `pause` / `unpause` | — (stops new placements) |
-| `sweepUsdc` | see below |
+| Power                  | Bounded by                                                     |
+| ---------------------- | -------------------------------------------------------------- |
+| `setAttestor`          | — (rotate the service signer; existing grants stand)           |
+| `setRegionCap`         | `MAX_REGION_CAP_*` — anywhere at or below it, either direction |
+| `setDailyTxCountLimit` | `MAX_DAILY_TX_COUNT_LIMIT` — anywhere at or below it, never 0  |
+| `setBlocked`           | — (denylist a wallet)                                          |
+| `pause` / `unpause`    | — (stops new placements)                                       |
+| `sweepUsdc`            | see below                                                      |
 
 `owner` is **immutable** — set at construction, never transferable. Use a
 multisig.
@@ -268,7 +268,7 @@ accumulates.
 > amount rather than zero. **That was still not enough**, and the second
 > version is worth recording too: a balance is never consumed, so one transfer
 > of a full order's worth left a standing balance that made every later order
-> anomalous until an owner swept — one order's USDC per *sweep cycle* to hold
+> anomalous until an owner swept — one order's USDC per _sweep cycle_ to hold
 > the alarm down permanently, not per order. An alarm a stranger can hold down
 > is one operators stop believing, which is the original failure by another
 > road.
@@ -319,17 +319,17 @@ integrator, which has no forwarding path — the funds would strand.
 
 ## 5. Base Sepolia deployment (live)
 
-| | |
-|---|---|
-| Integrator | [`0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032`](https://sepolia.basescan.org/address/0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032) |
-| `proxyImpl` | `0xF7dC3a639bc7d7500a4D1B93D7877DbbA008A6D3` |
-| Diamond | `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9` |
-| Settlement token | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` (GG mock, 6dp) |
-| Owner | `0x9DE9772AfCdf3AFa03CC689fE7AFA5b631088aB9` (deployer; immutable) |
-| Attestor | `0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda` ✅ the live service's signer |
-| Registered | `isActive=true`, `usdcThroughIntegrator=false` ✅ |
-| Caps | $100 India / $200 Abroad / 5 per day — all at their ceilings |
-| Tenant | `own-passport` on the passport service — `limit_usdc` 200 |
+|                  |                                                                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Integrator       | [`0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032`](https://sepolia.basescan.org/address/0x6e2Feec8434de08732D7ed5A0cDDd748dEFbB032) |
+| `proxyImpl`      | `0xF7dC3a639bc7d7500a4D1B93D7877DbbA008A6D3`                                                                                    |
+| Diamond          | `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9`                                                                                    |
+| Settlement token | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` (GG mock, 6dp)                                                                     |
+| Owner            | `0x9DE9772AfCdf3AFa03CC689fE7AFA5b631088aB9` (deployer; immutable)                                                              |
+| Attestor         | `0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda` ✅ the live service's signer                                                       |
+| Registered       | `isActive=true`, `usdcThroughIntegrator=false` ✅                                                                               |
+| Caps             | $100 India / $200 Abroad / 5 per day — all at their ceilings                                                                    |
+| Tenant           | `own-passport` on the passport service — `limit_usdc` 200                                                                       |
 
 The attestor was deployed as the deployer placeholder and **rotated 2026-08-06**
 to the passport service's signer in
@@ -383,11 +383,11 @@ seconds apart and indistinguishable.
 
 Expiry is **status-dependent** (`libOrderProcessorFacet.getOrderExpiresAt`):
 
-| status | expires at | default |
-|---|---|---|
-| `PLACED` | `placedTs + placedExpiry` | 3 min |
+| status     | expires at                    | default                   |
+| ---------- | ----------------------------- | ------------------------- |
+| `PLACED`   | `placedTs + placedExpiry`     | 3 min                     |
 | `ACCEPTED` | `acceptedTs + acceptedExpiry` | **5 min from ACCEPTANCE** |
-| `PAID` | `paidTs + paidExpiry` | 10 min |
+| `PAID`     | `paidTs + paidExpiry`         | 10 min                    |
 
 There is a second, independent bound that applies specifically to the buyer:
 `paidBuyOrder` also rejects `block.timestamp >= placedTimestamp + orderExpiry`
@@ -446,11 +446,11 @@ Steps 3 and 4 above, plus `paidBuyOrder`, are three transactions from the
 buyer's own wallet. The buyer is on this screen because they are acquiring
 their first stablecoin, so their Base ETH balance is zero. Measured:
 
-| call | gas | note |
-|---|---|---|
-| `submitPassportAttestation` | 99,644 | once per wallet |
-| `buyUsdc` | 1,107,487 / 987,781 | first call also deploys the `UserProxy` |
-| `paidBuyOrder` | ~150,000 | per order |
+| call                        | gas                 | note                                    |
+| --------------------------- | ------------------- | --------------------------------------- |
+| `submitPassportAttestation` | 99,644              | once per wallet                         |
+| `buyUsdc`                   | 1,107,487 / 987,781 | first call also deploys the `UserProxy` |
+| `paidBuyOrder`              | ~150,000            | per order                               |
 
 At Base's prevailing 0.005 gwei that is **about 1.5 cents in total**. It was
 never a cost problem — it is a chicken-and-egg problem, because the on-ramp is
@@ -482,19 +482,19 @@ convenience, never a dependency.
 
 The passport and liveness services are separate deployments with near-identical
 APIs. That resemblance is a trap: **every** one of these failures surfaces only
-*after* the user has completed a full passport scan. All three hit
+_after_ the user has completed a full passport scan. All three hit
 `own-protocol/app#66`, which was written from a liveness integration.
 
-| | |
-|---|---|
-| **Host** | The passport service is `passport-proxy.p2p.cool` (widget endpoints) / `passport-api.p2p.cool` (`/v1/attestor`). `liveness-api.p2p.cool` signs `LivenessVerifier`; this contract verifies `KycVerifier`, so pointing there reverts every submit with `InvalidSignature`. |
-| **postMessage** | The passport wizard posts `verify:complete` / `verify:error` — **not** `liveness:complete`. A host waiting on the wrong name never resolves; the popup only settles when the user gives up. |
-| **`country`** | The passport session endpoint **requires** ISO 3166-1 alpha-2 and 422s without it, before it even consults the redirect_uri allowlist. The liveness endpoint has no such field. |
+|                 |                                                                                                                                                                                                                                                                          |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Host**        | The passport service is `passport-proxy.p2p.cool` (widget endpoints) / `passport-api.p2p.cool` (`/v1/attestor`). `liveness-api.p2p.cool` signs `LivenessVerifier`; this contract verifies `KycVerifier`, so pointing there reverts every submit with `InvalidSignature`. |
+| **postMessage** | The passport wizard posts `verify:complete` / `verify:error` — **not** `liveness:complete`. A host waiting on the wrong name never resolves; the popup only settles when the user gives up.                                                                              |
+| **`country`**   | The passport session endpoint **requires** ISO 3166-1 alpha-2 and 422s without it, before it even consults the redirect_uri allowlist. The liveness endpoint has no such field.                                                                                          |
 
 Two further details, both learned the hard way:
 
 - The wizard's `handBackError` sends **`state: null`** while `handBackSuccess`
-  passes the real state. Gate the *code* on a state match — it is a bearer token
+  passes the real state. Gate the _code_ on a state match — it is a bearer token
   — but **not** the error, or every failure is silently swallowed.
 - The service covers eight markets (`IN NG BR MX CO AR VE ID`) against p2p.me's
   ten fiat rails. **ECU and PEN have no country policy**, so a ramp offering
@@ -514,7 +514,7 @@ key-holding proxy exposes only the two widget endpoints, so that lookup goes to
 
 - [x] ~~**Passport attestation backend.**~~ **Corrected 2026-08-06 — this was
       never a blocker.** An earlier draft of this doc claimed the passport
-      backend did not exist and named it *the* launch blocker. It does exist:
+      backend did not exist and named it _the_ launch blocker. It does exist:
       `simple-kyc` is that service, it signs the `KycVerifier` domain this
       contract verifies, and it has been doing so for other integrators. What
       was actually missing was a **tenant**, which is a minutes-long

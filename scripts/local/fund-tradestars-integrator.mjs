@@ -61,7 +61,9 @@ async function main() {
   const provider = new ethers.JsonRpcProvider(RPC_URL);
   const net = await provider.getNetwork();
   if (net.chainId !== 8453n) {
-    throw new Error(`Expected Base mainnet (chainId 8453), got ${net.chainId}.`);
+    throw new Error(
+      `Expected Base mainnet (chainId 8453), got ${net.chainId}.`,
+    );
   }
 
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
@@ -98,7 +100,9 @@ async function main() {
   const rcpt = await tx.wait();
   console.log(`confirmed in block ${rcpt.blockNumber}`);
   console.log(`integrator USDC now  ${f(await usdc.balanceOf(INTEGRATOR))}`);
-  console.log("\nDone. New offramp deliveries will now cover the fee from this buffer.");
+  console.log(
+    "\nDone. New offramp deliveries will now cover the fee from this buffer.",
+  );
 }
 
 main().catch((e) => {

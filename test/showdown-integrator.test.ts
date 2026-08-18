@@ -1731,6 +1731,52 @@ describe("ShowdownCheckoutIntegrator", function () {
       expect(await integrator.getRemainingDailyCount(user.address)).to.equal(fullToday - 1n);
     });
 
+    // #94: the exits were guarded but placement was not — a SECOND SELL could
+    // reach the exact state the exits refuse to create (pending == balance, zero
+    // fee margin), stranding one of two accepted merchants by the fee.
+    it("a second SELL cannot consume the fee headroom the exits protect", async function () {
+      await mockDiamond.setSellFee(ethers.parseUnits("0.1", 6)); // live INR fee
+      await bridgeIn(user, USDC(10));
+      const id1 = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(9), INR, 0, 1, 0, "pub");
+      await mockDiamond.acceptSellOrder(id1, "m1");
+
+      // gitchadd's repro: SELL #2 for $1 used to pass (balance 10 >= pending 9
+      // + 1) and zero the headroom; delivering #1 then left $0.90 against #2's
+      // $1.10 need. From the second SELL the floor now includes the $1 headroom.
+      await expect(integrator.connect(user).userInitiateOfframp(USDC(1), INR, 0, 1, 0, "pub")).to.be
+        .reverted; // validateOrder returns false -> Diamond hard-reverts
+
+      // The first (full-flow) SELL still delivers fine.
+      await expect(integrator.connect(user).deliverOfframpUpi(id1, "enc-upi")).to.emit(
+        integrator,
+        "OfframpUpiDelivered"
+      );
+    });
+
+    // #44 decision pinned: the FIRST full-balance SELL must remain placeable —
+    // _escrowFloor is 0 when nothing is pending.
+    it("a single full-balance SELL is still placeable", async function () {
+      await bridgeIn(user, USDC(100));
+      await expect(
+        integrator.connect(user).userInitiateOfframp(USDC(100), INR, 0, 1, 0, "pub")
+      ).to.emit(integrator, "OfframpInitiated");
+    });
+
+    // #96: a delivery that lands in a status that is neither PAID nor CANCELLED
+    // is surfaced as Unsettled, asserting nothing about what happened.
+    it("emits OfframpDeliveryUnsettled for an unexpected post-delivery status", async function () {
+      await bridgeIn(user, USDC(50));
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).userInitiateOfframp(USDC(50), INR, 0, 1, 0, "pub");
+      await mockDiamond.acceptSellOrder(orderId, "m");
+      await mockDiamond.setForceSellUpiNoOp(true); // returns success, moves nothing
+
+      await expect(integrator.connect(user).deliverOfframpUpi(orderId, "enc-upi"))
+        .to.emit(integrator, "OfframpDeliveryUnsettled")
+        .and.to.not.emit(integrator, "OfframpUpiDelivered");
+    });
+
     // #90 repro, verbatim from the issue: drain to exactly the escrow floor,
     // then your own delivery is impossible by the fee.
     it("a seller cannot drain to the bare principal and strand their accepted SELL", async function () {

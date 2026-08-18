@@ -421,8 +421,13 @@ async function main() {
     try {
       await probe.registerIntegrator.staticCall(integratorAddr, false, proxyImpl);
     } catch (e: unknown) {
+      // Only an on-chain revert means "this signer cannot register" (#96). An
+      // RPC blip must not print the same diagnosis and silently degrade a
+      // working path to a manual one — rethrow anything that is not a revert.
+      const err = e as { code?: string; shortMessage?: string };
+      if (err.code !== "CALL_EXCEPTION") throw e;
       canRegister = false;
-      const reason = (e as { shortMessage?: string; message?: string }).shortMessage ?? "";
+      const reason = err.shortMessage ?? "";
       console.log(`\n! registerIntegrator would revert for this signer (${reason}) — skipping.`);
       console.log("  Expected on mainnet: registration is onlySuperAdmin (held by p2p), while the");
       console.log("  deploy signer is the Showdown owner EOA. p2p completes the whitelist");

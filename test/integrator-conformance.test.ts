@@ -187,23 +187,39 @@ const CHECKS: Check[] = [
   },
   {
     id: "value-movers-are-nonreentrant",
-    title: "external entrypoints that move value carry nonReentrant",
+    title: "external entrypoints that move value (directly or via helpers) carry nonReentrant",
     run: (c) => {
-      const fns = parseFunctions(stripComments(c.src)).filter(
-        (f) => f.visibility === "external" || f.visibility === "public"
-      );
+      const fns = parseFunctions(stripComments(c.src));
+      const movesDirectly = (body: string) =>
+        /safeTransferFrom\s*\(|safeTransfer\s*\(|transferERC20ToIntegrator\s*\(|\.execute\s*\(|depositForBurn\s*\(/.test(
+          body
+        );
+      // Transitive closure (#95): a first version scanned only external bodies,
+      // so a contract whose transfers sit one `_helper` down reported "no value
+      // moved here at all" — exactly the contracts with zero guards. Iterate
+      // until fixpoint so `external f() { _place(); }` over `_place() {
+      // safeTransferFrom(...) }` is a value mover.
+      const moving = new Set(fns.filter((f) => movesDirectly(f.body)).map((f) => f.name));
+      let grew = true;
+      while (grew) {
+        grew = false;
+        for (const f of fns) {
+          if (moving.has(f.name)) continue;
+          for (const callee of moving) {
+            if (new RegExp(`\\b${callee}\\s*\\(`).test(f.body)) {
+              moving.add(f.name);
+              grew = true;
+              break;
+            }
+          }
+        }
+      }
       const movers = fns.filter((f) => {
-        const movesValue =
-          /safeTransferFrom\s*\(|safeTransfer\s*\(|transferERC20ToIntegrator\s*\(|\.execute\s*\(|depositForBurn\s*\(/.test(
-            f.body
-          );
-        // Out of scope by design: views, the Diamond re-enters validateOrder
-        // inside our own entrypoints, and the completion/cancel hooks plus
-        // selfBridge are self-calling (`onlySelf`) rather than user-facing.
+        const isEntry = f.visibility === "external" || f.visibility === "public";
         const exempt =
           /\bview\b|\bpure\b/.test(f.modifiers) ||
           /^(validateOrder|onOrderComplete|onOrderCancel|selfBridge)$/.test(f.name);
-        return movesValue && !exempt;
+        return isEntry && moving.has(f.name) && !exempt;
       });
       if (movers.length === 0) return null;
       return movers.every((f) => /\bnonReentrant\b/.test(f.modifiers));
@@ -243,7 +259,13 @@ const KNOWN: Record<string, Record<string, string>> = {
     "value-movers-are-nonreentrant": "No reentrancy guards anywhere in this contract.",
     "tolerates-repeat-cancel": "Reverts `OrderAlreadyCancelled` on a repeat.",
   },
+  OwnCheckoutIntegrator: {
+    "attestor-setters-reject-zero":
+      "`setAttestor` takes any address including zero, which bricks the tier. Same gap as UsdcDirect and Investabl. Merged to main in #64; tracked as #92.",
+  },
   UsdcDirectCheckoutIntegrator: {
+    "value-movers-are-nonreentrant":
+      "Value moves inside `_placeOrder`, reached from unguarded external entrypoints; zero nonReentrant in the file. Surfaced by the transitive tracing (#95) — the flat scan reported this as not-applicable.",
     "attestor-setters-reject-zero":
       "A zero attestor bricks the tier (every submit*Attestation reverts) and cannot be undone if the owner key is lost. Showdown rejects it.",
     "owner-limits-have-ceilings": "Audit F1 — as above. Queued for whitelisting.",
@@ -254,10 +276,14 @@ const KNOWN: Record<string, Record<string, string>> = {
     "tolerates-repeat-cancel": "Reverts `OrderAlreadyCancelled` on a repeat.",
   },
   LotPotCheckoutIntegrator: {
+    "value-movers-are-nonreentrant":
+      "Value moves inside `_placeOrder`; zero guards. DEPLOYED AND IMMUTABLE — record only. Surfaced by the transitive tracing (#95).",
     "tolerates-repeat-cancel":
       "Latches `cancelled` then reverts. DEPLOYED AND IMMUTABLE — record only. This is why contracts-v4 #362's cancel callback must stay OFF for LotPot: enabling it would revert the completion of a dispute the user won.",
   },
   LotPotCheckoutIntegratorV2: {
+    "value-movers-are-nonreentrant":
+      "Same shape as V1; zero guards. DEPLOYED AND IMMUTABLE — record only. Surfaced by the transitive tracing (#95).",
     "tolerates-repeat-cancel":
       "Latches `cancelled` then reverts. DEPLOYED AND IMMUTABLE — record only. 3468 of 4066 mainnet B2B placements; see #362.",
   },
@@ -283,7 +309,13 @@ describe("IP2PIntegrator conformance (#77)", function () {
       for (const c of contracts) {
         const known = KNOWN[c.name]?.[check.id];
 
-        it(`${c.name}: ${check.title}`, function () {
+        // #93: the title itself distinguishes a tracked divergence from a
+        // not-applicable skip, so the report reads as a divergence register —
+        // the KNOWN reason is the line you most want to see, not blank noise.
+        const title = known
+          ? `${c.name}: TRACKED DIVERGENCE — ${known}`
+          : `${c.name}: ${check.title}`;
+        it(title, function () {
           const result = check.run(c);
 
           if (result === null) {

@@ -280,15 +280,16 @@ bound stays available until the deploy transaction and not after.
   of "refuses to run unless the addresses are supplied": verified Base-mainnet CCTP V2 addresses are
   **baked into a preset table** picked by chainId, and a conflicting `TOKEN_MESSENGER` /
   `MESSAGE_TRANSMITTER` / `DIAMOND_ADDRESS` / `USDC_ADDRESS` in the environment is **ignored** on
-  mainnet unless `ALLOW_ADDRESS_OVERRIDE=true`. That is deliberate and stronger: `.env` carries
+  mainnet unless per-address `ALLOW_<NAME>_OVERRIDE=true` flags (#84 split the old blanket flag). That is deliberate and stronger: `.env` carries
   testnet values and dotenv applies them to every network, so honouring them would point a mainnet
   deploy at the Sepolia Diamond — the exact mistake the table exists to prevent.
 
   On top of the presets the script hard-fails on mainnet if `burnLimitsPerMessage(USDC) == 0`, if
   the Solana route is missing, if the Diamond holds none of the configured USDC (D2), if
   `EXPECTED_CHAIN_ID` is absent or mismatched (#76), or if either attestor equals the deploy key
-  (#69). Note `ALLOW_ADDRESS_OVERRIDE` unlocks the Diamond and USDC presets together with one flag —
-  a legitimate Diamond override silently re-opens the USDC one.
+  (#69). The old blanket `ALLOW_ADDRESS_OVERRIDE` — which unlocked the Diamond and USDC presets
+  together, so a legitimate Diamond override silently re-opened the USDC one — was split into
+  per-address flags by #84.
 
 - **D2 — `usdc` must be canonical Circle USDC on Base mainnet,** and it must be the token the mainnet
   Diamond actually settles in. This is doubly load-bearing: the `UserProxy` USDC-trap resolves via

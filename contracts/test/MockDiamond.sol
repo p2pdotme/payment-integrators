@@ -439,6 +439,12 @@ contract MockDiamond {
             emit MockSellOrderCancelled(orderId, 0);
             return;
         }
+        // Test hook (#96): return success while neither pulling nor changing
+        // status — the "neither PAID nor CANCELLED" post-state the integrator's
+        // Unsettled branch exists for.
+        if (forceSellUpiNoOp) {
+            return;
+        }
         // try/catch the pull exactly like the live facet. `_pullFor` is external so
         // the failure is caught here instead of bubbling up as a revert.
         try this._pullFor(o.user, needed) {
@@ -461,6 +467,14 @@ contract MockDiamond {
 
     function setForceSellUpiAutoCancel(bool v) external {
         forceSellUpiAutoCancel = v;
+    }
+
+    /// @notice Test-only (#96): setSellOrderUpi returns success without pulling
+    ///         or moving status off ACCEPTED.
+    bool public forceSellUpiNoOp;
+
+    function setForceSellUpiNoOp(bool v) external {
+        forceSellUpiNoOp = v;
     }
 
     /// @dev External so setSellOrderUpi can try/catch it (Solidity only catches

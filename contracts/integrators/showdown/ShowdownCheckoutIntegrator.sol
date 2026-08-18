@@ -216,6 +216,10 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
     ///         instead of pulling (its failed-pull branch cancels and returns).
     ///         Nothing was paid; the principal is still on the seller's proxy. (#71)
     event OfframpDeliveryAutoCancelled(uint256 indexed orderId, uint8 status);
+    /// @notice Delivery returned with the order in a status this contract does
+    ///         not expect (neither PAID nor CANCELLED). No claim is made about
+    ///         whether funds moved — investigate off-chain. (#96)
+    event OfframpDeliveryUnsettled(uint256 indexed orderId, uint8 status);
     event OfframpReconciled(uint256 indexed orderId, uint8 status);
 
     // ─── Tier / region constants ──────────────────────────────────────
@@ -1395,7 +1399,13 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         // (`needed = principal + fee > balance`) — see #44; the widget must
         // reserve fee headroom (surface via getRemainingOfframpDailyCount +
         // proxy balance) and/or p2p confirms a max-fee bound to enforce here.
-        if (usdc.balanceOf(proxy) < pendingOfframpTotal[msg.sender] + amount) {
+        // From the SECOND concurrent SELL onward the headroom binds here too
+        // (#94): placing another SELL could otherwise reach the exact state the
+        // exits refuse to create — pending == balance with zero fee margin, so
+        // one of two accepted deliveries strands by the fee. `_escrowFloor`
+        // returns 0 when nothing is pending, so a single full-balance SELL stays
+        // as permissive as ever (the recorded #44 widget-side decision).
+        if (usdc.balanceOf(proxy) < _escrowFloor(msg.sender) + amount) {
             revert InsufficientBridgedFunds();
         }
 
@@ -1509,12 +1519,49 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
         uint8 postStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
         if (postStatus == STATUS_PAID) {
             emit OfframpUpiDelivered(orderId, needed);
-        } else {
+        } else if (postStatus == STATUS_CANCELLED) {
             // Auto-cancelled: nothing was pulled, the principal is still on the
-            // seller's proxy. `reconcile` (permissionless) releases the escrow
-            // and, for a never-accepted order, refunds the daily slot.
+            // seller's proxy and `reconcile` (permissionless) releases the
+            // escrow. The daily SELL slot is NOT refunded — a merchant had
+            // accepted (delivery requires it) and `reconcile` refunds only a
+            // never-accepted order's slot — and the order cannot be retried;
+            // the seller re-places. Both costs are the deliberate price of never
+            // reverting a decision the Diamond has already finalised. (#96)
             emit OfframpDeliveryAutoCancelled(orderId, postStatus);
+        } else {
+            // Neither PAID nor CANCELLED — a state this contract does not
+            // expect here. Assert nothing about what happened; surface it. (#96)
+            emit OfframpDeliveryUnsettled(orderId, postStatus);
         }
+    }
+
+    /// @dev Diamond order status: 0 PLACED, 1 ACCEPTED, 2 PAID, 3 COMPLETED,
+    ///      4 CANCELLED. Only ACCEPTED is deliverable. (#72)
+    uint8 private constant STATUS_ACCEPTED = 1;
+    uint8 private constant STATUS_PAID = 2;
+    uint8 private constant STATUS_CANCELLED = 4;
+
+    /// @notice Flat fee headroom the user EXITS must leave on top of the escrowed
+    ///         principals, so a seller cannot drain the proxy to exactly the
+    ///         escrow floor after a merchant accepts and strand their own
+    ///         delivery by the fee. (#90)
+    /// @dev    The Diamond's SELL fee is FIXED and applies only at or under the
+    ///         small-order threshold — live mainnet values 2026-08-17: $0.10 INR,
+    ///         $0.05 BRL, $0.125 EUR, $0 USD/NGN, thresholds $10/$2. $1 covers
+    ///         8× the largest live fee, i.e. at least eight concurrent small
+    ///         SELLs. Applied in both exits AND — from the
+    ///         second concurrent SELL onward — in `userInitiateOfframp` (#94).
+    ///         A first SELL against an uncommitted balance sees a floor of 0, so
+    ///         the single full-balance SELL stays placeable per the recorded #44
+    ///         decision; that one order can still strand by its own fee,
+    ///         recoverably — the accepted residual. NB the headroom is immutable
+    ///         while the Diamond's fixed fee is owner-settable: a future fee
+    ///         above ~$0.20 erodes the margin (deploy runbook carries this).
+    uint256 public constant SELL_FEE_HEADROOM = 1e6;
+
+    function _escrowFloor(address user) internal view returns (uint256) {
+        uint256 pending = pendingOfframpTotal[user];
+        return pending == 0 ? 0 : pending + SELL_FEE_HEADROOM;
     }
 
     /**
@@ -1539,31 +1586,6 @@ contract ShowdownCheckoutIntegrator is IP2PIntegrator {
      *      and slot, and the accounting correctness matters more than the
      *      observability edge. Funds are unaffected either way.
      */
-    /// @dev Diamond order status: 0 PLACED, 1 ACCEPTED, 2 PAID, 3 COMPLETED,
-    ///      4 CANCELLED. Only ACCEPTED is deliverable. (#72)
-    uint8 private constant STATUS_ACCEPTED = 1;
-    uint8 private constant STATUS_PAID = 2;
-
-    /// @notice Flat fee headroom the user EXITS must leave on top of the escrowed
-    ///         principals, so a seller cannot drain the proxy to exactly the
-    ///         escrow floor after a merchant accepts and strand their own
-    ///         delivery by the fee. (#90)
-    /// @dev    The Diamond's SELL fee is FIXED and applies only at or under the
-    ///         small-order threshold — live mainnet values 2026-08-17: $0.10 INR,
-    ///         $0.05 BRL, $0.125 EUR, $0 USD/NGN, thresholds $10/$2. $1 covers
-    ///         8× the largest live fee, i.e. at least eight concurrent small
-    ///         SELLs. Applied only in `userRescueProxyUsdc` /
-    ///         `userBridgeBackToSolana`; `userInitiateOfframp` deliberately still
-    ///         escrows the bare principal — full-balance placement handling is
-    ///         widget-side by the recorded #44 decision, and a headroom there
-    ///         would block the max cash-out outright.
-    uint256 public constant SELL_FEE_HEADROOM = 1e6;
-
-    function _escrowFloor(address user) internal view returns (uint256) {
-        uint256 pending = pendingOfframpTotal[user];
-        return pending == 0 ? 0 : pending + SELL_FEE_HEADROOM;
-    }
-
     function reconcile(uint256 orderId) external {
         OfframpRecord storage record = offramps[orderId];
         if (!record.initialized) revert OfframpRecordNotFound();

@@ -147,9 +147,14 @@ async function main() {
     kyc: process.env.EXPECTED_KYC_ATTESTOR || "",
   };
 
+  // Validate EVERY pin against EVERY fetch BEFORE any transaction (#96): the
+  // checks used to sit inside the loop, so with the liveness pin good and the
+  // kyc pin wrong, liveness rotated on-chain and THEN the run threw — a
+  // half-applied rotation that also skipped the final safety gate. All-or-none.
+  const fetched = new Map<string, string>();
   for (const t of targets) {
-    console.log(`\n── ${t.tier} ──────────────────────────────`);
     const live = await fetchAttestor(t.api);
+    fetched.set(t.tier, live);
     const pin = PINS[t.tier];
     if (isMainnetRun && !pin) {
       throw new Error(
@@ -162,9 +167,14 @@ async function main() {
       throw new Error(
         `${t.api}/v1/attestor returned ${live}, but EXPECTED_${t.tier.toUpperCase()}_ATTESTOR is ` +
           `${pin}. Refusing to rotate — either the pin is stale or the host is not the one you ` +
-          `think it is. Resolve which before installing anything.`
+          `think it is. Nothing was sent for ANY tier.`
       );
     }
+  }
+
+  for (const t of targets) {
+    console.log(`\n── ${t.tier} ──────────────────────────────`);
+    const live = fetched.get(t.tier)!;
     const current: string = await integrator[t.read]();
     console.log(`  live signer:      ${live}   (${t.api}/v1/attestor)`);
     console.log(`  on-chain current: ${current}`);

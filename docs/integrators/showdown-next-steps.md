@@ -86,7 +86,7 @@ Note the Diamond's fee comes off the same proxy balance, so the proxy needs **pr
 
 - `userBridgeBackToSolana(amount, ata)` returns bridged-in funds to Solana instead of offramping.
 - `userRescueProxyUsdc(amount)` (#74) withdraws proxy USDC straight to the user's Base wallet with **no CCTP dependency** — the only exit that works while Circle's messenger is paused or migrated, and it is ungated by `blocked[]`, the kill switch, and KYC tier.
-- Both exits respect the SELL escrow plus a $1 `SELL_FEE_HEADROOM` (#90), so they can never strand an accepted merchant's delivery.
+- The SELL escrow plus a $1 `SELL_FEE_HEADROOM` binds both exits **and, from the second concurrent SELL onward, placement itself** (#90, #94). The one deliberate gap: a user's FIRST full-balance SELL is still placeable (the recorded #44 decision) and can strand by its own fee — recoverably, via expiry + `reconcile`. NB the headroom is an immutable $1 while the Diamond's fixed fee is owner-settable: if p2p ever raises a fixed fee above ~$0.20, revisit before relying on the margin.
 
 **Abandoning a placed SELL** (#86): there is deliberately no cancel entrypoint (#51.1 decision — a cancel landing after fiat is sent is a merchant double-spend). The recovery path is: the order expires on the Diamond's own TTL (live mainnet: PLACED 180s, ACCEPTED 300s, PAID 600s for INR/BRL/EUR), anyone calls the Diamond's permissionless `autoCancelExpiredOrders([orderId])`, then anyone calls the integrator's permissionless `reconcile(orderId)` — **`reconcile` is what releases the escrow** and, for a never-accepted order, refunds the daily slot. Total wait is minutes, not days. The widget should offer this as the "cancel" affordance.
 
