@@ -838,3 +838,22 @@ class TestCanonicalNullifierInLedger:
             "SELECT nullifier FROM drips WHERE wallet = ?", (w.lower(),)
         ).fetchone()[0]
         assert stored == "0x" + "ab" * 32, f"stored {stored}"
+
+
+class TestLimitZeroRejected:
+    """#80 regressed when attestation.py was deleted — the limit<=0 check lived
+    there. A limit-0 attestation verifies a wallet that can never buy, so
+    sponsoring it spends gas to reach a useless state."""
+
+    def test_a_limit_zero_submission_is_refused_before_any_gas(self, client, rpc):
+        w = Account.create().address
+        att = sign(w)
+        att["limit"] = 0
+        r = submit(client, w, att)
+        assert r.status_code == 400
+        assert r.json()["detail"] == "attested_limit_zero"
+        assert getattr(rpc, "sent_calls", []) == [], "no gas may be spent on a limit-0 submit"
+
+    def test_a_positive_limit_still_sponsors(self, client, rpc):
+        w = Account.create().address
+        assert submit(client, w, sign(w)).json()["submitted"] is True

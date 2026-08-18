@@ -569,7 +569,15 @@ def _encode_submit(wallet: str, nullifier: str, limit: int, expiry: int, signatu
         bytes.fromhex(nul)
     except ValueError as exc:
         raise HTTPException(400, f"bad_nullifier: {exc}") from exc
-    if not (0 <= limit < 2**256) or not (0 <= expiry < 2**256):
+    if limit == 0:
+        # A limit-0 attestation verifies a wallet whose effective cap is
+        # min(0, regionCap) = 0 — verified, but unable to buy anything. The
+        # service should never sign one; sponsoring it spends gas to reach a
+        # useless state the user then can't act on. (#80: the check lived in
+        # attestation.py, which the sponsored redesign deleted; restored here,
+        # the one place that still bounds the attested fields before spending.)
+        raise HTTPException(400, "attested_limit_zero")
+    if not (0 < limit < 2**256) or not (0 <= expiry < 2**256):
         # format(x, "064x") pads but does NOT truncate: a value >= 2^256
         # yields >64 hex chars and nibble-shifts every field after it.
         raise HTTPException(400, "bad_attestation: field out of uint256 range")
