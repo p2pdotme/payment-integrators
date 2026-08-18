@@ -348,7 +348,14 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
 
     /// @notice Rotate the attestation signer. Verifies nothing retroactively:
     ///         already-granted limits stand (use `setBlocked` to stop a wallet).
+    /// @dev    Zero is rejected (#92): a fat-fingered rotation to address(0)
+    ///         would make every submission revert `AttestorNotSet`, bricking
+    ///         the tier until someone diagnosed it. The constructor still
+    ///         accepts 0 deliberately — "deploy first, set once known" — but a
+    ///         ROTATION to nothing is never intentional. Stopping submissions
+    ///         on purpose is `pause()`, which now gates the submit path too.
     function setAttestor(address newAttestor) external onlyOwner {
+        if (newAttestor == address(0)) revert InvalidAddress();
         attestor = newAttestor;
         emit AttestorUpdated(newAttestor);
     }
@@ -484,6 +491,11 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
         uint256 expiry,
         bytes calldata signature
     ) external {
+        // Paused stops NEW enrolments as well as new purchases. Before this
+        // gate, the only way to halt sponsored submissions in an incident was
+        // rotating the attestor to zero — a diagnostic hazard masquerading as
+        // a lever (#92). Pause is the lever; the attestor is configuration.
+        if (paused) revert ContractPaused();
         if (wallet == address(0)) revert InvalidAddress();
         address signer = attestor;
         if (signer == address(0)) revert AttestorNotSet();

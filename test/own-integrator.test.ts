@@ -384,6 +384,41 @@ describe("OwnCheckoutIntegrator", function () {
         .reverted;
     });
 
+    it("rejects rotating the attestor to zero (#92)", async function () {
+      // setAttestor(0) used to be accepted — and would have bricked the tier:
+      // every submission reverts AttestorNotSet until someone diagnosed it.
+      await expect(
+        integrator.connect(owner).setAttestor(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      // A real rotation still works.
+      await integrator.connect(owner).setAttestor(stranger.address);
+      expect(await integrator.attestor()).to.equal(stranger.address);
+      await integrator.connect(owner).setAttestor(attestor.address);
+    });
+
+    it("pause stops new submissions, and unpause restores them", async function () {
+      // The deliberate stop lever for enrolment. Without this gate the only
+      // way to halt sponsored submissions was rotating the attestor to zero.
+      const nullifier = nullifierFor("paused-submit");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+
+      await integrator.connect(owner).pause();
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "ContractPaused");
+
+      await integrator.connect(owner).unpause();
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
+      ).to.not.be.reverted;
+      expect(await integrator.verified(user.address)).to.equal(true);
+    });
+
     it("rejects the zero address as the wallet", async function () {
       const nullifier = nullifierFor("zero-wallet");
       const expiry = await futureExpiry();
