@@ -27,7 +27,7 @@ It differs from the other integrators as follows:
 **All merchant USDC is custodied inside the integrator itself. There is no external
 vault.** USDC swept from a merchant proxy at BUY completion lands directly on the
 integrator's own balance, and every withdrawal pays out from that same balance. The
-integrator keeps both the funds *and* the accounting (per-merchant settlement
+integrator keeps both the funds _and_ the accounting (per-merchant settlement
 buckets, `totalOwed`, roles, limits).
 
 The hard solvency invariant is a **local** property, checkable from one contract:
@@ -80,11 +80,11 @@ integrator's own balance.
 
 ## Limits (enforced in `validateOrder`)
 
-| Limit | Value |
-| --- | --- |
-| Per-transaction cap | 50 USDC (INR) / 100 USDC (other markets) |
-| Daily transaction count | 25 per merchant per UTC day |
-| Settlement lock | default 10 min; per-currency override; bounds [1 min, 30 days] |
+| Limit                   | Value                                                          |
+| ----------------------- | -------------------------------------------------------------- |
+| Per-transaction cap     | 50 USDC (INR) / 100 USDC (other markets)                       |
+| Daily transaction count | 25 per merchant per UTC day                                    |
+| Settlement lock         | default 10 min; per-currency override; bounds [1 min, 30 days] |
 
 The settlement lock is **admin-configurable with no redeploy**: `setSettlementPeriod`
 sets the global default and `setLockPeriod(currency, seconds)` overrides per currency

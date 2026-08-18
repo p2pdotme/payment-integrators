@@ -56,8 +56,25 @@ contract MockDiamond {
         SellStatus status;
         string encUpi; // user's UPI encrypted to merchant
         string merchantPubkey;
+        address acceptedMerchant; // set on accept; surfaced via getOrdersById
         uint8 disputeRaisedBy; // test-only: mirror Diamond's Dispute.raisedBy
         uint8 disputeStatus; // test-only: mirror Diamond's Dispute.status
+    }
+
+    /// @notice SELL fee in bps, charged on top of principal (real Diamond charges
+    ///         a fee; the base mock charged zero, masking the #44 strand). 0 =
+    ///         legacy fee-free behaviour, so existing tests are unaffected.
+    uint256 public sellFeeBps;
+
+    function setSellFeeBps(uint256 bps) external {
+        sellFeeBps = bps;
+    }
+
+    /// @dev Integration resolution (#35 -> main): `main` charges a FLAT `sellFee`,
+    ///      the Showdown branch added a PROPORTIONAL `sellFeeBps`. Both are
+    ///      honoured so either suite's fixtures work unchanged.
+    function _sellFee(uint256 amount) internal view returns (uint256) {
+        return sellFee + (amount * sellFeeBps) / 10_000;
     }
 
     mapping(address => bool) public activeIntegrators;
@@ -240,6 +257,7 @@ contract MockDiamond {
             status: SellStatus.PLACED,
             encUpi: "",
             merchantPubkey: "",
+            acceptedMerchant: address(0),
             disputeRaisedBy: 0,
             disputeStatus: 0
         });
@@ -376,6 +394,7 @@ contract MockDiamond {
             status: SellStatus.PLACED,
             encUpi: "",
             merchantPubkey: "",
+            acceptedMerchant: address(0),
             disputeRaisedBy: 0,
             disputeStatus: 0
         });
@@ -389,6 +408,7 @@ contract MockDiamond {
         require(o.status == SellStatus.PLACED, "Bad state");
         o.status = SellStatus.ACCEPTED;
         o.merchantPubkey = merchantPubkey;
+        o.acceptedMerchant = msg.sender;
         emit MockSellOrderAccepted(orderId);
     }
 
@@ -409,7 +429,7 @@ contract MockDiamond {
         require(o.status == SellStatus.ACCEPTED, "Bad state");
         require(msg.sender == o.user, "Only order.user");
         o.encUpi = encUpi;
-        uint256 needed = o.amount + sellFee; // actualUsdtAmount (principal + fee)
+        uint256 needed = o.amount + _sellFee(o.amount); // actualUsdtAmount (principal + fee)
         // Test hook: force the live facet's "pull failed → auto-cancel, return
         // success (no revert)" branch even when the proxy is fully funded, so the
         // integrator's deliverFiatPayout status-read-back (#2) can be exercised
@@ -417,6 +437,12 @@ contract MockDiamond {
         if (forceSellUpiAutoCancel) {
             o.status = SellStatus.CANCELLED;
             emit MockSellOrderCancelled(orderId, 0);
+            return;
+        }
+        // Test hook (#96): return success while neither pulling nor changing
+        // status — the "neither PAID nor CANCELLED" post-state the integrator's
+        // Unsettled branch exists for.
+        if (forceSellUpiNoOp) {
             return;
         }
         // try/catch the pull exactly like the live facet. `_pullFor` is external so
@@ -441,6 +467,14 @@ contract MockDiamond {
 
     function setForceSellUpiAutoCancel(bool v) external {
         forceSellUpiAutoCancel = v;
+    }
+
+    /// @notice Test-only (#96): setSellOrderUpi returns success without pulling
+    ///         or moving status off ACCEPTED.
+    bool public forceSellUpiNoOp;
+
+    function setForceSellUpiNoOp(bool v) external {
+        forceSellUpiNoOp = v;
     }
 
     /// @dev External so setSellOrderUpi can try/catch it (Solidity only catches
@@ -469,7 +503,7 @@ contract MockDiamond {
         uint256 refund = 0;
         if (wasPaid) {
             // Refund what was pulled (principal + fee).
-            refund = o.amount + sellFee;
+            refund = o.amount + _sellFee(o.amount);
             usdc.safeTransfer(o.user, refund);
         }
         emit MockSellOrderCancelled(orderId, refund);
@@ -519,26 +553,40 @@ contract MockDiamond {
     ) external view returns (AdditionalOrderDetailsView memory) {
         return
             AdditionalOrderDetailsView({
-                fixedFeePaid: uint64(sellFee),
+                fixedFeePaid: uint64(_sellFee(sellOrders[orderId].amount)),
                 tipsPaid: 0,
                 acceptedTimestamp: 0,
                 paidTimestamp: 0,
                 reserved2: 0,
                 actualUsdtAmount: additionalOrderDetailsFeeUnready
                     ? 0
-                    : sellOrders[orderId].amount + sellFee,
+                    : actualUsdtAmountOverride[orderId] != 0
+                        ? actualUsdtAmountOverride[orderId]
+                        : sellOrders[orderId].amount + _sellFee(sellOrders[orderId].amount),
                 actualFiatAmount: 0
             });
     }
 
     /// @notice When set, `getAdditionalOrderDetails` returns 0 for
-    ///         actualUsdtAmount instead of the order amount. Used by tests
-    ///         to exercise the `OfframpFeeNotReady` revert path in
-    ///         deliverOfframpUpi without having to mutate sellOrders.amount.
+    ///         actualUsdtAmount. Showdown's `deliverOfframpUpi` now REVERTS
+    ///         `OfframpFeeNotReady` on this rather than falling back to the
+    ///         principal — the fallback read as a safety net but is unreachable
+    ///         for an ACCEPTED order, since the real Diamond writes
+    ///         actualUsdtAmount at placement and only zeroes it on cancel. (#72)
     bool public additionalOrderDetailsFeeUnready;
 
     function setAdditionalOrderDetailsFeeUnready(bool v) external {
         additionalOrderDetailsFeeUnready = v;
+    }
+
+    /// @notice Force a specific `actualUsdtAmount` for one order, so tests can
+    ///         express a Diamond that re-prices, partially fills or changes its
+    ///         fee model — values the bps fee alone cannot produce (notably any
+    ///         amount BELOW the escrowed principal). 0 = use the computed value.
+    mapping(uint256 => uint256) public actualUsdtAmountOverride;
+
+    function setActualUsdtAmountOverride(uint256 orderId, uint256 amount) external {
+        actualUsdtAmountOverride[orderId] = amount;
     }
 
     /// @notice Mock of GetterFacet.getOrdersById. Only the `status`,
@@ -586,9 +634,10 @@ contract MockDiamond {
     /// @notice Test-only helper: directly invokes
     ///         `IP2PIntegrator.onOrderComplete` on `integrator_` with the
     ///         supplied arguments. Lets tests exercise the integrator's
-    ///         defense-in-depth guards (AmountMismatch / UnknownOrder /
-    ///         OrderAlreadyCancelled) without having to manipulate the
-    ///         mock's internal `orders` mapping.
+    ///         onOrderComplete guards (UnexpectedRecipient / OrderAlreadyFulfilled
+    ///         / the delivered-amount re-pin) without manipulating the mock's
+    ///         internal `orders` mapping. (Showdown has no `AmountMismatch` guard —
+    ///         that is LotPot's; Showdown re-pins instead. #55)
     function adminCallOnOrderComplete(
         address integrator_,
         uint256 orderId,
@@ -625,6 +674,7 @@ contract MockDiamond {
         o.amount = s.amount;
         o.user = s.user;
         o.currency = s.currency;
+        o.acceptedMerchant = s.acceptedMerchant; // 0 until a merchant accepts
         o.id = orderId;
         o.disputeInfo.raisedBy = s.disputeRaisedBy;
         o.disputeInfo.status = s.disputeStatus;

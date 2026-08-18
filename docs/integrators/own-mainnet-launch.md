@@ -25,16 +25,16 @@ or Robinhood Chain — only the NatSpec explaining why they are absent. That is
 the direct payoff of the split-leg design: the Diamond settles to the buyer's
 own wallet and the contract's job ends.
 
-| change | needs a redeploy? |
-|---|---|
-| **Anything about bridging** — Relay params, gas top-up sizing, `usePermit`, switching routers, a different destination token | **No.** Frontend deploy. |
-| Gas faucet policy, caps, funding | **No.** Separate service. |
-| Rotate the attestor | **No.** `setAttestor`. |
-| Lower a region cap or the daily count | **No.** `setRegionCap` / `setDailyTxCountLimit`. |
-| Block a wallet, pause the ramp | **No.** `setBlocked` / `pause`. |
-| **Raise** a cap above its `MAX_*` ceiling | **Yes** — ceilings are immutable. |
-| Change the owner | **Yes** — `owner` is immutable. |
-| Any contract logic change | **Yes** — plus a fresh whitelist request. |
+| change                                                                                                                       | needs a redeploy?                                |
+| ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| **Anything about bridging** — Relay params, gas top-up sizing, `usePermit`, switching routers, a different destination token | **No.** Frontend deploy.                         |
+| Gas faucet policy, caps, funding                                                                                             | **No.** Separate service.                        |
+| Rotate the attestor                                                                                                          | **No.** `setAttestor`.                           |
+| Lower a region cap or the daily count                                                                                        | **No.** `setRegionCap` / `setDailyTxCountLimit`. |
+| Block a wallet, pause the ramp                                                                                               | **No.** `setBlocked` / `pause`.                  |
+| **Raise** a cap above its `MAX_*` ceiling                                                                                    | **Yes** — ceilings are immutable.                |
+| Change the owner                                                                                                             | **Yes** — `owner` is immutable.                  |
+| Any contract logic change                                                                                                    | **Yes** — plus a fresh whitelist request.        |
 
 So the bridge leg, which is the least-tested part of the system, is also the
 part you can fix fastest. That asymmetry is deliberate and worth preserving.
@@ -50,7 +50,7 @@ Diamond returns **5** (contracts-v4 #362 inserted `cancelCallbackEnabled` third,
 pushing `proxyImpl` to word 4). ethers silently drops the trailing word, so
 `proxyImpl` read as `0x0`.
 
-Consequence: `registerIntegrator` lands on chain, *then* the post-check throws
+Consequence: `registerIntegrator` lands on chain, _then_ the post-check throws
 `registered proxyImpl does not match the deployed one`. On a rerun the
 "already locked" guard reads 0 too, so it does not fire. Verified against
 mainnet:
@@ -155,8 +155,8 @@ fix, not a relaunch.
 
 Observed on Sepolia, same transaction:
 
-- MetaMask: *"Network fee: Paid by MetaMask"* — sponsors via EIP-7702
-- Keplr: *"Insufficient balance to cover the fees"*, Approve greyed out
+- MetaMask: _"Network fee: Paid by MetaMask"_ — sponsors via EIP-7702
+- Keplr: _"Insufficient balance to cover the fees"_, Approve greyed out
 
 So the faucet is load-bearing for some wallets and dead weight for others, and
 you cannot tell which in advance. Worth considering `wallet_getCapabilities`
