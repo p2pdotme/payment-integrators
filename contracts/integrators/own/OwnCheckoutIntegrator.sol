@@ -450,7 +450,7 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
      *                  address the signature binds and the only address the
      *                  call can affect.
      * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
-     * @param limit     Attested per-tx USDC ceiling (micro-USDC, 6dp). The
+     * @param limit     Attested per-tx USDC ceiling (micro-USDC, 6dp), > 0. The
      *                  effective cap is `min(limit, regionCap[region])` —
      *                  $100 for INR orders, $200 for anything else.
      * @param expiry    Unix seconds; the attestation must be claimed before this.
@@ -497,6 +497,13 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
         // a lever (#92). Pause is the lever; the attestor is configuration.
         if (paused) revert ContractPaused();
         if (wallet == address(0)) revert InvalidAddress();
+        // A limit-0 attestation verifies a wallet whose effective cap is
+        // min(0, regionCap) = 0 — it can never buy. The service should never
+        // sign one; rejecting at the source stops a useless verified=true
+        // state whoever submits, and stops the gas service paying to reach it
+        // (#80). The nullifier is NOT yet spent, so a corrected re-issue can
+        // still land.
+        if (limit == 0) revert InvalidLimit();
         address signer = attestor;
         if (signer == address(0)) revert AttestorNotSet();
         if (block.timestamp >= expiry) revert AttestationExpired();

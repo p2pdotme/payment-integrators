@@ -419,6 +419,29 @@ describe("OwnCheckoutIntegrator", function () {
       expect(await integrator.verified(user.address)).to.equal(true);
     });
 
+    it("rejects a limit-0 attestation (#80) — a wallet that could never buy", async function () {
+      // A limit-0 grant makes effectiveLimit min(0, regionCap) = 0, so the
+      // wallet verifies but can never buy. Rejected at the source, whoever
+      // submits, and the nullifier is NOT consumed so a corrected re-issue
+      // can still land.
+      const nullifier = nullifierFor("limit-zero");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, user.address, nullifier, 0n, expiry);
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(user.address, nullifier, 0n, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "InvalidLimit");
+      expect(await integrator.verified(user.address)).to.equal(false);
+
+      // The nullifier survived — a real limit re-verifies the same person.
+      const sig2 = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig2);
+      expect(await integrator.grantedLimit(user.address)).to.equal(CAP_INDIA);
+    });
+
     it("rejects the zero address as the wallet", async function () {
       const nullifier = nullifierFor("zero-wallet");
       const expiry = await futureExpiry();
