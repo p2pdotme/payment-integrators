@@ -96,7 +96,9 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
 
     error AttestorNotSet();
     error AttestationExpired();
+    error AttestationWindowTooLong();
     error NullifierAlreadySpent();
+    error NullifierNotSpent();
     error InvalidSignature();
 
     error NotVerified();
@@ -120,9 +122,15 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
     event PassportVerified(
         address indexed user,
         bytes32 indexed nullifier,
+        address indexed submitter,
         uint256 attestedLimit,
         uint256 grantedLimit
     );
+
+    /// @notice An enrolment was undone: the nullifier is spendable again and
+    ///         the wallet is back to unverified. The owner's only remedy for a
+    ///         nullifier bound to the wrong wallet.
+    event EnrolmentRevoked(address indexed user, bytes32 indexed nullifier, address indexed by);
 
     event OrderValidated(
         address indexed user,
@@ -199,6 +207,12 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
     uint256 public constant MAX_REGION_CAP_ABROAD = 200e6;
     /// @notice At most 5 onramp placements per user per day.
     uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5;
+    /// @notice How far ahead of now an attestation's `expiry` may sit. The
+    ///         service issues one-hour windows today, so this is generous
+    ///         headroom rather than a constraint on it. It exists because the
+    ///         signature is a bearer capability once submission is untied from
+    ///         the wallet, and an unbounded window is an unbounded one.
+    uint256 public constant MAX_ATTESTATION_WINDOW = 2 hours;
 
     // ─── EIP-712 (simple-kyc service) ─────────────────────────────────
     // Domain and typehash match the passport+liveness ("KYC") service exactly
@@ -348,7 +362,14 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
 
     /// @notice Rotate the attestation signer. Verifies nothing retroactively:
     ///         already-granted limits stand (use `setBlocked` to stop a wallet).
+    /// @dev    Zero is rejected (#92): a fat-fingered rotation to address(0)
+    ///         would make every submission revert `AttestorNotSet`, bricking
+    ///         the tier until someone diagnosed it. The constructor still
+    ///         accepts 0 deliberately — "deploy first, set once known" — but a
+    ///         ROTATION to nothing is never intentional. Stopping submissions
+    ///         on purpose is `pause()`, which now gates the submit path too.
     function setAttestor(address newAttestor) external onlyOwner {
+        if (newAttestor == address(0)) revert InvalidAddress();
         attestor = newAttestor;
         emit AttestorUpdated(newAttestor);
     }
@@ -377,6 +398,43 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
     function setBlocked(address user, bool isBlocked) external onlyOwner {
         blocked[user] = isBlocked;
         emit UserBlocked(user, isBlocked);
+    }
+
+    /**
+     * @notice Undo an enrolment: free the nullifier and unverify the wallet.
+     *
+     * @dev The cost of untying submission from the wallet. The user used to
+     *      hold a veto — a signature naming a wallet they could not use simply
+     *      never landed, and the service re-issued for the right one. Now any
+     *      holder of the signature lands it, so a retry, a stale queue entry,
+     *      an abandoned flow or a wrong address from the client permanently
+     *      binds that human's single nullifier to a wallet they may not
+     *      control. Without this the only remedies are redeploying an
+     *      immutable contract, which invalidates every existing grant, or
+     *      minting a second nullifier for one human, which is the Sybil
+     *      property the nullifier exists to provide.
+     *
+     *      `blocked` is not the same lever: it zeroes an effective limit and
+     *      leaves the nullifier spent forever.
+     *
+     *      The pairing is not stored on chain, because one SSTORE per enrolment
+     *      is a real cost on every sponsored submit for a remedy used almost
+     *      never. `PassportVerified` records the true (wallet, nullifier) pair,
+     *      so the caller reads it from the log and passes both back here, and
+     *      `EnrolmentRevoked` records what was actually undone.
+     *
+     * @param nullifier The nullifier to free. Must currently be spent.
+     * @param wallet    The wallet it was bound to, which loses its grant.
+     */
+    function revokeEnrolment(bytes32 nullifier, address wallet) external onlyOwner {
+        if (wallet == address(0)) revert InvalidAddress();
+        if (!nullifierSpent[nullifier]) revert NullifierNotSpent();
+
+        nullifierSpent[nullifier] = false;
+        verified[wallet] = false;
+        grantedLimit[wallet] = 0;
+
+        emit EnrolmentRevoked(wallet, nullifier, msg.sender);
     }
 
     function pause() external onlyOwner {
@@ -436,39 +494,92 @@ contract OwnCheckoutIntegrator is IP2PIntegrator {
 
     /**
      * @notice Verify and record a passport + liveness attestation for
-     *         `msg.sender`, unlocking the onramp for that wallet.
+     *         `wallet`, unlocking the onramp for that wallet. Callable by
+     *         ANYONE — the caller's identity plays no part in what is granted.
+     *
+     * @param wallet    The wallet the attestation was minted for. This is the
+     *                  address the signature binds and the only address the
+     *                  call can affect.
      * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
-     * @param limit     Attested per-tx USDC ceiling (micro-USDC, 6dp). The
+     * @param limit     Attested per-tx USDC ceiling (micro-USDC, 6dp), > 0. The
      *                  effective cap is `min(limit, regionCap[region])` —
      *                  $100 for INR orders, $200 for anything else.
      * @param expiry    Unix seconds; the attestation must be claimed before this.
      * @param signature 65-byte secp256k1 signature (r ‖ s ‖ v) from the service.
      *
-     * @dev The grant is monotonic and does not lapse: `expiry` is a
+     * @dev ── Why anyone may submit ────────────────────────────────────────
+     *      The signature IS the authorization: the service signed the exact
+     *      tuple `(wallet, nullifier, limit, expiry)`, so no submitter can
+     *      credit any wallet other than the one attested, grant any limit
+     *      other than the one attested, or reuse the nullifier. An earlier
+     *      version hashed `msg.sender` instead of a `wallet` parameter, which
+     *      added no security (the same binding, expressed differently) but
+     *      required the ONE wallet that by definition has no gas — a
+     *      first-time fiat buyer — to send the transaction itself. That
+     *      coupling was the whole cold-start problem: the sponsor service had
+     *      to drip ETH so the wallet could afford this call, and had to
+     *      re-verify attestations off-chain to decide who deserved the drip.
+     *      Untying it lets any funded party — the gas service, a partner
+     *      backend, or the wallet itself if it happens to hold ETH — land the
+     *      attestation on-chain.
+     *
+     *      Front-running is harmless by construction: whoever submits first
+     *      produces the identical state (the attested wallet verified, the
+     *      attested limit granted, the nullifier spent). A user's own
+     *      duplicate submit reverts `NullifierAlreadySpent` having lost
+     *      nothing but its own gas.
+     *
+     *      The grant is monotonic and does not lapse: `expiry` is a
      *      claim-freshness deadline, not an ongoing clock. That is safe
      *      because the nullifier is single-use, so an expired grant could
      *      never be re-claimed anyway — and `setBlocked` is the lever for
      *      revoking a wallet.
      */
     function submitPassportAttestation(
+        address wallet,
         bytes32 nullifier,
         uint256 limit,
         uint256 expiry,
         bytes calldata signature
     ) external {
+        // Paused stops NEW enrolments as well as new purchases. Before this
+        // gate, the only way to halt sponsored submissions in an incident was
+        // rotating the attestor to zero — a diagnostic hazard masquerading as
+        // a lever (#92). Pause is the lever; the attestor is configuration.
+        if (paused) revert ContractPaused();
+        if (wallet == address(0)) revert InvalidAddress();
+        // A limit-0 attestation verifies a wallet whose effective cap is
+        // min(0, regionCap) = 0 — it can never buy. The service should never
+        // sign one; rejecting at the source stops a useless verified=true
+        // state whoever submits, and stops the gas service paying to reach it
+        // (#80). The nullifier is NOT yet spent, so a corrected re-issue can
+        // still land.
+        if (limit == 0) revert InvalidLimit();
         address signer = attestor;
         if (signer == address(0)) revert AttestorNotSet();
         if (block.timestamp >= expiry) revert AttestationExpired();
+        // Untying submission from the wallet made the signature a bearer
+        // capability: whoever holds it can land it. An unbounded `expiry` then
+        // makes that capability live for as long as an off-chain service chose,
+        // and every other policy input here carries an immutable ceiling for
+        // exactly that reason. This is the one that now matters most.
+        if (expiry > block.timestamp + MAX_ATTESTATION_WINDOW) {
+            revert AttestationWindowTooLong();
+        }
         if (nullifierSpent[nullifier]) revert NullifierAlreadySpent();
 
-        bytes32 digest = _digest(msg.sender, nullifier, limit, expiry);
+        bytes32 digest = _digest(wallet, nullifier, limit, expiry);
         if (_recover(digest, signature) != signer) revert InvalidSignature();
 
         nullifierSpent[nullifier] = true;
-        verified[msg.sender] = true;
-        if (limit > grantedLimit[msg.sender]) grantedLimit[msg.sender] = limit;
+        verified[wallet] = true;
+        if (limit > grantedLimit[wallet]) grantedLimit[wallet] = limit;
 
-        emit PassportVerified(msg.sender, nullifier, limit, grantedLimit[msg.sender]);
+        // `msg.sender` is the whole new degree of freedom, so it belongs in the
+        // log. Without it nothing on chain separates "our sponsor enrolled this
+        // wallet" from "a third party front-ran it", which is the difference an
+        // incident turns on.
+        emit PassportVerified(wallet, nullifier, msg.sender, limit, grantedLimit[wallet]);
     }
 
     // ─── Views ────────────────────────────────────────────────────────

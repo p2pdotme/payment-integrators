@@ -59,7 +59,7 @@ const INTEGRATOR_ABI = [
   "function proxyAddress(address) view returns (address)",
   "function domainSeparator() view returns (bytes32)",
   "function getSession(uint256) view returns (tuple(address user, bool settled, bool cancelled, uint32 placementDay, uint256 amount, bytes32 currency))",
-  "function submitPassportAttestation(bytes32 nullifier, uint256 limit, uint256 expiry, bytes signature) returns ()",
+  "function submitPassportAttestation(address wallet, bytes32 nullifier, uint256 limit, uint256 expiry, bytes signature) returns ()",
   "function buyUsdc(uint256 amount, bytes32 currency, uint256 circleId, string pubKey, uint256 preferredPaymentChannelConfigId, uint256 fiatAmountLimit) returns (uint256)",
   "event OnrampOrderCreated(uint256 indexed orderId, address indexed user, uint256 amount, bytes32 currency)",
 ];
@@ -141,9 +141,16 @@ async function main() {
       { wallet: user.address, nullifier, limit, expiry }
     );
 
-    console.log("  submitting attestation…");
-    await (await integ.submitPassportAttestation(nullifier, limit, expiry, signature)).wait(1);
-    console.log("  ✅ verified");
+    // SPONSORED submission — the live proof of the new binding. The
+    // attestor account (signers[0]) pays the gas and submits FOR the user;
+    // the user's wallet signs nothing here and needs no ETH yet. This is the
+    // exact shape the gas service uses in production.
+    console.log("  submitting attestation (sponsored by", attestorSigner.address, ")…");
+    const asSponsor = new ethers.Contract(INTEGRATOR, INTEGRATOR_ABI, attestorSigner);
+    await (
+      await asSponsor.submitPassportAttestation(user.address, nullifier, limit, expiry, signature)
+    ).wait(1);
+    console.log("  ✅ verified — without the user's wallet sending anything");
   }
 
   // Read-after-write on this RPC lags the receipt by a few blocks, so a fresh

@@ -431,7 +431,12 @@ Own's app wires this up in `own-protocol/app` (`src/lib/kycClient.ts`):
 1. `POST {passport-proxy}/v1/widget/public-sessions` → open `widget_url` (popup).
 2. On return, `POST {passport-proxy}/v1/widget/attestation {code}` →
    `{nullifier, limit, expiry, signature}`.
-3. User's wallet calls `submitPassportAttestation(nullifier, limit, expiry, signature)`.
+3. The attestation is landed on-chain by **whoever has gas** —
+   `submitPassportAttestation(wallet, nullifier, limit, expiry, signature)` is
+   callable by anyone, because the signature itself binds the wallet, the
+   limit and the nullifier. In practice the gas service submits it, the app
+   falls back to the user's own wallet if that service is unreachable, and
+   both paths produce identical state.
 4. Gate the UI on `effectiveLimit(user, currency) >= amount` and
    `getRemainingDailyCount(user) > 0`, then `buyUsdc(...)`.
 5. On settlement, offer the Relay bridge leg (Base USDC → Robinhood USDG).
@@ -440,17 +445,18 @@ Useful views: `effectiveLimits(user)` returns both region caps in one call;
 `domainSeparator()` lets the service and the frontend assert they are signing
 for this exact deployment.
 
-### The buyer has no gas — steps 3, 4 and the mark-paid
+### The buyer has no gas — the mark-paid and the buy
 
-Steps 3 and 4 above, plus `paidBuyOrder`, are three transactions from the
-buyer's own wallet. The buyer is on this screen because they are acquiring
+**Since the sponsored-submission change, verification costs the buyer
+nothing**: anyone may land the attestation, so the gas service submits it on
+their behalf. What remains irreducibly the buyer's own are two transactions: The buyer is on this screen because they are acquiring
 their first stablecoin, so their Base ETH balance is zero. Measured:
 
-| call                        | gas                 | note                                    |
-| --------------------------- | ------------------- | --------------------------------------- |
-| `submitPassportAttestation` | 99,644              | once per wallet                         |
-| `buyUsdc`                   | 1,107,487 / 987,781 | first call also deploys the `UserProxy` |
-| `paidBuyOrder`              | ~150,000            | per order                               |
+| call                        | gas                 | who pays                                           |
+| --------------------------- | ------------------- | -------------------------------------------------- |
+| `submitPassportAttestation` | 99,644              | **the sponsor** (gas service) — anyone may submit  |
+| `buyUsdc`                   | 1,107,487 / 987,781 | the buyer; first call also deploys the `UserProxy` |
+| `paidBuyOrder`              | ~150,000            | the buyer — enforced by the Diamond                |
 
 At Base's prevailing 0.005 gwei that is **about 1.5 cents in total**. It was
 never a cost problem — it is a chicken-and-egg problem, because the on-ramp is

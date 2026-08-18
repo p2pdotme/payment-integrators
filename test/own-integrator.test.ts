@@ -76,7 +76,9 @@ describe("OwnCheckoutIntegrator", function () {
     const nullifier = nullifierFor(label ?? `kyc:${who.address}`);
     const expiry = await futureExpiry();
     const sig = await signAttestation(attestor, who.address, nullifier, limit, expiry);
-    return integrator.connect(who).submitPassportAttestation(nullifier, limit, expiry, sig);
+    return integrator
+      .connect(who)
+      .submitPassportAttestation(who.address, nullifier, limit, expiry, sig);
   }
 
   /**
@@ -200,7 +202,13 @@ describe("OwnCheckoutIntegrator", function () {
     it("grants the attested limit and marks the wallet verified", async function () {
       await expect(verify(user, USDC(60)))
         .to.emit(integrator, "PassportVerified")
-        .withArgs(user.address, nullifierFor(`kyc:${user.address}`), USDC(60), USDC(60));
+        .withArgs(
+          user.address,
+          nullifierFor(`kyc:${user.address}`),
+          user.address, // self-submit: the wallet is its own submitter
+          USDC(60),
+          USDC(60)
+        );
 
       expect(await integrator.verified(user.address)).to.equal(true);
       expect(await integrator.grantedLimit(user.address)).to.equal(USDC(60));
@@ -212,7 +220,9 @@ describe("OwnCheckoutIntegrator", function () {
       const expiry = await futureExpiry();
       const sig = await signAttestation(stranger, user.address, nullifier, CAP_INDIA, expiry);
       await expect(
-        integrator.connect(user).submitPassportAttestation(nullifier, CAP_INDIA, expiry, sig)
+        integrator
+          .connect(user)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
@@ -222,7 +232,9 @@ describe("OwnCheckoutIntegrator", function () {
       const expiry = BigInt(block!.timestamp);
       const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
       await expect(
-        integrator.connect(user).submitPassportAttestation(nullifier, CAP_INDIA, expiry, sig)
+        integrator
+          .connect(user)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
       ).to.be.revertedWithCustomError(integrator, "AttestationExpired");
     });
 
@@ -233,7 +245,9 @@ describe("OwnCheckoutIntegrator", function () {
       const expiry = await futureExpiry();
       const sig = await signAttestation(attestor, user2.address, nullifier, CAP_INDIA, expiry);
       await expect(
-        integrator.connect(user2).submitPassportAttestation(nullifier, CAP_INDIA, expiry, sig)
+        integrator
+          .connect(user2)
+          .submitPassportAttestation(user2.address, nullifier, CAP_INDIA, expiry, sig)
       ).to.be.revertedWithCustomError(integrator, "NullifierAlreadySpent");
     });
 
@@ -243,7 +257,9 @@ describe("OwnCheckoutIntegrator", function () {
       // Signed for `user`, submitted by `user2`.
       const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
       await expect(
-        integrator.connect(user2).submitPassportAttestation(nullifier, CAP_INDIA, expiry, sig)
+        integrator
+          .connect(user2)
+          .submitPassportAttestation(user2.address, nullifier, CAP_INDIA, expiry, sig)
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
@@ -261,7 +277,9 @@ describe("OwnCheckoutIntegrator", function () {
         await other.getAddress()
       );
       await expect(
-        integrator.connect(user).submitPassportAttestation(nullifier, CAP_INDIA, expiry, sig)
+        integrator
+          .connect(user)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
@@ -278,7 +296,9 @@ describe("OwnCheckoutIntegrator", function () {
         ethers.toBeHex(v === 27 ? 28 : 27, 1),
       ]);
       await expect(
-        integrator.connect(user).submitPassportAttestation(nullifier, CAP_INDIA, expiry, flipped)
+        integrator
+          .connect(user)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, flipped)
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
@@ -288,8 +308,161 @@ describe("OwnCheckoutIntegrator", function () {
       const expiry = await futureExpiry();
       const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
       await expect(
-        bare.connect(user).submitPassportAttestation(nullifier, CAP_INDIA, expiry, sig)
+        bare
+          .connect(user)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
       ).to.be.revertedWithCustomError(bare, "AttestorNotSet");
+    });
+
+    /*
+     * Sponsored submission. The signature is the authorization — the service
+     * signed (wallet, nullifier, limit, expiry) — so the submitter's identity
+     * plays no part in what is granted. This is what unties verification from
+     * the one wallet that, by definition, holds no gas.
+     */
+    it("lets a sponsor submit for a cold wallet, crediting only that wallet", async function () {
+      const nullifier = nullifierFor("sponsored");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+
+      // `stranger` pays the gas; `user` never sends a transaction.
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
+      )
+        .to.emit(integrator, "PassportVerified")
+        .withArgs(
+          user.address,
+          nullifier,
+          stranger.address, // the sponsor, which is the whole point of the log line
+          CAP_INDIA,
+          CAP_INDIA
+        );
+
+      expect(await integrator.verified(user.address)).to.equal(true);
+      expect(await integrator.grantedLimit(user.address)).to.equal(CAP_INDIA);
+      // The submitter gained nothing.
+      expect(await integrator.verified(stranger.address)).to.equal(false);
+      expect(await integrator.grantedLimit(stranger.address)).to.equal(0);
+    });
+
+    it("a sponsor cannot redirect a grant to themselves", async function () {
+      // The dangerous case the wallet parameter could have introduced:
+      // submit user's attestation but name yourself. The signature binds the
+      // wallet, so this must die.
+      const nullifier = nullifierFor("redirect-attempt");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(stranger.address, nullifier, CAP_INDIA, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
+      expect(await integrator.verified(stranger.address)).to.equal(false);
+    });
+
+    it("front-running a submit is a no-op: identical state, duplicate reverts", async function () {
+      const nullifier = nullifierFor("front-run");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+
+      // Attacker lands it first…
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig);
+      // …the user's own submit reverts, having lost nothing but its gas…
+      await expect(
+        integrator
+          .connect(user)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "NullifierAlreadySpent");
+      // …and the state is exactly what the user wanted anyway.
+      expect(await integrator.verified(user.address)).to.equal(true);
+      expect(await integrator.grantedLimit(user.address)).to.equal(CAP_INDIA);
+    });
+
+    it("a sponsored wallet can buy without ever having submitted anything", async function () {
+      const nullifier = nullifierFor("sponsored-buy");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig);
+
+      // The end-to-end claim: verification landed by a third party, purchase
+      // signed by the wallet itself.
+      await expect(integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0)).to.not.be
+        .reverted;
+    });
+
+    it("rejects rotating the attestor to zero (#92)", async function () {
+      // setAttestor(0) used to be accepted — and would have bricked the tier:
+      // every submission reverts AttestorNotSet until someone diagnosed it.
+      await expect(
+        integrator.connect(owner).setAttestor(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      // A real rotation still works.
+      await integrator.connect(owner).setAttestor(stranger.address);
+      expect(await integrator.attestor()).to.equal(stranger.address);
+      await integrator.connect(owner).setAttestor(attestor.address);
+    });
+
+    it("pause stops new submissions, and unpause restores them", async function () {
+      // The deliberate stop lever for enrolment. Without this gate the only
+      // way to halt sponsored submissions was rotating the attestor to zero.
+      const nullifier = nullifierFor("paused-submit");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+
+      await integrator.connect(owner).pause();
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "ContractPaused");
+
+      await integrator.connect(owner).unpause();
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
+      ).to.not.be.reverted;
+      expect(await integrator.verified(user.address)).to.equal(true);
+    });
+
+    it("rejects a limit-0 attestation (#80) — a wallet that could never buy", async function () {
+      // A limit-0 grant makes effectiveLimit min(0, regionCap) = 0, so the
+      // wallet verifies but can never buy. Rejected at the source, whoever
+      // submits, and the nullifier is NOT consumed so a corrected re-issue
+      // can still land.
+      const nullifier = nullifierFor("limit-zero");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, user.address, nullifier, 0n, expiry);
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(user.address, nullifier, 0n, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "InvalidLimit");
+      expect(await integrator.verified(user.address)).to.equal(false);
+
+      // The nullifier survived — a real limit re-verifies the same person.
+      const sig2 = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig2);
+      expect(await integrator.grantedLimit(user.address)).to.equal(CAP_INDIA);
+    });
+
+    it("rejects the zero address as the wallet", async function () {
+      const nullifier = nullifierFor("zero-wallet");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, ethers.ZeroAddress, nullifier, CAP_INDIA, expiry);
+      await expect(
+        integrator
+          .connect(user)
+          .submitPassportAttestation(ethers.ZeroAddress, nullifier, CAP_INDIA, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
 
     it("is monotonic — a lower later attestation cannot downgrade the grant", async function () {
@@ -664,7 +837,9 @@ describe("OwnCheckoutIntegrator", function () {
       const expiry = await futureExpiry();
       const sig = await signAttestation(attestor, user2.address, nullifier, USDC(10), expiry);
       await expect(
-        integrator.connect(user2).submitPassportAttestation(nullifier, USDC(10), expiry, sig)
+        integrator
+          .connect(user2)
+          .submitPassportAttestation(user2.address, nullifier, USDC(10), expiry, sig)
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
@@ -940,6 +1115,89 @@ describe("OwnCheckoutIntegrator", function () {
         "SettlementRoutingAnomaly"
       );
       expect((await integrator.getSession(orderId)).settled).to.equal(false);
+    });
+  });
+  describe("the attestation window is bounded", function () {
+    it("refuses an expiry further ahead than MAX_ATTESTATION_WINDOW", async function () {
+      const window = await integrator.MAX_ATTESTATION_WINDOW();
+      const nullifier = nullifierFor("too-long");
+      const expiry = (await futureExpiry(0)) + window + 60n;
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+
+      await expect(
+        integrator
+          .connect(stranger)
+          .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "AttestationWindowTooLong");
+
+      // Refused before the nullifier is touched, so a correctly scoped
+      // re-issue for the same human still lands.
+      expect(await integrator.nullifierSpent(nullifier)).to.equal(false);
+    });
+
+    it("accepts the one-hour window the service actually issues", async function () {
+      const nullifier = nullifierFor("normal-window");
+      const expiry = await futureExpiry(3600);
+      const sig = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, expiry);
+
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(user.address, nullifier, CAP_INDIA, expiry, sig);
+      expect(await integrator.verified(user.address)).to.equal(true);
+    });
+  });
+
+  describe("an enrolment can be undone", function () {
+    it("frees the nullifier and unverifies the wallet, so the human can re-enrol", async function () {
+      const nullifier = nullifierFor("wrong-wallet");
+      const expiry = await futureExpiry();
+      const sig = await signAttestation(attestor, stranger.address, nullifier, CAP_INDIA, expiry);
+
+      // The sponsor lands it against a wallet the human does not control.
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(stranger.address, nullifier, CAP_INDIA, expiry, sig);
+      expect(await integrator.verified(stranger.address)).to.equal(true);
+      expect(await integrator.nullifierSpent(nullifier)).to.equal(true);
+
+      await expect(integrator.connect(owner).revokeEnrolment(nullifier, stranger.address))
+        .to.emit(integrator, "EnrolmentRevoked")
+        .withArgs(stranger.address, nullifier, owner.address);
+
+      expect(await integrator.verified(stranger.address)).to.equal(false);
+      expect(await integrator.grantedLimit(stranger.address)).to.equal(0);
+      expect(await integrator.nullifierSpent(nullifier)).to.equal(false);
+
+      // The whole point: the same human, same nullifier, correct wallet.
+      const reissue = await futureExpiry();
+      const sig2 = await signAttestation(attestor, user.address, nullifier, CAP_INDIA, reissue);
+      await integrator
+        .connect(stranger)
+        .submitPassportAttestation(user.address, nullifier, CAP_INDIA, reissue, sig2);
+      expect(await integrator.verified(user.address)).to.equal(true);
+    });
+
+    it("is owner-only", async function () {
+      const nullifier = nullifierFor("owner-only");
+      await verify(user, CAP_INDIA, "owner-only");
+      await expect(
+        integrator.connect(stranger).revokeEnrolment(nullifier, user.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    it("refuses a nullifier that was never spent", async function () {
+      await expect(
+        integrator.connect(owner).revokeEnrolment(nullifierFor("never"), user.address)
+      ).to.be.revertedWithCustomError(integrator, "NullifierNotSpent");
+    });
+
+    it("refuses the zero wallet", async function () {
+      await verify(user, CAP_INDIA, "zero-wallet");
+      await expect(
+        integrator
+          .connect(owner)
+          .revokeEnrolment(nullifierFor("kyc:zero-wallet"), ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
   });
 });
