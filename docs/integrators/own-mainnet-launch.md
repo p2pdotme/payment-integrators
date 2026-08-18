@@ -33,7 +33,7 @@ own wallet and the contract's job ends.
 | Lower a region cap or the daily count                                                                                        | **No.** `setRegionCap` / `setDailyTxCountLimit`. |
 | Block a wallet, pause the ramp                                                                                               | **No.** `setBlocked` / `pause`.                  |
 | **Raise** a cap above its `MAX_*` ceiling                                                                                    | **Yes** — ceilings are immutable.                |
-| Change the owner                                                                                                             | **Yes** — `owner` is immutable.                  |
+| Change the owner                                                                                                             | **No.** `transferOwnership` (OZ `Ownable`).      |
 | Any contract logic change                                                                                                    | **Yes** — plus a fresh whitelist request.        |
 
 So the bridge leg, which is the least-tested part of the system, is also the
@@ -105,9 +105,10 @@ is mandatory, not housekeeping.
 
 ### 2.4 Deploy from a multisig
 
-`owner` is immutable. Whatever signs the constructor owns `pause`, `setBlocked`,
-`setRegionCap` and `sweepUsdc` forever. Deploy from the Own multisig, not a
-deployer EOA — there is no transfer path afterwards.
+Whatever signs the constructor owns `pause`, `setBlocked`, `setRegionCap` and
+`sweepUsdc` until ownership is transferred (`transferOwnership`). Deploy with
+the Own multisig as `DEPLOY_OWNER` anyway — a hot deployer key should never
+hold the levers, even briefly.
 
 ### 2.5 Whitelist request
 
@@ -224,9 +225,9 @@ both routing branches and which therefore could never have caught one · complet
 · `setRegionCap(region, 0)` to stop one region · `pause()` to stop all new
 placements. None affect orders already in flight, and none can move user funds.
 
-**What you cannot do:** raise a cap above its ceiling, change the owner, or
-recover a user's funds — by construction. Settlement goes directly to the buyer,
-so there is nothing to recover and no key that could.
+**What you cannot do:** raise a cap above its ceiling or recover a user's
+funds — by construction. Settlement goes directly to the buyer, so there is
+nothing to recover and no key that could.
 
 **Expect a low completion rate.** Every integrator on mainnet loses 8–87% of
 paid orders against a 1.57% organic baseline; Investabl's first two days ran

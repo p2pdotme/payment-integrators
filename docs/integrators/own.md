@@ -243,8 +243,8 @@ not an ongoing clock. Revocation is `setBlocked`.
 | `pause` / `unpause`    | — (stops new placements)                                       |
 | `sweepUsdc`            | see below                                                      |
 
-`owner` is **immutable** — set at construction, never transferable. Use a
-multisig.
+`owner` is set at construction and transferable via OpenZeppelin `Ownable`'s
+`transferOwnership`. Use a multisig.
 
 **`sweepUsdc` does not touch user funds.** By construction this contract's USDC
 balance is always zero, because settlement goes straight to the buyer. A
@@ -288,11 +288,10 @@ DEPLOY_OWNER=0x... ATTESTOR=0x... \
   npx hardhat run scripts/deploy-own.ts --network base
 ```
 
-**`DEPLOY_OWNER` must be the Own multisig.** `owner` is `immutable` with no
-transfer path, so it is the one input here that cannot be corrected afterwards
-— getting it wrong costs a redeploy, a fresh whitelist request, a new tenant,
-and every verified user re-attesting, because the EIP-712 domain binds
-`verifyingContract` and their grants do not carry over. It used to default
+**`DEPLOY_OWNER` must be the Own multisig.** `owner` is transferable
+(`transferOwnership`), so a wrong value is recoverable — but only by whoever
+holds the wrongly-set key, and until the transfer lands that key holds `pause`,
+`setBlocked`, `setRegionCap` and `sweepUsdc`. It used to default
 silently to the deployer EOA; on mainnet the script now refuses to run without
 it.
 
@@ -543,7 +542,7 @@ key-holding proxy exposes only the two widget endpoints, so that lookup goes to
       Note: the attested limit is **per-identity**, not per-tenant — raising a
       tenant's `limit_usdc` does nothing for already-enrolled users, so get it
       right before onboarding anyone real.
-- [ ] Deploy on Base mainnet from an Own multisig (`owner` is immutable),
+- [ ] Deploy on Base mainnet with the Own multisig as `DEPLOY_OWNER`,
       verify on Basescan, and open a whitelist request (`docs/WHITELISTING.md`).
 - [ ] Create the **mainnet** tenant bound to that deployment. The EIP-712 domain
       carries `chainId` + `verifyingContract`, so a Sepolia attestation cannot be
