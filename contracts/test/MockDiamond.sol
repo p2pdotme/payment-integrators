@@ -648,6 +648,16 @@ contract MockDiamond {
         IP2PIntegrator(integrator_).onOrderComplete(orderId, user_, amount, recipientAddr);
     }
 
+    /// @notice Test-only counterpart of `adminCallOnOrderComplete` for the
+    ///         cancel hook. `simulateOrderCancelled` guards on its own order
+    ///         bookkeeping (unknown / already-cancelled / already-completed)
+    ///         and so reverts before the integrator is ever reached; this
+    ///         reaches the integrator directly, which is what tests asserting
+    ///         the hook tolerates those cases actually need.
+    function adminCallOnOrderCancel(address integrator_, uint256 orderId) external {
+        IP2PIntegrator(integrator_).onOrderCancel(orderId);
+    }
+
     function getOrdersById(uint256 orderId) external view returns (OrderView memory o) {
         // BUY orders live in `orders`; SELL orders in `sellOrders`. A BUY id is
         // served as a BUY OrderView (so the integrator's BUY-side reads —
