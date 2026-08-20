@@ -16,11 +16,11 @@ buyer must still clear a one-time **liveness** check.
 No upstream protocol beyond the P2P Diamond. Investabl's backend consumes the
 `ChallengePurchased` event to grant the challenge.
 
-| | Base Mainnet | Base Sepolia |
-|---|---|---|
+|             | Base Mainnet                                 | Base Sepolia                                 |
+| ----------- | -------------------------------------------- | -------------------------------------------- |
 | P2P Diamond | `0x4cad6eC90e65baBec9335cAd728DDC610c316368` | `0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9` |
-| USDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` |
-| Integrator | `<TBD after deploy>` | `<TBD after deploy>` |
+| USDC        | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | `0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d` |
+| Integrator  | `<TBD after deploy>`                         | `<TBD after deploy>`                         |
 
 ## Order lifecycle (user POV)
 
@@ -31,7 +31,7 @@ No upstream protocol beyond the P2P Diamond. Investabl's backend consumes the
 2. User pays INR off-chain (UPI) to the matched liquidity provider.
 3. On settlement the Diamond delivers the purchased USDC to the integrator and
    calls `onOrderComplete`, which emits `ChallengePurchased(orderId, user,
-   amount, sessionRef)`.
+amount, sessionRef)`.
 4. Investabl's backend watches that event and grants the challenge, mapping
    `sessionRef` back to the checkout session.
 
@@ -62,9 +62,9 @@ treasury out of band (CCTP). USDC is never routed to a user EOA.
 Replaces the RP model with a **liveness-tier cap** (see
 [LIMITS-AND-RP.md](../LIMITS-AND-RP.md) §"Overriding limits"):
 
-| Tier | Requirement | Per-tx cap |
-|---|---|---|
-| `TIER_NONE` (0) | none | **0 — cannot buy** |
+| Tier                | Requirement             | Per-tx cap                                                                              |
+| ------------------- | ----------------------- | --------------------------------------------------------------------------------------- |
+| `TIER_NONE` (0)     | none                    | **0 — cannot buy**                                                                      |
 | `TIER_LIVENESS` (1) | one-time liveness check | `min(attested limit, livenessTierCap)`, deployed at **20 USDC** (the immutable ceiling) |
 
 The effective cap is `min(attested limit, livenessTierCap)`: the simple-kyc service

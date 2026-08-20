@@ -1,0 +1,49 @@
+# CI for services/**, which the Node workflows cannot see.
+#
+# ci.yml installs npm and runs hardhat; slither.yml is path-filtered to
+# contracts/**. Neither reaches services/gas-faucet, so its tests ran only when
+# a human remembered to run them locally — for the one process in this repo
+# that holds a private key and is exposed publicly.
+name: Faucet
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["services/**", ".github/workflows/faucet.yml"]
+  push:
+    branches: [main]
+    paths: ["services/**", ".github/workflows/faucet.yml"]
+
+jobs:
+  test:
+    name: pytest (services/gas-faucet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: services/gas-faucet
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: services/gas-faucet/requirements.txt
+
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      # The service refuses a relative FAUCET_DB_PATH so a container cannot
+      # silently reset its caps on deploy; CI is the legitimate exception.
+      - name: Test
+        env:
+          FAUCET_ALLOW_EPHEMERAL_DB: "1"
+        run: pytest -q
+
+      - name: Import check
+        env:
+          FAUCET_ALLOW_EPHEMERAL_DB: "1"
+        run: python -c "import faucet, policy, store, chain"

@@ -37,7 +37,10 @@ async function main() {
   console.log("Diamond:", DIAMOND_ADDRESS);
   console.log("USDC:", USDC_ADDRESS);
   console.log("Liveness tier cap:", ethers.formatUnits(LIVENESS_TIER_CAP, 6), "USDC per tx");
-  console.log("Liveness attestor:", LIVENESS_ATTESTOR || "(unset — no order can be placed until set)");
+  console.log(
+    "Liveness attestor:",
+    LIVENESS_ATTESTOR || "(unset — no order can be placed until set)"
+  );
   console.log("Daily TX Count Limit:", DAILY_TX_COUNT_LIMIT, "orders per day");
   console.log("");
 

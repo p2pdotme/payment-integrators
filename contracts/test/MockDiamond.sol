@@ -56,8 +56,25 @@ contract MockDiamond {
         SellStatus status;
         string encUpi; // user's UPI encrypted to merchant
         string merchantPubkey;
+        address acceptedMerchant; // set on accept; surfaced via getOrdersById
         uint8 disputeRaisedBy; // test-only: mirror Diamond's Dispute.raisedBy
         uint8 disputeStatus; // test-only: mirror Diamond's Dispute.status
+    }
+
+    /// @notice SELL fee in bps, charged on top of principal (real Diamond charges
+    ///         a fee; the base mock charged zero, masking the #44 strand). 0 =
+    ///         legacy fee-free behaviour, so existing tests are unaffected.
+    uint256 public sellFeeBps;
+
+    function setSellFeeBps(uint256 bps) external {
+        sellFeeBps = bps;
+    }
+
+    /// @dev Integration resolution (#35 -> main): `main` charges a FLAT `sellFee`,
+    ///      the Showdown branch added a PROPORTIONAL `sellFeeBps`. Both are
+    ///      honoured so either suite's fixtures work unchanged.
+    function _sellFee(uint256 amount) internal view returns (uint256) {
+        return sellFee + (amount * sellFeeBps) / 10_000;
     }
 
     mapping(address => bool) public activeIntegrators;
@@ -95,6 +112,84 @@ contract MockDiamond {
      *         integrator's pinned proxyImpl. Mirrors the real
      *         B2BGatewayFacet._resolveIntegrator (no isAuthorizedProxy callback).
      */
+    /* ── Adversarial modes ────────────────────────────────────────────────
+     *
+     * An integrator's own defences against a misbehaving Diamond cannot be
+     * tested by a Diamond that always behaves. These switches let a test drive
+     * the gateway off the happy path deliberately. All default false, so
+     * existing suites are unaffected.
+     */
+
+    /// @notice Mirrors `B2BGatewayStorage.IntegratorConfig.usdcThroughIntegrator`.
+    ///         The real gateway routes settlement on this but passes
+    ///         `recipientAddr` to `onOrderComplete` in BOTH branches — the
+    ///         asymmetry an integrator's routing alarm has to survive.
+    bool public usdcThroughIntegrator;
+    /// @notice Place without ever calling `validateOrder`.
+    bool public skipValidation;
+    /// @notice Call `validateOrder` twice for one placement.
+    bool public doubleValidate;
+    /// @notice Call `validateOrder` with an amount the integrator did not ask for.
+    bool public tamperValidationAmount;
+    /// @notice Hand back an order id that has already been used.
+    uint256 public forceOrderId;
+
+    function setUsdcThroughIntegrator(bool v) external {
+        usdcThroughIntegrator = v;
+    }
+
+    /**
+     * @notice Mirrors `B2BGatewayFacet.getIntegratorConfig`, including the
+     *         field ORDER of the deployed struct — five words, with the
+     *         routing flag at word 1 and `proxyImpl` last.
+     * @dev    The order is the point. `cancelCallbackEnabled` was inserted in
+     *         the middle, which is what makes a stale typed decode read
+     *         `proxyImpl` as zero. An integrator that reads word 1 raw is
+     *         unaffected, and this mock has to have the same shape for that to
+     *         mean anything in a test.
+     */
+    struct IntegratorConfigView {
+        bool isActive;
+        bool usdcThroughIntegrator;
+        bool cancelCallbackEnabled;
+        uint256 activeOrderCount;
+        address proxyImpl;
+    }
+
+    /// @notice Set false to simulate a Diamond whose config cannot be read.
+    bool public configReadable = true;
+
+    function setConfigReadable(bool v) external {
+        configReadable = v;
+    }
+
+    function getIntegratorConfig(
+        address integrator
+    ) external view returns (IntegratorConfigView memory cfg) {
+        require(configReadable, "config unreadable");
+        cfg.isActive = true;
+        cfg.usdcThroughIntegrator = usdcThroughIntegrator;
+        cfg.cancelCallbackEnabled = false;
+        cfg.activeOrderCount = 0;
+        cfg.proxyImpl = integratorProxyImpl[integrator];
+    }
+
+    function setSkipValidation(bool v) external {
+        skipValidation = v;
+    }
+
+    function setDoubleValidate(bool v) external {
+        doubleValidate = v;
+    }
+
+    function setTamperValidationAmount(bool v) external {
+        tamperValidationAmount = v;
+    }
+
+    function setForceOrderId(uint256 id) external {
+        forceOrderId = id;
+    }
+
     function placeB2BOrder(
         address user,
         uint256 amount,
@@ -107,10 +202,19 @@ contract MockDiamond {
     ) external returns (uint256 orderId) {
         address effectiveIntegrator = _resolveIntegrator();
 
-        bool allowed = IP2PIntegrator(effectiveIntegrator).validateOrder(user, amount, currency);
-        require(allowed, "Validation failed");
+        if (!skipValidation) {
+            bool allowed = IP2PIntegrator(effectiveIntegrator).validateOrder(
+                user,
+                tamperValidationAmount ? amount + 1 : amount,
+                currency
+            );
+            require(allowed, "Validation failed");
+            if (doubleValidate) {
+                IP2PIntegrator(effectiveIntegrator).validateOrder(user, amount, currency);
+            }
+        }
 
-        orderId = nextOrderId++;
+        orderId = forceOrderId != 0 ? forceOrderId : nextOrderId++;
         orders[orderId] = Order({
             integrator: effectiveIntegrator,
             user: user,
@@ -153,6 +257,7 @@ contract MockDiamond {
             status: SellStatus.PLACED,
             encUpi: "",
             merchantPubkey: "",
+            acceptedMerchant: address(0),
             disputeRaisedBy: 0,
             disputeStatus: 0
         });
@@ -205,14 +310,26 @@ contract MockDiamond {
     function simulateOrderComplete(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(!order.completed, "Already completed");
-        // CANCELLED is terminal on the real Diamond — a test must never be able
-        // to "complete" a cancelled BUY and validate an impossible transition.
-        require(!order.cancelled, "Cancelled is terminal");
+        // A CANCELLED BUY is NOT terminal on the real Diamond: OrderFlowHelper
+        // lets an admin re-open a CANCELLED BUY to PAID and complete from there
+        // (the dispute path). `orders` here is the BUY mapping, so completing a
+        // cancelled order is a faithful transition to model, not an impossible
+        // one — the prior `require(!cancelled)` was stricter than the protocol.
+        // See #56 (mirror of #41: a mock encoding a belief about the Diamond
+        // rather than the Diamond's code).
         order.completed = true;
 
-        // Transfer USDC to recipientAddr (mirrors usdcThroughIntegrator = false)
-        usdc.safeTransfer(order.recipientAddr, order.amount);
+        // Routing follows the flag, exactly as B2BGatewayFacet does.
+        if (usdcThroughIntegrator) {
+            usdc.safeTransfer(order.integrator, order.amount);
+        } else {
+            usdc.safeTransfer(order.recipientAddr, order.amount);
+        }
 
+        // ...but the callback carries `recipientAddr` in BOTH branches. This
+        // is not an oversight in the mock; it is what the real gateway does,
+        // and it is the reason an integrator cannot detect a mis-registration
+        // from this argument.
         try
             IP2PIntegrator(order.integrator).onOrderComplete(
                 orderId,
@@ -277,6 +394,7 @@ contract MockDiamond {
             status: SellStatus.PLACED,
             encUpi: "",
             merchantPubkey: "",
+            acceptedMerchant: address(0),
             disputeRaisedBy: 0,
             disputeStatus: 0
         });
@@ -290,6 +408,7 @@ contract MockDiamond {
         require(o.status == SellStatus.PLACED, "Bad state");
         o.status = SellStatus.ACCEPTED;
         o.merchantPubkey = merchantPubkey;
+        o.acceptedMerchant = msg.sender;
         emit MockSellOrderAccepted(orderId);
     }
 
@@ -310,7 +429,7 @@ contract MockDiamond {
         require(o.status == SellStatus.ACCEPTED, "Bad state");
         require(msg.sender == o.user, "Only order.user");
         o.encUpi = encUpi;
-        uint256 needed = o.amount + sellFee; // actualUsdtAmount (principal + fee)
+        uint256 needed = o.amount + _sellFee(o.amount); // actualUsdtAmount (principal + fee)
         // Test hook: force the live facet's "pull failed → auto-cancel, return
         // success (no revert)" branch even when the proxy is fully funded, so the
         // integrator's deliverFiatPayout status-read-back (#2) can be exercised
@@ -318,6 +437,12 @@ contract MockDiamond {
         if (forceSellUpiAutoCancel) {
             o.status = SellStatus.CANCELLED;
             emit MockSellOrderCancelled(orderId, 0);
+            return;
+        }
+        // Test hook (#96): return success while neither pulling nor changing
+        // status — the "neither PAID nor CANCELLED" post-state the integrator's
+        // Unsettled branch exists for.
+        if (forceSellUpiNoOp) {
             return;
         }
         // try/catch the pull exactly like the live facet. `_pullFor` is external so
@@ -342,6 +467,14 @@ contract MockDiamond {
 
     function setForceSellUpiAutoCancel(bool v) external {
         forceSellUpiAutoCancel = v;
+    }
+
+    /// @notice Test-only (#96): setSellOrderUpi returns success without pulling
+    ///         or moving status off ACCEPTED.
+    bool public forceSellUpiNoOp;
+
+    function setForceSellUpiNoOp(bool v) external {
+        forceSellUpiNoOp = v;
     }
 
     /// @dev External so setSellOrderUpi can try/catch it (Solidity only catches
@@ -370,7 +503,7 @@ contract MockDiamond {
         uint256 refund = 0;
         if (wasPaid) {
             // Refund what was pulled (principal + fee).
-            refund = o.amount + sellFee;
+            refund = o.amount + _sellFee(o.amount);
             usdc.safeTransfer(o.user, refund);
         }
         emit MockSellOrderCancelled(orderId, refund);
@@ -420,26 +553,40 @@ contract MockDiamond {
     ) external view returns (AdditionalOrderDetailsView memory) {
         return
             AdditionalOrderDetailsView({
-                fixedFeePaid: uint64(sellFee),
+                fixedFeePaid: uint64(_sellFee(sellOrders[orderId].amount)),
                 tipsPaid: 0,
                 acceptedTimestamp: 0,
                 paidTimestamp: 0,
                 reserved2: 0,
                 actualUsdtAmount: additionalOrderDetailsFeeUnready
                     ? 0
-                    : sellOrders[orderId].amount + sellFee,
+                    : actualUsdtAmountOverride[orderId] != 0
+                        ? actualUsdtAmountOverride[orderId]
+                        : sellOrders[orderId].amount + _sellFee(sellOrders[orderId].amount),
                 actualFiatAmount: 0
             });
     }
 
     /// @notice When set, `getAdditionalOrderDetails` returns 0 for
-    ///         actualUsdtAmount instead of the order amount. Used by tests
-    ///         to exercise the `OfframpFeeNotReady` revert path in
-    ///         deliverOfframpUpi without having to mutate sellOrders.amount.
+    ///         actualUsdtAmount. Showdown's `deliverOfframpUpi` now REVERTS
+    ///         `OfframpFeeNotReady` on this rather than falling back to the
+    ///         principal — the fallback read as a safety net but is unreachable
+    ///         for an ACCEPTED order, since the real Diamond writes
+    ///         actualUsdtAmount at placement and only zeroes it on cancel. (#72)
     bool public additionalOrderDetailsFeeUnready;
 
     function setAdditionalOrderDetailsFeeUnready(bool v) external {
         additionalOrderDetailsFeeUnready = v;
+    }
+
+    /// @notice Force a specific `actualUsdtAmount` for one order, so tests can
+    ///         express a Diamond that re-prices, partially fills or changes its
+    ///         fee model — values the bps fee alone cannot produce (notably any
+    ///         amount BELOW the escrowed principal). 0 = use the computed value.
+    mapping(uint256 => uint256) public actualUsdtAmountOverride;
+
+    function setActualUsdtAmountOverride(uint256 orderId, uint256 amount) external {
+        actualUsdtAmountOverride[orderId] = amount;
     }
 
     /// @notice Mock of GetterFacet.getOrdersById. Only the `status`,
@@ -487,9 +634,10 @@ contract MockDiamond {
     /// @notice Test-only helper: directly invokes
     ///         `IP2PIntegrator.onOrderComplete` on `integrator_` with the
     ///         supplied arguments. Lets tests exercise the integrator's
-    ///         defense-in-depth guards (AmountMismatch / UnknownOrder /
-    ///         OrderAlreadyCancelled) without having to manipulate the
-    ///         mock's internal `orders` mapping.
+    ///         onOrderComplete guards (UnexpectedRecipient / OrderAlreadyFulfilled
+    ///         / the delivered-amount re-pin) without manipulating the mock's
+    ///         internal `orders` mapping. (Showdown has no `AmountMismatch` guard —
+    ///         that is LotPot's; Showdown re-pins instead. #55)
     function adminCallOnOrderComplete(
         address integrator_,
         uint256 orderId,
@@ -526,6 +674,7 @@ contract MockDiamond {
         o.amount = s.amount;
         o.user = s.user;
         o.currency = s.currency;
+        o.acceptedMerchant = s.acceptedMerchant; // 0 until a merchant accepts
         o.id = orderId;
         o.disputeInfo.raisedBy = s.disputeRaisedBy;
         o.disputeInfo.status = s.disputeStatus;
@@ -545,7 +694,7 @@ contract MockDiamond {
     function simulateOrderCompleteNoCallback(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(!order.completed, "Already completed");
-        require(!order.cancelled, "Cancelled is terminal");
+        // A CANCELLED BUY is not terminal — see simulateOrderComplete / #56.
         order.completed = true;
         // Route USDC to the proxy exactly like a real completion, but skip the
         // integrator callback (the swallowed-revert end state).
