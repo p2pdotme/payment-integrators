@@ -63,6 +63,117 @@ failure mode structurally. See **Upgrades** below.
    `transferERC20ToIntegrator` (it now sits in the integrator's own custody) and
    records a `SettlementBucket {amount, unlockTimestamp = now + lockPeriod(currency)}`.
 
+### BUY via a payment link (customer has no wallet)
+
+`userPlaceOrder` credits `msg.sender`, so only the merchant's own signer can call
+it. That works at the counter, where the merchant's device signs while the
+customer pays fiat beside them — but not for a link the customer opens on their
+own phone, with no wallet, while the merchant is away.
+
+1. Merchant calls `createLink(linkId, amount, currency, expiresAt, maxUses,
+   encryptedConfig)` from their own signer. `owner` is taken from `msg.sender`,
+   so a link can only ever be created for oneself. `linkId` MUST come from
+   `PaymentLinksLib.computeLinkId(merchant, salt)`.
+2. The customer opens the link and taps Pay. Their browser has no key, so a
+   keeper — the contract's existing `trustedRelayer` — calls
+   `relayerPlaceOrder(linkId, client, productId, quantity, currency, circleId,
+   pubKey)` on the merchant's behalf.
+3. The customer pays fiat to the LP, then `relayerMarkPaid(linkId, orderId)`
+   moves the order to PAID.
+4. The LP confirms receipt and completes. From there the order settles
+   **identically to a counter sale**: same `onOrderComplete` sweep, same
+   `SettlementBucket`. Payment links change nothing about custody or unlock
+   timing.
+
+#### Why a link order's `order.user` is the merchant's PROXY
+
+The Diamond authorises `paidBuyOrder` against **`order.user`** — not the placer,
+and not `recipientAddr`. Verified by `eth_call` against both the Base mainnet
+Diamond (`0x4cad…6368`) and the Base Sepolia Diamond (`0xeb0B…beb9`): from
+`order.user` the call clears the ACL and fails only on a status/expiry check,
+while every other caller — including the order's own `recipientAddr` — reverts
+`NotAuthorized()`.
+
+So a link order that recorded the MERCHANT as `order.user` could never be marked
+paid: the merchant is absent by construction, and their key is the only one the
+Diamond would accept. The customer's fiat would be gone and the order would sit
+until TTL and cancel.
+
+`_placeOrder` therefore takes a `userIsProxy` flag:
+
+| path | `order.user` | who advances it |
+| --- | --- | --- |
+| `userPlaceOrder` (POS) | the merchant | the merchant's own device, directly |
+| `relayerPlaceOrder` (link) | the merchant's `UserProxy` | this contract, via `relayerMarkPaid` |
+
+The POS shape is unchanged, so the shipped `@p2pdotme/widgets` flow still signs
+`paidBuyOrder` itself.
+
+Two consequences fall out of that, and both are handled explicitly:
+
+- **`validateOrder`** sees a proxy as `order.user` for BOTH a SELL placement and
+  a link BUY. The old blanket `proxyMerchant[user] != 0 → return true` carve-out
+  would have silently disabled the per-tx cap, the daily count and the
+  frozen-merchant switch on the one flow open to anonymous customers. It is now
+  narrowed to a `transient _sellPlacement` flag set only around our own SELL
+  placement, and a link BUY **resolves** the proxy back to its owner so the
+  merchant's real limits apply.
+- **`onOrderComplete`** receives the proxy as `user`, so it resolves
+  proxy → merchant before touching money. Without this, `proxyAddress(proxy)`
+  is an address that was never deployed and the USDC sweep reverts — after the
+  customer has already paid.
+
+#### Link lifecycle
+
+`maxUses` is how many **successful** payments a link accepts; `0` is unlimited
+and `1` is the old single-use link. A cancelled or abandoned order releases its
+use in `onOrderCancel` (via `orderToLink`), so a customer who taps Pay and walks
+away does not retire the merchant's link.
+
+`revokeLink(linkId)` is callable by the link's owner or an `isOwner[]` admin —
+deliberately **not** by the relayer, which has no authority over link lifecycle.
+Because status, expiry, and use count are all checked inside `relayerPlaceOrder`
+itself, a revocation and the next payment attempt can never diverge.
+
+`setLinkOrdersEnabled(bool)` (MANAGER) is a kill switch scoped to link orders
+only: flipping it off stops `relayerPlaceOrder` and `relayerMarkPaid` while
+leaving the relayer's unrelated keeper duties — and every merchant's fiat
+withdrawal — working.
+
+#### False payment claims (`strikes`)
+
+PAID is a **claim**, not a settlement: no USDC moves, and the LP still settles
+against their own bank. A customer who lies cannot steal — but they can waste
+the LP's escrowed capital and dispute time for free.
+
+`relayerMarkPaid` takes a provisional strike, and `onOrderComplete` releases it
+when the claim proves true. An order marked paid and then CANCELLED therefore
+leaves exactly one permanent strike, with no per-order storage.
+
+Strikes are **advisory on-chain**: the contract records them so the merchant can
+see a link attracting false claims, and never blocks on them. Blocking the link
+would let anyone kill any merchant's link with two taps — a worse griefing
+surface than the one it closes. Throttling the CLAIMANT is the relayer service's
+job, because only it can see an IP. `resetLinkStrikes(linkId)` clears the
+counter (owner or admin).
+
+**Relayer blast radius.** The relayer is never a registered merchant, so
+`withdrawUSDC`, `withdrawFiat`, and `updateProfile` all reject it on
+`msg.sender`. Both relayer entry points require `orderToLink[orderId] == linkId`,
+so it cannot touch an order that did not come from the link it names. The worst
+a fully compromised relayer key can do is place spurious orders that **credit**
+merchants, and claim payment on a genuine link order that was not in fact paid —
+which the LP rejects, because the LP settles against their own bank.
+
+#### Contract size
+
+This contract sits against the 24,576-byte EIP-170 ceiling. Payment-link
+lifecycle lives in `PaymentLinksLib`, an external (delegatecall) library, and
+`hardhat.config.ts` carries a **per-file** optimizer override (`runs: 50`) for
+this contract alone. Even so the margin is ~130 bytes. The next feature here
+needs the withdrawal / fund-helper sections (~44% of the contract) moved into
+their own library, or a facet split.
+
 ### SELL (merchant withdraws fiat)
 
 1. Merchant calls `withdrawFiat(amount, circleId, pubKey, encPayout)` against
@@ -91,8 +202,17 @@ sets the global default and `setLockPeriod(currency, seconds)` overrides per cur
 (both super-admin-only, both bounded). Lock changes apply to **new** credits only;
 existing buckets keep their original unlock timestamp.
 
+Link payments consume the **same** allowance as counter sales — one shared
+per-tx cap and one shared daily count per merchant, because both paths reach
+`validateOrder` through the same `_placeOrder` helper. A link order arrives at
+`validateOrder` with the merchant's proxy as `user`, and is resolved back to the
+merchant there, so the limits that apply are the merchant's own.
+
 The merchant's own proxy is carved out of `validateOrder` so SELL/withdrawal
-placements do not hit buy-side limits. The daily counter resets when the UTC day
+placements do not hit buy-side limits — but only while `_sellPlacement` is set,
+i.e. for the duration of a withdrawal this contract is itself placing. A link
+BUY also arrives with a proxy as `order.user` and is deliberately NOT carved
+out. The daily counter resets when the UTC day
 (`block.timestamp / 86400`) changes; `onOrderCancel` releases a consumed slot for the
 current day only.
 
@@ -157,8 +277,17 @@ dormant-leftover recovery via escheat).
 - `validateOrder` / `onOrderComplete` / `onOrderCancel` are `onlyDiamond`.
 - Settlement buckets are compacted (spent buckets dropped) and bounded by
   `MAX_BUCKETS = 256` to keep withdrawal gas bounded.
-- `nonReentrant` + CEI on `userPlaceOrder`, every withdrawal, and all
-  reconcile/recovery paths.
+- `nonReentrant` + CEI on `userPlaceOrder`, `relayerPlaceOrder`, every
+  withdrawal, and all reconcile/recovery paths. `relayerPlaceOrder` increments
+  the link's use counter **before** the external call, so a single-use link is
+  consumed at commit time independently of the reentrancy guard.
+- Payment links pin what the merchant committed to: a fixed amount must match
+  exactly (`LinkAmountMismatch`), and the currency is fixed at creation
+  (`InvalidCurrency`), so even a compromised relayer cannot re-price a link into
+  another currency's cap or lock-period regime. `createLink` also rejects an
+  amount above the merchant's per-tx cap — keyed off their **registered**
+  currency, matching what `validateOrder` enforces at pay time — so a link
+  cannot be created that would only fail once a customer tries to pay it.
 - The offramp fee is charged to the withdrawing merchant (debited from their own
   buckets), never sourced from the commingled pool.
 - The merchant payout handle is **client-side encrypted** to the merchant's relay
