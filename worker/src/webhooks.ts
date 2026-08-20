@@ -13,26 +13,70 @@
  * the HMAC signature is what authenticates delivery.
  */
 
-import { decodeEventLog, type Address, type Hex } from "viem";
+import { decodeEventLog, hashMessage, recoverAddress, type Address, type Hex } from "viem";
 import { INTEGRATOR_ABI, limitsFor, type Env } from "./config";
 import { publicClientFor } from "./chain";
-import { json, badRequest } from "./http";
+import { json, badRequest, clientIp } from "./http";
+import { checkRateLimits } from "./limits";
+import { recordFalseClaim, clearMarkPaid } from "./claims";
 
 interface RegisterBody {
   linkId?: string;
   url?: string;
-  merchant?: string;
+  nonce?: string;
+  signature?: string;
 }
 
-/** POST /api/links — register a webhook URL for a link the caller owns. */
+/**
+ * The message the link owner signs to register a webhook.
+ *
+ * Includes the chain id and the integrator address so a signature captured on
+ * testnet cannot be replayed against mainnet, and a nonce so it cannot be
+ * replayed at all.
+ */
+export function registrationMessage(
+  linkId: string,
+  url: string,
+  nonce: string,
+  chainId: number,
+  integrator: string
+): string {
+  return [
+    "PayQR webhook registration",
+    `link: ${linkId.toLowerCase()}`,
+    `url: ${url}`,
+    `nonce: ${nonce}`,
+    `chain: ${chainId}`,
+    `integrator: ${integrator.toLowerCase()}`,
+  ].join("\n");
+}
+
+/**
+ * POST /api/links — register a webhook URL for a link you own.
+ *
+ * OWNERSHIP IS PROVED BY SIGNATURE, NOT CLAIMED IN THE BODY.
+ * This used to take a `merchant` field from the request and check it against
+ * the link's on-chain owner. But that owner is public — an indexed field of
+ * `LinkCreated`, and readable through `getLink` — so anyone could read an
+ * event and register their own URL against someone else's link. They would
+ * receive every payment notification for it AND, because the write was
+ * unconditional, silently displace the merchant's own. A merchant whose
+ * fulfilment is driven by that webhook simply stops shipping, with nothing to
+ * tell them why.
+ *
+ * The HMAC on delivery never helped here: it authenticates the DELIVERY, not
+ * the REGISTRATION.
+ */
 export async function handleRegisterWebhook(req: Request, env: Env): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as RegisterBody;
   const linkId = String(body.linkId ?? "");
   const url = String(body.url ?? "");
-  const merchant = String(body.merchant ?? "");
+  const nonce = String(body.nonce ?? "");
+  const signature = String(body.signature ?? "");
 
   if (!/^0x[0-9a-fA-F]{64}$/.test(linkId)) return badRequest("Invalid link.");
-  if (!/^0x[0-9a-fA-F]{40}$/.test(merchant)) return badRequest("Invalid merchant address.");
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) return badRequest("Invalid signature.");
+  if (nonce.length === 0 || nonce.length > 128) return badRequest("Invalid nonce.");
 
   let parsed: URL;
   try {
@@ -42,7 +86,14 @@ export async function handleRegisterWebhook(req: Request, env: Env): Promise<Res
   }
   if (parsed.protocol !== "https:") return badRequest("Webhook URLs must use HTTPS.");
 
-  // Ownership is checked against the chain, not against the request.
+  // Unmetered before this point it was a free KV-write amplifier.
+  const limited = await checkRateLimits(env, `hook:${linkId}`, clientIp(req));
+  if (limited) return json({ error: limited }, 429);
+
+  // One nonce, one registration.
+  const nonceKey = `hook:nonce:${linkId}:${nonce}`;
+  if (await env.KV.get(nonceKey)) return json({ error: "This request was already used." }, 409);
+
   const client = publicClientFor(env);
   const link = (await client
     .readContract({
@@ -52,12 +103,33 @@ export async function handleRegisterWebhook(req: Request, env: Env): Promise<Res
       args: [linkId as Hex],
     })
     .catch(() => null)) as readonly [Address, ...unknown[]] | null;
-
   if (!link) return json({ error: "Link not found." }, 404);
-  if (link[0].toLowerCase() !== merchant.toLowerCase()) {
-    return json({ error: "You do not own this link." }, 403);
+
+  const message = registrationMessage(
+    linkId,
+    url,
+    nonce,
+    client.chain?.id ?? 0,
+    env.INTEGRATOR_ADDRESS
+  );
+
+  let recovered: Address;
+  try {
+    recovered = await recoverAddress({
+      hash: hashMessage(message),
+      signature: signature as Hex,
+    });
+  } catch {
+    return badRequest("Invalid signature.");
   }
 
+  // The CURRENT owner, every time — a link that changed hands does not keep
+  // honouring the previous owner's signature.
+  if (recovered.toLowerCase() !== link[0].toLowerCase()) {
+    return json({ error: "That signature is not from this link's owner." }, 403);
+  }
+
+  await env.KV.put(nonceKey, "1", { expirationTtl: 604_800 });
   await env.KV.put(`hook:${linkId}`, url);
   return json({ ok: true });
 }
@@ -233,4 +305,73 @@ export async function deliverQueued(env: Env): Promise<number> {
   }
 
   return delivered;
+}
+
+/**
+ * Turns a broken "I have paid" claim into a strike against whoever made it.
+ *
+ * An order that was marked paid and then CANCELLED is the definition of a false
+ * claim: the LP settles against their own bank, so a cancellation after a claim
+ * means the money never arrived. An order that COMPLETED proves the claim was
+ * honest, and the record is simply dropped.
+ *
+ * The contract already counts strikes per LINK, which is what the merchant needs
+ * to see. This counts them per CLAIMANT, which is what actually stops a repeat
+ * abuser — and it can only be done here, because the chain cannot see an IP.
+ *
+ * Runs on the schedule rather than inline: the outcome of a claim is not known
+ * until the LP acts, which is minutes later.
+ */
+export async function sweepFalseClaims(env: Env): Promise<number> {
+  const client = publicClientFor(env);
+  const latest = await client.getBlockNumber();
+  const from = BigInt(
+    (await env.KV.get("claim:cursor")) ?? String(latest > 5000n ? latest - 5000n : 0n)
+  );
+  if (from >= latest) return 0;
+
+  const span = limitsFor(env).logScanBlocks;
+  const to = from + span > latest ? latest : from + span;
+
+  const events = INTEGRATOR_ABI.filter(
+    (e) => e.type === "event" && (e.name === "OrderCancelled" || e.name === "OrderCompleted")
+  ) as Extract<(typeof INTEGRATOR_ABI)[number], { type: "event" }>[];
+
+  let strikes = 0;
+  for (const event of events) {
+    const logs = await client.getLogs({
+      address: env.INTEGRATOR_ADDRESS as Address,
+      event,
+      fromBlock: from,
+      toBlock: to,
+    });
+
+    for (const log of logs) {
+      let ev;
+      try {
+        ev = decodeEventLog({
+          abi: INTEGRATOR_ABI,
+          data: log.data,
+          topics: log.topics as [Hex, ...Hex[]],
+        });
+      } catch {
+        continue;
+      }
+      const orderId = (ev.args as unknown as { orderId?: bigint }).orderId;
+      if (orderId === undefined) continue;
+
+      if (ev.eventName === "OrderCancelled") {
+        const ip = await recordFalseClaim(env, orderId);
+        if (ip) {
+          strikes++;
+          console.warn(`[paylinks] false payment claim on order ${orderId} from ${ip}`);
+        }
+      } else if (ev.eventName === "OrderCompleted") {
+        await clearMarkPaid(env, orderId);
+      }
+    }
+  }
+
+  await env.KV.put("claim:cursor", String(to));
+  return strikes;
 }

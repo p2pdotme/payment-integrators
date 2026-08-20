@@ -5,10 +5,10 @@
  * relay pubkey, and everything else about the payment is read from the chain.
  */
 
-import { decodeEventLog, type Address, type Hex } from "viem";
+import { decodeEventLog, type Address, type Hex, type PublicClient } from "viem";
 import { INTEGRATOR_ABI, limitsFor, productIdFor, type Env } from "./config";
 import { publicClientFor, relayerFor, readLink, linkBlockedReason } from "./chain";
-import { checkRateLimits, reserveGas, releaseGas } from "./limits";
+import { checkRateLimits, reserveGas, releaseGas, gasPriceFor } from "./limits";
 import { json, badRequest, clientIp, isHex32 } from "./http";
 
 interface PayBody {
@@ -75,7 +75,12 @@ export async function handlePay(req: Request, env: Env, linkId: string): Promise
       const unit = await unitPrice(client, env);
       if (unit === 0n) return json({ error: "This link is not payable right now." }, 409);
 
-      const cap = await perTxCap(client, env, link.currency);
+      // validateOrder keys the per-tx cap off the merchant's REGISTERED
+      // currency, never the link's — the exact trap createLink's own comment
+      // warns about. Using link.currency here made the precheck disagree with
+      // the contract, producing the confusing customer outcome this check
+      // exists to prevent (an INR merchant keeps their INR cap on a BRL link).
+      const cap = await perTxCap(client, env, await registeredCurrency(client, env, link.owner));
       if (cap > 0n && BigInt(q) * unit > cap) {
         return json({ error: "This amount is above the limit for this merchant." }, 409);
       }
@@ -117,7 +122,9 @@ export async function handlePay(req: Request, env: Env, linkId: string): Promise
     }
 
     // 6 ── Gas ceilings, reserved before sending.
-    const capped = await reserveGas(env, gas);
+    const sendGas = (gas * limitsFor(env).gasBufferPct) / 100n;
+    const gasPrice = await gasPriceFor(client);
+    const capped = await reserveGas(env, sendGas, gasPrice);
     if (capped) return json({ error: capped }, 503);
 
     // 7 ── One nonce, allocated globally so two links cannot collide.
@@ -136,12 +143,12 @@ export async function handlePay(req: Request, env: Env, linkId: string): Promise
         account: wallet.account!,
         chain: wallet.chain,
         nonce,
-        gas: (gas * limits.gasBufferPct) / 100n,
+        gas: sendGas,
       });
     } catch (err) {
       // Nothing was broadcast, so give the reservation back — otherwise a run
       // of RPC failures burns a whole day's budget with no transactions sent.
-      await releaseGas(env, gas);
+      await releaseGas(env, sendGas, gasPrice);
       // A failed send leaves a hole in the sequence — resync rather than
       // letting every later payment queue behind a nonce that never lands.
       await nonceStub.fetch("https://nonce/resync");
@@ -225,10 +232,34 @@ async function unitPrice(client: ReturnType<typeof publicClientFor>, env: Env): 
         },
       ] as const,
       functionName: "getProductPrice",
-      args: [1n],
+      // The SAME product the order is placed against. Hardcoding 1 meant that
+      // with PRODUCT_ID set to anything else, quantity was derived from product
+      // 1's price while the order was placed against a different product:
+      // fixed links then revert LinkAmountMismatch, variable links charge the
+      // wrong total.
+      args: [productIdFor(env)],
     })) as bigint;
   } catch {
     return 0n;
+  }
+}
+
+/**
+ * The merchant's REGISTERED currency — the one validateOrder keys limits off.
+ * Falls back to the link's currency only if the read fails, which keeps the
+ * precheck advisory rather than turning an RPC hiccup into a refusal.
+ */
+async function registeredCurrency(client: PublicClient, env: Env, merchant: Address): Promise<Hex> {
+  try {
+    const info = (await client.readContract({
+      address: env.INTEGRATOR_ADDRESS as Address,
+      abi: INTEGRATOR_ABI,
+      functionName: "getMerchantInfo",
+      args: [merchant],
+    })) as readonly [Hex, string, Hex, boolean, boolean];
+    return info[2];
+  } catch {
+    return "0x0000000000000000000000000000000000000000000000000000000000000000";
   }
 }
 
@@ -292,7 +323,8 @@ export function explainRevert(err: unknown): string {
   }
 
   if (s.includes("LinkExpired")) return "This payment link has expired.";
-  if (s.includes("LinkAlreadyUsed")) return "This payment link has already been paid.";
+  if (s.includes("LinkAlreadyUsed"))
+    return "This payment link has already been used the maximum number of times.";
   if (s.includes("LinkNotActive")) return "This payment link has been cancelled.";
   if (s.includes("LinkNotFound")) return "This payment link was not found.";
   if (s.includes("LinkAmountMismatch")) return "The amount has changed. Please reload the page.";

@@ -33,6 +33,29 @@ interface IOrderFlow {
 
     function getNextOrderId() external view returns (uint256);
 
+    /// @notice Marks a BUY order's fiat leg as sent, moving it to PAID.
+    /// @dev GATED ON THE DIAMOND TO `order.user` — not to msg.sender of the
+    ///      placement, and not to `recipientAddr`. Verified by eth_call against
+    ///      both the Base mainnet Diamond (0x4cad…6368) and the Base Sepolia
+    ///      Diamond (0xeb0B…beb9): from `order.user` the call clears the ACL and
+    ///      fails only on a status/expiry check, while every other caller —
+    ///      including the order's own `recipientAddr` — gets NotAuthorized()
+    ///      (0xea8e4eb5).
+    ///
+    ///      This is why a payment-link order must place with the merchant's
+    ///      proxy as `order.user`: the merchant is absent, and only an address
+    ///      this integrator can drive is able to advance the order.
+    ///
+    ///      PAID is a CLAIM, not a settlement. USDC moves at COMPLETED, which
+    ///      only the accepting LP can trigger after checking their own bank.
+    function paidBuyOrder(uint256 orderId) external;
+
+    /// @notice Cancels an order. Same `order.user` gate as `paidBuyOrder`.
+    /// @dev Succeeds from `order.user` in PLACED and ACCEPTED, and also while
+    ///      PAID (cancel-while-PAID refunds the escrowed USDC). Terminal states
+    ///      revert OrderStatusInvalid() (0x181b1b2e).
+    function cancelOrder(uint256 orderId) external;
+
     /// @notice Subset of GetterFacet.getAdditionalOrderDetails the integrator
     ///         needs to fund the system proxy correctly before setSellOrderUpi.
     ///         For SELL: actualUsdtAmount = principal + fee — this is what the

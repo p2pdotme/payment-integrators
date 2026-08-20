@@ -9,7 +9,7 @@
 
 import { createPublicClient, http, defineChain, type Address } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import type { Env } from "../src/config";
+import { DEFAULT_LIMITS, type Env } from "../src/config";
 
 export interface Addresses {
   rpcUrl: string;
@@ -47,7 +47,12 @@ function memoryKV(): KVNamespace {
  * real platform provides, which is exactly what the nonce logic depends on.
  */
 function memoryDO(
-  handler: (state: Map<string, unknown>, path: string, ctx: Ctx) => Promise<unknown>,
+  handler: (
+    state: Map<string, unknown>,
+    path: string,
+    ctx: Ctx,
+    body: Record<string, unknown>
+  ) => Promise<unknown>,
   ctx: Ctx
 ): DurableObjectNamespace {
   const states = new Map<string, Map<string, unknown>>();
@@ -59,15 +64,23 @@ function memoryDO(
       const name = String(id);
       if (!states.has(name)) states.set(name, new Map());
       return {
-        fetch: async (input: string) => {
+        fetch: async (input: string, init?: { body?: string }) => {
           const path = new URL(input).pathname;
+          let body: Record<string, unknown> = {};
+          if (init?.body) {
+            try {
+              body = JSON.parse(init.body);
+            } catch {
+              body = {};
+            }
+          }
           const prev = queues.get(name) ?? Promise.resolve();
           const next = prev
             .catch(() => undefined)
-            .then(() => handler(states.get(name)!, path, ctx));
+            .then(() => handler(states.get(name)!, path, ctx, body));
           queues.set(name, next);
-          const body = await next;
-          return new Response(JSON.stringify(body), {
+          const result = await next;
+          return new Response(JSON.stringify(result), {
             headers: { "Content-Type": "application/json" },
           });
         },
@@ -80,6 +93,9 @@ interface Ctx {
   rpcUrl: string;
   chainId: number;
   relayer: Address;
+  /** Wei ceilings, so the stubbed GasBudget enforces the same numbers as prod. */
+  maxGasWeiPerTx: bigint;
+  maxGasWeiPerDay: bigint;
 }
 
 /** Mirrors src/durable.ts NonceManager. */
@@ -106,6 +122,42 @@ async function nonceHandler(state: Map<string, unknown>, path: string, ctx: Ctx)
 }
 
 /** Mirrors src/durable.ts LinkLock. */
+/**
+ * Mirrors `GasBudget` in src/durable.ts. Serialized per instance by memoryDO,
+ * which is the whole point: the ceiling used to be a read-modify-write on KV
+ * and was bypassable by concurrency.
+ */
+async function gasBudgetHandler(
+  state: Map<string, unknown>,
+  path: string,
+  ctx: Ctx,
+  body: Record<string, unknown>
+): Promise<unknown> {
+  const wei = BigInt((body.wei as string) ?? "0");
+  const day = (body.day as number) ?? 0;
+
+  const stored = (state.get("budget") as { day: number; spent: string } | undefined) ?? {
+    day,
+    spent: "0",
+  };
+  let spent = stored.day === day ? BigInt(stored.spent) : 0n;
+
+  if (path === "/reserve") {
+    if (wei > ctx.maxGasWeiPerTx) return { ok: false, reason: "perTx" };
+    if (spent + wei > ctx.maxGasWeiPerDay) return { ok: false, reason: "perDay" };
+    spent += wei;
+    state.set("budget", { day, spent: spent.toString() });
+    return { ok: true, spent: spent.toString() };
+  }
+  if (path === "/release") {
+    spent = spent > wei ? spent - wei : 0n;
+    state.set("budget", { day, spent: spent.toString() });
+    return { ok: true, spent: spent.toString() };
+  }
+  if (path === "/read") return { spent: spent.toString(), day };
+  return { error: "not found" };
+}
+
 async function lockHandler(state: Map<string, unknown>, path: string): Promise<unknown> {
   const HOLD_MS = 60_000;
   if (path === "/acquire") {
@@ -122,9 +174,24 @@ async function lockHandler(state: Map<string, unknown>, path: string): Promise<u
   return { error: "not found" };
 }
 
-export function makeTestEnv(a: Addresses): Env {
+export interface EnvOverrides {
+  maxGasWeiPerTx?: bigint;
+  maxGasWeiPerDay?: bigint;
+}
+
+export function makeTestEnv(a: Addresses, overrides: EnvOverrides = {}): Env {
   const relayer = privateKeyToAccount(a.relayerKey as `0x${string}`).address;
-  const ctx: Ctx = { rpcUrl: a.rpcUrl, chainId: a.chainId, relayer };
+  const ctx: Ctx = {
+    rpcUrl: a.rpcUrl,
+    chainId: a.chainId,
+    relayer,
+    // A local node prices gas far above Base, and this suite makes dozens of
+    // real payments. Bound generously by default so the ceiling under test is
+    // the contract's, not the operator's daily spend cap. Pass an override to
+    // exercise the ceiling itself.
+    maxGasWeiPerTx: overrides.maxGasWeiPerTx ?? DEFAULT_LIMITS.maxGasWeiPerTx * 1000n,
+    maxGasWeiPerDay: overrides.maxGasWeiPerDay ?? DEFAULT_LIMITS.maxGasWeiPerDay * 1000n,
+  };
 
   return {
     RELAYER_PRIVATE_KEY: a.relayerKey,
@@ -138,6 +205,7 @@ export function makeTestEnv(a: Addresses): Env {
     KV: memoryKV(),
     LINK_LOCK: memoryDO((s, p) => lockHandler(s, p), ctx),
     NONCE: memoryDO(nonceHandler, ctx),
+    GAS_BUDGET: memoryDO(gasBudgetHandler, ctx),
   };
 }
 

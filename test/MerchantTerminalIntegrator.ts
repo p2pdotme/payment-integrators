@@ -2,6 +2,14 @@ import { expect } from "chai";
 import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
+/** Deploys PaymentLinksLib and returns its address, for linking. */
+async function deployPaymentLinksLib(): Promise<string> {
+  const Lib = await ethers.getContractFactory("PaymentLinksLib");
+  const lib = await Lib.deploy();
+  await lib.waitForDeployment();
+  return await lib.getAddress();
+}
+
 describe("MerchantTerminalIntegrator — registration, limits, settlement, withdrawals, security", function () {
   let owner: SignerWithAddress;
   let merchant1: SignerWithAddress;
@@ -46,7 +54,9 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     mockDiamond = await MockDiamond.deploy(await mockUsdc.getAddress());
 
     // Internal custody: the integrator holds all merchant USDC itself — no vault.
-    const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
+    const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator", {
+      libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+    });
     integrator = await Integrator.deploy(
       await mockDiamond.getAddress(),
       await mockUsdc.getAddress(),
@@ -1268,7 +1278,9 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     });
 
     it("constructor rejects zero diamond/usdc; seeds extra owners", async function () {
-      const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
+      const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator", {
+        libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+      });
       await expect(
         Integrator.deploy(ethers.ZeroAddress, await mockUsdc.getAddress(), [])
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
@@ -1343,7 +1355,9 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       // Deploy a brand-new integrator (the "upgrade"). It is EMPTY — no funds and
       // no records copied over. Nothing is migrated; nothing needs to be.
-      const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
+      const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator", {
+        libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+      });
       const next = await Integrator.deploy(
         await mockDiamond.getAddress(),
         await mockUsdc.getAddress(),
@@ -1395,7 +1409,9 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     });
 
     it("constructor seeds superAdmin = deployer and emits SuperAdminTransferred(0, deployer)", async function () {
-      const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
+      const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator", {
+        libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+      });
       const fresh = await Integrator.deploy(
         await mockDiamond.getAddress(),
         await mockUsdc.getAddress(),

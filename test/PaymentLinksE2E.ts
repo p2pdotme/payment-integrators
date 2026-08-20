@@ -3,6 +3,14 @@ import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 import { time } from "@nomicfoundation/hardhat-network-helpers";
 
+/** Deploys PaymentLinksLib and returns its address, for linking. */
+async function deployPaymentLinksLib(): Promise<string> {
+  const Lib = await ethers.getContractFactory("PaymentLinksLib");
+  const lib = await Lib.deploy();
+  await lib.waitForDeployment();
+  return await lib.getAddress();
+}
+
 /**
  * End-to-end: the money actually moves.
  *
@@ -45,7 +53,9 @@ describe("MerchantTerminalIntegrator — payment links, end to end", function ()
     ).deploy(await mockUsdc.getAddress());
 
     integrator = await (
-      await ethers.getContractFactory("MerchantTerminalIntegrator")
+      await ethers.getContractFactory("MerchantTerminalIntegrator", {
+        libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+      })
     ).deploy(await mockDiamond.getAddress(), await mockUsdc.getAddress(), []);
     SETTLEMENT = Number(await integrator.SETTLEMENT_PERIOD());
 
@@ -83,7 +93,7 @@ describe("MerchantTerminalIntegrator — payment links, end to end", function ()
     // ── 1. Ramesh creates a ₹3,000 single-use link, expiring in 7 days ──
     const expiresAt = (await time.latest()) + 7 * 86400;
     await expect(
-      integrator.connect(ramesh).createLink(LINK, USDC(3), INR, expiresAt, true, CONFIG)
+      integrator.connect(ramesh).createLink(LINK, USDC(3), INR, expiresAt, 1, CONFIG)
     ).to.emit(integrator, "LinkCreated");
 
     // The pay page reads this with no signature from Ramesh available.
@@ -154,7 +164,7 @@ describe("MerchantTerminalIntegrator — payment links, end to end", function ()
   });
 
   it("settlement parity: a link sale and a POS sale unlock at the same moment", async function () {
-    await integrator.connect(ramesh).createLink(LINK, USDC(5), INR, 0, false, CONFIG);
+    await integrator.connect(ramesh).createLink(LINK, USDC(5), INR, 0, 0, CONFIG);
 
     // Two sales in the same block-ish window: one through the link, one at the
     // counter. If links changed lock timing, these would diverge.
@@ -198,7 +208,7 @@ describe("MerchantTerminalIntegrator — payment links, end to end", function ()
   });
 
   it("a reusable link takes many payments and each one settles", async function () {
-    await integrator.connect(ramesh).createLink(LINK, USDC(2), INR, 0, false, CONFIG);
+    await integrator.connect(ramesh).createLink(LINK, USDC(2), INR, 0, 0, CONFIG);
 
     const ids: bigint[] = [];
     for (let i = 0; i < 4; i++) {
@@ -233,7 +243,7 @@ describe("MerchantTerminalIntegrator — payment links, end to end", function ()
 
   it("a cancelled link order credits nothing and releases the daily slot", async function () {
     await integrator.setDailyLimit(2);
-    await integrator.connect(ramesh).createLink(LINK, USDC(1), INR, 0, false, CONFIG);
+    await integrator.connect(ramesh).createLink(LINK, USDC(1), INR, 0, 0, CONFIG);
 
     const t = await integrator
       .connect(relayer)
@@ -264,7 +274,7 @@ describe("MerchantTerminalIntegrator — payment links, end to end", function ()
   });
 
   it("the relayer never holds or touches merchant USDC", async function () {
-    await integrator.connect(ramesh).createLink(LINK, USDC(3), INR, 0, false, CONFIG);
+    await integrator.connect(ramesh).createLink(LINK, USDC(3), INR, 0, 0, CONFIG);
 
     const t = await integrator
       .connect(relayer)

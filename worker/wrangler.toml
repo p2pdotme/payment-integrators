@@ -19,7 +19,11 @@ CLIENT_ADDRESS = "0x0000000000000000000000000000000000000000"
 PRODUCT_ID = "1"
 # Lock the pay endpoint to your own domains once they are known. Left empty
 # the endpoint is open, which is correct for a public pay page.
-ALLOWED_ORIGINS = ""
+# Leaving this empty makes corsHeaders fall back to "*", which lets any site
+# call /api/pay and /api/relay-tx. Defensible for a public pay page, but it
+# should be a deliberate choice at deploy time rather than a default nobody
+# revisited. Set your own pay-page origins here before going live.
+ALLOWED_ORIGINS = "https://pay.p2p.me"
 
 # ─── Operational limits ───────────────────────────────────────────────
 # Every value below is OPTIONAL. Unset, the service uses the defaults in
@@ -72,9 +76,16 @@ class_name = "LinkLock"
 name = "NONCE"
 class_name = "NonceManager"
 
+# The daily gas ceiling. A Durable Object, not KV: KV is eventually consistent,
+# so the read-modify-write this used to be was bypassable by simple concurrency
+# — which is exactly the condition the ceiling exists for.
+[[durable_objects.bindings]]
+name = "GAS_BUDGET"
+class_name = "GasBudget"
+
 [[migrations]]
 tag = "v1"
-new_classes = ["LinkLock", "NonceManager"]
+new_classes = ["LinkLock", "NonceManager", "GasBudget"]
 
 # Confirms completions on-chain, delivers webhooks, and checks the gas float.
 [triggers]
@@ -91,7 +102,11 @@ DIAMOND_ADDRESS = "0x0000000000000000000000000000000000000000"
 CLIENT_ADDRESS = "0x0000000000000000000000000000000000000000"
 PRODUCT_ID = "1"
 # Mainnet: pin the pay endpoint to your own origins.
-ALLOWED_ORIGINS = ""
+# Leaving this empty makes corsHeaders fall back to "*", which lets any site
+# call /api/pay and /api/relay-tx. Defensible for a public pay page, but it
+# should be a deliberate choice at deploy time rather than a default nobody
+# revisited. Set your own pay-page origins here before going live.
+ALLOWED_ORIGINS = "https://pay.p2p.me"
 # Mainnet gas is real money — start conservative and raise with observed
 # volume rather than guessing high.
 RATE_IP_PER_MINUTE = "10"

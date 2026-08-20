@@ -33,8 +33,8 @@ export interface Env {
   // still having a sane default that needs no configuration at all.
   RATE_IP_PER_MINUTE?: string;
   RATE_LINK_PER_HOUR?: string;
-  MAX_GAS_PER_TX?: string;
-  MAX_GAS_PER_DAY?: string;
+  MAX_GAS_WEI_PER_TX?: string;
+  MAX_GAS_WEI_PER_DAY?: string;
   LOW_BALANCE_WEI?: string;
   RECEIPT_TIMEOUT_MS?: string;
   /** Head-room multiplier on the gas estimate, as a percentage. 120 = +20%. */
@@ -50,6 +50,8 @@ export interface Env {
   KV: KVNamespace;
   LINK_LOCK: DurableObjectNamespace;
   NONCE: DurableObjectNamespace;
+  /** Daily gas ceiling. A DO, not KV — see limits.ts for why. */
+  GAS_BUDGET: DurableObjectNamespace;
 }
 
 /**
@@ -70,9 +72,29 @@ export const DEFAULT_LIMITS = {
    * Hard gas ceiling for one relayerPlaceOrder. Measured avg is ~348k and max
    * ~398k; anything materially above that is an anomaly, not a busy block.
    */
-  maxGasPerTx: 600_000n,
-  /** Total gas across all payments in a UTC day. ~1,400 payments at 600k. */
-  maxGasPerDay: 840_000_000n,
+  /**
+   * Per-transaction and per-day ceilings, in WEI — the unit the float is
+   * actually denominated in. The previous gas-UNIT ceilings let a gas-price
+   * spike drain the balance while the counter still read healthy.
+   *
+   * These are sized off the FLOAT, not off a fixed gas price. Pricing them at
+   * Base's typical 0.01 gwei produced ceilings so tight that a single payment
+   * was refused the moment the chain reached ~1 gwei — the service would go
+   * dark during exactly the congestion it needs to ride out.
+   *
+   *   • per-tx 0.001 ETH — generous enough for ~600k gas at 1.6 gwei, tight
+   *     enough to refuse a runaway estimate outright.
+   *   • per-day 0.01 ETH — about a fifth of the 0.05 ETH float the README's
+   *     cost model assumes. At Base's usual 0.01 gwei that is ~1,600 payments,
+   *     close to the ~1,400 the old unit ceiling allowed.
+   *
+   * The trade this makes deliberately: under a sustained price spike the daily
+   * ceiling buys fewer payments and the service throttles. That is the correct
+   * failure — a cost control that quietly scales with the gas price is not
+   * protecting anything.
+   */
+  maxGasWeiPerTx: 1_000_000_000_000_000n,
+  maxGasWeiPerDay: 10_000_000_000_000_000n,
   /** Warn while there is still time to act, not once the float is gone. */
   lowBalanceWei: 15_000_000_000_000_000n, // 0.015 ETH
   /** How long to wait for a receipt before telling the customer to retry. */
@@ -125,8 +147,8 @@ export function limitsFor(env: Env): Limits {
   return {
     ipPerMinute: num(env.RATE_IP_PER_MINUTE, d.ipPerMinute),
     linkPerHour: num(env.RATE_LINK_PER_HOUR, d.linkPerHour),
-    maxGasPerTx: big(env.MAX_GAS_PER_TX, d.maxGasPerTx),
-    maxGasPerDay: big(env.MAX_GAS_PER_DAY, d.maxGasPerDay),
+    maxGasWeiPerTx: big(env.MAX_GAS_WEI_PER_TX, d.maxGasWeiPerTx),
+    maxGasWeiPerDay: big(env.MAX_GAS_WEI_PER_DAY, d.maxGasWeiPerDay),
     lowBalanceWei: big(env.LOW_BALANCE_WEI, d.lowBalanceWei),
     receiptTimeoutMs: num(env.RECEIPT_TIMEOUT_MS, d.receiptTimeoutMs),
     gasBufferPct: big(env.GAS_BUFFER_PCT, d.gasBufferPct),
@@ -153,9 +175,10 @@ export const INTEGRATOR_ABI = [
       { name: "amount", type: "uint96" },
       { name: "currency", type: "bytes32" },
       { name: "expiresAt", type: "uint64" },
-      { name: "singleUse", type: "bool" },
+      { name: "maxUses", type: "uint32" },
       { name: "status", type: "uint8" },
       { name: "uses", type: "uint32" },
+      { name: "strikes", type: "uint16" },
     ],
   },
   {
@@ -179,6 +202,51 @@ export const INTEGRATOR_ABI = [
       { name: "pubKey", type: "string" },
     ],
     outputs: [{ type: "uint256" }],
+  },
+  {
+    // The Diamond gates paidBuyOrder on order.user, which for a link order is
+    // the merchant's proxy — an address only the integrator can drive. So the
+    // relayer asks the integrator; it cannot call the Diamond itself.
+    type: "function",
+    name: "relayerMarkPaid",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "linkId", type: "bytes32" },
+      { name: "orderId", type: "uint256" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "relayerCancelOrder",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "linkId", type: "bytes32" },
+      { name: "orderId", type: "uint256" },
+    ],
+    outputs: [],
+  },
+  {
+    // Needed for the per-tx cap precheck: validateOrder keys the cap off the
+    // merchant's REGISTERED currency, never the link's.
+    type: "function",
+    name: "getMerchantInfo",
+    stateMutability: "view",
+    inputs: [{ name: "merchant", type: "address" }],
+    outputs: [
+      { name: "encPayoutId", type: "bytes" },
+      { name: "shopName", type: "string" },
+      { name: "currency", type: "bytes32" },
+      { name: "isRegistered", type: "bool" },
+      { name: "isFrozen", type: "bool" },
+    ],
+  },
+  {
+    type: "function",
+    name: "orderToLink",
+    stateMutability: "view",
+    inputs: [{ name: "orderId", type: "uint256" }],
+    outputs: [{ type: "bytes32" }],
   },
   {
     type: "function",
@@ -206,6 +274,14 @@ export const INTEGRATOR_ABI = [
   },
   {
     type: "event",
+    name: "OrderCancelled",
+    inputs: [
+      { name: "orderId", type: "uint256", indexed: true },
+      { name: "merchant", type: "address", indexed: true },
+    ],
+  },
+  {
+    type: "event",
     name: "OrderCompleted",
     inputs: [
       { name: "orderId", type: "uint256", indexed: true },
@@ -225,17 +301,24 @@ export const INTEGRATOR_ABI = [
  *
  * Verified against the shipped @p2pdotme/widgets 1.7.1 bundle, which makes
  * exactly three such calls:
- *   • cancelOrder(uint256)   → diamondAddress      ✅ forwarded
- *   • paidBuyOrder(uint256)  → diamondAddress      ✅ forwarded
+ *   • cancelOrder(uint256)   → diamondAddress
+ *   • paidBuyOrder(uint256)  → diamondAddress
  *   • submitLivenessAttestation(...) → integrator  ❌ NOT forwarded
  *
- * The third only fires when the host passes a `liveness` config prop. The pay
- * page does not pass one, so it is unreachable in this flow — and it must stay
- * off the allowlist regardless, because it targets our own integrator.
+ * NEITHER of the first two can be forwarded to the Diamond any more, and they
+ * never worked: the Diamond authorises both against `order.user`, which for a
+ * link order is the merchant's proxy — never this relayer. Forwarding them
+ * signed by the relayer EOA always reverted NotAuthorized(), which is why a
+ * link payment could be placed and then never advance.
+ *
+ * They are now translated onto the integrator's own `relayerMarkPaid` /
+ * `relayerCancelOrder`, which reach the Diamond through the merchant's proxy.
+ * The allowlist is therefore a map from what the widget ASKS for to what we are
+ * willing to DO — two of our own functions, rather than raw Diamond calldata.
  */
-export const RELAY_SELECTORS: Record<string, string> = {
-  "0x514fcac7": "cancelOrder(uint256)",
-  "0x1e31508e": "paidBuyOrder(uint256)",
+export const RELAY_INTENTS: Record<string, "markPaid" | "cancel"> = {
+  "0x1e31508e": "markPaid", // paidBuyOrder(uint256)
+  "0x514fcac7": "cancel", // cancelOrder(uint256)
 };
 
 /**

@@ -28,6 +28,53 @@ jobs:
       - name: Test
         run: npx hardhat test
 
+  # worker/ holds the relayer's private key and ~1,600 lines of the code that
+  # decides what gets signed with it. Until this job existed, none of it was
+  # typechecked or tested by CI, and the coverage gate ignored it entirely.
+  worker:
+    name: Worker (typecheck + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      # The e2e suite needs a hardhat node and the addresses file it writes.
+      # Without them it skips rather than failing, so this step is what makes it
+      # actually run — it is the only suite that exercises the real handlers.
+      - name: Install root dependencies (for the hardhat node)
+        working-directory: .
+        run: npm ci
+
+      - name: Start hardhat node
+        working-directory: .
+        run: npx hardhat node > /tmp/hardhat-node.log 2>&1 &
+
+      - name: Wait for the node
+        working-directory: .
+        run: npx wait-on tcp:8545 --timeout 60000 || sleep 15
+
+      - name: Deploy the e2e fixture
+        working-directory: .
+        run: npx hardhat run scripts/e2e-setup.js --network localhost
+
+      - name: Test
+        run: npx vitest run
+
   lint:
     name: solhint + prettier
     runs-on: ubuntu-latest

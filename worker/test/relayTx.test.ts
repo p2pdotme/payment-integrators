@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { RELAY_SELECTORS, FORBIDDEN_SELECTORS, ORDER_ID_ABI } from "../src/config";
+import { RELAY_INTENTS, FORBIDDEN_SELECTORS, ORDER_ID_ABI } from "../src/config";
 import { explainRevert } from "../src/pay";
 import { linkBlockedReason, LINK_STATUS_ACTIVE, type Link } from "../src/chain";
 import { encodeFunctionData, decodeFunctionData, toFunctionSelector } from "viem";
@@ -9,8 +9,18 @@ import { encodeFunctionData, decodeFunctionData, toFunctionSelector } from "viem
  * calldata and ask us to sign it. These tests pin the exact shape we accept.
  */
 describe("relay-tx allowlist", () => {
-  it("allowlists exactly the two calls the widget signs itself", () => {
-    expect(Object.keys(RELAY_SELECTORS).sort()).toEqual(["0x1e31508e", "0x514fcac7"]);
+  it("recognises exactly the two calls the widget signs itself", () => {
+    expect(Object.keys(RELAY_INTENTS).sort()).toEqual(["0x1e31508e", "0x514fcac7"]);
+  });
+
+  it("maps each selector to the integrator function that can actually perform it", () => {
+    // Neither selector is forwarded to the Diamond any more, and neither ever
+    // worked: the Diamond authorises both against `order.user`, which for a
+    // link order is the merchant's proxy, never the relayer. We translate the
+    // intent onto our own integrator instead, which reaches the Diamond
+    // through that proxy.
+    expect(RELAY_INTENTS[toFunctionSelector("paidBuyOrder(uint256)")]).toBe("markPaid");
+    expect(RELAY_INTENTS[toFunctionSelector("cancelOrder(uint256)")]).toBe("cancel");
   });
 
   it("the allowlisted selectors really are cancelOrder and paidBuyOrder", () => {
@@ -24,7 +34,7 @@ describe("relay-tx allowlist", () => {
     // `liveness` config, which the pay page does not — but it must stay off
     // the allowlist regardless, because `to` would not be the Diamond.
     const sel = toFunctionSelector("submitLivenessAttestation(bytes32,uint256,uint256,bytes)");
-    expect(RELAY_SELECTORS[sel]).toBeUndefined();
+    expect(RELAY_INTENTS[sel]).toBeUndefined();
     expect(FORBIDDEN_SELECTORS[sel]).toBeDefined();
   });
 
@@ -37,7 +47,7 @@ describe("relay-tx allowlist", () => {
       "revokeLink(bytes32)",
       "createLink(bytes32,uint96,bytes32,uint64,bool,bytes)",
     ]) {
-      expect(RELAY_SELECTORS[toFunctionSelector(sig)]).toBeUndefined();
+      expect(RELAY_INTENTS[toFunctionSelector(sig)]).toBeUndefined();
     }
   });
 
@@ -48,7 +58,7 @@ describe("relay-tx allowlist", () => {
       args: [8821n],
     });
     expect(data.length).toBe(2 + 8 + 64);
-    expect(RELAY_SELECTORS[data.slice(0, 10)]).toBeDefined();
+    expect(RELAY_INTENTS[data.slice(0, 10)]).toBeDefined();
 
     const decoded = decodeFunctionData({ abi: ORDER_ID_ABI, data });
     expect(decoded.args[0]).toBe(8821n);
@@ -62,7 +72,7 @@ describe("relay-tx allowlist", () => {
     });
     const padded = (good + "0".repeat(64)) as `0x${string}`;
     // The length check is what stops this — the selector alone would pass.
-    expect(RELAY_SELECTORS[padded.slice(0, 10)]).toBeDefined();
+    expect(RELAY_INTENTS[padded.slice(0, 10)]).toBeDefined();
     expect(padded.length).not.toBe(2 + 8 + 64);
   });
 });
@@ -73,7 +83,7 @@ describe("link payability", () => {
     amount: 3_000_000n,
     currency: "0x494e520000000000000000000000000000000000000000000000000000000000",
     expiresAt: 0n,
-    singleUse: true,
+    maxUses: 1,
     status: LINK_STATUS_ACTIVE,
     uses: 0,
   };
@@ -96,8 +106,8 @@ describe("link payability", () => {
   });
 
   it("blocks a consumed single-use link but not a reusable one", () => {
-    expect(linkBlockedReason({ ...base, uses: 1 }, now)).toMatch(/already been paid/i);
-    expect(linkBlockedReason({ ...base, singleUse: false, uses: 9 }, now)).toBeNull();
+    expect(linkBlockedReason({ ...base, uses: 1 }, now)).toMatch(/already been used/i);
+    expect(linkBlockedReason({ ...base, maxUses: 0, uses: 9 }, now)).toBeNull();
   });
 });
 
@@ -105,7 +115,7 @@ describe("customer-facing error messages", () => {
   it("translates every link revert into something a person can act on", () => {
     const cases: [string, RegExp][] = [
       ["LinkExpired()", /expired/i],
-      ["LinkAlreadyUsed()", /already been paid/i],
+      ["LinkAlreadyUsed()", /already been used/i],
       ["LinkNotActive()", /cancelled/i],
       ["LinkNotFound()", /not found/i],
       ["LinkAmountMismatch()", /reload/i],

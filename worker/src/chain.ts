@@ -45,9 +45,12 @@ export interface Link {
   amount: bigint;
   currency: Hex;
   expiresAt: bigint;
-  singleUse: boolean;
+  /** How many SUCCESSFUL payments the link accepts. 0 = unlimited. */
+  maxUses: number;
   status: number;
   uses: number;
+  /** Marked-paid-then-cancelled claims. Advisory: the chain never blocks on it. */
+  strikes: number;
 }
 
 /**
@@ -66,16 +69,17 @@ export async function readLink(client: PublicClient, env: Env, linkId: Hex): Pro
       abi: INTEGRATOR_ABI,
       functionName: "getLink",
       args: [linkId],
-    })) as readonly [Address, bigint, Hex, bigint, boolean, number, number];
+    })) as readonly [Address, bigint, Hex, bigint, number, number, number, number];
 
     return {
       owner: r[0],
       amount: r[1],
       currency: r[2],
       expiresAt: r[3],
-      singleUse: r[4],
+      maxUses: r[4],
       status: r[5],
       uses: r[6],
+      strikes: r[7],
     };
   } catch {
     return null;
@@ -100,7 +104,11 @@ export function linkBlockedReason(link: Link, nowSec: number): string | null {
   if (link.status !== LINK_STATUS_ACTIVE) return "This payment link has been cancelled.";
   if (link.expiresAt !== 0n && BigInt(nowSec) > link.expiresAt)
     return "This payment link has expired.";
-  if (link.singleUse && link.uses > 0) return "This payment link has already been paid.";
+  // maxUses 0 means unlimited; otherwise the link is spent once `uses` reaches
+  // it. `uses` counts SUCCESSFUL payments — a cancelled or abandoned order
+  // releases its use on-chain, so an abandoned checkout never retires a link.
+  if (link.maxUses !== 0 && link.uses >= link.maxUses)
+    return "This payment link has already been used the maximum number of times.";
   return null;
 }
 

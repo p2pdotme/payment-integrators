@@ -28,13 +28,36 @@ const config: HardhatUserConfig = {
     },
   },
   solidity: {
-    version: "0.8.28",
-    settings: {
-      evmVersion: "cancun",
-      viaIR: true,
-      optimizer: {
-        enabled: true,
-        runs: 200,
+    compilers: [
+      {
+        version: "0.8.28",
+        settings: {
+          evmVersion: "cancun",
+          viaIR: true,
+          optimizer: { enabled: true, runs: 200 },
+        },
+      },
+    ],
+    // MerchantTerminalIntegrator is the one contract at the EIP-170 ceiling.
+    // At runs: 200 it measures 24,865 bytes — 289 over the 24,576 limit — even
+    // after moving payment-link lifecycle into PaymentLinksLib. Lowering `runs`
+    // for THIS FILE ONLY buys the difference without raising runtime gas for
+    // every other integrator in the repo, which a global change would do.
+    //
+    // This is a stopgap, not a fix. It leaves ~113 bytes of headroom, so the
+    // next change to this contract will hit the ceiling again. The structural
+    // answer is to move the withdrawal / fund-helper sections (1,079 lines,
+    // ~44% of the contract) into their own library, or to split the contract
+    // into facets — both of which touch audited custody code and belong in
+    // their own reviewed change, not in a blocker fix.
+    overrides: {
+      "contracts/integrators/merchant-terminal/MerchantTerminalIntegrator.sol": {
+        version: "0.8.28",
+        settings: {
+          evmVersion: "cancun",
+          viaIR: true,
+          optimizer: { enabled: true, runs: 50 },
+        },
       },
     },
   },

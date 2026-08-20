@@ -47,6 +47,7 @@ contract MockDiamond {
         address recipientAddr;
         bool completed;
         bool cancelled;
+        bool paid; // set by paidBuyOrder — a claim, not a settlement
     }
 
     struct SellOrder {
@@ -222,7 +223,8 @@ contract MockDiamond {
             currency: currency,
             recipientAddr: recipientAddr,
             completed: false,
-            cancelled: false
+            cancelled: false,
+            paid: false
         });
 
         emit MockOrderPlaced(orderId, effectiveIntegrator, user, amount);
@@ -344,6 +346,58 @@ contract MockDiamond {
         }
 
         emit MockOrderCompleted(orderId);
+    }
+
+    // ─── Buyer-driven transitions (the REAL order.user gate) ──────────
+    //
+    // These mirror the live Diamond, which authorises `paidBuyOrder` and
+    // `cancelOrder` against `order.user` — NOT against the placer, and NOT
+    // against `recipientAddr`. Verified by eth_call on both the Base mainnet
+    // Diamond (0x4cad6eC90e65baBec9335cAd728DDC610c316368) and the Base Sepolia
+    // Diamond (0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9): from `order.user`
+    // the call clears the ACL and fails only on a status/expiry check, while
+    // every other caller — including the order's own `recipientAddr` — reverts
+    // NotAuthorized() (0xea8e4eb5).
+    //
+    // Their ABSENCE from this mock is why a payment link could be placed and
+    // never paid, with the entire test suite green: nothing here could refuse
+    // the relayer, so nothing here noticed that the real Diamond does.
+
+    error NotAuthorized();
+    error OrderStatusInvalid();
+
+    event MockOrderPaid(uint256 orderId, address caller);
+    event MockOrderCancelledBy(uint256 orderId, address caller);
+
+    /// @notice Marks a BUY order's fiat leg as sent. PAID is a CLAIM: it moves
+    ///         no USDC. Settlement is `simulateOrderComplete`, which on the real
+    ///         Diamond only the accepting LP can trigger.
+    function paidBuyOrder(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        if (order.integrator == address(0)) revert OrderStatusInvalid();
+        if (msg.sender != order.user) revert NotAuthorized();
+        if (order.completed || order.cancelled || order.paid) revert OrderStatusInvalid();
+
+        order.paid = true;
+        emit MockOrderPaid(orderId, msg.sender);
+    }
+
+    /// @notice Buyer-driven cancellation. Same `order.user` gate. Allowed while
+    ///         PAID — cancel-while-PAID is a real transition on the Diamond —
+    ///         and terminal states revert.
+    function cancelOrder(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        if (order.integrator == address(0)) revert OrderStatusInvalid();
+        if (msg.sender != order.user) revert NotAuthorized();
+        if (order.completed || order.cancelled) revert OrderStatusInvalid();
+
+        order.cancelled = true;
+        try IP2PIntegrator(order.integrator).onOrderCancel(orderId) {
+            // ok
+        } catch (bytes memory reason) {
+            emit MockIntegratorCallbackFailed(orderId, order.integrator, reason);
+        }
+        emit MockOrderCancelledBy(orderId, msg.sender);
     }
 
     /**

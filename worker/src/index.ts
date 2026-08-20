@@ -14,10 +14,10 @@ import { publicClientFor, relayerFor } from "./chain";
 import { checkBalance } from "./limits";
 import { handlePay } from "./pay";
 import { handleRelayTx } from "./relayTx";
-import { handleRegisterWebhook, scanAndQueue, deliverQueued } from "./webhooks";
+import { handleRegisterWebhook, scanAndQueue, deliverQueued, sweepFalseClaims } from "./webhooks";
 import { json, corsHeaders } from "./http";
 
-export { LinkLock, NonceManager } from "./durable";
+export { LinkLock, NonceManager, GasBudget } from "./durable";
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -54,6 +54,7 @@ export default {
         try {
           const queued = await scanAndQueue(env);
           const delivered = await deliverQueued(env);
+          const strikes = await sweepFalseClaims(env);
 
           const client = publicClientFor(env);
           const { address } = relayerFor(env);
@@ -61,7 +62,9 @@ export default {
           const warning = await checkBalance(env, balance, address);
           if (warning) console.warn(`[paylinks] ${warning}`);
 
-          console.log(`[paylinks] queued=${queued} delivered=${delivered} balance=${balance} wei`);
+          console.log(
+            `[paylinks] queued=${queued} delivered=${delivered} strikes=${strikes} balance=${balance} wei`
+          );
         } catch (err) {
           console.error("[paylinks] scheduled run failed:", err);
         }
