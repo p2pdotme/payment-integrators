@@ -1,4 +1,5 @@
 import { ethers } from "hardhat";
+import { getIntegratorConfig } from "../lib/diamond";
 
 /**
  * Deploy + wire the USDC-direct onramp demo on Base Sepolia:
@@ -45,7 +46,6 @@ const KYC_ATTESTOR = process.env.KYC_ATTESTOR || "";
 
 const REGISTER_ABI = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, uint256 activeOrderCount, address proxyImpl))",
 ];
 
 const f = (n: bigint) => ethers.formatUnits(n, 6);
@@ -95,7 +95,7 @@ async function main() {
     console.log(`  dailyUsdcVolumeCap: ${f(BigInt(DAILY_USDC_VOLUME_CAP))} USDC`);
   }
 
-  const cfg = await b2b.getIntegratorConfig(integratorAddr);
+  const cfg = await getIntegratorConfig(ethers.provider, DIAMOND_ADDRESS, integratorAddr);
   console.log("\n=== USDC-direct demo deployment ===");
   console.log(`UsdcDirectCheckoutIntegrator: ${integratorAddr}`);
   console.log(`proxyImpl:                    ${proxyImpl}`);

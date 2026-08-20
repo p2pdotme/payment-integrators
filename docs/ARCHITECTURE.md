@@ -35,7 +35,7 @@ If the order is cancelled at any point (expiry, dispute, manual), Diamond calls 
 
 Two reasons:
 
-1. **CREATE2 authentication**: The Diamond authorizes integrators by verifying that `msg.sender` matches the CREATE2 address derived from the pinned `proxyImpl`, the immutable args `(user, integrator)`, and the user-only salt — with the integrator contract as the deployer. This lets the Diamond verify *which integrator deployed which proxy* without maintaining a separate per-proxy allowlist. This is why `UserProxy.sol` must not be forked — its bytecode and immutable-args layout must match what the Diamond expects when the integrator was registered.
+1. **CREATE2 authentication**: The Diamond authorizes integrators by verifying that `msg.sender` matches the CREATE2 address derived from the pinned `proxyImpl`, the immutable args `(user, integrator)`, and the user-only salt — with the integrator contract as the deployer. This lets the Diamond verify _which integrator deployed which proxy_ without maintaining a separate per-proxy allowlist. This is why `UserProxy.sol` must not be forked — its bytecode and immutable-args layout must match what the Diamond expects when the integrator was registered.
 2. **Fraud-bypass closure**: USDC stranded on a proxy cannot be swept out by the user. It can only be consumed by the upstream protocol the integrator routes to. This closes a path where a scammer could use a B2B integration to convert fiat → USDC while evading consumer-side fraud checks. See [`PROXY-PATTERN.md`](PROXY-PATTERN.md) for the full reasoning.
 
 ## Where state lives
@@ -60,4 +60,4 @@ These are the protocol's contract with the integrator. Everything else (per-tx l
 - **ExampleIntegrator**: vanilla flow. Per-product price, per-tx limits, daily count, no exotic routing.
 - **LotPotCheckoutIntegrator**: replaces "client delivers product" with "Megapot mints lottery tickets to user EOA". Adds a credit-redemption path that lets stranded USDC be redeemed for tickets without re-placing a Diamond order.
 
-When designing a new integrator, the question to answer is: *what changes for me on the `onOrderComplete` side?* If you're just routing USDC to a client, copy `ExampleIntegrator`. If you're routing through a third-party protocol with its own pricing / inventory / NFT receipt logic, use `LotPotCheckoutIntegrator` as a more elaborate reference.
+When designing a new integrator, the question to answer is: _what changes for me on the `onOrderComplete` side?_ If you're just routing USDC to a client, copy `ExampleIntegrator`. If you're routing through a third-party protocol with its own pricing / inventory / NFT receipt logic, use `LotPotCheckoutIntegrator` as a more elaborate reference.

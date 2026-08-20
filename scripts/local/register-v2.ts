@@ -1,4 +1,5 @@
 import { ethers } from "hardhat";
+import { getIntegratorConfig } from "../lib/diamond";
 
 /**
  * Whitelist the v2 integrator on the live Diamond's B2BGatewayFacet
@@ -13,7 +14,6 @@ import { ethers } from "hardhat";
 const REGISTER_ABI = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
   "function isActiveIntegrator(address) view returns (bool)",
-  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, uint256 activeOrderCount, address proxyImpl))",
 ];
 
 async function main() {
@@ -38,7 +38,7 @@ async function main() {
   );
 
   const b2b = new ethers.Contract(DIAMOND, REGISTER_ABI, admin);
-  const before = await b2b.getIntegratorConfig(INTEGRATOR);
+  const before = await getIntegratorConfig(ethers.provider, DIAMOND, INTEGRATOR);
   console.log("before:", { isActive: before.isActive, proxyImpl: before.proxyImpl });
   if (
     before.proxyImpl !== ethers.ZeroAddress &&
@@ -53,7 +53,7 @@ async function main() {
   const r = await tx.wait();
   console.log("registerIntegrator tx:", r?.hash);
 
-  const cfg = await b2b.getIntegratorConfig(INTEGRATOR);
+  const cfg = await getIntegratorConfig(ethers.provider, DIAMOND, INTEGRATOR);
   console.log("after:", {
     isActive: cfg.isActive,
     usdcThroughIntegrator: cfg.usdcThroughIntegrator,

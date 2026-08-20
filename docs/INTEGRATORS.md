@@ -4,15 +4,15 @@ This is the canonical list of integrators that are whitelisted on the P2P Diamon
 
 ## Base mainnet (chainId 8453)
 
-| Integrator | Address | Source commit | Whitelisted since | Status |
-|---|---|---|---|---|
-| LotPot | `0xb901c3399ED225e4C6c7bfbd8DABA16BBF340132` | <!-- TODO: backfill from p2p-checkout commit SHA --> | <!-- TODO: YYYY-MM-DD --> | Production |
+| Integrator | Address                                      | Source commit                                        | Whitelisted since         | Status     |
+| ---------- | -------------------------------------------- | ---------------------------------------------------- | ------------------------- | ---------- |
+| LotPot     | `0xb901c3399ED225e4C6c7bfbd8DABA16BBF340132` | <!-- TODO: backfill from p2p-checkout commit SHA --> | <!-- TODO: YYYY-MM-DD --> | Production |
 
 ## Base Sepolia (chainId 84532)
 
-| Integrator | Address | Source commit | Whitelisted since | Status |
-|---|---|---|---|---|
-| LotPot | <!-- TODO: fill from project_sepolia_addresses or skip if not whitelisted --> | <!-- TODO --> | <!-- TODO --> | Test |
+| Integrator | Address                                                                       | Source commit | Whitelisted since | Status |
+| ---------- | ----------------------------------------------------------------------------- | ------------- | ----------------- | ------ |
+| LotPot     | <!-- TODO: fill from project_sepolia_addresses or skip if not whitelisted --> | <!-- TODO --> | <!-- TODO -->     | Test   |
 
 ## How this table is maintained
 
@@ -38,10 +38,10 @@ The widget's `parseOrderIdFromReceipt` helper walks the transaction logs and sto
 
    ```solidity
    event B2BOrderPlaced(
-       uint256 indexed orderId,
-       address indexed integrator,
-       address indexed user,
-       uint256 amount
+     uint256 indexed orderId,
+     address indexed integrator,
+     address indexed user,
+     uint256 amount
    );
    ```
 
@@ -49,11 +49,11 @@ The widget's `parseOrderIdFromReceipt` helper walks the transaction logs and sto
 
    ```solidity
    event CheckoutOrderCreated(
-       uint256 indexed orderId,
-       address indexed user,
-       address indexed client,
-       uint256 productId,
-       uint256 usdcAmount
+     uint256 indexed orderId,
+     address indexed user,
+     address indexed client,
+     uint256 productId,
+     uint256 usdcAmount
    );
    ```
 
@@ -80,7 +80,7 @@ If you want the one-call widget convenience without forcing hosts to know about 
 
 ```solidity
 function userTxLimit() external view returns (uint256) {
-    return baseTxLimit;
+  return baseTxLimit;
 }
 ```
 

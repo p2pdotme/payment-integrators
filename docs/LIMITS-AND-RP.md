@@ -37,7 +37,7 @@ Both reference integrators support `quantity > 1`:
 - `userPlaceOrder(client, productId, quantity, ...)` multiplies `unitPrice * quantity` and submits the total to the Diamond.
 - `onOrderComplete` delivers `quantity` units to the user on settlement.
 
-The RP-based per-tx limit applies to the *total* (unitPrice × quantity), not per-unit.
+The RP-based per-tx limit applies to the _total_ (unitPrice × quantity), not per-unit.
 
 ## Overriding limits in a custom integrator
 

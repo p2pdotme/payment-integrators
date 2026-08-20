@@ -1,9 +1,16 @@
 import { ethers, artifacts } from "hardhat";
+import { getIntegratorConfig } from "../lib/diamond";
 
 /**
  * Read-only verification of the deployed PikerOnrampIntegrator on Base Sepolia.
  * Confirms immutables + bytecode parity vs the reviewed PR source (masking the
  * immutable byte-ranges), and reads the Diamond's current registration config.
+ *
+ * ⚠️ CURRENTLY NON-FUNCTIONAL (#61). `FQN` below names a contract that has never
+ * existed in this repo on any branch, so `artifacts.getBuildInfo` returns
+ * undefined and the bytecode-parity block throws before the registration read is
+ * ever reached. Kept building against the shared Diamond helper so it does not
+ * carry a stale ABI, but it needs #61 to actually run.
  */
 const ADDR = process.env.PIKER || "0xEaD7aF84b4c778008E09846809344c0703c2DBb4";
 const FQN = "contracts/integrators/piker/PikerOnrampIntegrator.sol:PikerOnrampIntegrator";
@@ -75,12 +82,8 @@ async function main() {
   console.log("code-only MATCH:       ", localMasked === onchainMasked);
 
   // Current registration state on the Diamond.
-  const dAbi = [
-    "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, uint256 activeOrderCount, address proxyImpl))",
-  ];
   try {
-    const d = new ethers.Contract(DIAMOND, dAbi, provider);
-    const cfg = await d.getIntegratorConfig(ADDR);
+    const cfg = await getIntegratorConfig(provider, DIAMOND, ADDR);
     console.log("--- diamond registration (current) ---");
     console.log(
       "isActive:",

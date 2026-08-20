@@ -32,18 +32,18 @@ Credit can only exit as Megapot tickets — `UserProxy` disables both user-initi
 
 ## External dependencies
 
-| Dependency | Base mainnet address |
-|---|---|
-| Megapot `Jackpot` | `0x3bAe643002069dBCbcd62B1A4eb4C4A397d042a2` |
+| Dependency                         | Base mainnet address                         |
+| ---------------------------------- | -------------------------------------------- |
+| Megapot `Jackpot`                  | `0x3bAe643002069dBCbcd62B1A4eb4C4A397d042a2` |
 | Megapot `BatchPurchaseFacilitator` | `0x01774B531591b286b9f02C6Bc02ab3fD9526Aa76` |
-| Megapot `JackpotTicketNFT` | `0x48FfE35AbB9f4780a4f1775C2Ce1c46185b366e4` |
-| USDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
+| Megapot `JackpotTicketNFT`         | `0x48FfE35AbB9f4780a4f1775C2Ce1c46185b366e4` |
+| USDC                               | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
 
 **Allowlist**: `BatchPurchaseFacilitator.createBatchOrder` is permissioned via an `isAllowed(msg.sender)` allowlist managed by Megapot's owner. The deployed integrator address must be added to this allowlist before any >10-ticket order can fulfill. Coordinate with Megapot before requesting whitelisting on the Diamond.
 
 ## Pricing
 
-The integrator does not configure ticket price — it reads from Megapot's active drawing at placement time (`getDrawingState(currentDrawingId())`). Megapot is the single source of truth for price and ball ranges. The integrator's tx-amount validation uses whatever the drawing has *now*; if the drawing rolls between `userPlaceOrder` and `onOrderComplete`, the integrator uses the new drawing's price for fulfillment.
+The integrator does not configure ticket price — it reads from Megapot's active drawing at placement time (`getDrawingState(currentDrawingId())`). Megapot is the single source of truth for price and ball ranges. The integrator's tx-amount validation uses whatever the drawing has _now_; if the drawing rolls between `userPlaceOrder` and `onOrderComplete`, the integrator uses the new drawing's price for fulfillment.
 
 ## Limits
 
@@ -72,6 +72,7 @@ itself is held in two vaults (Megapot-funded primary, P2P-funded
 fallback) and pulled to the user's proxy at ticket-purchase time.
 
 **New surface vs V1:**
+
 - `issueCredit(address user, uint256 amount)` — gated to a whitelisted
   `creditIssuer` (the P2P Diamond on day one). Increments the per-user
   accumulating ledger; no USDC moves until redeemed.

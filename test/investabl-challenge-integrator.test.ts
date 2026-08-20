@@ -56,7 +56,12 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
         { name: "expiry", type: "uint256" },
       ],
     };
-    const signature = await signer.signTypedData(domain, types, { wallet, nullifier, limit, expiry });
+    const signature = await signer.signTypedData(domain, types, {
+      wallet,
+      nullifier,
+      limit,
+      expiry,
+    });
     return { nullifier, limit, expiry, signature };
   }
 
@@ -453,17 +458,35 @@ describe("InvestablChallengeCheckoutIntegrator — goods model, liveness-gated $
     });
     it("reverts InvalidAddress when diamond is zero", async function () {
       await expect(
-        Integrator.deploy(ethers.ZeroAddress, await mockUsdc.getAddress(), LIVENESS_CAP, DAILY_COUNT_LIMIT, attestor.address)
+        Integrator.deploy(
+          ethers.ZeroAddress,
+          await mockUsdc.getAddress(),
+          LIVENESS_CAP,
+          DAILY_COUNT_LIMIT,
+          attestor.address
+        )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
     it("reverts InvalidAddress when usdc is zero", async function () {
       await expect(
-        Integrator.deploy(await mockDiamond.getAddress(), ethers.ZeroAddress, LIVENESS_CAP, DAILY_COUNT_LIMIT, attestor.address)
+        Integrator.deploy(
+          await mockDiamond.getAddress(),
+          ethers.ZeroAddress,
+          LIVENESS_CAP,
+          DAILY_COUNT_LIMIT,
+          attestor.address
+        )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
     it("reverts InvalidAmount when cap is zero", async function () {
       await expect(
-        Integrator.deploy(await mockDiamond.getAddress(), await mockUsdc.getAddress(), 0, DAILY_COUNT_LIMIT, attestor.address)
+        Integrator.deploy(
+          await mockDiamond.getAddress(),
+          await mockUsdc.getAddress(),
+          0,
+          DAILY_COUNT_LIMIT,
+          attestor.address
+        )
       ).to.be.revertedWithCustomError(integrator, "InvalidAmount");
     });
     it("reverts InvalidAmount when daily limit is zero", async function () {

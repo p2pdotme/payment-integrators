@@ -1,12 +1,12 @@
 # Proposal: ChatterPay → P2P Off-ramp (USDC → ARS) Integration
 
-| | |
-|---|---|
-| **Status** | Draft for discussion |
-| **Audience** | P2P (payment-integrators) + ChatterPay / P4-Games backend |
-| **Scope** | Off-ramp **only** (crypto → fiat). On-ramp is out of scope. |
-| **Corridor** | USDC → **ARS** (Argentina). P2P confirms ARS merchant/payout liquidity exists. |
-| **Author** | P2P integrations |
+|              |                                                                                     |
+| ------------ | ----------------------------------------------------------------------------------- |
+| **Status**   | Draft for discussion                                                                |
+| **Audience** | P2P (payment-integrators) + ChatterPay / P4-Games backend                           |
+| **Scope**    | Off-ramp **only** (crypto → fiat). On-ramp is out of scope.                         |
+| **Corridor** | USDC → **ARS** (Argentina). P2P confirms ARS merchant/payout liquidity exists.      |
+| **Author**   | P2P integrations                                                                    |
 | **Based on** | `github.com/P4-Games/ChatterPay-Backend` (public, `main`) and P2P `feat/offramp-v2` |
 
 ---
@@ -16,18 +16,18 @@
 ChatterPay wants to let its WhatsApp users cash out crypto to Argentine pesos through P2P's off-ramp network. This is **very feasible and unusually low-friction**, because:
 
 1. **ChatterPay is already ramp-shaped.** It ships a provider-based ramp abstraction (`/ramp/*` routes) with one provider wired in today (**Manteca**, an Argentine ARS ramp). Adding P2P is "add a second off-ramp provider," not "build ramps."
-2. **ChatterPay can act as the user's on-chain agent.** It runs full ERC-4337 account abstraction and **custodies the per-user signing key**, submitting gas-sponsored UserOperations on the user's behalf. Its smart account exposes a generic `execute(dest, value, func)`, so it can drive *any* P2P contract call the user would normally make.
+2. **ChatterPay can act as the user's on-chain agent.** It runs full ERC-4337 account abstraction and **custodies the per-user signing key**, submitting gas-sponsored UserOperations on the user's behalf. Its smart account exposes a generic `execute(dest, value, func)`, so it can drive _any_ P2P contract call the user would normally make.
 3. **P2P's v2 off-ramp is user-driven and non-custodial.** The user funds their own per-user proxy and drives the SELL; P2P never holds the funds. ChatterPay-as-agent slots into the "user" role naturally.
 4. **The ARS corridor exists on P2P's side** — the one true business prerequisite is satisfied.
 5. **Zero-KYC by design.** The P2P off-ramp requires **no end-user identity verification** — the user keeps custody and supplies only an (encrypted) payout destination. This matches the commitment made to ChatterPay and is simply how the P2P protocol works; any merchant-side regulatory obligations live entirely inside the P2P merchant network and never touch the ChatterPay user flow. It is also a differentiator vs. the Manteca path (KYC documents + tiered limits).
 
 There are **three mismatches to bridge**, none blocking:
 
-| Mismatch | ChatterPay today | P2P today | Resolution |
-|---|---|---|---|
-| **Chain** | Scroll | Base | Bridge USDC Scroll → Base via ChatterPay's existing LI.FI integration |
-| **Custody model** | Manteca = custodial "deposit & forget" | v2 = non-custodial, user-driven | New ChatterPay-specific integrator; user self-funds proxy (recommended) |
-| **Asset backing** | n/a | TradeStars v2 allocation is **Solana-burn-backed** | New integrator drops Solana/vault; user's own bridged USDC backs the off-ramp |
+| Mismatch          | ChatterPay today                       | P2P today                                          | Resolution                                                                    |
+| ----------------- | -------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **Chain**         | Scroll                                 | Base                                               | Bridge USDC Scroll → Base via ChatterPay's existing LI.FI integration         |
+| **Custody model** | Manteca = custodial "deposit & forget" | v2 = non-custodial, user-driven                    | New ChatterPay-specific integrator; user self-funds proxy (recommended)       |
+| **Asset backing** | n/a                                    | TradeStars v2 allocation is **Solana-burn-backed** | New integrator drops Solana/vault; user's own bridged USDC backs the off-ramp |
 
 **Recommended approach:** a new, lean **`ChatterPayOfframpIntegrator`** on Base (sibling to TradeStars/Piker), reusing v2's audited user-driven lifecycle but **self-funded** (no relayer, no vault, no Solana burn) and with a **refund path**. On the ChatterPay side, a new `services/p2p/` provider plus a P2P branch in the existing ramp controller.
 
@@ -39,7 +39,7 @@ There are **three mismatches to bridge**, none blocking:
 
 - **Product:** a WhatsApp wallet ("Chatizalo" bot). Users are keyed by `phone_number`; each user has `wallets[].wallet_proxy` (the 4337 smart account) and `wallet_eoa`.
 - **Stack:** Bun + Fastify + MongoDB + ethers.js. Full ERC-4337: bundler / paymaster / userOp services under `src/services/web3/`.
-- **Key custody:** the backend builds an `ethers.Wallet` signer per user (`src/services/walletService.ts`) and submits **paymaster-sponsored UserOperations** on the user's behalf. **This is the linchpin** — ChatterPay's backend can execute arbitrary contract calls *from the user's smart account*.
+- **Key custody:** the backend builds an `ethers.Wallet` signer per user (`src/services/walletService.ts`) and submits **paymaster-sponsored UserOperations** on the user's behalf. **This is the linchpin** — ChatterPay's backend can execute arbitrary contract calls _from the user's smart account_.
 - **Chain:** default **Scroll** (`DEFAULT_CHAIN_ID = 534351` Scroll Sepolia; `ONRAMP_DEFAULT_NETWORK = 'scroll'`). Config includes **Base Sepolia (84532)** in the testnet list, and the codebase already has **LI.FI cross-chain** (`src/services/crossChainService.ts`, "Source network config (Scroll)" → destination chain) and an **Alchemy deposit ingestor** (`src/services/alchemy/depositIngestorService.ts`).
 - **Per-chain accounts — addresses are NOT the same across chains (verified).** The user's signing key is derived as `sha256(secret + chainId + secret + phone)` (`secService.get_up(phone, chainId)`, called from `src/services/web3/contractSetupService.ts:23`), and wallets are stored **per chain** (`getUserWalletByChainId`, `wallets[]` keyed by `chainId`). Because **`chainId` is an input to the key derivation**, a user's owner EOA — and therefore their 4337 smart-account address — is **different on Base than on Scroll**. There is no cross-chain address parity. Both accounts are ChatterPay-controlled (the backend can derive either key on demand), so this is a provisioning fact, not a blocker.
 - **Existing ramp surface:** `src/api/rampRoutes.ts` exposes `/ramp/off`, `/ramp/on`, `/ramp/linkToOperate`, plus balance / limits / KYC-document endpoints. Provider = Manteca (`src/services/manteca/**`). Off-ramp model (`MantecaRampOff` in `src/types/mantecaType.ts`) is a 3-stage synthetic op: **DEPOSIT** crypto → **ORDER** SELL USDC→ARS → **WITHDRAW** ARS to a bank account (CBU/CVU/alias). **Most of `rampController.ts` is currently mocked**, so there is room to make P2P a first-class path.
@@ -80,7 +80,7 @@ In P2P's model, ChatterPay's backend **is the user's wallet agent**. When Chatte
 - **Removed:** `allocateOfframp`, the Solana burn dedup, the yield vault, the off-ramp relayer. The user self-funds the proxy.
 - **Added:**
   - `userReclaimProxyFunds(uint256 amount)` — returns idle proxy USDC to `msg.sender` (the ChatterPay account). **Safe and important here** because the funds are user-owned (no burn backing to double-spend). This closes the "funds stuck in proxy if the corridor is briefly down" gap that v2 intentionally left for the burn-backed TradeStars case.
-  - *(optional)* `userFundAndStart(...)` — `transferFrom`s USDC from `msg.sender` into the proxy and places the SELL in one call (needs a prior `approveToken`). Saves a round-trip vs. transfer-then-start.
+  - _(optional)_ `userFundAndStart(...)` — `transferFrom`s USDC from `msg.sender` into the proxy and places the SELL in one call (needs a prior `approveToken`). Saves a round-trip vs. transfer-then-start.
 - Deployed on Base and registered on the Diamond (`registerIntegrator`, `proxyImpl` set-once — same as every other integrator).
 
 **ChatterPay side — new `services/p2p/` provider** mirroring `services/manteca/`, plus a P2P branch in `rampController.rampOff`:
@@ -137,7 +137,7 @@ sequenceDiagram
 
 ### 4.3 Operational details that matter
 
-- **Use the delivered amount, not the requested amount.** LI.FI fees/slippage mean the proxy may receive slightly less than 50 USDC. ChatterPay must compute `principal` from `availableOfframp(user)` *after* the bridge settles, or `userStartOfframp` reverts on the `principal + fee` balance check.
+- **Use the delivered amount, not the requested amount.** LI.FI fees/slippage mean the proxy may receive slightly less than 50 USDC. ChatterPay must compute `principal` from `availableOfframp(user)` _after_ the bridge settles, or `userStartOfframp` reverts on the `principal + fee` balance check.
 - **Retry-on-cancel is normal.** A SELL that isn't taken expires (≈3 min PLACED) and the P2P keeper (`autoCancelExpiredOrders`) cancels it; the USDC never moved (it's still in the proxy). ChatterPay's poller should treat CANCELLED as "re-place," not "failed." Funds are always safe in the proxy.
 - **One in-flight draw per user.** The prior order must be terminal before the next `userStartOfframp`. Partial cash-outs are supported (draw any principal ≤ proxy balance, in parts).
 - **Payout details are currency-agnostic.** `encUpi` is an opaque encrypted string — UPI for India, **CBU/CVU/alias for Argentina**. ChatterPay reuses its existing ARS bank-account binding to source it.
@@ -159,6 +159,7 @@ P2P could instead expose a **hosted, Manteca-style REST off-ramp** (deposit addr
 ## 6. Work breakdown
 
 ### 6.1 P2P side
+
 1. `ChatterPayOfframpIntegrator.sol` — fork v2; drop allocate/vault/Solana; add `userReclaimProxyFunds` (+ optional `userFundAndStart`).
 2. Tests to the **80% branch-coverage gate**; deploy to Base Sepolia; `registerIntegrator`.
 3. **ARS corridor config** — circle(s), payment-channel config, small-order threshold, sell pricing for USDC→ARS.
@@ -166,62 +167,73 @@ P2P could instead expose a **hosted, Manteca-style REST off-ramp** (deposit addr
 5. SDK helper for ECIES payout encryption (or expose via `@p2pdotme/sdk`).
 
 ### 6.2 ChatterPay side
+
 1. `services/p2p/` provider (quote / offramp / payout) mirroring `services/manteca/`.
 2. P2P branch in `rampController.rampOff` (provider switch by token/config).
 3. **Cross-chain orchestration** — reuse `crossChainService` (LI.FI) to bridge Scroll→Base to the proxy address; reuse the deposit ingestor to confirm arrival.
 4. **Generic call helper** alongside `createTransferCallData` — encode `execute(integrator, 0, <method calldata>)` for the three user-driven calls.
-5. **Base account provisioning** — derive/deploy the user's **Base** smart account (a *distinct* address from Scroll, since chainId is in the key derivation), store it as a per-chain wallet, and ensure the factory + paymaster are deployed and funded on Base. The P2P proxy and the bridge destination both key off this Base address.
+5. **Base account provisioning** — derive/deploy the user's **Base** smart account (a _distinct_ address from Scroll, since chainId is in the key derivation), store it as a per-chain wallet, and ensure the factory + paymaster are deployed and funded on Base. The P2P proxy and the bridge destination both key off this Base address.
 6. Status polling + retry-on-cancel; `transactionModel` records; WhatsApp notifications; token entry (`ramp_enabled`, provider `p2p`) on Base.
 
 ### 6.3 Phasing
+
 - **Phase 1 (P2P):** contract + corridor config + Base Sepolia deploy/register.
 - **Phase 2 (P2P):** quote/status SDK + payout encryption.
 - **Phase 3 (ChatterPay):** provider + ramp branch + bridge orchestration + notifications.
 - **Phase 4 (joint):** testnet E2E (Scroll Sepolia + Base Sepolia), then a capped mainnet pilot.
-- **Phase 5 (later):** P2P fraud/risk engine called per off-ramp transaction with the user's **phone number** for screening (a risk signal — *not* identity KYC; consistent with §1.5).
+- **Phase 5 (later):** P2P fraud/risk engine called per off-ramp transaction with the user's **phone number** for screening (a risk signal — _not_ identity KYC; consistent with §1.5).
 
 ---
 
 ## 7. Risks & mitigations
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| Bridge slippage vs. fee check | `userStartOfframp` reverts | Compute principal from `availableOfframp` post-bridge |
-| No merchant takes the SELL | Order expires | Keeper auto-cancels; ChatterPay re-places; funds stay in proxy |
-| User abandons mid-flow | USDC idle in proxy | `userReclaimProxyFunds` returns funds to the ChatterPay account |
-| Base account not provisioned / paymaster unfunded | userOps fail | Provision the per-user **Base** account (own address — no Scroll parity) + fund paymaster on Base before pilot |
-| ARS price volatility between quote and SELL | User gets unexpected rate | Short quote TTL; surface rate in WhatsApp confirmation |
+| Risk                                              | Impact                     | Mitigation                                                                                                     |
+| ------------------------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Bridge slippage vs. fee check                     | `userStartOfframp` reverts | Compute principal from `availableOfframp` post-bridge                                                          |
+| No merchant takes the SELL                        | Order expires              | Keeper auto-cancels; ChatterPay re-places; funds stay in proxy                                                 |
+| User abandons mid-flow                            | USDC idle in proxy         | `userReclaimProxyFunds` returns funds to the ChatterPay account                                                |
+| Base account not provisioned / paymaster unfunded | userOps fail               | Provision the per-user **Base** account (own address — no Scroll parity) + fund paymaster on Base before pilot |
+| ARS price volatility between quote and SELL       | User gets unexpected rate  | Short quote TTL; surface rate in WhatsApp confirmation                                                         |
 
 ---
 
 ## 8. Open decisions (for ChatterPay + P2P to confirm)
 
-1. **Integration depth / custody** — *Recommended:* **Option A, non-custodial** (ChatterPay drives P2P contracts as the user's wallet). Confirm, or choose Option B (P2P-hosted custodial REST facade) for a faster, lower-effort pilot.
-2. **Chain strategy** — *Recommended:* **bridge Scroll→Base** and reuse ChatterPay's LI.FI integration. (Deploying the full P2P/Diamond stack on Scroll is a large lift; P2P infra is Base-native.) Confirm.
+1. **Integration depth / custody** — _Recommended:_ **Option A, non-custodial** (ChatterPay drives P2P contracts as the user's wallet). Confirm, or choose Option B (P2P-hosted custodial REST facade) for a faster, lower-effort pilot.
+2. **Chain strategy** — _Recommended:_ **bridge Scroll→Base** and reuse ChatterPay's LI.FI integration. (Deploying the full P2P/Diamond stack on Scroll is a large lift; P2P infra is Base-native.) Confirm.
 3. **Gas sponsorship on Base** — ChatterPay's paymaster (extend/fund it on Base) vs. a P2P paymaster. Who sponsors the off-ramp userOps?
 4. **Order status delivery** — start with **polling** (P2P subgraph/Diamond views) and add a **P2P → ChatterPay webhook** later? Confirm the interim approach.
-5. **Base account provisioning policy** — the user's Base account is a *distinct* address from Scroll (chainId is in ChatterPay's key derivation — confirmed in `secService.get_up`), so the P2P identity binds to the **Base** account. Decide whether ChatterPay provisions Base accounts for all users up front or lazily on first off-ramp (and when the paymaster is funded for them).
-6. **Limits & amounts (liquidity-based, not KYC-tiered)** — caps are **risk/liquidity** limits (the contract's `maxUsdcPerOfframp` + merchant capacity), *not* identity tiers. There is **no user KYC** (see §1.5). Confirm the per-off-ramp min/max and how they surface in ChatterPay's UX.
+5. **Base account provisioning policy** — the user's Base account is a _distinct_ address from Scroll (chainId is in ChatterPay's key derivation — confirmed in `secService.get_up`), so the P2P identity binds to the **Base** account. Decide whether ChatterPay provisions Base accounts for all users up front or lazily on first off-ramp (and when the paymaster is funded for them).
+6. **Limits & amounts (liquidity-based, not KYC-tiered)** — caps are **risk/liquidity** limits (the contract's `maxUsdcPerOfframp` + merchant capacity), _not_ identity tiers. There is **no user KYC** (see §1.5). Confirm the per-off-ramp min/max and how they surface in ChatterPay's UX.
 
 ---
 
 ## Appendix A — Key interfaces
 
 **P2P integrator (user-driven, called by the ChatterPay account via `execute`):**
+
 ```solidity
 function userStartOfframp(
-    uint256 principal, bytes32 currency, uint256 fiatAmount,
-    uint256 circleId, uint256 preferredPaymentChannelConfigId, string calldata userPubKey
+  uint256 principal,
+  bytes32 currency,
+  uint256 fiatAmount,
+  uint256 circleId,
+  uint256 preferredPaymentChannelConfigId,
+  string calldata userPubKey
 ) external returns (uint256 orderId);
-function userDeliverOfframpUpi(uint256 orderId, string calldata encUpi) external;
+function userDeliverOfframpUpi(
+  uint256 orderId,
+  string calldata encUpi
+) external;
 function syncOfframp(uint256 orderId) external;
 function availableOfframp(address user) external view returns (uint256);
 // new for ChatterPay:
-function userReclaimProxyFunds(uint256 amount) external;     // refund idle proxy USDC to msg.sender
-function userFundAndStart(/* … */) external returns (uint256 orderId); // optional convenience
+function userReclaimProxyFunds(uint256 amount) external; // refund idle proxy USDC to msg.sender
+function userFundAndStart() external returns (/* … */ uint256 orderId); // optional convenience
 ```
 
 **ChatterPay account primitive (verified in `ChatterPay.sol` ABI):**
+
 ```solidity
 function execute(address dest, uint256 value, bytes calldata func) external; // generic call
 ```
