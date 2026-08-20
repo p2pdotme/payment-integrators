@@ -8,14 +8,14 @@
 
 ## Proposed agreements — react 👍 / 👎 per row
 
-| # | Topic | Proposal |
-|---|-------|----------|
-| 1 | **Scope** | Off-ramp only, **USDC → ARS** (Argentina). ARS payout liquidity exists on P2P. |
-| 2 | **Custody** | **Non-custodial** — P2P never holds funds. User's USDC sits in their own per-user proxy; ChatterPay drives the SELL via gas-sponsored userOps. *(Alt: P2P-hosted custodial REST facade — faster, but reintroduces custody.)* |
-| 3 | **Chain** | ChatterPay is on Scroll, P2P off-ramp is on Base → **bridge Scroll→Base via ChatterPay's existing LI.FI**. P2P stays Base-native. |
-| 4 | **Zero-KYC** | **No end-user identity verification.** User keeps custody + supplies an encrypted payout destination (CBU). Any merchant-side obligations stay inside the P2P network. |
-| 5 | **Identity** | P2P binds to the user's **Base** ChatterPay account (per-chain address, distinct from Scroll). ChatterPay provisions Base accounts + funds the paymaster on Base. |
-| 6 | **Refund** | `userReclaimProxyFunds` returns idle funds to the user anytime — money is never stuck. |
+| #   | Topic        | Proposal                                                                                                                                                                                                                     |
+| --- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Scope**    | Off-ramp only, **USDC → ARS** (Argentina). ARS payout liquidity exists on P2P.                                                                                                                                               |
+| 2   | **Custody**  | **Non-custodial** — P2P never holds funds. User's USDC sits in their own per-user proxy; ChatterPay drives the SELL via gas-sponsored userOps. _(Alt: P2P-hosted custodial REST facade — faster, but reintroduces custody.)_ |
+| 3   | **Chain**    | ChatterPay is on Scroll, P2P off-ramp is on Base → **bridge Scroll→Base via ChatterPay's existing LI.FI**. P2P stays Base-native.                                                                                            |
+| 4   | **Zero-KYC** | **No end-user identity verification.** User keeps custody + supplies an encrypted payout destination (CBU). Any merchant-side obligations stay inside the P2P network.                                                       |
+| 5   | **Identity** | P2P binds to the user's **Base** ChatterPay account (per-chain address, distinct from Scroll). ChatterPay provisions Base accounts + funds the paymaster on Base.                                                            |
+| 6   | **Refund**   | `userReclaimProxyFunds` returns idle funds to the user anytime — money is never stuck.                                                                                                                                       |
 
 ---
 
@@ -64,13 +64,14 @@ P2P Diamond + per-user proxy (Base)
 P2P circle merchant ──── pays ARS to user's CBU/CVU/alias
 ```
 
-> **Later phase:** each off-ramp call also hits P2P's fraud/risk engine with the user's **phone number** for per-transaction screening (a risk signal — *not* identity KYC).
+> **Later phase:** each off-ramp call also hits P2P's fraud/risk engine with the user's **phone number** for per-transaction screening (a risk signal — _not_ identity KYC).
 
 ---
 
 ## Work split
 
 **P2P side**
+
 - `ChatterPayOfframpIntegrator.sol` — fork v2; drop allocate/vault/Solana; add `userReclaimProxyFunds` (+ optional `userFundAndStart`).
 - Tests to the 80% branch-coverage gate; deploy to Base Sepolia; `registerIntegrator`.
 - ARS corridor config — circle(s), payment-channel config, small-order threshold, sell pricing for USDC→ARS.
@@ -78,6 +79,7 @@ P2P circle merchant ──── pays ARS to user's CBU/CVU/alias
 - SDK helper for ECIES payout encryption (or expose via `@p2pdotme/sdk`).
 
 **ChatterPay side**
+
 - `services/p2p/` provider (quote / offramp / payout) mirroring `services/manteca/`.
 - P2P branch in `rampController.rampOff` (provider switch by token/config).
 - Cross-chain orchestration — reuse `crossChainService` (LI.FI) to bridge Scroll→Base to the proxy; reuse the deposit ingestor to confirm arrival.
@@ -98,7 +100,8 @@ P2P circle merchant ──── pays ARS to user's CBU/CVU/alias
 ---
 
 ## To confirm
+
 - **Gas sponsorship on Base** — ChatterPay paymaster vs. P2P paymaster.
 - **Status delivery** — polling now, P2P→ChatterPay webhook later?
 - **Base account provisioning** — up front for all users, or lazily on first off-ramp?
-- **Limits** — per-off-ramp min/max (liquidity-based, *not* KYC tiers).
+- **Limits** — per-off-ramp min/max (liquidity-based, _not_ KYC tiers).

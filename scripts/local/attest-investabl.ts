@@ -32,10 +32,7 @@ async function main() {
   if (!INTEGRATOR || !WALLET) throw new Error("INTEGRATOR and WALLET are required");
 
   const [signer] = await ethers.getSigners();
-  const integrator = await ethers.getContractAt(
-    "InvestablChallengeCheckoutIntegrator",
-    INTEGRATOR
-  );
+  const integrator = await ethers.getContractAt("InvestablChallengeCheckoutIntegrator", INTEGRATOR);
 
   const attestor: string = await integrator.livenessAttestor();
   const me = await signer.getAddress();
