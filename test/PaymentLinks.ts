@@ -3,6 +3,14 @@ import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 import { time } from "@nomicfoundation/hardhat-network-helpers";
 
+/** Deploys PaymentLinksLib and returns its address, for linking. */
+async function deployPaymentLinksLib(): Promise<string> {
+  const Lib = await ethers.getContractFactory("PaymentLinksLib");
+  const lib = await Lib.deploy();
+  await lib.waitForDeployment();
+  return await lib.getAddress();
+}
+
 /**
  * Payment links: a merchant creates a shareable link, a WALLETLESS customer pays
  * it, and `trustedRelayer` places the order on the merchant's behalf.
@@ -73,7 +81,9 @@ describe("MerchantTerminalIntegrator — payment links", function () {
     const MockDiamond = await ethers.getContractFactory("MockDiamond");
     mockDiamond = await MockDiamond.deploy(await mockUsdc.getAddress());
 
-    const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
+    const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator", {
+      libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+    });
     integrator = await Integrator.deploy(
       await mockDiamond.getAddress(),
       await mockUsdc.getAddress(),
@@ -113,22 +123,24 @@ describe("MerchantTerminalIntegrator — payment links", function () {
     return evs[evs.length - 1].args[1];
   }
 
+  // `singleUse` is now expressed as `maxUses`: 1 is the old single-use link, 0
+  // is unlimited. The helper keeps accepting `singleUse` so the existing cases
+  // read unchanged, and `maxUses` is available for the multi-use cases.
   function createLink(
     as: SignerWithAddress,
     linkId: string,
     amount: bigint,
-    opts: { currency?: string; expiresAt?: number; singleUse?: boolean } = {}
+    opts: {
+      currency?: string;
+      expiresAt?: number;
+      singleUse?: boolean;
+      maxUses?: number;
+    } = {}
   ) {
+    const maxUses = opts.maxUses ?? (opts.singleUse ? 1 : 0);
     return integrator
       .connect(as)
-      .createLink(
-        linkId,
-        amount,
-        opts.currency ?? INR,
-        opts.expiresAt ?? 0,
-        opts.singleUse ?? false,
-        CONFIG
-      );
+      .createLink(linkId, amount, opts.currency ?? INR, opts.expiresAt ?? 0, maxUses, CONFIG);
   }
 
   // ─── Creation ─────────────────────────────────────────────────────
@@ -137,15 +149,16 @@ describe("MerchantTerminalIntegrator — payment links", function () {
     it("stores the link and emits its config blob for the merchant to read back", async function () {
       await expect(createLink(merchant1, LINK_A, linkAmount(3), { singleUse: true }))
         .to.emit(integrator, "LinkCreated")
-        .withArgs(LINK_A, merchant1.address, linkAmount(3), INR, 0, true, CONFIG);
+        .withArgs(LINK_A, merchant1.address, linkAmount(3), INR, 0, 1, CONFIG);
 
       const L = await integrator.getLink(LINK_A);
       expect(L[0]).to.equal(merchant1.address);
       expect(L[1]).to.equal(linkAmount(3));
       expect(L[2]).to.equal(INR);
-      expect(L[4]).to.equal(true); // singleUse
+      expect(L[4]).to.equal(1); // maxUses — 1 is the old singleUse
       expect(L[5]).to.equal(0); // ACTIVE
       expect(L[6]).to.equal(0); // uses
+      expect(L[7]).to.equal(0); // strikes
     });
 
     it("records the owner from msg.sender, so a link cannot be created for someone else", async function () {

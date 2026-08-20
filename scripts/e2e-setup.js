@@ -7,6 +7,14 @@ const { ethers } = require("hardhat");
 const fs = require("fs");
 const path = require("path");
 
+/** Deploys PaymentLinksLib and returns its address, for linking. */
+async function deployPaymentLinksLib() {
+  const Lib = await ethers.getContractFactory("PaymentLinksLib");
+  const lib = await Lib.deploy();
+  await lib.waitForDeployment();
+  return await lib.getAddress();
+}
+
 // Resolved from THIS file, not the working directory — hardhat runs scripts
 // from the project root, and a bare "../worker" silently resolved outside the
 // repo depending on where the contracts live.
@@ -20,7 +28,9 @@ async function main() {
     await ethers.getContractFactory("MockDiamond")
   ).deploy(await usdc.getAddress());
   const integrator = await (
-    await ethers.getContractFactory("MerchantTerminalIntegrator")
+    await ethers.getContractFactory("MerchantTerminalIntegrator", {
+      libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+    })
   ).deploy(await diamond.getAddress(), await usdc.getAddress(), []);
   const client = await (
     await ethers.getContractFactory("SimpleERC721Client")

@@ -1,5 +1,13 @@
 import { ethers, network } from "hardhat";
 
+/** Deploys PaymentLinksLib and returns its address, for linking. */
+async function deployPaymentLinksLib(): Promise<string> {
+  const Lib = await ethers.getContractFactory("PaymentLinksLib");
+  const lib = await Lib.deploy();
+  await lib.waitForDeployment();
+  return await lib.getAddress();
+}
+
 /**
  * Deploy MerchantTerminalIntegrator + the SimpleERC721Client price source.
  *
@@ -61,7 +69,9 @@ async function main() {
   // 1. Integrator (internal custody). Deployer + any extra owners each get full
   //    access; the deployer is also the super-admin (hand off to a multisig later).
   console.log("Deploying MerchantTerminalIntegrator (internal custody)...");
-  const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
+  const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator", {
+    libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+  });
   const integrator = await Integrator.deploy(DIAMOND_ADDRESS, USDC_ADDRESS, EXTRA_OWNERS);
   await integrator.deploymentTransaction()?.wait(3);
   const address = await integrator.getAddress();
