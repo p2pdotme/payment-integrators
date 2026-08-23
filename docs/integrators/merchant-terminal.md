@@ -170,7 +170,7 @@ which the LP rejects, because the LP settles against their own bank.
 This contract sits against the 24,576-byte EIP-170 ceiling. Payment-link
 lifecycle lives in `PaymentLinksLib`, an external (delegatecall) library, and
 `hardhat.config.ts` carries a **per-file** optimizer override (`runs: 50`) for
-this contract alone. Even so the margin is ~130 bytes. The next feature here
+this contract alone. Even so the margin is 72 bytes. The next feature here
 needs the withdrawal / fund-helper sections (~44% of the contract) moved into
 their own library, or a facet split.
 
@@ -188,6 +188,83 @@ their own library, or a facet split.
 
 `withdrawUSDC(amount)` sends unlocked USDC straight to the merchant wallet from the
 integrator's own balance.
+
+
+## Deployment and whitelisting checklist
+
+Payment links depend on three things that live OUTSIDE this repository. All
+three are silent when missing — nothing reverts, nothing logs, the feature
+simply does not work — so they are listed here rather than discovered later.
+
+### 1. The cancel callback must be switched on (required)
+
+`onOrderCancel` is only delivered if a p2p super-admin has run
+`setIntegratorCancelCallback(integrator, true)`. It is per-integrator and
+defaults to OFF. Without it, on the real Diamond:
+
+- a link's `uses` is never released, so a `maxUses = 1` link is burned by the
+  first abandoned tap and no later customer can pay it;
+- the merchant's daily slot is never released on cancellation or expiry;
+- `OrderCancelled` never fires, so the relayer's false-claim sweep records
+  nothing and the per-claimant block is dead code.
+
+This integrator meets the callback's requirements: `onOrderCancel` is
+idempotent, `onOrderComplete` does not revert on a re-opened CANCELLED → PAID
+order, and both are well inside the 250k gas ceiling.
+
+### 2. Fraud screening must be wired to the pay page (required for INR)
+
+The merchant app only accepts an order that has an approved screening record,
+keyed by order id, and INR BUY orders are not auto-approved. An unscreened
+order sits at PLACED until it expires. Testnet demo bots do not enforce this,
+so a green testnet run says nothing about it.
+
+The screening call must be EIP-191 signed by "the user", and `order.user` for a
+link order is the merchant's proxy, which cannot sign. The workable path is the
+one `<Checkout>` already supports: the pay page passes the screening prop and
+gives its signer stub a `signMessage` backed by the customer's ephemeral key —
+the same key it already generates for `pubKey` — so the screening subject is
+that ephemeral address. That also satisfies the engine's one-in-flight-per-
+wallet rule, which the relayer as subject would trip immediately.
+
+Also needed: a fraud-engine CORS entry for the pay-page origin, and the shared
+key handover.
+
+### 3. Deploy is two contracts, and the optimizer setting is not standard
+
+`PaymentLinksLib` is an external library and must be deployed and linked before
+the integrator. The whitelist request needs BOTH addresses, and Basescan
+verification of the integrator needs the library address too.
+
+This contract also carries a per-file optimizer override (`runs: 50`) because it
+sits against the size ceiling. That has a consequence worth stating plainly:
+the constructor deploys a `UserProxy`, and an overridden file is compiled
+together with its imports, so the `proxyImpl` this integrator deploys is built
+at `runs: 50` rather than the `runs: 200` used by every other integrator. Since
+whitelisting checks `proxyImpl` against the canonical `UserProxy` bytecode and
+`proxyImpl` is set-once on the Diamond, this needs either an explicit exception
+with a reproducible build recipe, or the size problem solved structurally so
+the override can be dropped.
+
+### Also confirm before going live
+
+- `setLinkRelayer` for each relaying key, and `setTrustedRelayer` for the fiat
+  keeper — these are separate roles.
+- `ALLOWED_ORIGINS` set to the real pay-page origins, not the `*` fallback.
+- Worker secrets stored with `--env production`; bindings repeated under
+  `[env.production]` (they are not inherited).
+- **Turnstile is configured**: `wrangler secret put TURNSTILE_SECRET --env
+  production`, and the pay page renders the widget and sends the token (header
+  `cf-turnstile-response`, or `turnstileToken` in the body) on both `/api/pay`
+  and `/api/relay-tx`.
+
+  Order placement is anonymous and the relayer pays for it, so rate limits
+  ration the wrong thing — requests are free to an attacker and each one that
+  lands costs a real transaction and a real slot out of a merchant's daily
+  limit. `REQUIRE_TURNSTILE = "true"` is already set for production, so a
+  missing secret is a loud 503 rather than an open door; `GET /health` reports
+  `turnstile: true` once the gate is live. Confirm that before announcing a
+  link publicly.
 
 ## Limits (enforced in `validateOrder`)
 

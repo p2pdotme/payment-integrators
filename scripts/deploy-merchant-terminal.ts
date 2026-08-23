@@ -5,7 +5,12 @@ async function deployPaymentLinksLib(): Promise<string> {
   const Lib = await ethers.getContractFactory("PaymentLinksLib");
   const lib = await Lib.deploy();
   await lib.waitForDeployment();
-  return await lib.getAddress();
+  const address = await lib.getAddress();
+  // Printed because two separate steps need it and neither can proceed
+  // without it: Basescan verification of the integrator, and the whitelist
+  // request, which has to list both deployed addresses.
+  console.log(`PaymentLinksLib deployed: ${address}`);
+  return address;
 }
 
 /**

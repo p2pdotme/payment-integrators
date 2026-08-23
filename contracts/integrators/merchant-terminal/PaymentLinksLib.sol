@@ -83,10 +83,17 @@ library PaymentLinksLib {
 
     // ─── Ids ──────────────────────────────────────────────────────────
 
-    /// @notice The only id `createLink` should ever be given. Binding the id to
-    ///         the merchant's own address makes it unforgeable by an observer:
-    ///         nobody else can produce a colliding id for someone else's salt,
-    ///         so a creation cannot be front-run and griefed with `LinkExists`.
+    /// @notice The id `createLink` should be given. Derives from the merchant's
+    ///         own address, so two merchants choosing the same salt still get
+    ///         different ids and cannot collide with each other by accident.
+    /// @dev Does NOT make the id unguessable, and the earlier claim that it did
+    ///      was wrong: an observer watching the mempool copies the id straight
+    ///      out of the pending call — they never need to derive it. Front-running
+    ///      a creation to grief it with `LinkExists` therefore remains possible
+    ///      in principle. It is low risk on Base, whose sequencer mempool is
+    ///      private, and closing it properly means taking `salt` and deriving
+    ///      inside `createLink` so the id is never in calldata at all — which
+    ///      does not currently fit in this contract's remaining size.
     function computeLinkId(address merchant, bytes32 salt) public pure returns (bytes32) {
         return keccak256(abi.encode(merchant, salt));
     }

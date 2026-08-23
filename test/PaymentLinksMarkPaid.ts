@@ -108,6 +108,10 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       .connect(relayer)
       .relayerPlaceOrder(id, erc721Client.target, PRODUCT_ID, qty, INR, 0, PK);
 
+  /** An LP takes the order. On the real Diamond nothing can reach PAID until
+   *  this has happened — there is no one to have sent fiat to before it. */
+  const accept = (orderId: bigint) => mockDiamond.simulateOrderAccepted(orderId);
+
   async function lastOrderId(): Promise<bigint> {
     const evs = await integrator.queryFilter(integrator.filters.LinkOrderPlaced());
     return evs[evs.length - 1].args[1];
@@ -140,7 +144,9 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       const stored = await mockDiamond.orders(orderId);
 
       expect(stored.user).to.equal(merchant1.address);
-      // The merchant's own signer can therefore still mark it paid directly.
+      // The merchant's own signer can therefore still mark it paid directly,
+      // once an LP has accepted it.
+      await accept(orderId);
       await expect(mockDiamond.connect(merchant1).paidBuyOrder(orderId)).to.not.be.reverted;
     });
 
@@ -170,6 +176,7 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       await mkLink(LINK, 1);
       await payLink(LINK, 1);
       const orderId = await lastOrderId();
+      await accept(orderId);
 
       await expect(integrator.connect(relayer).relayerMarkPaid(LINK, orderId))
         .to.emit(integrator, "LinkOrderPaid")
@@ -218,14 +225,30 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       ).to.be.revertedWithCustomError(integrator, "LinkNotFound");
     });
 
-    it("is stopped by the link-orders kill switch", async function () {
+    it("keeps working when link orders are halted — the customer already paid", async function () {
+      // The kill switch stops NEW activity. A customer whose bank transfer has
+      // already left cannot un-send it, so refusing them here would strand real
+      // money with the LP and no one present to explain.
+      await mkLink(LINK, 1);
+      await payLink(LINK, 1);
+      const orderId = await lastOrderId();
+      await accept(orderId);
+
+      await integrator.setLinkOrdersEnabled(false);
+      await expect(integrator.connect(relayer).relayerMarkPaid(LINK, orderId)).to.emit(
+        integrator,
+        "LinkOrderPaid"
+      );
+    });
+
+    it("but CANCEL is stopped by it — that is the direction a stolen key abuses", async function () {
       await mkLink(LINK, 1);
       await payLink(LINK, 1);
       const orderId = await lastOrderId();
 
       await integrator.setLinkOrdersEnabled(false);
       await expect(
-        integrator.connect(relayer).relayerMarkPaid(LINK, orderId)
+        integrator.connect(relayer).relayerCancelOrder(LINK, orderId)
       ).to.be.revertedWithCustomError(integrator, "LinkOrdersDisabled");
     });
   });
@@ -339,9 +362,13 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       await payLink(LINK, 1);
       const orderId = await lastOrderId();
 
+      await accept(orderId);
       await integrator.connect(relayer).relayerMarkPaid(LINK, orderId);
       expect((await integrator.getLink(LINK))[7]).to.equal(1); // provisional
 
+      // The claim was false, so the order never settles and the keeper cancels
+      // it at TTL. That gateway-side cancel is the real strike source — the
+      // relayer cannot cancel a PAID order on the live Diamond.
       await mockDiamond.simulateOrderCancelled(orderId);
       expect((await integrator.getLink(LINK))[7]).to.equal(1); // stands: claim was false
     });
@@ -351,6 +378,7 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       await payLink(LINK, 1);
       const orderId = await lastOrderId();
 
+      await accept(orderId);
       await integrator.connect(relayer).relayerMarkPaid(LINK, orderId);
       await mockDiamond.simulateOrderComplete(orderId);
       expect((await integrator.getLink(LINK))[7]).to.equal(0);
@@ -361,6 +389,7 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       for (let i = 0; i < 3; i++) {
         await payLink(LINK, 1);
         const id = await lastOrderId();
+        await accept(id);
         await integrator.connect(relayer).relayerMarkPaid(LINK, id);
         await mockDiamond.simulateOrderCancelled(id);
       }
@@ -375,6 +404,7 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       await mkLink(LINK, 1, 0);
       await payLink(LINK, 1);
       const orderId = await lastOrderId();
+      await accept(orderId);
       await integrator.connect(relayer).relayerMarkPaid(LINK, orderId);
       await mockDiamond.simulateOrderCancelled(orderId);
 

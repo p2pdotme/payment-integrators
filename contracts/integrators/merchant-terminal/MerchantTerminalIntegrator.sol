@@ -1140,12 +1140,34 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// Takes a provisional strike, released in `onOrderComplete` when the claim
     /// proves true. A marked-then-cancelled order therefore leaves exactly one
     /// permanent strike, with no extra per-order storage.
-    function relayerMarkPaid(bytes32 linkId, uint256 orderId) external whenNotPaused nonReentrant {
-        if (!linkOrdersEnabled) revert LinkOrdersDisabled();
-        unchecked {
-            links[linkId].strikes++;
-        }
+    /// @dev Gated by NEITHER `whenNotPaused` NOR `linkOrdersEnabled`, and that
+    ///      is deliberate. Both switches exist to stop NEW activity; this call
+    ///      finishes activity already in flight. A customer whose bank transfer
+    ///      has already left cannot un-send it, so refusing them here strands
+    ///      real money: the LP holds the fiat, the order expires, and nobody
+    ///      present can explain it. `pause()`'s own documentation says in-flight
+    ///      completion keeps working, `linkOrdersEnabled` describes itself as a
+    ///      switch for placement only, and the POS path does not pause-gate
+    ///      `paidBuyOrder` either. The code now matches all three.
+    function relayerMarkPaid(bytes32 linkId, uint256 orderId) external nonReentrant {
+        // Forward FIRST. `_relayForward` is what proves this order actually came
+        // from this link; taking the strike before that check let a bogus orderId
+        // mark a link the caller never paid through.
         _relayForward(linkId, orderId, abi.encodeCall(IOrderFlow.paidBuyOrder, (orderId)));
+
+        // Saturate rather than wrap. `strikes` is a uint16 and this was unchecked,
+        // so 65,536 claims against one link reset the counter to zero — hiding the
+        // fraud signal at exactly the point it mattered most. Reaching that needs a
+        // compromised key or volume the relayer throttles long before, but a
+        // counter that silently reads clean when it should read alarming is not
+        // worth the gas it saves.
+        PaymentLinksLib.PaymentLink storage lk = links[linkId];
+        if (lk.strikes < type(uint16).max) {
+            unchecked {
+                lk.strikes++;
+            }
+        }
+
         emit LinkOrderPaid(linkId, orderId);
     }
 
@@ -1170,7 +1192,15 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      Diamond swallows callback failures, so the merchant's daily slot and
     ///      the link's use vanish with no revert to notice. See
     ///      `nonReentrantCallback`.
+    /// @dev Gated on `linkOrdersEnabled` — the opposite way round from
+    ///      `relayerMarkPaid`. Cancelling destroys an in-flight order, so it is
+    ///      the direction a compromised relayer key would abuse: with the kill
+    ///      switch closed it could otherwise still cancel every link order in
+    ///      flight. Abandoned orders expire on the Diamond's own TTL regardless,
+    ///      so making the switch cover this costs a little latency and closes
+    ///      the one lever built for exactly that incident.
     function relayerCancelOrder(bytes32 linkId, uint256 orderId) external nonReentrant {
+        if (!linkOrdersEnabled) revert LinkOrdersDisabled();
         _relayForward(linkId, orderId, abi.encodeCall(IOrderFlow.cancelOrder, (orderId)));
         emit LinkOrderCancelled(linkId, orderId);
     }
