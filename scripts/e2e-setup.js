@@ -49,8 +49,52 @@ async function main() {
       "INR"
     );
 
-  // The two deployment steps that need a human in production.
-  await integrator.setTrustedRelayer(relayer.address);
+  // ─── The relayer-free path ────────────────────────────────────────
+  //
+  // Everything below stands in for infrastructure that already exists on
+  // mainnet. Deploying it locally is what lets the worker run UNCHANGED
+  // between here and production: only the RPC URLs differ.
+  //
+  //   EntryPoint            — the same singleton already deployed on Base
+  //   SimpleAccountFactory  — the account factory. Both this and a hosted
+  //                           provider's derive addresses deterministically, so
+  //                           a link's wallet is known before it exists and is
+  //                           created lazily on first payment.
+  //   VerifyingPaymaster    — sponsorship gated by an off-chain signer, which
+  //                           is how a hosted paymaster decides per operation.
+  const entryPoint = await (await ethers.getContractFactory("EntryPoint")).deploy();
+  await entryPoint.waitForDeployment();
+
+  const accountFactory = await (
+    await ethers.getContractFactory("SimpleAccountFactory")
+  ).deploy(await entryPoint.getAddress());
+  await accountFactory.waitForDeployment();
+
+  // Hardhat account #3 signs sponsorship approvals — the hosted paymaster
+  // service's role.
+  const sponsorSigner = (await ethers.getSigners())[3];
+  const paymaster = await (
+    await ethers.getContractFactory("VerifyingPaymaster")
+  ).deploy(await entryPoint.getAddress(), sponsorSigner.address);
+  await paymaster.waitForDeployment();
+
+  // The sponsor funds ITS OWN deposit. This is the money that pays for every
+  // payment, and note where it is NOT: no link wallet ever holds a balance.
+  await paymaster.deposit({ value: ethers.parseEther("10") });
+  await paymaster.addStake(1, { value: ethers.parseEther("1") });
+
+  const router = await (
+    await ethers.getContractFactory("LinkRouter")
+  ).deploy(await integrator.getAddress());
+  await router.waitForDeployment();
+
+  // THE one on-chain change the whole design needs. The trusted relayer becomes
+  // a contract that holds nothing, instead of a funded EOA.
+  await integrator.setTrustedRelayer(await router.getAddress());
+
+  // The old relayer is still funded here only so the legacy suites keep
+  // exercising the path they were written for. Nothing on the Router path
+  // touches it, and it is what gets deleted at cutover.
   await deployer.sendTransaction({
     to: relayer.address,
     value: ethers.parseEther("1"),
@@ -68,6 +112,15 @@ async function main() {
     customer: customer.address,
     // Hardhat's deterministic account #2 — the relayer in this test.
     relayerKey: "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+    // ─── The relayer-free path ───
+    router: await router.getAddress(),
+    entryPoint: await entryPoint.getAddress(),
+    accountFactory: await accountFactory.getAddress(),
+    paymaster: await paymaster.getAddress(),
+    // Hardhat account #3: signs sponsorship approvals.
+    sponsorKey: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+    // Hardhat account #4: submits handleOps, as a bundler's operational key.
+    bundlerKey: "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
     settlementPeriod: Number(await integrator.SETTLEMENT_PERIOD()),
   };
 
