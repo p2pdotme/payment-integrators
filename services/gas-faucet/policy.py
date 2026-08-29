@@ -17,8 +17,9 @@ class Limits:
 
     #: Gas units a full first journey burns — attestation, buy, mark-paid.
     gas_units: int
-    #: Multiple of the current base fee to fund, so a fee rise mid-journey
-    #: doesn't strand a user halfway through with a half-finished order.
+    #: Base-fee MULTIPLE the drip provisions for — a wallet's maxFeePerGas is
+    #: roughly `base_fee * this + a fixed priority tip`, so this is the
+    #: proportional half of that fee model.
     safety_factor: int
     #: Clamp on the computed target. The ceiling is the important one: it is
     #: what stops a gas spike turning each drip into a real amount of money.
@@ -32,6 +33,14 @@ class Limits:
     max_wei_per_nullifier: int
     #: Whole-faucet circuit breaker.
     max_wei_global: int
+    #: Fixed priority-tip a consumer wallet adds ON TOP of the base fee, in
+    #: wei-per-gas. This is the ADDITIVE half of the wallet's fee model, and at
+    #: Base's floor base fee (~0.005 gwei) it DOMINATES: a wallet's maxFeePerGas
+    #: is mostly this tip, not the base fee. A pure `base_fee * multiple` drip
+    #: has no term for it and so systematically under-funds when base fee is low
+    #: — no constant multiple can track a fixed additive as base fee varies.
+    #: `0` reproduces the old pure-multiple formula exactly (used for rollback).
+    wallet_tip_wei: int = 0
 
 
 @dataclass(frozen=True)
@@ -49,8 +58,17 @@ def drip_target_wei(base_fee_wei: int, limits: Limits) -> int:
     exact failure this service exists to prevent) and needlessly generous the
     rest of the time. Clamped at both ends so neither a zero-fee read nor a
     spike can distort it.
+
+    Modelled on what a WALLET actually charges to sign — `gas_units * per_gas`,
+    where `per_gas = base_fee * multiple + priority_tip` — rather than the
+    naive `base_fee * gas_units * multiple`. The tip term is the fix: at Base's
+    floor base fee the tip is most of the fee, so a pure-multiple drip lands
+    below what any wallet (MetaMask especially) demands to sign, and no
+    constant multiple can cover it across base-fee levels. With
+    `wallet_tip_wei == 0` this reduces to the old formula exactly.
     """
-    target = base_fee_wei * limits.gas_units * limits.safety_factor
+    per_gas = base_fee_wei * limits.safety_factor + limits.wallet_tip_wei
+    target = limits.gas_units * per_gas
     return max(limits.min_target, min(target, limits.max_target))
 
 

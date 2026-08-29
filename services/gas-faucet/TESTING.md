@@ -130,10 +130,12 @@ endpoint, not a treasury.
 > a 0.02 ETH float, `FAUCET_MAX_WEI_GLOBAL=10000000000000000` (0.01 ETH/day,
 > ~330 wallets) leaves a day of headroom either way.
 
-Watch the balance:
+Watch the balance (the token goes in a header — a query string would land in
+every access log between you and the service):
 
 ```bash
-curl -s https://<faucet>/healthz | jq '{funder, funderBalanceWei, spentTodayWei}'
+curl -s -H "X-Ops-Token: $FAUCET_OPS_TOKEN" https://<faucet>/v1/ops/health \
+  | jq '{funder, funderBalanceWei, spentTodayWei, globalCapWei}'
 ```
 
 ## Deploying to Railway
@@ -154,7 +156,7 @@ railway variables \
   --set 'ALLOWED_ORIGIN_REGEX=^https://own-app-[a-z0-9-]+\.vercel\.app$'
 
 railway domain            # public URL
-curl -s https://<url>/healthz | jq .funder    # ← fund this address
+curl -s -H "X-Ops-Token: <token>" https://<url>/v1/ops/health | jq .funder   # ← fund this address
 ```
 
 Two things that will bite otherwise:

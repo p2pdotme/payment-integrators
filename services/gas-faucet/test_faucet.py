@@ -73,6 +73,60 @@ class TestDripTarget:
         assert floor_wei(30_000_000_000_000) == 15_000_000_000_000
 
 
+class TestDripCoversTheWalletTip:
+    """The drip must cover what a WALLET charges to sign: `gas ×
+    (base_fee × multiple + priority_tip)`. At Base's floor base fee the tip is
+    most of that, so a pure `base_fee × multiple` drip lands short — this is the
+    bug that stranded no-gas MetaMask wallets. These pin the tip term.
+    """
+
+    TIP = 20_000_000  # 0.02 gwei — a consumer wallet's priority floor
+    L = Limits(
+        gas_units=2_200_000,
+        safety_factor=2,
+        wallet_tip_wei=TIP,
+        min_target=10_000_000_000_000,
+        max_target=400_000_000_000_000,
+        max_drips_per_wallet=4,
+        max_wei_per_wallet=800_000_000_000_000,
+        max_wei_per_nullifier=1_600_000_000_000_000,
+        max_wei_global=200_000_000_000_000_000,
+    )
+
+    def test_target_adds_the_tip_term_on_top_of_the_multiple(self):
+        base = 5_000_000  # Base's floor base fee
+        pure = self.L.gas_units * base * self.L.safety_factor  # old formula
+        assert drip_target_wei(base, self.L) == pure + self.L.gas_units * self.TIP
+
+    def test_one_drip_covers_a_wallets_buyusdc_reservation_at_the_floor(self):
+        # A ~2M-gas buyUsdc priced at maxFee = base×2 + tip must be affordable
+        # from a single drip — the whole point of the fix.
+        base = 5_000_000
+        reservation = 2_000_000 * (base * self.L.safety_factor + self.TIP)
+        assert drip_target_wei(base, self.L) >= reservation
+
+    def test_tip_still_funds_a_usable_amount_when_base_fee_reads_zero(self):
+        # Even at base_fee 0 the tip alone provisions a real amount, where the
+        # old formula collapsed to just min_target.
+        assert drip_target_wei(0, self.L) == self.L.gas_units * self.TIP
+
+    def test_tip_zero_reproduces_the_old_pure_multiple_formula(self):
+        # The rollback guarantee: tip=0 ⇒ identical to `base × gas × multiple`.
+        base = 5_000_000
+        old_style = Limits(
+            gas_units=1_500_000,
+            safety_factor=5,
+            wallet_tip_wei=0,
+            min_target=10_000_000_000_000,
+            max_target=400_000_000_000_000,
+            max_drips_per_wallet=4,
+            max_wei_per_wallet=800_000_000_000_000,
+            max_wei_per_nullifier=1_600_000_000_000_000,
+            max_wei_global=200_000_000_000_000_000,
+        )
+        assert drip_target_wei(base, old_style) == base * 1_500_000 * 5
+
+
 # ── the decision ────────────────────────────────────────────────────────────
 
 

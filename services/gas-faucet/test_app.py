@@ -720,8 +720,11 @@ class TestOpsTokenNoOracle:
         monkeypatch.setenv("FAUCET_OPS_TOKEN", "secret-value")
         # A non-ASCII guess used to raise TypeError -> 500, confirming the
         # token is configured. It must 404 exactly like a wrong ASCII guess.
-        assert client.get("/v1/ops/health", params={"token": "wrong"}).status_code == 404
-        assert client.get("/v1/ops/health", params={"token": "wröng"}).status_code == 404
+        # (bytes: httpx refuses to encode a non-ASCII str header; on the wire
+        # Starlette decodes it latin-1, which is the case under test.)
+        assert client.get("/v1/ops/health", headers={"X-Ops-Token": "wrong"}).status_code == 404
+        assert client.get("/v1/ops/health",
+                          headers={b"X-Ops-Token": "wröng".encode("latin-1")}).status_code == 404
 
 
 class TestRecordFeeByRow:
@@ -971,3 +974,382 @@ class TestSponsorRespectsTheFloat:
     def test_a_funded_float_still_sponsors(self, client, rpc):
         wallet = Account.create().address
         assert submit(client, wallet, sign(wallet)).json()["submitted"] is True
+
+
+# ── security review, 2026-08-24 ─────────────────────────────────────────────
+
+
+class TestNoSecretsInErrorBodies:
+    """H1. Every 502 carried str(exc), and httpx quotes the full RPC URL in
+    its errors — which, for a keyed provider endpoint, IS the API key. The
+    send-failure 502 echoed the node too, and a node refusing an underfunded
+    key says "insufficient funds ... have <balance>": the float, to anyone."""
+
+    def _rpc_with(self, handler):
+        import chain as chain_mod
+        import httpx
+
+        rpc = chain_mod.Rpc("http://provider.example/v2/SECRET-KEY")
+        rpc._client = httpx.Client(transport=httpx.MockTransport(handler))
+        return rpc, chain_mod
+
+    def test_a_transport_error_never_carries_the_rpc_url(self):
+        import httpx
+
+        rpc, chain_mod = self._rpc_with(lambda request: httpx.Response(429, text="slow down"))
+        with pytest.raises(chain_mod.ChainError) as caught:
+            rpc.call("eth_blockNumber", [])
+        assert caught.value.transport
+        assert "SECRET-KEY" not in str(caught.value)
+        assert "<rpc>" in str(caught.value), "the URL is replaced, not merely absent"
+
+    def test_a_non_json_body_is_a_transport_fault_not_a_500(self):
+        # L3. A proxy's HTML error page on a 200 used to raise JSONDecodeError
+        # past every `except ChainError`.
+        import httpx
+
+        rpc, chain_mod = self._rpc_with(lambda request: httpx.Response(200, text="<html>oops"))
+        with pytest.raises(chain_mod.ChainError) as caught:
+            rpc.call("eth_blockNumber", [])
+        assert caught.value.transport
+
+    def test_a_null_quantity_is_a_transport_fault_not_a_500(self):
+        import httpx
+
+        rpc, chain_mod = self._rpc_with(
+            lambda request: httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": None})
+        )
+        with pytest.raises(chain_mod.ChainError) as caught:
+            rpc.balance(Account.create().address)
+        assert caught.value.transport
+
+    def test_a_502_body_is_a_fixed_word(self, client, rpc):
+        rpc.fail_reads = True
+        r = req(client, Account.create().address)
+        assert r.status_code == 502
+        assert r.json()["detail"] == "chain_unreachable"
+
+    def test_a_failed_send_does_not_echo_the_node(self, client, rpc, monkeypatch):
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+
+        def broke(**k):
+            raise faucet.ChainError(
+                "insufficient funds for gas * price + value: have 12345 want 99999"
+            )
+
+        monkeypatch.setattr(rpc, "send_value", broke)
+        r = req(client, w)
+        assert r.status_code == 502
+        assert r.json()["detail"] == "send_failed"
+        assert "12345" not in r.text
+
+
+class TestOpsTokenInHeader:
+    """H2. A `?token=` query string is written to the edge access log, browser
+    history and every proxy's log. The header is not."""
+
+    def test_the_query_string_is_no_longer_a_credential(self, client, rpc, monkeypatch):
+        monkeypatch.setenv("FAUCET_OPS_TOKEN", "secret-value")
+        assert client.get("/v1/ops/health", params={"token": "secret-value"}).status_code == 404
+
+    def test_a_bearer_header_is_accepted(self, client, rpc, monkeypatch):
+        monkeypatch.setenv("FAUCET_OPS_TOKEN", "secret-value")
+        r = client.get("/v1/ops/health", headers={"Authorization": "Bearer secret-value"})
+        assert r.status_code == 200
+        assert r.json()["funder"] == faucet._ACCOUNT.address
+
+    def test_an_x_ops_token_header_is_accepted(self, client, rpc, monkeypatch):
+        monkeypatch.setenv("FAUCET_OPS_TOKEN", "secret-value")
+        r = client.get("/v1/ops/health", headers={"X-Ops-Token": "secret-value"})
+        assert r.status_code == 200
+
+    def test_guessing_is_rate_limited(self, client, monkeypatch):
+        monkeypatch.setenv("FAUCET_OPS_TOKEN", "secret-value")
+        monkeypatch.setattr(faucet, "RATE_IP_PER_MIN", 3)
+        codes = [
+            client.get("/v1/ops/health", headers={"X-Ops-Token": f"guess{i}"}).status_code
+            for i in range(5)
+        ]
+        assert codes == [404, 404, 404, 429, 429]
+
+
+class TestForwardedFor:
+    """M2. The leftmost X-Forwarded-For hop is whatever the client wrote; only
+    the rightmost TRUSTED_PROXIES hops came from something we trust."""
+
+    def _status(self, client, xff, wallet=None):
+        return client.get(
+            "/v1/gas/status",
+            params={"chainId": CHAIN, "integrator": INTEG,
+                    "wallet": wallet or Account.create().address},
+            headers={"x-forwarded-for": xff},
+        ).status_code
+
+    def test_the_leftmost_hop_cannot_pick_the_limit_key(self, client, rpc, monkeypatch):
+        monkeypatch.setattr(faucet, "RATE_IP_PER_MIN", 2)
+        # Same real client behind the proxy, spoofing a fresh leftmost hop each
+        # time. Used to reset its own limiter with every request.
+        codes = [self._status(client, f"10.0.0.{i}, 203.0.113.9") for i in range(4)]
+        assert codes[2:] == [429, 429]
+
+    def test_distinct_clients_behind_the_proxy_are_limited_separately(self, client, rpc, monkeypatch):
+        monkeypatch.setattr(faucet, "RATE_IP_PER_MIN", 2)
+        codes = [self._status(client, f"1.1.1.1, 203.0.113.{i % 2}") for i in range(4)]
+        assert codes == [200, 200, 200, 200]
+
+    def test_with_no_proxy_the_header_is_ignored(self, client, rpc, monkeypatch):
+        monkeypatch.setattr(faucet, "TRUSTED_PROXIES", 0)
+        monkeypatch.setattr(faucet, "RATE_IP_PER_MIN", 2)
+        codes = [self._status(client, f"203.0.113.{i}") for i in range(4)]
+        assert codes[2:] == [429, 429], "rotating the header must not rotate the key"
+
+    def test_status_is_limited_per_wallet_too(self, client, rpc, monkeypatch):
+        monkeypatch.setattr(faucet, "RATE_WALLET_PER_MIN", 2)
+        w = Account.create().address
+        # A different trusted hop every time, so only the wallet key can trip.
+        codes = [self._status(client, f"203.0.113.{i}", wallet=w) for i in range(4)]
+        assert codes[2:] == [429, 429]
+
+
+class TestRateBucketEviction:
+    def test_a_hot_key_survives_a_flood_of_fresh_keys(self, monkeypatch):
+        # M3. Insertion-order eviction dropped the OLDEST bucket first — the
+        # very key being hammered, created before the flood — so the flood
+        # un-throttled it. LRU keeps whatever is still being touched.
+        monkeypatch.setattr(faucet, "_RATE_MAX_BUCKETS", 5)
+        for _ in range(3):
+            faucet._over_limit("hot", 3)
+        for i in range(50):
+            faucet._over_limit(f"cold{i}", 3)
+            assert faucet._over_limit("hot", 3) is True, f"hot key lost its history at {i}"
+        assert len(faucet._RATE_BUCKETS) <= 5
+
+
+class TestInputBounds:
+    """M5. Unbounded string fields were accepted by the schema and handed to
+    bytes.fromhex — CPU and memory on input that can never be valid."""
+
+    def test_an_oversized_nullifier_is_refused_at_the_schema(self, client, rpc):
+        w = Account.create().address
+        att = sign(w)
+        att["nullifier"] = "0x" + "ab" * 50_000
+        r = submit(client, w, att)
+        assert 400 <= r.status_code < 500
+        assert getattr(rpc, "sent_calls", []) == []
+
+    def test_an_oversized_signature_is_refused_at_the_schema(self, client, rpc):
+        w = Account.create().address
+        att = sign(w)
+        att["signature"] = "0x" + "ab" * 50_000
+        assert 400 <= submit(client, w, att).status_code < 500
+
+    def test_an_oversized_wallet_is_refused_on_every_endpoint(self, client, rpc):
+        huge = "0x" + "a" * 50_000
+        assert 400 <= client.post("/v1/gas/request", json={
+            "chainId": CHAIN, "integrator": INTEG, "wallet": huge}).status_code < 500
+        assert 400 <= client.get("/v1/gas/status", params={
+            "chainId": CHAIN, "integrator": INTEG, "wallet": huge}).status_code < 500
+
+    def test_the_encoder_checks_length_before_decoding(self, monkeypatch):
+        decoded = []
+        real = bytes.fromhex
+        # Shadow the builtin inside the module so the call is observable.
+        monkeypatch.setattr(faucet, "bytes", type("B", (), {"fromhex": staticmethod(
+            lambda h: decoded.append(len(h)) or real(h))}), raising=False)
+        with pytest.raises(HTTPException) as caught:
+            faucet._encode_submit(Account.create().address, "ab" * 40, 1, 2, "0x" + "11" * 65)
+        assert caught.value.status_code == 400
+        assert decoded == [], "an over-long value must not reach the decoder"
+
+
+class TestReceiptParsing:
+    """M1. The `status` parse sat outside the inner try: a node answering with
+    a malformed status raised ValueError out of the wait — after the money had
+    moved — as a 500, and on the sponsor path past the marker release."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        monkeypatch.setattr(faucet.time, "sleep", lambda s: None)
+
+    def test_a_malformed_status_is_pending_not_a_500(self, client, rpc):
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        rpc.receipt_status = "not-hex"
+        r = req(client, w)
+        assert r.status_code == 200
+        assert r.json()["funded"] is True and r.json()["pending"] is True
+
+    def test_a_malformed_receipt_on_submit_releases_the_marker(self, client, rpc):
+        w = Account.create().address
+        rpc.receipt_status = "garbage"
+        r = submit(client, w, sign(w))
+        assert r.status_code == 200
+        assert faucet._SUBMITS_IN_FLIGHT == set()
+
+    def test_an_exception_in_the_wait_still_releases_the_marker(self, client, rpc, monkeypatch):
+        def explode(rpc_, tx_hash, **k):
+            raise RuntimeError("anything at all")
+
+        monkeypatch.setattr(faucet, "_await_receipt", explode)
+        w = Account.create().address
+        with pytest.raises(RuntimeError):
+            submit(client, w, sign(w))
+        assert faucet._SUBMITS_IN_FLIGHT == set(), "the marker outlived the request"
+
+
+class TestFeeClamp:
+    def test_an_absurd_receipt_fee_cannot_trip_the_breaker(self, client, rpc):
+        # L2. A hostile or broken RPC reporting a 10^24 wei fee used to book
+        # it verbatim, tripping the global breaker from the read side.
+        import chain as chain_mod
+
+        rpc.receipt_gas_used = hex(10**12)
+        rpc.receipt_gas_price = hex(10**12)
+        w = Account.create().address
+        rpc.verified.add(w.lower())
+        assert req(client, w).json()["funded"] is True
+        row = faucet.STORE._conn.execute(
+            "SELECT fee_wei FROM drips WHERE wallet = ?", (w.lower(),)
+        ).fetchone()
+        assert row[0] == str(chain_mod.max_transfer_fee_wei())
+        # and the next wallet is still served
+        w2 = Account.create().address
+        rpc.verified.add(w2.lower())
+        assert req(client, w2).json()["funded"] is True
+
+    def test_the_ledger_refuses_a_negative_or_overflowing_fee(self, store_direct):
+        a = store_direct.reserve(chain_id=CHAIN, wallet="0xA", nullifier=None, amount_wei=1)
+        store_direct.record_fee(a, -5)
+        assert store_direct._conn.execute("SELECT fee_wei FROM drips WHERE id=?", (a,)).fetchone()[0] == "0"
+        store_direct.record_fee(a, 10**30)
+        assert int(store_direct._conn.execute("SELECT fee_wei FROM drips WHERE id=?", (a,)).fetchone()[0]) == 2**63 - 1
+
+
+class TestRevertSelectorMatching:
+    def test_the_contract_errors_the_table_missed_decode(self):
+        # L5. Both are real reverts of submitPassportAttestation.
+        from eth_utils import keccak
+
+        for err, name in [("InvalidLimit", "invalid_limit"),
+                          ("AttestationWindowTooLong", "attestation_window_too_long")]:
+            sel = "0x" + keccak(text=err + "()")[:4].hex()
+            assert faucet._submit_reason(f"eth_call: execution reverted data={sel}") == name
+
+    def test_a_selector_buried_inside_other_hex_is_not_a_match(self):
+        # L6. Eight hex characters recur by chance inside signatures and
+        # addresses; a substring match mislabelled such reverts.
+        sel = list(faucet._SUBMIT_ERRORS)[0][2:]
+        blob = "0x" + "12" * 20 + sel + "00" * 8
+        assert faucet._submit_reason(f"execution reverted data={blob}") == "simulation_reverted"
+
+    def test_a_selector_at_the_head_of_the_data_matches(self):
+        sel = list(faucet._SUBMIT_ERRORS)[0]
+        assert faucet._submit_reason(
+            f"execution reverted data={sel}{'00' * 32}") == "nullifier_already_spent"
+        assert faucet._submit_reason(f"execution reverted: {sel[2:]}") == "nullifier_already_spent"
+
+
+class TestStatusHidesTheFloat:
+    """L1. /v1/gas/status needs no verified wallet, so through it the float's
+    emptiness and the breaker's state were a public gauge."""
+
+    def _status(self, client):
+        return client.get("/v1/gas/status", params={
+            "chainId": CHAIN, "integrator": INTEG, "wallet": Account.create().address}).json()
+
+    def test_an_empty_float_is_not_announced(self, client, rpc):
+        rpc.funder_wei = 1
+        body = self._status(client)
+        assert body["wouldFund"] is False
+        assert body["reason"] == "temporarily_unavailable"
+
+    def test_a_tripped_breaker_is_not_announced(self, client, rpc, monkeypatch):
+        monkeypatch.setattr(faucet, "LIMITS", faucet.LIMITS.__class__(
+            **{**faucet.LIMITS.__dict__, "max_wei_global": 0}))
+        assert self._status(client)["reason"] == "temporarily_unavailable"
+
+    def test_wallet_side_reasons_are_still_named(self, client, rpc):
+        w = Account.create().address
+        rpc.balances[w.lower()] = 10**18
+        body = client.get("/v1/gas/status", params={
+            "chainId": CHAIN, "integrator": INTEG, "wallet": w}).json()
+        assert body["reason"] == "sufficient_balance"
+
+
+class TestNonceTracking:
+    """L4. Both spend paths release the lock before the receipt wait, so a
+    second send can follow within a second; an RPC whose pending count lags
+    the first broadcast then hands out the same nonce twice."""
+
+    def _rpc(self, pending):
+        import chain as chain_mod
+
+        rpc = chain_mod.Rpc("http://x")
+        sent: list[str] = []
+
+        def call(m, p):
+            if m == "eth_getTransactionCount":
+                return hex(pending[0])
+            if m == "eth_sendRawTransaction":
+                sent.append(p[0])
+                return "0x" + "ab" * 32
+            if m == "eth_getCode":
+                return "0x"
+            return "0x0"
+
+        rpc.call = call
+        return rpc, sent
+
+    @staticmethod
+    def _nonces(sent):
+        import rlp
+
+        # type-2 tx: 0x02 || rlp([chainId, nonce, ...]); nonce is field 1
+        return [int.from_bytes(rlp.decode(bytes.fromhex(r[2:])[1:])[1], "big") for r in sent]
+
+    def _send(self, rpc):
+        rpc.send_value(account=faucet._ACCOUNT, to=Account.create().address,
+                       amount_wei=1, chain_id=CHAIN, base_fee=5_000_000)
+
+    def test_a_lagging_pending_count_does_not_reuse_a_nonce(self):
+        rpc, sent = self._rpc([5])
+        self._send(rpc)
+        self._send(rpc)  # the node still says 5
+        assert self._nonces(sent) == [5, 6]
+
+    def test_the_node_wins_when_it_is_ahead(self):
+        # An operator sending from the key by hand, or a restart: re-sync.
+        pending = [5]
+        rpc, sent = self._rpc(pending)
+        self._send(rpc)
+        pending[0] = 9
+        self._send(rpc)
+        assert self._nonces(sent) == [5, 9]
+
+    def test_a_nonce_refusal_forgets_the_local_view(self):
+        pending = [5]
+        rpc, sent = self._rpc(pending)
+        self._send(rpc)  # local view is now 6
+        healthy = rpc.call
+
+        def refusing(m, p):
+            if m == "eth_sendRawTransaction":
+                raise faucet.ChainError("eth_sendRawTransaction: nonce too low")
+            return healthy(m, p)
+
+        rpc.call = refusing
+        with pytest.raises(faucet.ChainError):
+            self._send(rpc)
+        rpc.call = healthy
+        pending[0] = 3  # the node's word, after a reorg or a drop
+        self._send(rpc)
+        assert self._nonces(sent)[-1] == 3, "a stale local view must not walk ahead"
+
+    def test_the_submit_path_shares_the_tracker(self):
+        rpc, sent = self._rpc([5])
+        data = faucet.SEL_SUBMIT_ATTESTATION + "00" * 100
+        rpc.call = (lambda orig: (lambda m, p: hex(150_000) if m == "eth_estimateGas" else orig(m, p)))(rpc.call)
+        rpc.send_call(account=faucet._ACCOUNT, to=INTEG, data=data, chain_id=CHAIN, base_fee=5_000_000)
+        self._send(rpc)
+        assert self._nonces(sent) == [5, 6]

@@ -52,15 +52,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from eth_utils import to_checksum_address
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -73,6 +74,8 @@ from chain import (
     Rpc,
     account_from_key,
     fee_ceiling_wei,
+    max_submit_fee_wei,
+    max_transfer_fee_wei,
     submit_fee_ceiling_wei,
 )
 from policy import Decision, Limits, decide, drip_target_wei, floor_wei
@@ -181,6 +184,11 @@ LIMITS = Limits(
     # themselves anyway, at double the price on every cap and half the float's
     # lifetime. (Review finding: the size was asserted, never argued.)
     safety_factor=_int_env("FAUCET_SAFETY_FACTOR", 2),
+    # The fixed priority tip a wallet adds on top of base fee, per gas. At
+    # Base's floor base fee this is most of what a wallet charges to sign, so
+    # the drip must provision it explicitly; a base-fee multiple alone can't.
+    # Default 0 keeps the old pure-multiple sizing until the env sets it.
+    wallet_tip_wei=_int_env("FAUCET_WALLET_TIP_WEI", 0),
     # Floors and ceilings in wei. At Base's usual 0.005 gwei the target lands
     # near 1.5e13 (~$0.03, ~2 journeys); the floor is the fee-spike safety net
     # and the ceiling stops a spike scaling the drip freely.
@@ -263,42 +271,71 @@ def _integrator_paused(integrator: Integrator, rpc: Rpc) -> bool:
 RATE_IP_PER_MIN = _int_env("FAUCET_RATE_IP_PER_MIN", 60)
 RATE_WALLET_PER_MIN = _int_env("FAUCET_RATE_WALLET_PER_MIN", 12)
 _RATE_LOCK = threading.Lock()
-_RATE_BUCKETS: dict[str, deque] = {}
+#: Ordered least-recently-TOUCHED first, so eviction under a flood drops the
+#: idle buckets rather than the oldest. Insertion-order eviction — the previous
+#: version — evicted the busiest, longest-lived keys first: exactly the wallet
+#: being hammered, whose bucket was created earliest, lost its history to a
+#: flood of fresh keys and was un-throttled by the very traffic it should
+#: have been throttled against.
+_RATE_BUCKETS: OrderedDict[str, deque] = OrderedDict()
 
 
-#: Hard cap on distinct rate buckets. A flood of fresh keys (the X-Forwarded-
-#: -For header rotates freely — this is throttling, not a security control)
-#: cannot grow the map without bound, and cannot make eviction an O(n) scan
-#: run inside the lock on every request: the old "evict only 60s-idle buckets"
-#: selected nothing during exactly such a flood while the scan ran anyway.
+#: Hard cap on distinct rate buckets. A flood of fresh keys cannot grow the
+#: map without bound, and cannot make eviction an O(n) scan run inside the
+#: lock on every request: the old "evict only 60s-idle buckets" selected
+#: nothing during exactly such a flood while the scan ran anyway.
 _RATE_MAX_BUCKETS = int(os.environ.get("FAUCET_RATE_MAX_BUCKETS", 20_000))
 
 
 def _over_limit(key: str, limit: int) -> bool:
     now = time.time()
     with _RATE_LOCK:
-        bucket = _RATE_BUCKETS.setdefault(key, deque())
+        bucket = _RATE_BUCKETS.get(key)
+        if bucket is None:
+            bucket = _RATE_BUCKETS[key] = deque()
+        else:
+            _RATE_BUCKETS.move_to_end(key)  # touched: it is the newest now
         while bucket and bucket[0] <= now - 60:
             bucket.popleft()
         if len(bucket) >= limit:
             return True
         bucket.append(now)
-        # O(1) amortised: when full, drop THIS key's own now-stale neighbours
-        # is not enough under a fresh-key flood, so evict in insertion order
-        # (dicts preserve it) until back under the cap. Bounded work per call.
+        # Bounded work per call: pop least-recently-touched until under the
+        # cap. The key just touched sits at the end, so it is never the victim
+        # unless it is the only entry, which the cap check excludes.
         while len(_RATE_BUCKETS) > _RATE_MAX_BUCKETS:
-            oldest_key = next(iter(_RATE_BUCKETS))
-            if oldest_key == key:  # never evict the bucket we just touched
+            oldest_key, _ = _RATE_BUCKETS.popitem(last=False)
+            if oldest_key == key:  # defensive; unreachable with cap >= 1
+                _RATE_BUCKETS[key] = bucket
                 break
-            del _RATE_BUCKETS[oldest_key]
     return False
 
 
+#: How many proxies in front of this process append to X-Forwarded-For.
+#: Railway's edge is one. The header is a comma-separated chain where each
+#: proxy APPENDS the address it saw, so only the last `n` entries were written
+#: by something trusted — everything to their left is the client's own claim.
+#: Reading the LEFTMOST entry (the old behaviour) let any caller pick its own
+#: rate-limit key per request, which made the per-IP limiter a formality.
+#: 0 = no proxy, ignore the header and use the socket peer.
+TRUSTED_PROXIES = _int_env("FAUCET_TRUSTED_PROXIES", 1)
+
+
 def _client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    if TRUSTED_PROXIES <= 0:
+        return peer
     forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    if not forwarded:
+        return peer
+    hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+    if len(hops) < TRUSTED_PROXIES:
+        # Fewer hops than trusted proxies: the header did not come through
+        # the proxies we expect, so it is not evidence of anything.
+        return peer
+    # Count TRUSTED_PROXIES entries in from the right: the first proxy wrote
+    # the client it saw as the entry TRUSTED_PROXIES-th from the end.
+    return hops[-TRUSTED_PROXIES]
 
 
 # ── float alerting ───────────────────────────────────────────────────────────
@@ -348,6 +385,16 @@ def _announce() -> None:
         )
     if not _ACCOUNT:
         log.error(_event("misconfigured", detail="FAUCET_PRIVATE_KEY unset; every request 503s"))
+    if not os.environ.get("FAUCET_MAX_WEI_GLOBAL"):
+        # The default is sized for a float far larger than any this service
+        # is meant to hold, so at the default the breaker cannot trip before
+        # the wallet simply runs dry — the silent failure, not the legible
+        # one. Deploys should size it to the float actually loaded.
+        log.warning(
+            _event("misconfigured",
+                   detail="FAUCET_MAX_WEI_GLOBAL unset; the global breaker is at its "
+                          f"default of {LIMITS.max_wei_global} wei/day, size it to the float")
+        )
 
 
 @asynccontextmanager
@@ -378,6 +425,16 @@ if ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX:
     )
 
 
+#: Bounds on the request's hex fields, in characters, so the body is rejected
+#: at the schema before anything decodes it. A checksummed address is 42; a
+#: bytes32 is 64 plus "0x"; a 65-byte signature is 130 plus "0x". Without a
+#: bound, a multi-megabyte "nullifier" is accepted by the schema and handed
+#: to bytes.fromhex — CPU and memory spent on input that can never be valid.
+ADDRESS_MAX_LEN = 42
+NULLIFIER_MAX_LEN = 66
+SIGNATURE_MAX_LEN = 132
+
+
 class SubmitRequest(BaseModel):
     """POST /v1/attestation — sponsor a verification on-chain.
 
@@ -390,12 +447,12 @@ class SubmitRequest(BaseModel):
     """
 
     chainId: int
-    integrator: str
-    wallet: str
-    nullifier: str
+    integrator: str = Field(max_length=ADDRESS_MAX_LEN)
+    wallet: str = Field(max_length=ADDRESS_MAX_LEN)
+    nullifier: str = Field(max_length=NULLIFIER_MAX_LEN)
     limit: int
     expiry: int
-    signature: str
+    signature: str = Field(max_length=SIGNATURE_MAX_LEN)
 
 
 class SubmitResponse(BaseModel):
@@ -407,8 +464,8 @@ class SubmitResponse(BaseModel):
 
 class GasRequest(BaseModel):
     chainId: int
-    integrator: str
-    wallet: str
+    integrator: str = Field(max_length=ADDRESS_MAX_LEN)
+    wallet: str = Field(max_length=ADDRESS_MAX_LEN)
 
 
 class GasResponse(BaseModel):
@@ -435,14 +492,38 @@ def healthz() -> dict:
     return {"status": "ok" if _ACCOUNT else "no_key"}
 
 
+def _ops_token(request: Request) -> str:
+    """The presented ops token, from a header only.
+
+    It used to be a `?token=` query parameter. Query strings are written to
+    the edge's HTTP access log, to browser history, to any proxy in between
+    and to the Referer of anything the page loads — so the secret that guards
+    the funder's balance and the day's spend was being recorded, in plain
+    text, by every system that saw the request. Headers are not.
+    """
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.headers.get("x-ops-token", "").strip()
+
+
 @app.get("/v1/ops/health")
-def ops_health(token: str = "") -> dict:
+def ops_health(request: Request) -> dict:
     """The operational numbers, behind a shared secret.
 
+    Send it as `Authorization: Bearer <token>` or `X-Ops-Token: <token>`.
     Unavailable rather than public when FAUCET_OPS_TOKEN is unset, because a
     default-open operational endpoint is how the previous version leaked.
     """
+    # The same per-IP window as every other endpoint. A 404 is cheap to
+    # produce, which is exactly what makes an unthrottled guess loop cheap
+    # to run; this bounds it to the documented request rate.
+    ip = _client_ip(request)
+    if _over_limit(f"ip:{ip}", RATE_IP_PER_MIN):
+        raise HTTPException(429, "rate_limited")
+
     expected = os.environ.get("FAUCET_OPS_TOKEN", "")
+    token = _ops_token(request)
     # Compare bytes, not str: secrets.compare_digest raises TypeError on a
     # non-ASCII str, and that 500 (vs the 404 a wrong ASCII token gets)
     # confirms FAUCET_OPS_TOKEN is set — an oracle defeating the endpoint's
@@ -491,7 +572,7 @@ def _authorise(integrator: Integrator, rpc: Rpc, wallet: str) -> None:
         is_blocked = rpc.read_bool(integrator.address, SEL_BLOCKED, wallet)
     except ChainError as exc:
         log.error(_event("chain_unreachable", detail=str(exc)))
-        raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+        raise HTTPException(502, "chain_unreachable") from exc
     if is_blocked:
         log.warning(
             _event("refused", reason="wallet_blocked", wallet=_short(wallet),
@@ -504,7 +585,7 @@ def _authorise(integrator: Integrator, rpc: Rpc, wallet: str) -> None:
             return
     except ChainError as exc:
         log.error(_event("chain_unreachable", detail=str(exc)))
-        raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+        raise HTTPException(502, "chain_unreachable") from exc
 
     log.info(
         _event("refused", reason="not_verified", wallet=_short(wallet),
@@ -526,15 +607,24 @@ _SUBMIT_ERRORS = {
         ("AttestorNotSet", "attestor_not_set"),
         ("InvalidAddress", "invalid_wallet"),
         ("ContractPaused", "contract_paused"),
+        ("InvalidLimit", "invalid_limit"),
+        ("AttestationWindowTooLong", "attestation_window_too_long"),
     ]
 }
+
+#: Every hex run in a message, with or without a 0x prefix. A custom-error
+#: selector is the FIRST four bytes of revert data, so it is matched only at
+#: the start of such a run — never as a substring somewhere inside a longer
+#: hex blob (a signature, an address, an unrelated error's arguments), where
+#: eight hex characters recur by chance often enough to mislabel a revert.
+_HEX_RUN = re.compile(r"(?:0x)?([0-9a-f]{8,})")
 
 
 def _submit_reason(detail: str) -> str:
     """Map a revert's error selector, if present in the RPC message, to a name."""
-    lowered = detail.lower()
-    for selector, name in _SUBMIT_ERRORS.items():
-        if selector[2:] in lowered:
+    for run in _HEX_RUN.finditer(detail.lower()):
+        name = _SUBMIT_ERRORS.get("0x" + run.group(1)[:8])
+        if name:
             return name
     return "simulation_reverted"
 
@@ -570,10 +660,14 @@ def _encode_submit(wallet: str, nullifier: str, limit: int, expiry: int, signatu
     # all, was concatenated into the calldata while a 31-byte value became the
     # ledger's per-human key. Validate one form, use the other, and the two
     # disagree exactly where it is hardest to notice.
+    nul_raw = nullifier[2:] if nullifier.lower().startswith("0x") else nullifier
+    if len(nul_raw) > 64:
+        # Cheap character bound BEFORE the decode, so an oversized value is
+        # refused for the price of a len(); the byte check below is still
+        # the one that decides validity.
+        raise HTTPException(400, "bad_nullifier: must be 32 bytes")
     try:
-        nul_bytes = bytes.fromhex(
-            nullifier[2:] if nullifier.lower().startswith("0x") else nullifier
-        )
+        nul_bytes = bytes.fromhex(nul_raw)
     except ValueError as exc:
         raise HTTPException(400, f"bad_nullifier: {exc}") from exc
     if len(nul_bytes) != 32:
@@ -592,6 +686,8 @@ def _encode_submit(wallet: str, nullifier: str, limit: int, expiry: int, signatu
         # yields >64 hex chars and nibble-shifts every field after it.
         raise HTTPException(400, "bad_attestation: field out of uint256 range")
     sig = (signature[2:] if signature.lower().startswith("0x") else signature).lower()
+    if len(sig) > 130:
+        raise HTTPException(400, "bad_signature: must be 65 bytes")
     try:
         sig_bytes = bytes.fromhex(sig)
     except ValueError as exc:
@@ -676,7 +772,7 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
             raise HTTPException(403, "wallet_blocked")
     except ChainError as exc:
         log.error(_event("chain_unreachable", detail=str(exc)))
-        raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+        raise HTTPException(502, "chain_unreachable") from exc
 
     if STORE.usage(wallet="0x", nullifier=None).global_wei >= LIMITS.max_wei_global:
         log.warning(_event("refused", reason="global_daily_budget_reached",
@@ -697,7 +793,7 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
         # indistinguishable from every bad signature.
         if getattr(exc, "transport", False):
             log.error(_event("chain_unreachable", detail=str(exc)))
-            raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+            raise HTTPException(502, "chain_unreachable") from exc
         reason = _submit_reason(str(exc))
         log.info(
             _event("refused", reason=reason, wallet=_short(wallet),
@@ -722,7 +818,7 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
             funder_balance = rpc.balance(_ACCOUNT.address)
         except ChainError as exc:
             log.error(_event("chain_unreachable", detail=str(exc)))
-            raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+            raise HTTPException(502, "chain_unreachable") from exc
 
         # The breaker again, now that the lock is held. The read above the
         # simulate is a fast path that saves an eth_call; this one is the
@@ -785,7 +881,7 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
                     _event("sponsor_send_failed", wallet=_short(wallet),
                            integrator=integrator.label, detail=str(exc))
                 )
-                raise HTTPException(502, f"send_failed: {exc}") from exc
+                raise HTTPException(502, "send_failed") from exc
         except BaseException:
             # Nothing was broadcast, so the marker must not outlive the attempt.
             # It used to be released only on a send failure, which left the
@@ -805,17 +901,17 @@ def submit_attestation(req: SubmitRequest, request: Request) -> SubmitResponse:
                        tx=_short(tx_hash, 12), detail=str(exc))
             )
 
-    outcome, fee_wei = _await_receipt(rpc, tx_hash)
-    with _SEND_LOCK:
-        _SUBMITS_IN_FLIGHT.discard(canon)
-    if fee_wei:
-        try:
-            STORE.record_fee(drip_id, fee_wei)
-        except Exception as exc:
-            log.error(
-                _event("ledger_fee_failed", drip_id=drip_id,
-                       fee_wei=fee_wei, tx=_short(tx_hash, 12), detail=str(exc))
-            )
+    try:
+        outcome, fee_wei = _await_receipt(rpc, tx_hash)
+    finally:
+        # Whatever the wait does — including raise — the broadcast is done
+        # and the marker must go. It was released only on the straight-line
+        # path, so any exception out of the receipt wait held the nullifier
+        # for the life of the process: that person could not enrol again
+        # until a restart, and nothing said why.
+        with _SEND_LOCK:
+            _SUBMITS_IN_FLIGHT.discard(canon)
+    _book_fee(drip_id, fee_wei, max_submit_fee_wei(), tx_hash)
     log.info(
         _event("sponsored" if outcome != "failed" else "sponsor_reverted",
                wallet=_short(wallet), integrator=integrator.label,
@@ -890,7 +986,7 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
             funder_balance = rpc.balance(_ACCOUNT.address)
         except ChainError as exc:
             log.error(_event("chain_unreachable", detail=str(exc)))
-            raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+            raise HTTPException(502, "chain_unreachable") from exc
 
         target = drip_target_wei(base_fee, LIMITS)
 
@@ -1000,7 +1096,7 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
                        integrator=integrator.label, amount_wei=decision.amount,
                        detail=str(exc))
             )
-            raise HTTPException(502, f"send_failed: {exc}") from exc
+            raise HTTPException(502, "send_failed") from exc
 
         # Money moved and the slot is already claimed. Linking the tx is
         # best-effort: a failure costs only the hash and this row's later fee.
@@ -1020,14 +1116,7 @@ def request_gas(req: GasRequest, request: Request) -> GasResponse:
     # telling the caller `funded: true` when nothing moved is worse than
     # useless: it is the one signal they have, and it would be a lie.
     outcome, fee_wei = _await_receipt(rpc, tx_hash)
-    if fee_wei:
-        try:
-            STORE.record_fee(drip_id, fee_wei)
-        except Exception as exc:
-            log.error(
-                _event("ledger_fee_failed", drip_id=drip_id,
-                       fee_wei=fee_wei, tx=_short(tx_hash, 12), detail=str(exc))
-            )
+    _book_fee(drip_id, fee_wei, max_transfer_fee_wei(), tx_hash)
     log.info(
         _event("funded" if outcome != "failed" else "send_reverted",
                wallet=_short(wallet), integrator=integrator.label,
@@ -1080,14 +1169,64 @@ def _await_receipt(
                 return ("failed" if failed else "success", fee)
             if receipt is not None:
                 return ("success", 0)
-        except ChainError:
-            pass
+        except Exception as exc:  # noqa: BLE001 — see below
+            # Not only ChainError. The `status` parse above sat OUTSIDE the
+            # inner try, so a node answering with a malformed status raised
+            # ValueError straight out of this loop — after the money had
+            # moved — as a 500, and on the sponsor path past the marker
+            # release. Whatever the node sends, the answer here is "not
+            # confirmed yet": keep polling, then report pending.
+            # An unreachable node during the wait is ordinary and already
+            # logged where it matters; a receipt the node MANGLED is not.
+            log.log(logging.DEBUG if isinstance(exc, ChainError) else logging.WARNING,
+                    _event("receipt_unreadable", tx=_short(tx_hash, 12),
+                           detail=str(exc)[:200]))
         time.sleep(delay)
     return ("pending", 0)
 
 
+def _book_fee(drip_id: int, fee_wei: int, ceiling_wei: int, tx_hash: str) -> None:
+    """Record what a transaction cost, bounded by what it COULD have cost.
+
+    The fee comes from the receipt — the node's word. `gas * maxFeePerGas`
+    of the signed transaction is a hard ceiling on the real spend, so a fee
+    above it did not describe a transaction this service signed: a hostile or
+    broken RPC could otherwise book one absurd fee, trip the global breaker,
+    and switch the faucet off for the day from the read side. Clamped, and
+    the clamp is logged, so the oddity is visible without being effective.
+    """
+    if not fee_wei:
+        return
+    if fee_wei > ceiling_wei:
+        log.warning(
+            _event("fee_clamped", drip_id=drip_id, tx=_short(tx_hash, 12),
+                   reported_fee_wei=fee_wei, ceiling_wei=ceiling_wei)
+        )
+        fee_wei = ceiling_wei
+    try:
+        STORE.record_fee(drip_id, fee_wei)
+    except Exception as exc:
+        log.error(
+            _event("ledger_fee_failed", drip_id=drip_id,
+                   fee_wei=fee_wei, tx=_short(tx_hash, 12), detail=str(exc))
+        )
+
+
+#: Reasons that describe the FAUCET's state rather than the wallet's. The
+#: status endpoint needs no verified wallet, so through it these were a public
+#: gauge of "the float is empty" / "the day's budget is gone" — exactly the
+#: numbers /healthz stopped publishing. The funding path still returns them,
+#: to a caller who has at least established a verified wallet.
+_PRIVATE_REASONS = {"faucet_empty", "global_daily_budget_reached"}
+
+
 @app.get("/v1/gas/status")
-def status(chainId: int, integrator: str, wallet: str, request: Request) -> dict:
+def status(
+    chainId: int,
+    request: Request,
+    integrator: str = Query(max_length=ADDRESS_MAX_LEN),
+    wallet: str = Query(max_length=ADDRESS_MAX_LEN),
+) -> dict:
     """What the faucet would do for this wallet, without doing it.
 
     `wouldFund` runs the SAME `decide()` the funding path runs. It used to be
@@ -1108,6 +1247,12 @@ def status(chainId: int, integrator: str, wallet: str, request: Request) -> dict
         # from the faucet being broken.
         raise HTTPException(400, f"bad_address: {exc}") from exc
 
+    # Per-wallet as well as per-IP, like the money endpoints: this one costs
+    # three chain reads and used to have only the (spoofable) IP window. Its
+    # own key, so polling status never eats a wallet's funding-path budget.
+    if _over_limit(f"status:{wallet.lower()}", RATE_WALLET_PER_MIN):
+        raise HTTPException(429, "rate_limited")
+
     if integrator_key not in INTEGRATORS:
         raise HTTPException(403, "integrator_not_allowed")
 
@@ -1118,7 +1263,7 @@ def status(chainId: int, integrator: str, wallet: str, request: Request) -> dict
         funder_balance = rpc.balance(_ACCOUNT.address) if _ACCOUNT else 0
     except ChainError as exc:
         log.error(_event("chain_unreachable", detail=str(exc)))
-        raise HTTPException(502, f"chain_unreachable: {exc}") from exc
+        raise HTTPException(502, "chain_unreachable") from exc
 
     usage = STORE.usage(wallet=wallet, nullifier=STORE.nullifier_for(wallet), chain_id=chainId)
     decision = decide(
@@ -1131,12 +1276,15 @@ def status(chainId: int, integrator: str, wallet: str, request: Request) -> dict
         funder_balance=funder_balance,
         limits=LIMITS,
     )
+    reason = decision.reason
+    if reason in _PRIVATE_REASONS:
+        reason = "temporarily_unavailable"
     return {
         "balanceWei": str(balance),
         "targetWei": str(target),
         "floorWei": str(floor_wei(target)),
         "wouldFund": decision.fund,
-        "reason": decision.reason,
+        "reason": reason,
         "dripsToday": usage.wallet_drips,
         "weiToday": str(usage.wallet_wei),
     }

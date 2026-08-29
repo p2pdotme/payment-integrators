@@ -222,6 +222,10 @@ class Store:
         transfer mines; a receipt that never arrives leaves NULL, a bounded
         under-count the chain.py clamps bound.
         """
+        # The caller clamps to what the signed transaction could have cost;
+        # this is the ledger's own floor and ceiling — never negative, never
+        # past the 64-bit integer the daily SUM is computed in.
+        fee_wei = max(0, min(int(fee_wei), 2**63 - 1))
         with self._lock:
             self._conn.execute(
                 "UPDATE drips SET fee_wei = ? WHERE id = ?", (str(fee_wei), drip_id)

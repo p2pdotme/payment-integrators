@@ -70,7 +70,7 @@ Then the caps, all per UTC day:
 | per wallet, count | 4 drips | bounds a loop |
 | per wallet, value | 8×10¹⁴ wei | bounds one wallet |
 | **per nullifier, value** | 1.6×10¹⁵ wei | a nullifier is per-(tenant, human); a sponsored submit records it, and drips are booked against it |
-| global | 2×10¹⁵ wei | circuit breaker over the float (unscoped by chain — one process, one key, one float), enforced on the drip AND sponsor paths |
+| global | 2×10¹⁷ wei | circuit breaker over the float (unscoped by chain — one process, one key, one float), enforced on the drip AND sponsor paths. **Set `FAUCET_MAX_WEI_GLOBAL` to the float actually loaded** — the default is far above any realistic float, so left alone the breaker cannot trip before the wallet runs dry, and the service warns at startup when it is unset |
 
 A drip is **booked before it is sent**, not after. Every cap is a SUM or COUNT
 over the ledger, so the row that feeds those caps is written before the ETH
@@ -156,28 +156,26 @@ it. `event=` is always first, so `grep event=refused` and
 
 ```
 event=startup   funder=0x… integrators=1 chains=8453 db=/data/faucet.db docs=off
-event=integrator label=own chain=8453 address=0x… attestor=0x…
-event=refused   reason=invalid_attestation wallet=0x60907330… integrator=own detail=…
+event=integrator label=own chain=8453 address=0x…
+event=refused   reason=invalid_signature wallet=0x60907330… integrator=own detail=…
 event=declined  reason=sufficient_balance wallet=0x… balance_wei=… target_wei=…
 event=funding   wallet=0x… amount_wei=30000000000000
 event=funded    wallet=0x… tx=0x3fb6033e… fee_wei=… outcome=success
-event=refused   reason=invalid_signature wallet=0x… (a submission the chain rejected)
 event=low_balance funder_balance_wei=… drips_left=42
 event=rate_limited scope=wallet wallet=0x…
+event=fee_clamped drip_id=… reported_fee_wei=… ceiling_wei=…
 ```
 
 Alert on `event=low_balance` (the float is running out; heal by sending ETH)
 and on a run of `event=chain_unreachable` (the RPC is down; every request
 fails until it recovers).
-```
 
-The service had none of this. It matters for one failure in particular: a
-wrong `attestor` rejects **every** cold-start request, and from outside — with
-a client that fails open by contract — that is indistinguishable from the
-faucet being down. It has bitten two prior integrations. `event=refused
-reason=invalid_attestation` is the line that tells them apart, and the startup
-banner prints the resolved attestor to compare against the service's own
-`GET /v1/attestor`.
+The service had none of this. It matters because the client fails open by
+contract: a refused sponsorship, a dead RPC and an empty float all look, from
+outside, like nothing happening. `event=refused reason=<the chain's verdict>`
+is the line that tells a rejected attestation apart from an outage, and
+`event=chain_unreachable` names the outage — with the RPC URL scrubbed, since
+a keyed provider URL is a credential.
 
 Never logged: signatures, the private key, or a full nullifier. The nullifier
 is a per-(tenant, human) pseudonym and is truncated — enough to correlate one
@@ -187,10 +185,18 @@ logs leak. Tests assert all three.
 ## API
 
 ```
-GET  /healthz
+GET  /healthz                                   liveness word only
 GET  /v1/gas/status?chainId=&integrator=&wallet=
 POST /v1/gas/request
+POST /v1/attestation                            sponsor a verification
+GET  /v1/ops/health                             operators; X-Ops-Token or Authorization: Bearer
 ```
+
+Every error body is a fixed word (`chain_unreachable`, `send_failed`,
+`not_verified`, …) — never the node's message. `/v1/gas/status` answers
+`temporarily_unavailable` where the funding path would say `faucet_empty` or
+`global_daily_budget_reached`: it needs no verified wallet, so it does not get
+to be a gauge of the float.
 
 ```jsonc
 // POST /v1/gas/request
@@ -220,21 +226,29 @@ POST /v1/gas/request
 
 ```bash
 FAUCET_PRIVATE_KEY=0x…            # hot key, small float
-FAUCET_INTEGRATORS='[{"chainId":8453,"address":"0x…","attestor":"0x…","label":"own"}]'
-FAUCET_RPC_URLS='{"8453":"https://mainnet.base.org"}'
+FAUCET_INTEGRATORS='[{"chainId":8453,"address":"0x…","label":"own"}]'
+FAUCET_RPC_URLS='{"8453":"https://base-mainnet.g.alchemy.com/v2/<key>"}'   # keyed; the URL is a secret
 ALLOWED_ORIGINS=https://ownfinance.org
 FAUCET_DB_PATH=/data/faucet.db    # must be a persistent volume
+FAUCET_MAX_WEI_GLOBAL=…           # size to the float actually loaded
+FAUCET_OPS_TOKEN=…                # /v1/ops/health; sent as a HEADER, never a query string
 ```
 
-> `attestor` **must** be read from the verification service's own
-> `GET /v1/attestor` — never a value relayed by a partner or a teammate. A
-> wrong attestor here rejects every cold-start request, which looks exactly
-> like the faucet being down. This has bitten two prior integrations.
+> There is no `attestor` setting. The chain verifies every attestation — in
+> simulation before any gas is spent, and for real after — so there is no
+> signer for this service to hold or to get wrong. An `attestor` key in an old
+> config is ignored.
+
+`FAUCET_TRUSTED_PROXIES` (default `1`, Railway's edge) is how many proxies
+append to `X-Forwarded-For` in front of this process; the per-IP limiter keys
+on the hop that many from the right, never the leftmost, which is the
+caller's own claim. Set `0` when nothing proxies the service.
 
 Optional, all with working defaults: `FAUCET_GAS_UNITS`,
 `FAUCET_SAFETY_FACTOR`, `FAUCET_MIN_TARGET_WEI`, `FAUCET_MAX_TARGET_WEI`,
 `FAUCET_MAX_DRIPS_PER_WALLET`, `FAUCET_MAX_WEI_PER_WALLET`,
-`FAUCET_MAX_WEI_PER_NULLIFIER`, `FAUCET_MAX_WEI_GLOBAL`.
+`FAUCET_MAX_WEI_PER_NULLIFIER`, `FAUCET_RATE_IP_PER_MIN`,
+`FAUCET_RATE_WALLET_PER_MIN`, `FAUCET_TRUSTED_PROXIES`.
 
 **`FAUCET_DB_PATH` must be on a persistent volume.** The ledger is what every
 daily cap is computed from; a faucet that forgets what it paid out is a faucet
