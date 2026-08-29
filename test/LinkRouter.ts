@@ -438,6 +438,169 @@ describe("LinkRouter — payments without a funded relayer key", function () {
     });
   });
 
+  // ─── Gaps coverage found ──────────────────────────────────────────
+
+  describe("the remaining guards", function () {
+    it("refuses to deploy against the zero address", async function () {
+      const F = await ethers.getContractFactory("LinkRouter");
+      await expect(F.deploy(ethers.ZeroAddress)).to.be.revertedWithCustomError(
+        router,
+        "ZeroAddress"
+      );
+    });
+
+    it("refuses a placement with no customer key", async function () {
+      // Without this the order would have NO key able to settle it: the
+      // customer could never mark it paid, and it would sit until TTL with
+      // their fiat already sent.
+      await mkLink(LINK, 1);
+      await register(LINK, agent1);
+      await expect(
+        router
+          .connect(agent1)
+          .place(LINK, erc721Client.target, PRODUCT_ID, 1, INR, 0, PK, ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(router, "ZeroAddress");
+    });
+
+    it("refuses registering an agent for a link that does not exist", async function () {
+      await expect(router.connect(merchant1).registerAgent(LINK, agent1.address)).to.be.reverted;
+    });
+
+    it("catches an order/link mismatch even from a legitimate agent", async function () {
+      // agent1 IS the right wallet for LINK, and the order IS real — but it
+      // belongs to LINK2. Without this check the Router would forward a
+      // mismatched pair and rely entirely on the integrator to notice.
+      await mkLink(LINK, 1);
+      await mkLink(LINK2, 1);
+      await register(LINK, agent1);
+      await register(LINK2, agent2);
+      await place(LINK2, 1, agent2);
+      const orderId = await lastOrderId();
+
+      await expect(
+        router.connect(agent1).markPaid(LINK, orderId, await markPaidSig(LINK, orderId))
+      ).to.be.revertedWithCustomError(router, "OrderLinkMismatch");
+    });
+
+    it("exposes the order owner so support can answer who may settle it", async function () {
+      await mkLink(LINK, 1);
+      await register(LINK, agent1);
+      await place(LINK, 1, agent1);
+      const orderId = await lastOrderId();
+
+      expect(await router.orderCustomer(orderId)).to.equal(customer.address);
+      expect(await router.orderCustomer(999999n)).to.equal(ethers.ZeroAddress);
+    });
+
+    it("gives mark-paid and cancel DIFFERENT digests for the same order", async function () {
+      // If these collided, authorising a cancel would authorise a payment.
+      await mkLink(LINK, 1);
+      await register(LINK, agent1);
+      await place(LINK, 1, agent1);
+      const orderId = await lastOrderId();
+
+      const paid = await router.markPaidDigest(LINK, orderId);
+      const cancelled = await router.cancelDigest(LINK, orderId);
+      expect(paid).to.not.equal(cancelled);
+    });
+
+    it("cannot mark the same order paid twice", async function () {
+      await mkLink(LINK, 1);
+      await register(LINK, agent1);
+      await place(LINK, 1, agent1);
+      const orderId = await lastOrderId();
+      await accept(orderId);
+
+      const sig = await markPaidSig(LINK, orderId);
+      await router.connect(agent1).markPaid(LINK, orderId, sig);
+      // The signature is still valid — replay protection here is the ORDER's
+      // state, not a nonce. The Diamond refuses a second claim.
+      await expect(router.connect(agent1).markPaid(LINK, orderId, sig)).to.be.reverted;
+    });
+
+    it("cannot cancel an order that is already paid", async function () {
+      await mkLink(LINK, 1);
+      await register(LINK, agent1);
+      await place(LINK, 1, agent1);
+      const orderId = await lastOrderId();
+      await accept(orderId);
+      await router.connect(agent1).markPaid(LINK, orderId, await markPaidSig(LINK, orderId));
+
+      // The customer's fiat has left their bank. Letting a cancel through here
+      // would strand it with the order dead and no wallet to dispute with.
+      await expect(router.connect(agent1).cancel(LINK, orderId, await cancelSig(LINK, orderId))).to
+        .be.reverted;
+    });
+  });
+
+  // ─── Reentrancy ───────────────────────────────────────────────────
+
+  describe("the reentrancy guard actually fires", function () {
+    // `place` cannot follow checks-effects-interactions: the orderId it must
+    // record only exists after the external call returns, so the write happens
+    // last. That is the shape reentrancy exploits, and the guard is the reason
+    // it is safe. A guard nobody has seen fire is a guard nobody knows works.
+    let hostile: any;
+    let hostileRouter: any;
+
+    beforeEach(async function () {
+      hostile = await (await ethers.getContractFactory("ReentrantIntegrator")).deploy();
+      hostileRouter = await (
+        await ethers.getContractFactory("LinkRouter")
+      ).deploy(await hostile.getAddress());
+      await hostile.setRouter(await hostileRouter.getAddress());
+      await hostile.setLinkOwner(merchant1.address);
+      await hostileRouter.connect(merchant1).registerAgent(LINK, agent1.address);
+    });
+
+    it("blocks a re-entrant place, and the outer call still records ONE order", async function () {
+      await hostile.setAttack(true, false);
+
+      await hostileRouter
+        .connect(agent1)
+        .place(LINK, erc721Client.target, PRODUCT_ID, 1, INR, 0, PK, customer.address);
+
+      // The nested call was refused, not silently allowed.
+      expect(await hostile.reentryReverted()).to.equal(true);
+
+      // And the outer call completed correctly: exactly one order recorded,
+      // owned by the real customer.
+      const evs = await hostileRouter.queryFilter(hostileRouter.filters.OrderPlaced());
+      expect(evs.length).to.equal(1);
+      expect(await hostileRouter.orderCustomer(evs[0].args[1])).to.equal(customer.address);
+    });
+
+    it("blocks a re-entrant mark-paid", async function () {
+      await hostile.setAttack(true, false);
+      await hostileRouter
+        .connect(agent1)
+        .place(LINK, erc721Client.target, PRODUCT_ID, 1, INR, 0, PK, customer.address);
+      const evs = await hostileRouter.queryFilter(hostileRouter.filters.OrderPlaced());
+      const orderId = evs[0].args[1];
+
+      await hostile.setAttack(false, true);
+      const domain = {
+        name: "P2P LinkRouter",
+        version: "1",
+        chainId: (await ethers.provider.getNetwork()).chainId,
+        verifyingContract: await hostileRouter.getAddress(),
+      };
+      const sig = await customer.signTypedData(
+        domain,
+        {
+          MarkPaid: [
+            { name: "linkId", type: "bytes32" },
+            { name: "orderId", type: "uint256" },
+          ],
+        },
+        { linkId: LINK, orderId }
+      );
+
+      await hostileRouter.connect(agent1).markPaid(LINK, orderId, sig);
+      expect(await hostile.reentryReverted()).to.equal(true);
+    });
+  });
+
   // ─── Replay across deployments ────────────────────────────────────
 
   describe("signatures are bound to this chain and this Router", function () {
