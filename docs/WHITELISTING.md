@@ -41,7 +41,9 @@ Use the **"Whitelist request"** issue template. Required fields:
 - **Network**: `base` or `baseSepolia`
 - **Integrator address**: `0x...`
 - **Pinned `proxyImpl`**: `0x...` — output of `cast call <integrator> "proxyImpl()(address)" --rpc-url <rpc>`
-- **`usdcThroughIntegrator`**: `true` or `false` — pinned at registration. `true` routes BUY proceeds to the integrator on completion (e.g. LotPot); `false` routes direct to the order's `recipientAddr`. Must match what the integrator's `onOrderComplete` was coded to expect.
+- **`usdcThroughIntegrator`**: `true` or `false` — pinned at registration. `true` routes BUY proceeds to the integrator on completion; `false` routes direct to the order's `recipientAddr`. Must match what the integrator's `onOrderComplete` was coded to expect.
+
+  Every reference integrator in this repo registers **`false`** — LotPot, Marketplace, Showdown and CubeSkins included. If your integrator needs to receive settlement USDC itself, the idiomatic way is to pin `recipientAddr = address(this)` when calling `placeB2BOrder` (see `ShowdownCheckoutIntegrator` / `CubeSkinsIntegrator`) and still register `false`. Setting the flag *as well* would double-route. Reach for `true` only if you genuinely cannot control `recipientAddr`, and say so explicitly in the request.
 - **Deployer address**: `0x...`
 - **Merged commit hash**: short SHA, e.g. `8f89206`
 - **Bytecode hash**: `keccak256(<runtime bytecode>)` — paste output of `cast code <addr> | cast keccak`
