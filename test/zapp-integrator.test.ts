@@ -3,7 +3,7 @@ import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
 /**
- * PlasmaPayCheckoutIntegrator: a fiat -> Base USDC onramp gated on a single
+ * ZappCheckoutIntegrator: a fiat -> Base USDC onramp gated on a single
  * liveness tier and settling DIRECTLY into the buyer's own wallet
  * ($20 per tx, 5 orders/day).
  *
@@ -11,7 +11,7 @@ import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
  * `ecrecover(...) == attestor`, so a locally-signed EIP-712 struct is
  * indistinguishable from one the real simple-kyc service signs.
  */
-describe("PlasmaPayCheckoutIntegrator", function () {
+describe("ZappCheckoutIntegrator", function () {
   let owner: SignerWithAddress;
   let user: SignerWithAddress;
   let user2: SignerWithAddress;
@@ -100,7 +100,7 @@ describe("PlasmaPayCheckoutIntegrator", function () {
     dailyCount: number = DAILY_COUNT,
     attestorAddr: string = attestor.address
   ) {
-    return (await ethers.getContractFactory("PlasmaPayCheckoutIntegrator")).deploy(
+    return (await ethers.getContractFactory("ZappCheckoutIntegrator")).deploy(
       diamondAddr,
       usdcAddr,
       owner.address,
@@ -713,7 +713,7 @@ describe("PlasmaPayCheckoutIntegrator", function () {
     });
 
     it("rejects zero addresses for the core wiring", async function () {
-      const F = await ethers.getContractFactory("PlasmaPayCheckoutIntegrator");
+      const F = await ethers.getContractFactory("ZappCheckoutIntegrator");
       await expect(
         F.deploy(
           ethers.ZeroAddress,

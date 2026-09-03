@@ -1,20 +1,20 @@
-# PlasmaPay — fiat → USDC onramp (liveness)
+# Zapp — fiat → USDC onramp (liveness)
 
-Fiat on-ramp for [PlasmaPay](https://plasmapay.app), a prediction-market betting
+Fiat on-ramp for [Zapp](https://zapp.app), a prediction-market betting
 app. Buyers pay local fiat (INR via UPI) and receive Base USDC **directly in
 their own wallet**, gated on a single liveness attestation from the simple-kyc
 service.
 
-- Contract: `contracts/integrators/plasmapay/PlasmaPayCheckoutIntegrator.sol`
-- Tests: `test/plasmapay-integrator.test.ts`
-- Deploy: `scripts/deploy-plasmapay.ts`
+- Contract: `contracts/integrators/zapp/ZappCheckoutIntegrator.sol`
+- Tests: `test/zapp-integrator.test.ts`
+- Deploy: `scripts/deploy-zapp.ts`
 - Maintainer: dev@paytrie.com
 
 ---
 
 ## 1. Why this integrator exists
 
-PlasmaPay's ramp runs on the **direct-user** path today: the user's own wallet
+Zapp's ramp runs on the **direct-user** path today: the user's own wallet
 calls `placeOrder` on the Diamond, and order size is derived from the wallet's
 Reputation Points. That path has a cold-start wall — a zero-RP wallet reverts
 `USER_HAS_NO_REPUTATION`, so a first-time user must complete a full identity
@@ -58,7 +58,7 @@ condition surfaces on the first order rather than the hundredth.
 
 ### Bridging is not on-chain here
 
-PlasmaPay's betting balance lives on Polygon; this integrator delivers USDC on
+Zapp's betting balance lives on Polygon; this integrator delivers USDC on
 Base. That second leg deliberately runs from the user's own wallet in the app,
 not from inside the contract. Bridging here would mean taking custody of every
 buyer's proceeds and re-deriving each user's share — reintroducing exactly the
@@ -89,7 +89,7 @@ uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5;
 only ever move a limit **down**. The policy therefore holds against a
 compromised **owner** key, not just a compromised attestor — a whitelisted
 integrator that can raise its own caps is a risk to the protocol, not just to
-PlasmaPay. A deploy may launch tighter than policy; it can never launch looser.
+Zapp. A deploy may launch tighter than policy; it can never launch looser.
 
 ### Attestation binding
 

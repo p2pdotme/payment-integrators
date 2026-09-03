@@ -9,8 +9,8 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
 /**
- * @title PlasmaPayCheckoutIntegrator
- * @notice Fiat -> Base USDC onramp for PlasmaPay, gated on a single
+ * @title ZappCheckoutIntegrator
+ * @notice Fiat -> Base USDC onramp for Zapp, gated on a single
  *         verification tier: a simple-kyc **liveness** attestation.
  *
  *         ── Where the money goes ─────────────────────────────────────────
@@ -25,7 +25,7 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *         back.
  *
  *         ── Why an integrator at all ─────────────────────────────────────
- *         PlasmaPay's existing ramp uses the direct-user path, where the
+ *         Zapp's existing ramp uses the direct-user path, where the
  *         Diamond sizes orders from the wallet's Reputation Points and a
  *         zero-RP wallet cannot place any order at all. That is a cold-start
  *         wall: a first-time user has to complete a full identity check
@@ -52,7 +52,7 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *         a limit DOWN. The policy therefore holds against a compromised
  *         OWNER key, not merely a compromised attestor — which matters
  *         because a whitelisted integrator that could raise its own caps is a
- *         risk to the protocol, not just to PlasmaPay.
+ *         risk to the protocol, not just to Zapp.
  *
  *         ── Verification is the on-chain twin of simple-kyc ──────────────
  *         EIP-712 typehash `LivenessAttestation(address wallet,bytes32
@@ -66,7 +66,7 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *         nullifier is single-use, which is the on-chain half of the Sybil
  *         defence (face dedup is the off-chain half).
  */
-contract PlasmaPayCheckoutIntegrator is IP2PIntegrator {
+contract ZappCheckoutIntegrator is IP2PIntegrator {
     using SafeERC20 for IERC20;
 
     // ─── Errors ───────────────────────────────────────────────────────

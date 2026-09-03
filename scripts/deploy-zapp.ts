@@ -1,11 +1,11 @@
 import { ethers } from "hardhat";
 
 /**
- * Deploy + whitelist PlasmaPayCheckoutIntegrator — the fiat -> Base USDC onramp
- * for PlasmaPay, gated on a liveness attestation and settling straight into the
+ * Deploy + whitelist ZappCheckoutIntegrator — the fiat -> Base USDC onramp
+ * for Zapp, gated on a liveness attestation and settling straight into the
  * buyer's own wallet.
  *
- *   PlasmaPayCheckoutIntegrator
+ *   ZappCheckoutIntegrator
  *   → register on the Diamond (usdcThroughIntegrator = FALSE)
  *
  * ── Why usdcThroughIntegrator MUST be false ───────────────────────────────
@@ -41,7 +41,7 @@ import { ethers } from "hardhat";
  *   [DIAMOND_ADDRESS=0x...] [USDC_ADDRESS=0x...] [ATTESTOR=0x...] \
  *   [TIER_CAP=20000000] [DAILY_TX_COUNT_LIMIT=5] \
  *   [DEPLOY_OWNER=0x...] [SKIP_REGISTER=false] [DRY_RUN=1] \
- *   npx hardhat run scripts/deploy-plasmapay.ts --network baseSepolia
+ *   npx hardhat run scripts/deploy-zapp.ts --network baseSepolia
  */
 
 /**
@@ -91,7 +91,7 @@ async function main() {
   const DEPLOY_OWNER = process.env.DEPLOY_OWNER || deployer.address;
   let ATTESTOR = process.env.ATTESTOR || "";
 
-  console.log(`\n=== PlasmaPayCheckoutIntegrator — ${preset.label} (${chainId}) ===`);
+  console.log(`\n=== ZappCheckoutIntegrator — ${preset.label} (${chainId}) ===`);
   console.log("Deployer:", deployer.address);
   console.log(
     "Balance: ",
@@ -163,8 +163,8 @@ async function main() {
   }
 
   // ── 1. Deploy ───────────────────────────────────────────────────────────
-  console.log("\nDeploying PlasmaPayCheckoutIntegrator…");
-  const Integ = await ethers.getContractFactory("PlasmaPayCheckoutIntegrator");
+  console.log("\nDeploying ZappCheckoutIntegrator…");
+  const Integ = await ethers.getContractFactory("ZappCheckoutIntegrator");
   const integrator = await Integ.deploy(
     DIAMOND_ADDRESS,
     USDC_ADDRESS,
@@ -176,7 +176,7 @@ async function main() {
   await integrator.deploymentTransaction()?.wait(2);
   const integratorAddr = await integrator.getAddress();
   const proxyImpl = await integrator.proxyImpl();
-  console.log("  PlasmaPayCheckoutIntegrator:", integratorAddr);
+  console.log("  ZappCheckoutIntegrator:", integratorAddr);
   console.log("  proxyImpl:                  ", proxyImpl);
 
   // ── 2. Register on the Diamond — usdcThroughIntegrator = FALSE ──────────
@@ -209,13 +209,13 @@ async function main() {
 
   // ── 3. Report ───────────────────────────────────────────────────────────
   const code = await ethers.provider.getCode(integratorAddr);
-  console.log("\n=== PlasmaPay deployment ===");
-  console.log(`PlasmaPayCheckoutIntegrator: ${integratorAddr}`);
+  console.log("\n=== Zapp deployment ===");
+  console.log(`ZappCheckoutIntegrator: ${integratorAddr}`);
   console.log(`proxyImpl:                   ${proxyImpl}`);
   console.log(`bytecode hash:               ${ethers.keccak256(code)}`);
   console.log(`domainSeparator:             ${await integrator.domainSeparator()}`);
 
-  console.log("\n--- PlasmaPay app .env ---");
+  console.log("\n--- Zapp app .env ---");
   console.log(`VITE_P2P_INTEGRATOR=${integratorAddr}`);
   console.log(`VITE_P2P_USDC=${USDC_ADDRESS}`);
   console.log(`VITE_P2P_CHAIN_ID=${chainId}`);
