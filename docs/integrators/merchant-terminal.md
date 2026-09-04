@@ -190,11 +190,78 @@ their own library, or a facet split.
 integrator's own balance.
 
 
+## The contract is at its size ceiling
+
+`MerchantTerminalIntegrator` measures **24,515 of the 24,576 bytes** EIP-170
+allows — 61 bytes of headroom, at `runs: 50` for this file only.
+
+This is a standing constraint on the contract, not a note about one change. Any
+addition to it needs a plan for where the space comes from: relocating the
+withdrawal and fund-helper sections into a library (~44% of the contract), or
+splitting into facets. Both touch audited custody code and belong in their own
+reviewed change.
+
+Everything in the payment-links work is additive — `LinkRouter` is a separate
+contract with its own budget — so none of it consumed that headroom.
+
 ## Deployment and whitelisting checklist
 
 Payment links depend on three things that live OUTSIDE this repository. All
 three are silent when missing — nothing reverts, nothing logs, the feature
 simply does not work — so they are listed here rather than discovered later.
+
+### 0. LinkRouter must be deployed and wired (required)
+
+Every link payment goes through `LinkRouter`. Without it the integrator's
+`trustedRelayer` still points at whatever it pointed at before, and no link
+payment can be placed at all.
+
+```
+INTEGRATOR=0x… npx hardhat run scripts/deploy-link-router.ts --network base
+```
+
+That deploys `LinkRouter(integrator)` and calls `setTrustedRelayer(router)`,
+which needs the MANAGER role. Pass `SKIP_WIRE=1` to deploy only, when the
+manager is a different key.
+
+`setTrustedRelayer` is also the rollback: pointing it back at the previous
+address stops every link payment without touching anything else.
+
+Then the Worker needs the account-abstraction wiring — see `worker/README.md`
+for the full list. Two are worth repeating because getting them wrong is
+invisible:
+
+- **`ACCOUNT_FACTORY_KIND`** — `thirdweb` takes `(address, bytes)`,
+  the ERC-4337 reference factory takes `(address, uint256)`. Different
+  argument types mean different SELECTORS, so the wrong value does not fail
+  loudly; it calls a function the factory does not have. This shipped wrong once.
+- **`SPONSOR_VERIFIER_SECRET`** — `/api/sponsor-check` FAILS CLOSED without
+  it. That is deliberate: unauthenticated, an outsider can exhaust a link's
+  sponsorship allowance without ever sending a transaction.
+
+Finally, the provider's sponsorship policy must allowlist **this Router and
+nothing else**, and point its server verifier at `/api/sponsor-check`. Without
+the allowlist a leaked client id sponsors strangers' transactions on your bill.
+
+### 0a. Creating a link is two calls, in this order
+
+A link needs a wallet before it can be paid, and the merchant app must mint one:
+
+```
+POST /api/links/:linkId/wallet   →  { account }        (merchant-signed)
+then batch, IN THIS ORDER:
+  integrator.createLink(linkId, …)
+  router.registerAgent(linkId, account)
+```
+
+`registerAgent` reads `getLink` to check ownership, so `createLink` has to land
+first within the batch. Reversed, the batch reverts. **Omitted entirely, the
+link looks completely correct** — on-chain, owned by the merchant, active,
+correct amount — and can never be paid, with nothing before the first payment
+attempt to say so.
+
+`registerAgent` is write-once. A link whose wallet is lost cannot be re-bound;
+revoke it and issue a new one.
 
 ### 1. The cancel callback must be switched on (required)
 
