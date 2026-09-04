@@ -70,6 +70,20 @@ async function main() {
   ).deploy(await entryPoint.getAddress());
   await accountFactory.waitForDeployment();
 
+  // A second factory whose accounts also implement ERC-1271.
+  //
+  // The reference account can send operations but cannot SIGN — it has no
+  // isValidSignature. Hosted accounts, thirdweb's included, implement both,
+  // because a smart-account wallet has to be able to sign in to things. The
+  // provisioning endpoint depends on that: the merchant signs with the key
+  // their login controls, but the address registered as a merchant is the
+  // ACCOUNT, so the only way to check is to ask the account. A fixture without
+  // 1271 cannot exercise that path at all.
+  const account1271Factory = await (
+    await ethers.getContractFactory("Account1271Factory")
+  ).deploy(await entryPoint.getAddress());
+  await account1271Factory.waitForDeployment();
+
   // Hardhat account #3 signs sponsorship approvals — the hosted paymaster
   // service's role.
   const sponsorSigner = (await ethers.getSigners())[3];
@@ -116,6 +130,10 @@ async function main() {
     router: await router.getAddress(),
     entryPoint: await entryPoint.getAddress(),
     accountFactory: await accountFactory.getAddress(),
+    // Same (address, uint256) shape as the reference factory, so the worker
+    // addresses it with ACCOUNT_FACTORY_KIND = "simple" and needs no special
+    // case for the fixture.
+    account1271Factory: await account1271Factory.getAddress(),
     paymaster: await paymaster.getAddress(),
     // Hardhat account #3: signs sponsorship approvals.
     sponsorKey: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
