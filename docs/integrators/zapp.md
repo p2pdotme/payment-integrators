@@ -51,10 +51,20 @@ retry, or refund machinery in this contract, and no owner key that can move a
 user's money. `sweepUsdc` exists solely to recover tokens mistakenly sent to the
 contract address — in normal operation its balance is always zero.
 
-If a completion callback ever arrives with `recipientAddr != buyer` — the
-on-chain signature of a mis-registered `usdcThroughIntegrator` — the contract
-emits `SettlementRoutingAnomaly` and refuses to mark the session settled, so the
-condition surfaces on the first order rather than the hundredth.
+If a completion callback ever describes something other than the order this
+contract placed, it emits `SettlementRoutingAnomaly` and refuses to mark the
+session settled, so the condition surfaces on the first order rather than the
+hundredth.
+
+That check does **not** rely on `recipientAddr`. The Diamond routes settlement on
+`usdcThroughIntegrator` but passes `_order.recipientAddr` to the callback in both
+branches, so under a mis-registration the callback still names the buyer while
+the USDC is routed to the integrator — the argument looks correct in exactly the
+case the alarm exists for. The routing limb therefore reads the Diamond's own
+`getIntegratorConfig` flag, falling back to a balance comparison only when that
+view is unreadable. The integrator's balance is emitted for diagnosis but is not
+the signal: nothing here consumes the balance, so a stranger could donate one
+order's worth and hold the alarm on until an owner swept.
 
 ### Bridging is not on-chain here
 

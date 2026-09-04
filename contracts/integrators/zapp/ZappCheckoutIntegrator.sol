@@ -129,20 +129,35 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
     event OnrampOrderCancelled(uint256 indexed orderId, address indexed user, uint256 amount);
 
     /**
-     * @notice Emitted when a completion callback does not describe the order
-     *         this contract placed — in particular when `recipientAddr` is
-     *         not the buyer. Under the intended registration
-     *         (`usdcThroughIntegrator = false`) this can never fire; if it
-     *         does, the integrator was mis-registered and settlement is being
-     *         routed somewhere other than the buyer's wallet. Loud on-chain
-     *         so it is caught on the first order rather than the hundredth.
+     * @notice Emitted when a completion does not describe the order this
+     *         contract placed — either the callback names something else, or
+     *         the money did not go where the callback says it went. Under the
+     *         intended registration (`usdcThroughIntegrator = false`) this can
+     *         never fire. Loud on-chain so a mis-registration is caught on the
+     *         first order rather than the hundredth.
+     *
+     * @dev    The routing limb reads the Diamond's registration flag rather
+     *         than `recipientAddr`. The Diamond routes settlement on
+     *         `usdcThroughIntegrator` but passes `_order.recipientAddr` to this
+     *         callback in BOTH branches, so under a mis-registration the
+     *         argument still names the buyer: a check on it sees nothing wrong
+     *         while the USDC sits here, and the alarm stays silent in exactly
+     *         the case it exists for.
+     *
+     *         `integratorBalance` is reported for diagnosis but is NOT the
+     *         signal. This contract never consumes its balance, so a stranger
+     *         could donate one order's worth and make every later completion
+     *         anomalous until an owner swept — and redo it after each sweep.
+     *         An alarm a third party can hold down is one operators learn to
+     *         ignore, which reaches the same silent failure by another road.
      */
     event SettlementRoutingAnomaly(
         uint256 indexed orderId,
         address indexed expectedUser,
         address callbackUser,
         uint256 callbackAmount,
-        address callbackRecipient
+        address callbackRecipient,
+        uint256 integratorBalance
     );
 
     event UsdcSwept(address indexed to, uint256 amount);
@@ -622,9 +637,11 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
      *      revert here would not undo the settlement; it would only lose the
      *      event and leave the session permanently un-finalised. A callback
      *      that does not match the recorded order is reported via
-     *      `SettlementRoutingAnomaly` instead — most importantly when
-     *      `recipientAddr` is not the buyer, which is the on-chain signature
-     *      of a mis-registered `usdcThroughIntegrator`.
+     *      `SettlementRoutingAnomaly` instead — including the case the
+     *      callback arguments cannot show, a mis-registered
+     *      `usdcThroughIntegrator` routing the USDC here instead of to the
+     *      buyer. See the event for why that limb reads the Diamond's flag
+     *      rather than `recipientAddr` or a balance.
      */
     function onOrderComplete(
         uint256 orderId,
@@ -635,8 +652,30 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
         Session storage session = sessions[orderId];
         if (session.user == address(0) || session.settled || session.cancelled) return;
 
-        if (session.user != user || session.amount != amount || recipientAddr != session.user) {
-            emit SettlementRoutingAnomaly(orderId, session.user, user, amount, recipientAddr);
+        (bool routesHere, bool flagKnown) = _routesThroughIntegrator();
+
+        // Reported for diagnosis, not used as the signal.
+        uint256 selfBalance = usdc.balanceOf(address(this));
+
+        // The balance stays the fallback for the one case the flag cannot
+        // answer: a Diamond that no longer exposes a readable config at all.
+        // That is already deeply abnormal, and a griefable signal beats none.
+        bool misrouted = flagKnown ? routesHere : selfBalance >= amount;
+
+        if (
+            session.user != user ||
+            session.amount != amount ||
+            recipientAddr != session.user ||
+            misrouted
+        ) {
+            emit SettlementRoutingAnomaly(
+                orderId,
+                session.user,
+                user,
+                amount,
+                recipientAddr,
+                selfBalance
+            );
             return;
         }
 
@@ -668,6 +707,41 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
     }
 
     // ─── Internals ────────────────────────────────────────────────────
+
+    /// @dev `bytes4(keccak256("getIntegratorConfig(address)"))`.
+    bytes4 private constant _GET_INTEGRATOR_CONFIG = 0x17353447;
+
+    /**
+     * @dev Is the Diamond routing this integrator's settlements to us?
+     *
+     *      A raw `staticcall` that reads word 1 and ignores everything after
+     *      it. That is deliberate: `B2BGatewayStorage.IntegratorConfig` has
+     *      grown twice and the new field landed in the MIDDLE both times, so a
+     *      typed tuple decode would revert or mis-read on the next change,
+     *      while a fixed leading word cannot. `isActive` and
+     *      `usdcThroughIntegrator` have stayed words 0 and 1 throughout.
+     *      Verified against the live Base Sepolia Diamond, which returns
+     *      `isActive = 1`, `usdcThroughIntegrator = 0` and `proxyImpl` in the
+     *      fifth word for a registered integrator.
+     *
+     *      Returns `known = false` rather than reverting if the call fails or
+     *      is too short: a view a safety alarm depends on must never be the
+     *      thing that breaks the callback.
+     */
+    function _routesThroughIntegrator() private view returns (bool routes, bool known) {
+        (bool ok, bytes memory ret) = diamond.staticcall(
+            abi.encodeWithSelector(_GET_INTEGRATOR_CONFIG, address(this))
+        );
+        // Two words minimum: anything shorter cannot contain word 1.
+        if (!ok || ret.length < 64) return (false, false);
+
+        uint256 flag;
+        assembly {
+            // ret + 0x20 is word 0 (isActive); + 0x40 is word 1.
+            flag := mload(add(ret, 0x40))
+        }
+        return (flag != 0, true);
+    }
 
     function _salt(address user) internal pure returns (bytes32) {
         return bytes32(uint256(uint160(user)));

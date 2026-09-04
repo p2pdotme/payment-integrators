@@ -513,10 +513,58 @@ describe("ZappCheckoutIntegrator", function () {
         )
       )
         .to.emit(integrator, "SettlementRoutingAnomaly")
-        .withArgs(orderId, user.address, user.address, USDC(10), integratorAddr);
+        .withArgs(orderId, user.address, user.address, USDC(10), integratorAddr, 0);
 
       // …and the session is NOT marked settled on a mismatch.
       expect((await integrator.getSession(orderId)).settled).to.equal(false);
+    });
+
+    it("flags a mis-registered usdcThroughIntegrator the callback cannot show", async function () {
+      // The Diamond routes settlement on `usdcThroughIntegrator` but passes
+      // `_order.recipientAddr` to the callback in BOTH branches. Under a
+      // mis-registration every callback argument still looks correct — the
+      // buyer is named as the recipient — while the USDC is routed here.
+      // Only the Diamond's own flag distinguishes this case.
+      await verify(user, TIER_CAP);
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0);
+
+      await mockDiamond.setUsdcThroughIntegrator(integratorAddr, true);
+
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          integratorAddr,
+          orderId,
+          user.address,
+          USDC(10),
+          user.address // correct on its face — this is the blind spot
+        )
+      )
+        .to.emit(integrator, "SettlementRoutingAnomaly")
+        .withArgs(orderId, user.address, user.address, USDC(10), user.address, 0);
+
+      // The order must not be reported as a successful settlement.
+      expect((await integrator.getSession(orderId)).settled).to.equal(false);
+    });
+
+    it("settles normally while the registration is correct", async function () {
+      await verify(user, TIER_CAP);
+      const orderId = await mockDiamond.nextOrderId();
+      await integrator.connect(user).buyUsdc(USDC(10), INR, 1, "pubkey", 0, 0);
+
+      expect(await mockDiamond.usdcThroughIntegrator(integratorAddr)).to.equal(false);
+
+      await expect(
+        mockDiamond.adminCallOnOrderComplete(
+          integratorAddr,
+          orderId,
+          user.address,
+          USDC(10),
+          user.address
+        )
+      ).to.emit(integrator, "OnrampOrderSettled");
+
+      expect((await integrator.getSession(orderId)).settled).to.equal(true);
     });
 
     it("flags a completion with the wrong amount", async function () {

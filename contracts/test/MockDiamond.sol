@@ -39,6 +39,22 @@ contract MockDiamond {
     IERC20 public usdc;
     uint256 public nextOrderId = 1;
 
+    /// @dev Mirrors `B2BGatewayStorage.IntegratorConfig` closely enough for an
+    ///      integrator to read `usdcThroughIntegrator` out of word 1. Defaults
+    ///      to the correct registration (active, settle to the buyer);
+    ///      `setUsdcThroughIntegrator` flips it to model a mis-registration.
+    mapping(address => bool) public usdcThroughIntegrator;
+
+    function setUsdcThroughIntegrator(address integrator, bool on) external {
+        usdcThroughIntegrator[integrator] = on;
+    }
+
+    function getIntegratorConfig(
+        address integrator
+    ) external view returns (bool isActive, bool routesThroughIntegrator, address proxyImpl) {
+        return (true, usdcThroughIntegrator[integrator], address(0));
+    }
+
     struct Order {
         address integrator;
         address user;
