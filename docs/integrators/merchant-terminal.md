@@ -74,12 +74,17 @@ own phone, with no wallet, while the merchant is away.
    encryptedConfig)` from their own signer. `owner` is taken from `msg.sender`,
    so a link can only ever be created for oneself. `linkId` MUST come from
    `PaymentLinksLib.computeLinkId(merchant, salt)`.
-2. The customer opens the link and taps Pay. Their browser has no key, so a
-   keeper — the contract's existing `trustedRelayer` — calls
+2. The customer opens the link and taps Pay. Their browser generates a throwaway
+   keypair, and the link's own account-abstraction wallet — bound to that link by
+   `LinkRouter.registerAgent`, holding nothing, its gas paid by a paymaster —
+   calls `LinkRouter.place(...)`, which calls
    `relayerPlaceOrder(linkId, client, productId, quantity, currency, circleId,
-   pubKey)` on the merchant's behalf.
-3. The customer pays fiat to the LP, then `relayerMarkPaid(linkId, orderId)`
-   moves the order to PAID.
+   pubKey)` on the merchant's behalf. The Router is the `trustedRelayer`; there
+   is no funded relayer key anywhere on this path.
+3. The customer pays fiat to the LP, then taps "I have paid". That needs TWO
+   credentials — the link wallet AND the customer's own browser key, which we
+   never hold — and `LinkRouter.markPaid` verifies the second before calling
+   `relayerMarkPaid(linkId, orderId)` to move the order to PAID.
 4. The LP confirms receipt and completes. From there the order settles
    **identically to a counter sale**: same `onOrderComplete` sweep, same
    `SettlementBucket`. Payment links change nothing about custody or unlock
@@ -165,12 +170,33 @@ a fully compromised relayer key can do is place spurious orders that **credit**
 merchants, and claim payment on a genuine link order that was not in fact paid —
 which the LP rejects, because the LP settles against their own bank.
 
+**Two limits on that claim, stated because the short version reads stronger than
+what the contract enforces** (round-4 L8):
+
+- "Our backend cannot settle a payment" holds for orders placed by REAL
+  customers, whose browser key the backend never sees. It does **not** hold for
+  an order the backend places while naming a customer key it generated itself:
+  it can then mark that order paid. No USDC moves — the LP still settles against
+  their own bank statement — but it burns LP escrow and the merchant's daily
+  allowance. The IP strike system that bounds this runs in the same backend, so
+  a full compromise removes the bound along with the guarantee.
+- The guarantee also assumes the **pay page's origin is not compromised
+  alongside the Worker**, since that origin serves the JavaScript that generates
+  the customer key. An attacker holding both can produce customer signatures
+  directly, and the two-credential split stops meaning anything.
+
+Both are acceptable — neither moves money, and the LP's bank check is the
+backstop in both cases — but they are the real boundary, not "the backend can do
+nothing."
+
 #### Contract size
 
 This contract sits against the 24,576-byte EIP-170 ceiling. Payment-link
 lifecycle lives in `PaymentLinksLib`, an external (delegatecall) library, and
 `hardhat.config.ts` carries a **per-file** optimizer override (`runs: 50`) for
-this contract alone. Even so the margin is 72 bytes. The next feature here
+this contract alone. Even so the margin is 61 bytes — 24,515 of 24,576, the
+figure "The contract is at its size ceiling" below gives, and this line
+previously disagreed with it. The next feature here
 needs the withdrawal / fund-helper sections (~44% of the contract) moved into
 their own library, or a facet split.
 
@@ -181,6 +207,20 @@ their own library, or a facet split.
 2. The integrator funds the **merchant's own proxy** and places `placeB2BSellOrder`
    with the merchant's relay pubkey as `userPubKey`. The payout handle (UPI/PIX) is
    delivered later, encrypted, via `deliverFiatPayout` → `setSellOrderUpi`.
+
+   **Who calls step 2: the MERCHANT, from the merchant app, once the LP accepts.**
+   The integrator permits `merchant || owner || trustedRelayer`, and
+   `trustedRelayer` is the LinkRouter, which has no such function — so there is
+   no keeper service, and the merchant path is the only routine one. The third
+   slot is deliberately left unused: an operational keeper would have to be
+   either the LinkRouter (which cannot) or an owner (which would also hold
+   `pause`, `unpause` and `revokeLink` — far too much authority for a payout
+   service).
+
+   If the merchant does not deliver in time the Diamond cancels the SELL. That
+   is recoverable, not a loss: `reconcileWithdrawal(orderId)` sweeps the refund
+   back into custody and re-credits the merchant, so the outcome is a withdrawal
+   to retry. `withdrawUSDC` is unaffected either way.
 3. If the Diamond cancels the SELL order, `reconcileWithdrawal(orderId)` reads the
    authoritative status from the Diamond, sweeps the refunded USDC back off the proxy
    into custody (capped at the recorded amount), and re-credits the merchant — so no
@@ -224,8 +264,17 @@ That deploys `LinkRouter(integrator)` and calls `setTrustedRelayer(router)`,
 which needs the MANAGER role. Pass `SKIP_WIRE=1` to deploy only, when the
 manager is a different key.
 
-`setTrustedRelayer` is also the rollback: pointing it back at the previous
-address stops every link payment without touching anything else.
+**Rollback.** Prefer `linkOrdersEnabled = false` (MANAGER tier). It stops link
+orders instantly and disturbs nothing else — which is exactly why the contract
+carries it as a separate switch rather than expecting you to clear the relayer
+slot.
+
+`setTrustedRelayer` is the heavier rollback: pointing it back at the previous
+address also stops every link payment, but it retargets the slot itself. Since
+that slot is ALSO the third address `deliverFiatPayout` and `sweepStrandedBuy`
+accept, whatever you point it at gains those two permissions on every merchant's
+withdrawal. Point it at zero, or at an address you would be content to hold
+them; do not point it at a service picked only for the link path.
 
 Then the Worker needs the account-abstraction wiring — see `worker/README.md`
 for the full list. Two are worth repeating because getting them wrong is
@@ -315,8 +364,12 @@ the override can be dropped.
 
 ### Also confirm before going live
 
-- `setLinkRelayer` for each relaying key, and `setTrustedRelayer` for the fiat
-  keeper — these are separate roles.
+- `setTrustedRelayer` points at the **LinkRouter, and nothing else**. There is
+  ONE such slot, it means the link path, and it has no second role. Merchants
+  deliver their own fiat payouts — see "SELL (merchant withdraws fiat)".
+  (An earlier version of this line named `setLinkRelayer` "for each relaying
+  key". No such function exists; it described a two-slot contract that was never
+  built. Round-4 review, N1.)
 - `ALLOWED_ORIGINS` set to the real pay-page origins, not the `*` fallback.
 - Worker secrets stored with `--env production`; bindings repeated under
   `[env.production]` (they are not inherited).

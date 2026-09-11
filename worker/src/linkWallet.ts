@@ -242,13 +242,28 @@ export async function destroyLinkWallet(env: Env, linkId: string): Promise<void>
  * So: no expiry on the link, no expiry on the key. Revoking the link deletes it
  * (`destroyLinkWallet`), which is the real off-switch.
  */
+/**
+ * Cloudflare KV refuses `expirationTtl` below 60 seconds, by throwing from
+ * inside `put`. That makes it a value this function must never return.
+ */
+export const KV_MIN_TTL = 60;
+
 export function keyTtlFor(
   expiresAt: bigint,
   now = Math.floor(Date.now() / 1000)
-): number | undefined {
+): number | undefined | null {
   // undefined => no expiry, matching a link that never expires.
   if (expiresAt === 0n) return undefined;
   const remaining = Number(expiresAt) - now;
-  if (remaining <= 0) return 0;
-  return remaining;
+  // null => ALREADY EXPIRED, refuse. Round-4 L6: this used to return 0, which
+  // KV rejects, throwing out of `KV.put` into a route with no error boundary —
+  // a 500 with no CORS headers, which the pay page can only surface as an
+  // opaque network error. Refusing is also the correct answer on the merits:
+  // an expired link cannot be paid, so there is nothing worth provisioning.
+  if (remaining <= 0) return null;
+  // A link expiring in under a minute is legal on-chain but not expressible as
+  // a KV TTL. Round up rather than refuse — the key outliving its link by under
+  // a minute is harmless, because expiry is enforced by the integrator on every
+  // order, never by the lifetime of this record.
+  return Math.max(KV_MIN_TTL, remaining);
 }

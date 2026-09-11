@@ -42,6 +42,31 @@ import { json, badRequest, isHex32, normalizeLinkId } from "./http";
 /** How long a provisioning signature stays valid. */
 export const PROVISION_WINDOW_SECONDS = 300;
 
+/**
+ * Wallets one merchant may mint per hour (round-4 L7).
+ *
+ * Set well above genuine use — a merchant creating a batch of links for a
+ * catalogue is normal, and refusing that is a worse failure than the abuse this
+ * bounds. It exists to cap the blast radius of a stolen merchant key, not to
+ * shape ordinary behaviour.
+ */
+export const MAX_PROVISIONS_PER_MERCHANT_HOUR = 100;
+
+/**
+ * Fixed-window counter, keyed on the merchant.
+ *
+ * Approximate for the same reason `limits.ts` documents: KV is eventually
+ * consistent, so a concurrent burst can slip past the line before the window
+ * catches up. Acceptable here — this is a blast-radius cap, and the authoritative
+ * limits on what a link can do are on-chain.
+ */
+async function bumpProvisionCount(env: Env, merchant: Address): Promise<number> {
+  const key = `rl:provision:${merchant.toLowerCase()}:${Math.floor(Date.now() / 3_600_000)}`;
+  const n = Number((await env.KV.get(key)) ?? "0") + 1;
+  await env.KV.put(key, String(n), { expirationTtl: 7200 });
+  return n;
+}
+
 interface ProvisionBody {
   signer?: string;
   signature?: string;
@@ -236,10 +261,35 @@ export async function handleProvisionWallet(
   const allowed = await authorise(env, linkId, signer);
   if (!allowed.ok) return json({ error: "Not authorised." }, 403);
 
+  // ROUND-4 L7. Rate limited on the MERCHANT, not the IP, because the route is
+  // signature-gated — an IP bucket would be the wrong axis entirely, since one
+  // merchant behind a rotating address is the case that matters and many
+  // merchants behind one carrier NAT is the case that must not be punished.
+  //
+  // Bounded because a mint is not free: two RPC reads, and since round-3 M1
+  // removed the key TTL cap, a link with `expiresAt = 0` writes a KV record
+  // with NO expiry at all. One compromised or careless merchant key could
+  // otherwise write unbounded permanent records. Deliberately loose — a real
+  // merchant creating links in a burst must not be blocked.
+  const minted = await bumpProvisionCount(env, signer);
+  if (minted > MAX_PROVISIONS_PER_MERCHANT_HOUR) {
+    return json({ error: "Too many links created. Please wait a few minutes." }, 429);
+  }
+
+  const ttl = keyTtlFor(allowed.expiresAt);
+  // ROUND-4 L6. `null` means the link has already expired. Refuse: an expired
+  // link cannot be paid, so the wallet would be unusable the moment it existed
+  // — and passing the old `0` into KV threw from inside `put`, which before the
+  // error boundary in `index.ts` reached the caller as an opaque 500 with no
+  // CORS headers.
+  if (ttl === null) {
+    return json({ error: "This payment link has already expired." }, 410);
+  }
+
   const account = await createLinkWallet(
     env,
     linkId,
-    keyTtlFor(allowed.expiresAt),
+    ttl,
     (owner) => predictAccount(env, owner),
     signer
   );

@@ -44,6 +44,8 @@ let registered = new Set<string>();
 let frozen = new Set<string>();
 /** linkId -> owner, or absent to model a link that does not exist yet. */
 let links = new Map<string, string>();
+/** linkId -> expiresAt. Absent means 0n, a link that never expires. */
+let linkExpiry = new Map<string, bigint>();
 /** Set to fail the chain reads, for the RPC-outage cases. */
 let rpcDown = false;
 
@@ -61,7 +63,8 @@ vi.mock("../src/chain", () => ({
         // The integrator reverts LinkNotFound for a link that does not exist,
         // which is the case the merchant is in when minting before the batch.
         if (!owner) throw new Error("LinkNotFound");
-        return [owner, 0n, "0x", 0n, 0, 0, 0, 0];
+        const expiresAt = linkExpiry.get(String(args[0]).toLowerCase()) ?? 0n;
+        return [owner, 0n, "0x", expiresAt, 0, 0, 0, 0];
       }
       if (functionName === "getMerchantInfo") {
         const who = String(args[0]).toLowerCase();
@@ -85,6 +88,7 @@ function fakeEnv(): { env: Env; store: Map<string, string> } {
   registered = new Set([MERCHANT.address.toLowerCase(), OTHER_MERCHANT.address.toLowerCase()]);
   frozen = new Set();
   links = new Map();
+  linkExpiry = new Map();
   rpcDown = false;
 
   const store = new Map<string, string>();
@@ -324,5 +328,82 @@ describe("minting a link's wallet", () => {
       "0x1234"
     );
     expect(res.status).toBe(400);
+  });
+
+  // ─── Round-4 L6 ───────────────────────────────────────────────────
+
+  it("refuses an already-expired link instead of throwing an illegal KV TTL", async () => {
+    // L6. `keyTtlFor` returned 0 for an expired link, and Cloudflare KV rejects
+    // any expirationTtl below 60 by THROWING from inside `put`. The route had no
+    // try/catch, so this surfaced as a bare 500 with no CORS headers — which the
+    // pay page cannot read at all, and so reports as an opaque network error.
+    //
+    // Reachable on the RE-provision path: the first-time path passes 0n (the
+    // link does not exist yet) and is fine, but a merchant re-provisioning a
+    // link that has since expired lands here.
+    links.set(LINK.toLowerCase(), MERCHANT.address);
+    linkExpiry.set(LINK.toLowerCase(), BigInt(nowSec() - 60));
+
+    const res = await provision(env, MERCHANT);
+    expect(res.status).toBe(410);
+    expect((await res.json()) as any).toMatchObject({
+      error: expect.stringContaining("expired"),
+    });
+  });
+
+  it("mints for a link expiring within KV's 60-second floor", async () => {
+    // The other half of L6. A link expiring in 30 seconds is legal on-chain but
+    // not expressible as a KV TTL, so the TTL rounds up rather than refusing —
+    // a live link must stay provisionable.
+    links.set(LINK.toLowerCase(), MERCHANT.address);
+    linkExpiry.set(LINK.toLowerCase(), BigInt(nowSec() + 30));
+
+    const res = await provision(env, MERCHANT);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as any).account).toMatch(/^0xacc0/);
+  });
+
+  // ─── Round-4 L7 ───────────────────────────────────────────────────
+
+  it("rate limits provisioning per MERCHANT, not per IP", async () => {
+    // L7. The route costs two RPC reads and, since round-3 M1 removed the key
+    // TTL cap, writes a KV record with NO expiry for a link with expiresAt = 0.
+    // It is signature-gated, so the world cannot reach it — but one compromised
+    // merchant key could otherwise write unbounded permanent records.
+    //
+    // Keyed on the merchant because that is the axis the signature establishes.
+    // An IP bucket would be the wrong one: many merchants behind one carrier NAT
+    // is the case that must not be punished.
+    const { MAX_PROVISIONS_PER_MERCHANT_HOUR } = await import("../src/provision");
+    const hour = Math.floor(Date.now() / 3_600_000);
+    const key = `rl:provision:${MERCHANT.address.toLowerCase()}:${hour}`;
+    await env.KV.put(key, String(MAX_PROVISIONS_PER_MERCHANT_HOUR));
+
+    const res = await provision(env, MERCHANT, ("0x" + "cd".repeat(32)) as `0x${string}`);
+    expect(res.status).toBe(429);
+
+    // A DIFFERENT merchant is unaffected — the bucket is per-merchant.
+    const other = await provision(
+      env,
+      OTHER_MERCHANT,
+      ("0x" + "ef".repeat(32)) as `0x${string}`
+    );
+    expect(other.status).toBe(200);
+  });
+
+  it("does not consume the rate limit on an idempotent retry", async () => {
+    // A retry after a dropped response returns the existing record BEFORE the
+    // counter is touched. Otherwise a merchant retrying a flaky request would
+    // burn their own allowance for work that was already done.
+    const first = await provision(env, MERCHANT);
+    expect(first.status).toBe(200);
+
+    const hour = Math.floor(Date.now() / 3_600_000);
+    const key = `rl:provision:${MERCHANT.address.toLowerCase()}:${hour}`;
+    const afterFirst = await env.KV.get(key);
+
+    const retry = await provision(env, MERCHANT);
+    expect(((await retry.json()) as any).existing).toBe(true);
+    expect(await env.KV.get(key)).toBe(afterFirst);
   });
 });

@@ -8,6 +8,7 @@ import {
   linkOwnerAddress,
   destroyLinkWallet,
   keyTtlFor,
+  KV_MIN_TTL,
 } from "../src/linkWallet";
 import type { Env } from "../src/config";
 
@@ -219,7 +220,29 @@ describe("key lifetime", () => {
     expect(keyTtlFor(BigInt(NOW + year), NOW)).toBe(year);
   });
 
-  it("returns zero for an already-expired link", () => {
-    expect(keyTtlFor(BigInt(NOW - 1), NOW)).toBe(0);
+  it("REFUSES an already-expired link rather than returning an illegal TTL", () => {
+    // This asserted `0`, and `0` was a bug — round-4 L6.
+    //
+    // Cloudflare KV rejects any expirationTtl below 60 by THROWING from inside
+    // `put`. Zero therefore never expressed "expire immediately"; it threw out
+    // of the provisioning route, which had no error boundary, and reached the
+    // pay page as a bare 500 with no CORS headers — unreadable by the browser,
+    // and so indistinguishable from the Worker being down.
+    //
+    // `null` instead, and the caller refuses with a 410. That is also the right
+    // answer on the merits: an expired link cannot be paid, so there is nothing
+    // worth provisioning a wallet for.
+    expect(keyTtlFor(BigInt(NOW - 1), NOW)).toBeNull();
+  });
+
+  it("never returns a TTL below KV's 60-second floor", () => {
+    // The other half of L6, and the one that could bite a LIVE link: a link
+    // expiring in 30 seconds is perfectly legal on-chain but not expressible as
+    // a KV TTL. Round up rather than refuse — the key outliving its link by
+    // under a minute is harmless, because expiry is enforced by the integrator
+    // on every order, never by the lifetime of this record.
+    expect(keyTtlFor(BigInt(NOW + 1), NOW)).toBe(KV_MIN_TTL);
+    expect(keyTtlFor(BigInt(NOW + 59), NOW)).toBe(KV_MIN_TTL);
+    expect(keyTtlFor(BigInt(NOW + 61), NOW)).toBe(61);
   });
 });

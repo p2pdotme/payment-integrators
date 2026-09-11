@@ -39,6 +39,54 @@ export default {
 
     let res: Response;
 
+    try {
+      res = await route(req, env, path);
+    } catch (err) {
+      // ROUND-4 L6, generalised. CORS headers are applied below, AFTER the
+      // handler returns — so ANY throw in ANY route escaped this function
+      // entirely and reached the browser as a bare 500 with no CORS headers.
+      // The pay page cannot read such a response at all: it surfaces as an
+      // opaque network error, indistinguishable from the Worker being down.
+      //
+      // L6 was one instance (an out-of-range KV TTL throwing inside `put`), but
+      // the shape is general, so the boundary belongs here rather than around
+      // any single route. Log the detail; tell the caller nothing but that it
+      // failed.
+      console.error(`[paylinks] unhandled error on ${req.method} ${path}:`, err);
+      res = json({ error: "Something went wrong. Please try again." }, 500);
+    }
+
+    for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
+    return res;
+  },
+
+  /** Every 5 minutes: confirm completions, deliver webhooks, watch the float. */
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const queued = await scanAndQueue(env);
+          const delivered = await deliverQueued(env);
+          const strikes = await sweepFalseClaims(env);
+
+          // The relayer balance check is gone with the relayer. Watching a
+          // wallet whose emptiness is the design told an operator nothing, and
+          // made RELAYER_PRIVATE_KEY a hard requirement for a cron that no
+          // longer needs it. What needs watching now is the sponsorship budget,
+          // which lives at the provider.
+          console.log(`[paylinks] queued=${queued} delivered=${delivered} strikes=${strikes}`);
+        } catch (err) {
+          console.error("[paylinks] scheduled run failed:", err);
+        }
+      })()
+    );
+  },
+};
+
+/** The route table itself. Kept separate so `fetch` can wrap it in one place. */
+async function route(req: Request, env: Env, path: string): Promise<Response> {
+    let res: Response;
+
     if (req.method === "GET" && path === "/health") {
       res = await health(env);
     } else if (req.method === "POST" && path.startsWith("/api/pay/")) {
@@ -77,32 +125,8 @@ export default {
       res = json({ error: "Not found." }, 404);
     }
 
-    for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
     return res;
-  },
-
-  /** Every 5 minutes: confirm completions, deliver webhooks, watch the float. */
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(
-      (async () => {
-        try {
-          const queued = await scanAndQueue(env);
-          const delivered = await deliverQueued(env);
-          const strikes = await sweepFalseClaims(env);
-
-          // The relayer balance check is gone with the relayer. Watching a
-          // wallet whose emptiness is the design told an operator nothing, and
-          // made RELAYER_PRIVATE_KEY a hard requirement for a cron that no
-          // longer needs it. What needs watching now is the sponsorship budget,
-          // which lives at the provider.
-          console.log(`[paylinks] queued=${queued} delivered=${delivered} strikes=${strikes}`);
-        } catch (err) {
-          console.error("[paylinks] scheduled run failed:", err);
-        }
-      })()
-    );
-  },
-};
+}
 
 /**
  * Liveness only.
