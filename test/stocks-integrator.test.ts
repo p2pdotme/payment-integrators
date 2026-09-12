@@ -477,6 +477,182 @@ describe("StocksIntegrator", function () {
     });
   });
 
+  // ─── Guard arms ─────────────────────────────────────────────────────
+  // The untested half of each validation branch. Cheap to cover, and every one
+  // is a way to brick a deployment that can only be fixed by redeploying AND
+  // re-whitelisting, because the address is what the Diamond registers.
+
+  describe("constructor validation", function () {
+    async function deployWith(
+      overrides: Partial<{
+        diamond: string;
+        usdc: string;
+        messenger: string;
+        reserve: string;
+        ata: string;
+        txLimit: bigint;
+        daily: number;
+      }>
+    ) {
+      const f = await ethers.getContractFactory("StocksIntegrator");
+      return f.deploy(
+        overrides.diamond ?? (await mockDiamond.getAddress()),
+        overrides.usdc ?? usdcAddr,
+        overrides.messenger ?? (await tokenMessenger.getAddress()),
+        overrides.reserve ?? usdcAddr,
+        overrides.ata ?? TREASURY_ATA,
+        SOLANA_DOMAIN,
+        overrides.txLimit ?? TX_LIMIT,
+        overrides.daily ?? DAILY_COUNT
+      );
+    }
+
+    it("rejects a zero address in any constructor slot", async function () {
+      for (const slot of ["diamond", "usdc", "messenger", "reserve"] as const) {
+        await expect(deployWith({ [slot]: ethers.ZeroAddress })).to.be.revertedWithCustomError(
+          integrator,
+          "InvalidAddress"
+        );
+      }
+    });
+
+    it("rejects a txLimit of zero or above the ceiling", async function () {
+      await expect(deployWith({ txLimit: 0n })).to.be.revertedWithCustomError(
+        integrator,
+        "AboveCeiling"
+      );
+      await expect(deployWith({ txLimit: USDC(51) })).to.be.revertedWithCustomError(
+        integrator,
+        "AboveCeiling"
+      );
+    });
+
+    it("rejects a daily count of zero or above the ceiling", async function () {
+      await expect(deployWith({ daily: 0 })).to.be.revertedWithCustomError(
+        integrator,
+        "AboveCeiling"
+      );
+      await expect(deployWith({ daily: 11 })).to.be.revertedWithCustomError(
+        integrator,
+        "AboveCeiling"
+      );
+    });
+  });
+
+  describe("owner setters, remaining arms", function () {
+    it("rejects a zero txLimit and a zero daily count", async function () {
+      // Zero would otherwise be a plausible way to mean "unlimited", which is a
+      // route around the immutable ceiling.
+      await expect(integrator.setTxLimit(0)).to.be.revertedWithCustomError(
+        integrator,
+        "AboveCeiling"
+      );
+      await expect(integrator.setDailyTxCountLimit(0)).to.be.revertedWithCustomError(
+        integrator,
+        "AboveCeiling"
+      );
+    });
+
+    it("accepts values at the ceiling", async function () {
+      await integrator.setTxLimit(USDC(50));
+      expect(await integrator.txLimit()).to.equal(USDC(50));
+      await integrator.setDailyTxCountLimit(10);
+      expect(await integrator.dailyTxCountLimit()).to.equal(10);
+      await integrator.setBridgeMaxFeeBps(10);
+      expect(await integrator.bridgeMaxFeeBps()).to.equal(10);
+      await integrator.setStockEnabled(AAPL, false);
+      expect(await integrator.stockEnabled(AAPL)).to.equal(false);
+    });
+
+    it("refuses to sweep to the zero address", async function () {
+      await expect(integrator.withdrawUsdc(ethers.ZeroAddress, 0)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidAddress"
+      );
+    });
+  });
+
+  describe("validateOrder", function () {
+    it("declines rather than reverts when over the per-tx limit", async function () {
+      // The Diamond treats a false return as a refusal. Reverting would surface
+      // as an opaque gateway failure instead.
+      const diamond = await asDiamond();
+      expect(
+        await integrator.connect(diamond).validateOrder.staticCall(user.address, USDC(51), INR)
+      ).to.equal(false);
+    });
+
+    it("declines once the day's count is spent, per wallet", async function () {
+      const diamond = await asDiamond();
+      for (let i = 0; i < DAILY_COUNT; i++) {
+        await buy(user, USDC(1), AAPL, ethers.keccak256(ethers.toUtf8Bytes(`vo-${i}`)));
+      }
+      expect(
+        await integrator.connect(diamond).validateOrder.staticCall(user.address, USDC(1), INR)
+      ).to.equal(false);
+      expect(
+        await integrator.connect(diamond).validateOrder.staticCall(user2.address, USDC(1), INR)
+      ).to.equal(true);
+    });
+  });
+
+  describe("delivery accounting edges", function () {
+    it("clamps an over-reported delivery down to what was placed", async function () {
+      // Defence in depth: today's gateway passes exactly what it transferred,
+      // but this integrator is immutable and the Diamond is not. Reserving more
+      // than was placed would let this order's burn spend another buyer's USDC.
+      const orderId = await buy(user, USDC(10));
+      await tokenMessenger.setBurnLimitPerMessage(usdcAddr, 0); // stay unbridged so the reservation is readable
+      await mockUsdc.mint(integratorAddr, USDC(40)); // plenty of free balance to over-reserve from
+      const diamond = await asDiamond();
+
+      await integrator
+        .connect(diamond)
+        .onOrderComplete(orderId, user.address, USDC(30), integratorAddr);
+
+      expect((await integrator.getSession(orderId)).amount).to.equal(USDC(10));
+      expect(await integrator.unbridgedTotal()).to.equal(USDC(10));
+    });
+
+    it("records a zero delivery and skips the burn when no reserve is funded", async function () {
+      // The real operational trap: in receipt mode the burn comes out of a
+      // reserve held BY THE INTEGRATOR and nothing funds it automatically. A
+      // settled order then reserves nothing, and must not attempt a burn.
+      const reserve = await (await ethers.getContractFactory("MockUSDC")).deploy();
+      const c = await deploy(await reserve.getAddress()); // reserve deliberately left empty
+      const orderId = await mockDiamond.nextOrderId();
+      await c.connect(user).userBuyStock(USDC(10), AAPL, INR, USER_WALLET, REF, 1, "", 0, 0);
+
+      await expect(mockDiamond.simulateOrderComplete(orderId))
+        .to.emit(c, "StockDeliveryRequested")
+        .withArgs(orderId, REF, user.address, USER_WALLET, AAPL, 0);
+
+      const s = await c.getSession(orderId);
+      expect(s.fulfilled).to.equal(true);
+      expect(s.amount).to.equal(0);
+      expect(await c.unbridgedTotal()).to.equal(0);
+    });
+
+    it("refuses to retry or rescue an order that never settled", async function () {
+      const orderId = await buy(user, USDC(10));
+      await expect(integrator.retryBridge(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "NotFulfilled"
+      );
+      await expect(
+        integrator.connect(user).userRescueStuckBridge(orderId)
+      ).to.be.revertedWithCustomError(integrator, "NotFulfilled");
+    });
+
+    it("refuses to rescue an order that already bridged", async function () {
+      const orderId = await buyAndComplete(user, USDC(10));
+      await time.increase(7 * 24 * 3600 + 1);
+      await expect(
+        integrator.connect(user).userRescueStuckBridge(orderId)
+      ).to.be.revertedWithCustomError(integrator, "AlreadyBridged");
+    });
+  });
+
   // ─── Receipt mode (how testnet exercises the REAL CCTP path) ────────
 
   describe("receipt mode", function () {
