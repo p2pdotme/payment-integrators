@@ -131,6 +131,30 @@ function req(name: string): string {
   return v;
 }
 
+/**
+ * Read from a freshly deployed contract, tolerating an RPC node that has not
+ * yet seen it. Losing a deployment to a stale read is expensive: the address is
+ * what gets whitelisted, so "just redeploy" is not free.
+ */
+async function retryRead<T>(fn: () => Promise<T>, what: string, attempts = 8): Promise<T> {
+  let last: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      last = e;
+      const wait = 1500 * (i + 1);
+      console.log(`  (${what} not readable yet, retrying in ${wait}ms — RPC lag)`);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw new Error(
+    `${what} still unreadable after ${attempts} attempts. The contract is very ` +
+      `likely deployed — recover it with scripts/find-deployment.mjs rather than ` +
+      `redeploying. Last error: ${(last as Error)?.message}`
+  );
+}
+
 async function main() {
   const chainId = Number((await ethers.provider.getNetwork()).chainId);
   const isMainnet = chainId === 8453;
@@ -249,7 +273,14 @@ async function main() {
   ).deploy(diamond, usdc, tokenMessenger, reserve, treasuryAta, SOLANA_DOMAIN, txLimit, dailyCount);
   await integrator.waitForDeployment();
   const addr = await integrator.getAddress();
-  const proxyImpl = await integrator.proxyImpl();
+
+  // `waitForDeployment` only proves the receipt exists. A public RPC behind a
+  // load balancer can still answer a read from a node that has not caught up,
+  // returning "0x" and failing to decode — which is exactly what happened on
+  // the first Base Sepolia deploy, aborting the script AFTER a good contract
+  // was already on chain and before any stock was enabled. Retry the first
+  // read rather than throwing away a deployment over RPC lag.
+  const proxyImpl = await retryRead(() => integrator.proxyImpl(), "proxyImpl()");
 
   console.log(`\n✅ StocksIntegrator:  ${addr}`);
   console.log(`   proxyImpl:         ${proxyImpl}`);
