@@ -61,16 +61,19 @@ pay ₹1 for a ₹3,000 order, we never read that field. And if this Worker were
 fully compromised, the contract still rejects a mismatched amount with
 `LinkAmountMismatch`.
 
-## Why a global nonce sequencer
+## Nonces: why there is no longer a global sequencer
 
-The relayer is one EOA, so every payment draws from one nonce sequence. Two
-customers paying two **different** links in the same second would otherwise
-both read the same pending nonce, and the second transaction would be silently
-dropped — no error, a customer watching a spinner forever.
+When one funded EOA relayed every payment, all of them drew on a single nonce
+sequence. Two customers paying two **different** links in the same second both
+read the same pending nonce, and the second transaction was silently dropped —
+no error, a customer watching a spinner forever. Per-link locking could not fix
+it, because the collision was across links.
 
-Per-link locking cannot fix this; the collision is across links. `NonceManager`
-is a single Durable Object instance for the whole Worker, so allocation is
-serialized by construction.
+The Router removed the cause rather than managing it. Each link has its own
+ERC-4337 account with its own nonce sequence, so one slow payment cannot block
+any other. `NonceManager` survives in `durable.ts` for the deprecated relayer
+path only; nothing on the payment path instantiates it, and it goes when
+`RELAYER_PRIVATE_KEY` does.
 
 ## The relay-tx allowlist
 
@@ -130,7 +133,11 @@ Measured from the contract's own gas report:
 |---|---|
 | `relayerPlaceOrder` | ~348k gas avg, ~398k max |
 | At 0.01 gwei on Base | **~$0.01 per payment** |
-| A 0.05 ETH float | **~14,000 payments** |
+| A 0.05 ETH paymaster deposit | **~14,000 payments** |
+
+Gas comes out of the **paymaster's deposit**, not a relayer float — no key of
+ours holds a balance, so the deposit at the provider is the only thing to top
+up.
 
 Those figures assume Base's usual gas price. The ceilings below are denominated
 in **wei**, not gas units, precisely so that assumption is not load-bearing: a
@@ -156,8 +163,17 @@ change and a redeploy to turn down.
 
 | | |
 |---|---|
-| `RELAYER_PRIVATE_KEY` | the relayer EOA's key |
+| `LINK_KEY_MASTER` | 32 random bytes, base64. Wraps every per-link wallet key. |
 | `WEBHOOK_SIGNING_KEY` | HMAC key for outbound webhook signatures |
+| `SPONSOR_VERIFIER_SECRET` | shared with the sponsorship provider; `/api/sponsor-check` fails CLOSED without it |
+| `TURNSTILE_SECRET` | the human-cost gate; `REQUIRE_TURNSTILE=true` turns its absence into a loud 503 |
+| `RELAYER_PRIVATE_KEY` | **deprecated and optional.** Not on the payment path. |
+
+`LINK_KEY_MASTER` is what replaced the funded relayer key, and the difference is
+the point: it holds no money, so losing it costs availability rather than funds.
+
+Secrets are per-environment. Repeat each one with `--env production` or mainnet
+ships without it.
 
 **Wiring** — must be set before the first payment:
 
@@ -166,8 +182,22 @@ change and a redeploy to turn down.
 | `CHAIN_ID`, `RPC_URL` | which chain |
 | `INTEGRATOR_ADDRESS` | our contract |
 | `DIAMOND_ADDRESS` | the only target `/api/relay-tx` will forward to |
+| `LINK_ROUTER_ADDRESS` | the LinkRouter, which is the integrator's `trustedRelayer` |
 | `CLIENT_ADDRESS`, `PRODUCT_ID` | the pinned price source |
 | `ALLOWED_ORIGINS` | empty = open, correct for a public pay page |
+
+**Account abstraction** — every link payment is a sponsored user operation, so
+these are required too. Each is silent when wrong: nothing reverts, nothing
+logs, the payment simply never lands.
+
+| | |
+|---|---|
+| `ENTRYPOINT_ADDRESS` | the 4337 singleton, already on Base. Do not deploy your own. |
+| `ACCOUNT_FACTORY_ADDRESS` | the factory link accounts are derived from |
+| `ACCOUNT_FACTORY_KIND` | `thirdweb` or `simple`. **Different selectors** — the wrong value calls a function the factory does not have. This shipped wrong once. |
+| `BUNDLER_URL` | replaces the funded key AND the nonce manager |
+| `PAYMASTER_URL`, `PAYMASTER_POLICY_ID` | who pays the gas |
+| `MAX_SPONSORED_OPS_PER_LINK` | per-link lifetime ceiling, enforced by `/api/sponsor-check` — not a provider dashboard setting |
 
 **Operational limits** — all optional; unset, the defaults in
 `src/config.ts` apply. Those defaults are sized from the contract's own
@@ -199,21 +229,37 @@ real money and the daily cap starts tighter.
 npm install
 
 wrangler kv namespace create KV          # put the id in wrangler.toml
-wrangler secret put RELAYER_PRIVATE_KEY
+wrangler secret put LINK_KEY_MASTER      # 32 random bytes, base64
 wrangler secret put WEBHOOK_SIGNING_KEY
+wrangler secret put SPONSOR_VERIFIER_SECRET
+wrangler secret put TURNSTILE_SECRET
 
-# set INTEGRATOR_ADDRESS / DIAMOND_ADDRESS / CLIENT_ADDRESS in wrangler.toml
+# set the wiring and account-abstraction vars in wrangler.toml — see
+# Configuration above. Repeat every secret with --env production.
 wrangler deploy                    # testnet
 wrangler deploy --env production   # mainnet
 ```
 
-On-chain, once: `setLinkRelayer(<relaying key>, true)` for each key in the pool
-— these are SEPARATE from `setTrustedRelayer`, which now carries only the fiat
-keeper duty — then fund each address
-with a small ETH float. Confirm with `GET /health`.
+**On-chain, once** — deploy the Router and point the integrator at it:
 
-If the relayer runs dry, link payments fail visibly with no risk to funds — it
-never holds or touches merchant USDC.
+```bash
+INTEGRATOR=0x… npx hardhat run scripts/deploy-link-router.ts --network base
+```
+
+That deploys `LinkRouter` and calls `setTrustedRelayer(router)`. There is ONE
+such slot, it means the link path, and it has no second role — merchants
+deliver their own fiat payouts. Put the address it prints into
+`LINK_ROUTER_ADDRESS` and redeploy the Worker; without it no link payment can
+be placed at all. `SKIP_WIRE=1` deploys without wiring, for when the deployer
+is not the manager.
+
+**No key needs funding.** A link payment is placed by that link's own ERC-4337
+account, which holds nothing before, during or after, and the paymaster pays
+the gas. What can run dry is the paymaster's deposit, not a relayer float —
+watch it at the provider, and check `GET /health`.
+
+To roll link payments back, call `setLinkOrdersEnabled(false)` (MANAGER). Do
+**not** clear `trustedRelayer` to do it.
 
 ## Tests
 

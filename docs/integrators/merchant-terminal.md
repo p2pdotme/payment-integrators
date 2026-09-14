@@ -312,6 +312,14 @@ attempt to say so.
 `registerAgent` is write-once. A link whose wallet is lost cannot be re-bound;
 revoke it and issue a new one.
 
+**This assumes merchants hold smart accounts, and they do** — confirmed for
+production during the round-5 review. Both halves depend on it: batching the
+two calls into one atomic operation, and sponsoring the gas so the merchant
+needs no ETH. On a plain EOA neither holds — the batch becomes two separate
+transactions the merchant pays for and can half-complete, which produces
+exactly the silent, unpayable link described above. If that ever changes, this
+flow needs redesigning, not adjusting.
+
 ### 1. The cancel callback must be switched on (required)
 
 `onOrderCancel` is only delivered if a p2p super-admin has run
@@ -361,6 +369,24 @@ whitelisting checks `proxyImpl` against the canonical `UserProxy` bytecode and
 `proxyImpl` is set-once on the Diamond, this needs either an explicit exception
 with a reproducible build recipe, or the size problem solved structurally so
 the override can be dropped.
+
+### 4. v1 is scoped to single-use (per-invoice) links
+
+One link per invoice. **Do not advertise a standing counter QR** until
+multi-use links queue rather than refuse.
+
+`/api/pay` takes a per-link lock, and a caller that cannot get it is refused
+immediately with 409 — *"This payment is already being processed."* — not
+queued (`worker/src/pay.ts:118`). For a single-use invoice that is correct and
+the message is accurate: there is one payer and one payment. On a shared QR,
+two customers tapping inside the same round-trip means one of them is told
+about a stranger's payment, with nothing behind them.
+
+Measured, not assumed: 120 concurrent payments across 40 links yield exactly
+40 × 200 and 80 × 409, asserted in `worker/test/stress.test.ts`. The lock is
+deliberate — it is cost control, and the contract's `LinkAlreadyUsed` is the
+real guarantee — so lifting this scope means adding a queue behind the lock,
+not removing it. The assertions are exact, so that change shows up in the diff.
 
 ### Also confirm before going live
 
