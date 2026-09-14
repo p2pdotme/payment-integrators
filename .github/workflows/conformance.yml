@@ -13,9 +13,12 @@
 # review ran this by hand and it passed; running it never again is how the next
 # one ships.
 #
-# NOTE: GitHub only runs `schedule` on the DEFAULT branch. This does nothing
-# until it is merged to main — the manual trigger below is how to exercise it
-# before then.
+# NOTE: GitHub runs `schedule` — and registers `workflow_dispatch` — only from
+# the DEFAULT branch. This file therefore does nothing at all until it merges to
+# main, the manual trigger included. Until then the only way to exercise it is
+# the command the test's own header documents:
+#
+#   LIVE_DIAMOND=1 npx hardhat test test/PaymentLinksDiamondConformance.ts
 name: Conformance (live Diamond)
 
 on:
