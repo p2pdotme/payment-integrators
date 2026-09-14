@@ -766,6 +766,28 @@ contract MockDiamond {
      *         scenario sweepStrandedBuy recovers, without needing to force a
      *         contrived revert inside the real callback.
      */
+    /**
+     * @notice Cancel a BUY protocol-side WITHOUT invoking the integrator.
+     *
+     *         THIS IS THE DEFAULT REAL BEHAVIOUR, not an edge case.
+     *         B2BGatewayFacet.onB2BOrderCancelled decrements the gateway's own
+     *         activeOrderCount and emits, and never calls the integrator — unlike
+     *         onB2BOrderComplete, which does call onOrderComplete. Later revisions
+     *         add setIntegratorCancelCallback, opt-in and default OFF (this mock's
+     *         getIntegratorConfig already reports cancelCallbackEnabled = false).
+     *
+     *         So an integrator whose accounting depends on onOrderCancel leaks on
+     *         every expired or abandoned order. This is what a reconcile path has
+     *         to recover, and `simulateOrderCancelled` (which DOES call back)
+     *         cannot express it.
+     */
+    function simulateOrderCancelledNoCallback(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        require(!order.cancelled, "Already cancelled");
+        order.cancelled = true;
+        emit MockOrderCancelled(orderId);
+    }
+
     function simulateOrderCompleteNoCallback(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(!order.completed, "Already completed");
