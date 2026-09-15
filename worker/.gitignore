@@ -1,0 +1,4 @@
+node_modules/
+.wrangler/
+.dev.vars
+test/e2e-addresses.json

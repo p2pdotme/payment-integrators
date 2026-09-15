@@ -1,0 +1,71 @@
+# Nightly conformance against the LIVE Diamond.
+#
+# WHY THIS IS SEPARATE FROM ci.yml
+# `PaymentLinksDiamondConformance.ts` asserts that the real Diamond still gates
+# `paidBuyOrder` and `cancelOrder` on `order.user` — the premise MockDiamond
+# encodes and the entire proxy-as-order.user fix rests on. It is read-only
+# (`eth_call` throughout, no keys, no funds, no state change), but it needs the
+# internet, so it cannot sit in the PR job: a suite that goes red because an RPC
+# blinked is a suite nobody can act on, and it would be disabled within a week.
+#
+# Nightly is the right cadence. The B1 blocker was a factual error about a
+# contract we do not own, and nothing was watching for it to change. Round-4
+# review ran this by hand and it passed; running it never again is how the next
+# one ships.
+#
+# NOTE: GitHub runs `schedule` — and registers `workflow_dispatch` — only from
+# the DEFAULT branch. This file therefore does nothing at all until it merges to
+# main, the manual trigger included. Until then the only way to exercise it is
+# the command the test's own header documents:
+#
+#   LIVE_DIAMOND=1 npx hardhat test test/PaymentLinksDiamondConformance.ts
+name: Conformance (live Diamond)
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC daily — off the hour, which is congested
+  workflow_dispatch:
+    inputs:
+      rpc:
+        description: "RPC URL (blank = the LIVE_RPC variable, else Base Sepolia)"
+        required: false
+      diamond:
+        description: "Diamond address (blank = the DIAMOND_ADDRESS variable)"
+        required: false
+
+jobs:
+  live-diamond:
+    name: Does the live Diamond still gate on order.user?
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Compile
+        run: npx hardhat compile
+
+      # Retried, because the failure we care about is "the Diamond changed",
+      # not "a public RPC dropped one request". Three consecutive failures is
+      # a signal; one is weather. A real conformance break fails all three.
+      - name: Conformance
+        env:
+          LIVE_DIAMOND: "1"
+          LIVE_RPC: ${{ github.event.inputs.rpc || vars.LIVE_RPC }}
+          DIAMOND_ADDRESS: ${{ github.event.inputs.diamond || vars.DIAMOND_ADDRESS }}
+        run: |
+          for attempt in 1 2 3; do
+            echo "── attempt $attempt ──"
+            if npx hardhat test test/PaymentLinksDiamondConformance.ts; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then sleep 30; fi
+          done
+          echo "::error::Live Diamond conformance failed 3x. MockDiamond may no longer match the real Diamond — the proxy-as-order.user fix rests on this."
+          exit 1
