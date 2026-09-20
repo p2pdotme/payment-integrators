@@ -370,23 +370,46 @@ whitelisting checks `proxyImpl` against the canonical `UserProxy` bytecode and
 with a reproducible build recipe, or the size problem solved structurally so
 the override can be dropped.
 
-### 4. v1 is scoped to single-use (per-invoice) links
+### 4. Standing counter QRs are supported
 
-One link per invoice. **Do not advertise a standing counter QR** until
-multi-use links queue rather than refuse.
+A link with `amount = 0` and `maxUses = 0` is a counter QR: the customer scans
+it, types their own amount, and pays. The contract always allowed this shape —
+`PaymentLinksLib.consume` skips the amount match for a variable link and lets
+`validateOrder`'s per-transaction cap bound it — but three worker ceilings,
+each sized for one invoice with one payer, made it unusable in practice. All
+three are now sized for the shared case.
 
-`/api/pay` takes a per-link lock, and a caller that cannot get it is refused
-immediately with 409 — *"This payment is already being processed."* — not
-queued (`worker/src/pay.ts:118`). For a single-use invoice that is correct and
-the message is accurate: there is one payer and one payment. On a shared QR,
-two customers tapping inside the same round-trip means one of them is told
-about a stranger's payment, with nothing behind them.
+**The lock queues instead of refusing.** `/api/pay` still takes a per-link lock
+and still must: the link's account has its own nonce sequence, read from the
+EntryPoint while the operation is assembled, so two payments built at the same
+instant would collide on it. That is correctness, not only cost. What changed
+is what happens to the loser of the race — `acquireWithWait` waits for a turn
+(`LINK_LOCK_WAIT_MS`, default 6s; a normal hold is the length of one request,
+since the lock is released in a `finally`). A caller who never gets a turn is
+told the **link** is busy, not that their payment is already being processed —
+the old message described a stranger's transaction to whoever tapped second.
 
-Measured, not assumed: 120 concurrent payments across 40 links yield exactly
-40 × 200 and 80 × 409, asserted in `worker/test/stress.test.ts`. The lock is
-deliberate — it is cost control, and the contract's `LinkAlreadyUsed` is the
-real guarantee — so lifting this scope means adding a queue behind the lock,
-not removing it. The assertions are exact, so that change shows up in the diff.
+**The sponsorship allowance is per day, not per lifetime.** It was a lifetime
+counter on a key whose 30-day expiry was refreshed on every write, so a link in
+active use never reset: at two sponsored operations per payment, a printed QR
+stopped working at roughly its tenth customer, permanently, with nothing
+on-chain to explain it. It is now a per-UTC-day window, defaulting to 60 —
+above the 50 a merchant's own `dailyLimit` of 25 orders could spend. What the
+counter defends against is the place-then-cancel loop (cancelling returns the
+use), and a loop is bounded just as well per day as per lifetime.
+
+**Rate limits key on the source.** `linkPerHour` was 20, which read "popular"
+as "attacked" and shut a busy shop down mid-queue. The tight limit is now
+`ipLinkPerHour` (12) — one address against one link — with `linkPerHour` (240)
+kept only as a ceiling on total noise reaching a single link.
+
+Still true, and worth stating to the merchant: a variable link is bounded by
+the merchant's per-transaction cap (50 USDC for INR, 100 otherwise), and every
+link sale counts against the same `dailyLimit` as a POS sale. Raise that limit
+before pointing a busy counter at it.
+
+`worker/test/stress.test.ts` asserts the queue behaviour, and that a refusal
+says the link is busy rather than narrating another customer's payment.
 
 ### Also confirm before going live
 
