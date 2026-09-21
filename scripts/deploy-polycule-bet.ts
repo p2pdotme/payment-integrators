@@ -6,19 +6,30 @@ import { ethers } from "hardhat";
  *
  * Usage:
  *   DIAMOND_ADDRESS=0x... USDC_ADDRESS=0x... OWNER_ADDRESS=0x... \
- *   REGISTRAR_ADDRESS=0x... \
+ *   REGISTRAR_ADDRESS=0x... REPUTATION_MANAGER_ADDRESS=0x... \
  *   npx hardhat run scripts/deploy-polycule-bet.ts --network base
+ *
+ * REPUTATION_MANAGER_ADDRESS is the p2p.me ReputationManager the Diamond
+ * reads (Base mainnet: 0xCF613e08EE1B4c2669DdCf06A7d22c9856f6Aa1D). Wallets it
+ * blacklists cannot place orders through this integrator.
  */
 
 const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
 const USDC_ADDRESS = process.env.USDC_ADDRESS || "";
 const OWNER_ADDRESS = process.env.OWNER_ADDRESS || "";
 const REGISTRAR_ADDRESS = process.env.REGISTRAR_ADDRESS || "";
+const REPUTATION_MANAGER_ADDRESS = process.env.REPUTATION_MANAGER_ADDRESS || "";
 
 async function main() {
-  if (!DIAMOND_ADDRESS || !USDC_ADDRESS || !OWNER_ADDRESS || !REGISTRAR_ADDRESS) {
+  if (
+    !DIAMOND_ADDRESS ||
+    !USDC_ADDRESS ||
+    !OWNER_ADDRESS ||
+    !REGISTRAR_ADDRESS ||
+    !REPUTATION_MANAGER_ADDRESS
+  ) {
     throw new Error(
-      "DIAMOND_ADDRESS, USDC_ADDRESS, OWNER_ADDRESS, REGISTRAR_ADDRESS env vars required"
+      "DIAMOND_ADDRESS, USDC_ADDRESS, OWNER_ADDRESS, REGISTRAR_ADDRESS, REPUTATION_MANAGER_ADDRESS env vars required"
     );
   }
 
@@ -32,6 +43,7 @@ async function main() {
   console.log("USDC:", USDC_ADDRESS);
   console.log("Owner:", OWNER_ADDRESS);
   console.log("Registrar:", REGISTRAR_ADDRESS);
+  console.log("ReputationManager:", REPUTATION_MANAGER_ADDRESS);
   console.log("");
 
   const Integrator = await ethers.getContractFactory("PolyculeBetIntegrator");
@@ -40,7 +52,8 @@ async function main() {
     DIAMOND_ADDRESS,
     USDC_ADDRESS,
     OWNER_ADDRESS,
-    REGISTRAR_ADDRESS
+    REGISTRAR_ADDRESS,
+    REPUTATION_MANAGER_ADDRESS
   );
   const estimatedGas = await ethers.provider.estimateGas({
     from: deployerAddr,
@@ -65,7 +78,8 @@ async function main() {
     DIAMOND_ADDRESS,
     USDC_ADDRESS,
     OWNER_ADDRESS,
-    REGISTRAR_ADDRESS
+    REGISTRAR_ADDRESS,
+    REPUTATION_MANAGER_ADDRESS
   );
   const deployTx = integrator.deploymentTransaction();
   console.log("Deploy tx:", deployTx?.hash);
@@ -85,6 +99,7 @@ async function main() {
   console.log(`USDC:                  ${await integrator.usdc()}`);
   console.log(`Owner:                 ${await integrator.owner()}`);
   console.log(`Registrar:             ${await integrator.registrar()}`);
+  console.log(`ReputationManager:     ${await integrator.reputationManager()}`);
   console.log("");
   console.log("Next steps:");
   console.log(`  1. Register on Diamond (super-admin):`);
@@ -96,6 +111,8 @@ async function main() {
   console.log(
     `  2. Registrar calls setBridgeRecipient(user, recipient) per user after off-chain auth.`
   );
+  console.log(`  3. Replacing an earlier deployment? Follow "Migrating to a new deployment" in`);
+  console.log(`     docs/integrators/polycule-bet.md before deactivating the old address.`);
 }
 
 main()

@@ -8,6 +8,7 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 
 import { IB2BGateway } from "../../interfaces/IB2BGateway.sol";
 import { IP2PIntegrator } from "../../interfaces/IP2PIntegrator.sol";
+import { IReputationManager } from "../../interfaces/IReputationManager.sol";
 import { UserProxy } from "../../base/UserProxy.sol";
 
 /**
@@ -32,7 +33,14 @@ import { UserProxy } from "../../base/UserProxy.sol";
  *         (thirdweb JWT) AND the user's Polymarket bridge address has been
  *         derived. The `owner` is a multisig held by polycule.bet and only
  *         rotates the registrar / pulls funds stranded by a settlement-time
- *         revert.
+ *         revert / maintains the blocklist.
+ *
+ *         Blocking: the Diamond skips its user blacklist on B2B orders and
+ *         leaves the check to `validateOrder`. This integrator refuses to
+ *         place orders for a wallet that is blacklisted on the p2p.me
+ *         ReputationManager (the same flag that blocks consumer BUY orders)
+ *         or on this contract's own owner-set `blocked` list. Settlement is
+ *         never gated: an order that was placed can still complete and pay out.
  */
 contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -72,6 +80,13 @@ contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
     ///         `userPlaceOrder` — the user's server-wallet smart account.
     mapping(address user => address recipient) public bridgeRecipientOf;
 
+    /// @notice p2p.me ReputationManager whose `isBlacklisted` flag blocks
+    ///         placement. `address(0)` disables the check (owner kill-switch).
+    address public reputationManager;
+
+    /// @notice Owner-set denylist, independent of the ReputationManager.
+    mapping(address user => bool) public blocked;
+
     // ─── Events ───────────────────────────────────────────────────────
 
     event PolyculeOrderPlaced(
@@ -87,6 +102,8 @@ contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
     event BridgeRecipientSet(address indexed user, address indexed recipient);
     event RegistrarUpdated(address indexed registrar);
     event UserProxyDeployed(address indexed user, address proxy);
+    event UserBlocked(address indexed user, bool blocked);
+    event ReputationManagerUpdated(address indexed reputationManager);
 
     // ─── Errors ───────────────────────────────────────────────────────
 
@@ -96,22 +113,32 @@ contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
     error InvalidAmount();
     error InvalidAddress();
     error NoBridgeRecipient();
+    error UserIsBlocked();
 
     // ─── Constructor ──────────────────────────────────────────────────
 
-    constructor(address diamond_, address usdc_, address owner_, address registrar_) {
+    constructor(
+        address diamond_,
+        address usdc_,
+        address owner_,
+        address registrar_,
+        address reputationManager_
+    ) {
         if (
             diamond_ == address(0) ||
             usdc_ == address(0) ||
             owner_ == address(0) ||
-            registrar_ == address(0)
+            registrar_ == address(0) ||
+            reputationManager_.code.length == 0
         ) revert InvalidAddress();
         diamond = diamond_;
         usdc = IERC20(usdc_);
         owner = owner_;
         proxyImpl = address(new UserProxy());
         registrar = registrar_;
+        reputationManager = reputationManager_;
         emit RegistrarUpdated(registrar_);
+        emit ReputationManagerUpdated(reputationManager_);
     }
 
     modifier onlyDiamond() {
@@ -136,7 +163,9 @@ contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
      *         recipient must already be set by the registrar. Reverts with
      *         `NoBridgeRecipient()` for unmapped wallets — placement is the
      *         authorization gate, since the registrar only maps users who
-     *         passed off-chain auth.
+     *         passed off-chain auth. Reverts with `UserIsBlocked()` for a
+     *         blocked wallet (see `isUserBlocked`); `validateOrder` re-checks
+     *         when the Diamond calls back.
      */
     function userPlaceOrder(
         uint256 amount,
@@ -149,6 +178,7 @@ contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
         if (amount == 0) revert InvalidAmount();
 
         address user = msg.sender;
+        if (isUserBlocked(user)) revert UserIsBlocked();
         address recipient = bridgeRecipientOf[user];
         if (recipient == address(0)) revert NoBridgeRecipient();
 
@@ -175,13 +205,16 @@ contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
     // ─── IP2PIntegrator callbacks ─────────────────────────────────────
 
     /// @inheritdoc IP2PIntegrator
-    /// @dev Nothing to validate here — gating happens in `userPlaceOrder`.
+    /// @dev The Diamond skips its own user blacklist on B2B orders, so this is
+    ///      the authoritative block check. The recipient gate lives in
+    ///      `userPlaceOrder`, the only path that reaches the Diamond through
+    ///      this integrator's proxies.
     function validateOrder(
-        address /* user */,
+        address user,
         uint256 /* amount */,
         bytes32 /* currency */
     ) external view onlyDiamond returns (bool allowed) {
-        return true;
+        return !isUserBlocked(user);
     }
 
     /// @inheritdoc IP2PIntegrator
@@ -233,6 +266,24 @@ contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
         emit RegistrarUpdated(registrar_);
     }
 
+    /// @notice Deny/allow a wallet (confirmed fraud, abuse). Stops new
+    ///         placements only; orders already placed still settle.
+    function setBlocked(address user, bool isBlocked) external onlyOwner {
+        if (user == address(0)) revert InvalidAddress();
+        blocked[user] = isBlocked;
+        emit UserBlocked(user, isBlocked);
+    }
+
+    /// @notice Point the blacklist check at a new ReputationManager, or pass
+    ///         `address(0)` to switch it off and rely on `blocked` alone.
+    function setReputationManager(address reputationManager_) external onlyOwner {
+        if (reputationManager_ != address(0) && reputationManager_.code.length == 0) {
+            revert InvalidAddress();
+        }
+        reputationManager = reputationManager_;
+        emit ReputationManagerUpdated(reputationManager_);
+    }
+
     /// @notice Escape hatch for USDC stranded on this contract. The realistic
     ///         path is `onOrderComplete`'s `safeTransfer` reverting (recipient
     ///         is blacklisted by USDC or otherwise rejects) and the Diamond's
@@ -270,6 +321,31 @@ contract PolyculeBetIntegrator is IP2PIntegrator, ReentrancyGuard {
 
     function isRegistered(address user) external view returns (bool) {
         return bridgeRecipientOf[user] != address(0);
+    }
+
+    /// @notice True if `user` may not place orders: on the owner's `blocked`
+    ///         list, or blacklisted on the ReputationManager.
+    function isUserBlocked(address user) public view returns (bool) {
+        return blocked[user] || _isBlacklisted(user);
+    }
+
+    // ─── Internal: blacklist ──────────────────────────────────────────
+
+    /// @dev Fails OPEN: if the ReputationManager call reverts or returns an
+    ///      unexpected shape, the wallet is treated as not blacklisted, so an
+    ///      upgrade on the p2p.me side cannot halt every placement here. The
+    ///      raw staticcall (rather than try/catch) is what makes a malformed
+    ///      return non-fatal: a decode failure inside a `try` success branch
+    ///      reverts the caller. The owner's `blocked` list is unaffected.
+    function _isBlacklisted(address user) internal view returns (bool) {
+        address rm = reputationManager;
+        if (rm == address(0)) return false;
+        (bool ok, bytes memory ret) = rm.staticcall(
+            abi.encodeCall(IReputationManager.rmusers, (user))
+        );
+        if (!ok || ret.length < 96) return false;
+        (, , uint256 isBlacklisted) = abi.decode(ret, (uint256, uint256, uint256));
+        return isBlacklisted != 0;
     }
 
     // ─── Internal: proxy helpers ──────────────────────────────────────

@@ -14,6 +14,7 @@ describe("PolyculeBetIntegrator", function () {
 
   let mockUsdc: any;
   let mockDiamond: any;
+  let mockRm: any;
   let integrator: any;
 
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
@@ -30,12 +31,16 @@ describe("PolyculeBetIntegrator", function () {
     const MockDiamond = await ethers.getContractFactory("MockDiamond");
     mockDiamond = await MockDiamond.deploy(await mockUsdc.getAddress());
 
+    const MockRm = await ethers.getContractFactory("MockReputationManager");
+    mockRm = await MockRm.deploy();
+
     const Integrator = await ethers.getContractFactory("PolyculeBetIntegrator");
     integrator = await Integrator.deploy(
       await mockDiamond.getAddress(),
       await mockUsdc.getAddress(),
       owner.address,
-      registrar.address
+      registrar.address,
+      await mockRm.getAddress()
     );
 
     await mockDiamond.registerIntegrator(
@@ -66,7 +71,8 @@ describe("PolyculeBetIntegrator", function () {
           ethers.ZeroAddress,
           await mockUsdc.getAddress(),
           owner.address,
-          registrar.address
+          registrar.address,
+          await mockRm.getAddress()
         )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
@@ -78,7 +84,8 @@ describe("PolyculeBetIntegrator", function () {
           await mockDiamond.getAddress(),
           ethers.ZeroAddress,
           owner.address,
-          registrar.address
+          registrar.address,
+          await mockRm.getAddress()
         )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
@@ -90,7 +97,8 @@ describe("PolyculeBetIntegrator", function () {
           await mockDiamond.getAddress(),
           await mockUsdc.getAddress(),
           ethers.ZeroAddress,
-          registrar.address
+          registrar.address,
+          await mockRm.getAddress()
         )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
@@ -102,7 +110,8 @@ describe("PolyculeBetIntegrator", function () {
           await mockDiamond.getAddress(),
           await mockUsdc.getAddress(),
           owner.address,
-          ethers.ZeroAddress
+          ethers.ZeroAddress,
+          await mockRm.getAddress()
         )
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
@@ -113,11 +122,53 @@ describe("PolyculeBetIntegrator", function () {
         await mockDiamond.getAddress(),
         await mockUsdc.getAddress(),
         owner.address,
-        registrar.address
+        registrar.address,
+        await mockRm.getAddress()
       );
       await expect(tx.deploymentTransaction())
         .to.emit(tx, "RegistrarUpdated")
         .withArgs(registrar.address);
+    });
+
+    it("sets reputationManager and emits ReputationManagerUpdated", async function () {
+      expect(await integrator.reputationManager()).to.equal(await mockRm.getAddress());
+      const Integrator = await ethers.getContractFactory("PolyculeBetIntegrator");
+      const tx = await Integrator.deploy(
+        await mockDiamond.getAddress(),
+        await mockUsdc.getAddress(),
+        owner.address,
+        registrar.address,
+        await mockRm.getAddress()
+      );
+      await expect(tx.deploymentTransaction())
+        .to.emit(tx, "ReputationManagerUpdated")
+        .withArgs(await mockRm.getAddress());
+    });
+
+    it("reverts InvalidAddress when reputationManager is zero", async function () {
+      const Integrator = await ethers.getContractFactory("PolyculeBetIntegrator");
+      await expect(
+        Integrator.deploy(
+          await mockDiamond.getAddress(),
+          await mockUsdc.getAddress(),
+          owner.address,
+          registrar.address,
+          ethers.ZeroAddress
+        )
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    });
+
+    it("reverts InvalidAddress when reputationManager has no code", async function () {
+      const Integrator = await ethers.getContractFactory("PolyculeBetIntegrator");
+      await expect(
+        Integrator.deploy(
+          await mockDiamond.getAddress(),
+          await mockUsdc.getAddress(),
+          owner.address,
+          registrar.address,
+          outsider.address
+        )
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     });
   });
 
@@ -264,6 +315,119 @@ describe("PolyculeBetIntegrator", function () {
       expect(order1.recipientAddr).to.equal(bridgeRecipient.address);
       expect(order2.recipientAddr).to.equal(bridgeRecipient2.address);
     });
+
+    it("reverts UserIsBlocked when the owner blocked the caller", async function () {
+      await integrator.connect(owner).setBlocked(user.address, true);
+      await expect(
+        integrator.connect(user).userPlaceOrder(USD, INR, "pk", 1, 1, 0)
+      ).to.be.revertedWithCustomError(integrator, "UserIsBlocked");
+    });
+
+    it("reverts UserIsBlocked when the ReputationManager blacklists the caller", async function () {
+      await mockRm.setBlacklisted(user.address, true);
+      await expect(
+        integrator.connect(user).userPlaceOrder(USD, INR, "pk", 1, 1, 0)
+      ).to.be.revertedWithCustomError(integrator, "UserIsBlocked");
+    });
+
+    it("places again once the block is lifted", async function () {
+      await integrator.connect(owner).setBlocked(user.address, true);
+      await integrator.connect(owner).setBlocked(user.address, false);
+      await expect(integrator.connect(user).userPlaceOrder(USD, INR, "pk", 1, 1, 0)).to.emit(
+        integrator,
+        "PolyculeOrderPlaced"
+      );
+    });
+
+    it("ignores the ReputationManager when it is switched off", async function () {
+      await mockRm.setBlacklisted(user.address, true);
+      await integrator.connect(owner).setReputationManager(ethers.ZeroAddress);
+      await expect(integrator.connect(user).userPlaceOrder(USD, INR, "pk", 1, 1, 0)).to.emit(
+        integrator,
+        "PolyculeOrderPlaced"
+      );
+    });
+
+    it("fails open when the ReputationManager reverts", async function () {
+      await mockRm.setReverts(true);
+      await expect(integrator.connect(user).userPlaceOrder(USD, INR, "pk", 1, 1, 0)).to.emit(
+        integrator,
+        "PolyculeOrderPlaced"
+      );
+    });
+
+    it("still enforces the owner blocklist when the ReputationManager reverts", async function () {
+      await mockRm.setReverts(true);
+      await integrator.connect(owner).setBlocked(user.address, true);
+      await expect(
+        integrator.connect(user).userPlaceOrder(USD, INR, "pk", 1, 1, 0)
+      ).to.be.revertedWithCustomError(integrator, "UserIsBlocked");
+    });
+  });
+
+  // ─── Blocklist admin ──────────────────────────────────────────────
+
+  describe("setBlocked", function () {
+    it("owner blocks and unblocks, emitting UserBlocked", async function () {
+      await expect(integrator.connect(owner).setBlocked(user.address, true))
+        .to.emit(integrator, "UserBlocked")
+        .withArgs(user.address, true);
+      expect(await integrator.blocked(user.address)).to.equal(true);
+      expect(await integrator.isUserBlocked(user.address)).to.equal(true);
+
+      await expect(integrator.connect(owner).setBlocked(user.address, false))
+        .to.emit(integrator, "UserBlocked")
+        .withArgs(user.address, false);
+      expect(await integrator.isUserBlocked(user.address)).to.equal(false);
+    });
+
+    it("reverts OnlyOwner from the registrar", async function () {
+      await expect(
+        integrator.connect(registrar).setBlocked(user.address, true)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    it("reverts InvalidAddress for the zero address", async function () {
+      await expect(
+        integrator.connect(owner).setBlocked(ethers.ZeroAddress, true)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    });
+  });
+
+  describe("setReputationManager", function () {
+    it("owner rotates it and emits ReputationManagerUpdated", async function () {
+      const MockRm = await ethers.getContractFactory("MockReputationManager");
+      const rm2 = await MockRm.deploy();
+      await expect(integrator.connect(owner).setReputationManager(await rm2.getAddress()))
+        .to.emit(integrator, "ReputationManagerUpdated")
+        .withArgs(await rm2.getAddress());
+      expect(await integrator.reputationManager()).to.equal(await rm2.getAddress());
+
+      // The old manager's flags no longer apply; the new one's do.
+      await mockRm.setBlacklisted(user.address, true);
+      expect(await integrator.isUserBlocked(user.address)).to.equal(false);
+      await rm2.setBlacklisted(user.address, true);
+      expect(await integrator.isUserBlocked(user.address)).to.equal(true);
+    });
+
+    it("accepts the zero address as an off switch", async function () {
+      await mockRm.setBlacklisted(user.address, true);
+      expect(await integrator.isUserBlocked(user.address)).to.equal(true);
+      await integrator.connect(owner).setReputationManager(ethers.ZeroAddress);
+      expect(await integrator.isUserBlocked(user.address)).to.equal(false);
+    });
+
+    it("reverts InvalidAddress for an address with no code", async function () {
+      await expect(
+        integrator.connect(owner).setReputationManager(outsider.address)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    });
+
+    it("reverts OnlyOwner from non-owner", async function () {
+      await expect(
+        integrator.connect(registrar).setReputationManager(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
   });
 
   // ─── validateOrder ────────────────────────────────────────────────
@@ -283,6 +447,28 @@ describe("PolyculeBetIntegrator", function () {
         .connect(diamondSigner)
         .validateOrder.staticCall(user.address, USD, INR);
       expect(result).to.equal(true);
+      await stopImpersonate(diamondAddr);
+    });
+
+    it("returns false for a blocked or blacklisted user, true once cleared", async function () {
+      const diamondAddr = await mockDiamond.getAddress();
+      await impersonate(diamondAddr);
+      const diamondSigner = await ethers.getSigner(diamondAddr);
+      const validate = () =>
+        integrator.connect(diamondSigner).validateOrder.staticCall(user.address, USD, INR);
+
+      await integrator.connect(owner).setBlocked(user.address, true);
+      expect(await validate()).to.equal(false);
+      await integrator.connect(owner).setBlocked(user.address, false);
+      expect(await validate()).to.equal(true);
+
+      await mockRm.setBlacklisted(user.address, true);
+      expect(await validate()).to.equal(false);
+      await mockRm.setBlacklisted(user.address, false);
+      expect(await validate()).to.equal(true);
+
+      await mockRm.setReverts(true);
+      expect(await validate()).to.equal(true);
       await stopImpersonate(diamondAddr);
     });
   });
@@ -342,6 +528,19 @@ describe("PolyculeBetIntegrator", function () {
 
       expect(await mockUsdc.balanceOf(bridgeRecipient.address)).to.equal(0);
       expect(await mockUsdc.balanceOf(bridgeRecipient2.address)).to.equal(USD);
+    });
+
+    it("still settles an order for a user blocked after placement", async function () {
+      await mockUsdc.mint(await integrator.getAddress(), USD);
+      await integrator.connect(owner).setBlocked(user.address, true);
+      await mockRm.setBlacklisted(user.address, true);
+
+      await expect(
+        integrator.connect(diamondSigner).onOrderComplete(1, user.address, USD, ethers.ZeroAddress)
+      )
+        .to.emit(integrator, "PolyculeOrderSettled")
+        .withArgs(user.address, bridgeRecipient.address, USD);
+      expect(await mockUsdc.balanceOf(bridgeRecipient.address)).to.equal(USD);
     });
 
     it("reverts NoBridgeRecipient if user has never been mapped (defense-in-depth)", async function () {
