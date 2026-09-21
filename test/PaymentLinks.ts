@@ -345,7 +345,7 @@ describe("MerchantTerminalIntegrator — payment links", function () {
       ).to.be.revertedWithCustomError(integrator, "NotRegistered");
 
       await expect(
-        integrator.connect(relayer).updateProfile(UPI_2, "Hijacked")
+        integrator.connect(relayer).updateProfile(UPI_2, "Hijacked", SECTOR)
       ).to.be.revertedWithCustomError(integrator, "NotRegistered");
     });
 

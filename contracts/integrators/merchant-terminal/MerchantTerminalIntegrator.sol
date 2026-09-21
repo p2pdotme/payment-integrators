@@ -723,13 +723,23 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         merchant uses a fresh wallet/registration.
     /// @param encPayoutId New payout handle, client-side ENCRYPTED (non-empty).
     /// @param shopName New display name.
-    function updateProfile(bytes calldata encPayoutId, string calldata shopName) external {
+    function updateProfile(
+        bytes calldata encPayoutId,
+        string calldata shopName,
+        bytes32 businessSector
+    ) external {
         if (!registered[msg.sender]) revert NotRegistered();
         if (encPayoutId.length == 0) revert InvalidAddress();
         MerchantTypes.Merchant storage m = merchants[msg.sender];
         if (m.isFrozen) revert MerchantIsFrozen(); // a frozen merchant can't edit
         m.encPayoutId = encPayoutId;
         m.shopName = shopName;
+        // Editable for the same reason shopName is. It is REQUIRED at
+        // registration, so without this a merchant who mistyped their sector
+        // was stuck with it permanently and could not blank it either — an
+        // asymmetry with shopName that had no justification.
+        MerchantRegistryLib.validateSector(businessSector);
+        m.businessSector = businessSector;
         emit MerchantProfileUpdated(msg.sender, shopName);
     }
 
@@ -1344,6 +1354,20 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         bytes32 currency,
         string memory pubKey
     ) internal returns (uint256 orderId) {
+        // The payout handle is OPTIONAL at registration and required HERE — the
+        // one place an empty one means something. A SELL placed without it
+        // produces fiat with nowhere to land: the order reaches the circle, the
+        // LP has no handle to pay, and the merchant's funds sit locked in an
+        // in-flight withdrawal until someone reconciles by hand.
+        //
+        // In the shared fiat internal, NOT in _checkWithdraw, because
+        // withdrawUSDC shares that helper and sends USDC to the merchant's OWN
+        // wallet — it has nothing to do with a fiat rail. Checking there locked
+        // merchants out of their own crypto until they set a payout handle they
+        // may never want, and since registration now starts empty that was every
+        // new merchant. Here it covers withdrawFiat and withdrawFiatIn, which
+        // both funnel through this function, and nothing else.
+        if (m.encPayoutId.length == 0) revert PayoutHandleNotSet();
         if (circleId == 0) revert InvalidCircle(); // friendly local guard
         if (bytes(pubKey).length == 0) revert InvalidAddress(); // need a real relay key
         // MED-1: serialize a merchant's fiat withdrawals. The merchant has ONE
@@ -1720,16 +1744,6 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         m = merchants[msg.sender];
         if (m.isFrozen) revert MerchantIsFrozen();
         if (amount == 0) revert NothingToWithdraw();
-        // The payout handle is OPTIONAL at registration and required HERE — the
-        // one place an empty one actually means something. A SELL placed without
-        // it produces fiat with nowhere to land: the order reaches the circle,
-        // the LP has no handle to pay, and the merchant's funds sit locked in an
-        // in-flight withdrawal until someone reconciles it by hand.
-        //
-        // Deliberately in _checkWithdraw rather than in withdrawFiat, because
-        // withdrawFiatIn shares this gate and needs the same guarantee. Putting
-        // it in the caller would have left the second path open.
-        if (m.encPayoutId.length == 0) revert PayoutHandleNotSet();
     }
 
     /// @dev Append an unlocked/locked bucket, compacting fully-spent buckets
@@ -1748,12 +1762,6 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // number the solvency invariant (balanceOf(this) >= totalOwed) is written
         // against and it stays in the contract that owns it.
         totalOwed += SettlementLib.creditBucket(m, amount, unlockTimestamp);
-    }
-
-    /// @dev Removes ALL fully-spent (amount == 0) buckets, preserving order of
-    ///      the live ones. See SettlementLib.compact.
-    function _compact(MerchantTypes.Merchant storage m) internal {
-        SettlementLib.compact(m);
     }
 
     /// @dev Sums unlocked buckets, reverts if short, then deducts
@@ -2124,7 +2132,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             m.buckets[i].amount = 0;
         }
         if (amount == 0) revert NothingToEscheat();
-        _compact(m); // drop the now-zeroed buckets
+        SettlementLib.compact(m); // drop the now-zeroed buckets
 
         // Decrement the global owed by exactly what we removed (solvency preserved),
         // then transfer the funds out of custody to the chosen destination.

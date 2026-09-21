@@ -92,24 +92,23 @@ library MerchantRegistryLib {
             }
         }
 
-        // Required, per the integration request. Unlike the payout handle there
-        // is no later point at which this becomes necessary, so there is no
-        // deferred check to fall back on — it is required here or nowhere.
-        //
-        // bytes32, not string. A sector label is short ("Food & Beverage",
-        // "Professional Services"), and a dynamic string costs real bytecode on
-        // a contract that had 61 bytes of headroom: the storage copy, the ABI
-        // encoder in the generated `merchants` getter, and the event encoding
-        // all grow. Measured at ~550 bytes for this one field. bytes32 holds 31
-        // characters, which covers every real label, and `fromCurrency` above
-        // already gives callers a bytes32→string decoder to render it with.
-        if (businessSector == bytes32(0)) revert BusinessSectorRequired();
+        validateSector(businessSector);
+    }
 
-        // Same canonical-form rule as the currency, for the same reason: without
-        // it "Retail\0<junk>" would display as "Retail" via fromCurrency while
-        // comparing unequal to bytes32("Retail"), so two merchants could hold
-        // sectors that render identically but are distinct values — and any
-        // future rule that keys off the sector would silently miss one of them.
+    /**
+     * @notice The business-sector rule, shared by registration and profile edits.
+     * @dev Required, and canonical-form checked for the same reason the currency
+     *      is: "Retail" followed by a NUL and junk renders as "Retail" via
+     *      fromCurrency while comparing unequal to bytes32("Retail"), so two
+     *      merchants could hold sectors that look identical and are not.
+     *
+     *      bytes32, not string: a dynamic string measured ~550 bytes of bytecode
+     *      across the storage write, the generated getter and the event, on a
+     *      contract that had 61 bytes of headroom. 31 characters covers every
+     *      real label, and fromCurrency already decodes it for display.
+     */
+    function validateSector(bytes32 businessSector) public pure {
+        if (businessSector == bytes32(0)) revert BusinessSectorRequired();
         bool sectorNul = false;
         for (uint256 i = 0; i < 32; i++) {
             if (businessSector[i] == 0) {

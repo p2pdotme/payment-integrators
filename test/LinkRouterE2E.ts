@@ -565,6 +565,7 @@ describe("LinkRouter — sponsored end to end, real EntryPoint", function () {
           integrator.interface.encodeFunctionData("updateProfile", [
             enc("attacker-bank"),
             "hijacked",
+            SECTOR,
           ])
         ),
         signer: linkKey,

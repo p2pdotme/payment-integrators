@@ -167,7 +167,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   it("2f. updateProfile edits (encrypted) payout + shop name (currency stays locked)", async function () {
     const newEnc = enc("new@upi");
     await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE, SECTOR);
-    await expect(integrator.connect(merchant1).updateProfile(newEnc, "New Shop"))
+    await expect(integrator.connect(merchant1).updateProfile(newEnc, "New Shop", SECTOR))
       .to.emit(integrator, "MerchantProfileUpdated")
       .withArgs(merchant1.address, "New Shop"); // handle NOT in event
     const [payout, shop, currency] = await integrator.getMerchantInfo(merchant1.address);
@@ -176,14 +176,14 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     expect(currency).to.equal(INR); // currency unchanged
     // guards: unregistered can't update, empty payout reverts, frozen can't edit
     await expect(
-      integrator.connect(merchant2).updateProfile(enc("x@upi"), "X")
+      integrator.connect(merchant2).updateProfile(enc("x@upi"), "X", SECTOR)
     ).to.be.revertedWithCustomError(integrator, "NotRegistered");
     await expect(
-      integrator.connect(merchant1).updateProfile("0x", "X")
+      integrator.connect(merchant1).updateProfile("0x", "X", SECTOR)
     ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
     await integrator.connect(owner).freezeMerchant(merchant1.address);
     await expect(
-      integrator.connect(merchant1).updateProfile(enc("y@upi"), "Y")
+      integrator.connect(merchant1).updateProfile(enc("y@upi"), "Y", SECTOR)
     ).to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
   });
 
@@ -253,10 +253,47 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     // And once set through updateProfile, the same call gets past that gate.
     // It fails LATER (no balance), which is the point — a different error means
     // the handle check is satisfied.
-    await integrator.connect(merchant1).updateProfile(UPI_1, "Shop");
+    await integrator.connect(merchant1).updateProfile(UPI_1, "Shop", SECTOR);
     await expect(
       integrator.connect(merchant1).withdrawFiat(USDC(1), 1, PK, "")
     ).to.be.revertedWithCustomError(integrator, "InsufficientAvailableBalance");
+  });
+
+  it("2g-v. the business sector can be corrected later, like the shop name", async function () {
+    // It is REQUIRED at registration, so without this a merchant who mistyped
+    // theirs was stuck with it permanently and could not blank it either —
+    // an asymmetry with shopName that had no justification.
+    await integrator
+      .connect(merchant1)
+      .registerMerchant(UPI_1, "Shop", INR_CODE, ethers.encodeBytes32String("Grocries"));
+    const fixed = ethers.encodeBytes32String("Groceries");
+    await integrator.connect(merchant1).updateProfile(UPI_1, "Shop", fixed);
+    expect((await integrator.getMerchantInfo(merchant1.address))[5]).to.equal(fixed);
+
+    // And it stays validated on the edit path — blanking it is still refused.
+    await expect(
+      integrator.connect(merchant1).updateProfile(UPI_1, "Shop", ethers.ZeroHash)
+    ).to.be.revertedWithCustomError(integrator, "BusinessSectorRequired");
+  });
+
+  it("2g-iv. withdrawUSDC is NOT gated on the payout handle — it never touches fiat", async function () {
+    // REGRESSION. The handle check first went into _checkWithdraw
+    // unconditionally, and withdrawUSDC shares that helper — so a merchant was
+    // locked out of their OWN crypto until they set a fiat rail they may never
+    // want. Registration now starts with an empty handle, so that was every new
+    // merchant. Every pre-existing test registered WITH a handle, which is
+    // exactly why none of them caught it.
+    await depositFor(merchant1, "0x", 2); // registers with NO payout handle
+    await increaseTime(SETTLEMENT + 60);
+    const before = await mockUsdc.balanceOf(merchant1.address);
+    await integrator.connect(merchant1).withdrawUSDC(USDC(20));
+    expect((await mockUsdc.balanceOf(merchant1.address)) - before).to.equal(USDC(20));
+
+    // The same merchant still cannot take the FIAT path, which is the whole
+    // point of the distinction.
+    await expect(
+      integrator.connect(merchant1).withdrawFiat(USDC(1), 1, PK, "")
+    ).to.be.revertedWithCustomError(integrator, "PayoutHandleNotSet");
   });
 
   it("2g-iii. withdrawFiatIn is gated on the handle too, not just withdrawFiat", async function () {
@@ -2898,7 +2935,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         // payout handle is now an ENCRYPTED bytes blob, not a plaintext string —
         // the frontend must encrypt client-side and pass bytes here.
         "registerMerchant(bytes,string,string,bytes32)",
-        "updateProfile(bytes,string)",
+        "updateProfile(bytes,string,bytes32)",
         "registerMerchantRaw(bytes,string,bytes32,bytes32)",
         "userPlaceOrder(address,uint256,uint256,bytes32,uint256,string)",
         "withdrawFiat(uint256,uint256,string,string)",
