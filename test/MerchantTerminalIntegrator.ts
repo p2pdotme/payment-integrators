@@ -259,6 +259,37 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     ).to.be.revertedWithCustomError(integrator, "InsufficientAvailableBalance");
   });
 
+  it("2g-vi. a withdrawal spends ONLY matured buckets and leaves locked ones untouched", async function () {
+    // Coverage showed the "skip this bucket" arm of deductUnlocked had never
+    // executed: every test so far deducted from a merchant whose buckets were
+    // all spendable, so the loop never had to step OVER a locked one. That skip
+    // is what stops a withdrawal reaching money that has not settled yet, so it
+    // was the one line in the deduction doing the actual protecting and nothing
+    // was exercising it.
+    await depositFor(merchant1, UPI_1, 2); // 20 USDC, locked
+    await increaseTime(SETTLEMENT + 60); // ...now matured
+
+    // Second sale: still locked, and it sits in a LATER bucket than the matured one.
+    const second = await placeOrder(merchant1, 2);
+    await mockDiamond.simulateOrderComplete(second);
+
+    const before = await integrator.getMerchantBalance(merchant1.address);
+    expect(before[0]).to.be.greaterThan(0); // pending
+    expect(before[1]).to.equal(USDC(20)); // available
+
+    await integrator.connect(merchant1).withdrawUSDC(USDC(20));
+
+    const after = await integrator.getMerchantBalance(merchant1.address);
+    expect(after[1]).to.equal(0); // the matured bucket is drained
+    expect(after[0]).to.equal(before[0]); // the LOCKED bucket is untouched
+
+    // And the locked funds still cannot be reached by asking for one more unit.
+    await expect(integrator.connect(merchant1).withdrawUSDC(USDC(1))).to.be.revertedWithCustomError(
+      integrator,
+      "InsufficientAvailableBalance"
+    );
+  });
+
   it("2g-v. the business sector can be corrected later, like the shop name", async function () {
     // It is REQUIRED at registration, so without this a merchant who mistyped
     // theirs was stuck with it permanently and could not blank it either —
