@@ -24,6 +24,28 @@ import { ethers } from "hardhat";
  * Set SKIP_WIRE=1 to deploy only — useful when the deployer is not the manager
  * and step 2 has to be done from a different key.
  */
+/**
+ * Re-reads until the node agrees, instead of trusting the first answer.
+ *
+ * A public RPC can serve state from a block behind the one that just mined, so a
+ * read taken immediately after `wait()` legitimately returns the OLD value. This
+ * script hit that on three separate deploys — reporting "size: 0 bytes" for a
+ * router that was deployed, and "setTrustedRelayer did not take" for a call that
+ * had taken — and every time the state was correct seconds later.
+ *
+ * A deploy script that cries wolf is worse than a slow one: the next person
+ * either re-runs a deploy that already succeeded, or starts ignoring its errors.
+ */
+async function settle<T>(read: () => Promise<T>, ok: (v: T) => boolean, what: string): Promise<T> {
+  let last: T = await read();
+  for (let i = 0; i < 10; i++) {
+    if (ok(last)) return last;
+    await new Promise((r) => setTimeout(r, 2000));
+    last = await read();
+  }
+  throw new Error(`${what}: still wrong after 20s — last read ${String(last)}`);
+}
+
 async function main() {
   const integrator = process.env.INTEGRATOR;
   if (!integrator || !ethers.isAddress(integrator)) {
@@ -59,7 +81,11 @@ async function main() {
   await router.waitForDeployment();
   const routerAddress = await router.getAddress();
 
-  const code = await ethers.provider.getCode(routerAddress);
+  const code = await settle(
+    () => ethers.provider.getCode(routerAddress),
+    (c) => c.length > 2,
+    "router code never appeared"
+  );
   console.log(`\nLinkRouter : ${routerAddress}`);
   console.log(`size       : ${(code.length - 2) / 2} bytes`);
 
@@ -72,10 +98,11 @@ async function main() {
     console.log("\nsetTrustedRelayer …");
     const tx = await probe.setTrustedRelayer(routerAddress);
     await tx.wait();
-    const now: string = await probe.trustedRelayer();
-    if (now.toLowerCase() !== routerAddress.toLowerCase()) {
-      throw new Error(`setTrustedRelayer did not take: reads ${now}`);
-    }
+    const now = await settle<string>(
+      () => probe.trustedRelayer(),
+      (v) => v.toLowerCase() === routerAddress.toLowerCase(),
+      "setTrustedRelayer did not take"
+    );
     console.log(`trustedRelayer is now ${now}`);
   }
 

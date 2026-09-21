@@ -176,6 +176,56 @@ describe("MerchantTerminalIntegrator — payment links", function () {
 
   // ─── Creation ─────────────────────────────────────────────────────
 
+  describe("merchant link enumeration", function () {
+    // These should have existed when getMerchantLinks was added and did not.
+    // The reverse index is the whole point of the feature — the mapping answers
+    // "who owns THIS link" and cannot answer "which links does this merchant
+    // own", which is why the frontend was scanning logs and silently truncating.
+    it("lists a created link against its owner", async function () {
+      expect(await integrator.getMerchantLinkCount(merchant1.address)).to.equal(0);
+
+      await createLink(merchant1, LINK_A, linkAmount(3));
+
+      expect(await integrator.getMerchantLinkCount(merchant1.address)).to.equal(1);
+      expect(await integrator.getMerchantLinks(merchant1.address, 0, 10)).to.deep.equal([LINK_A]);
+    });
+
+    it("keeps one merchant's links out of another's list", async function () {
+      await createLink(merchant1, LINK_A, linkAmount(1));
+      await createLink(merchant2, LINK_B, linkAmount(1));
+
+      expect(await integrator.getMerchantLinks(merchant1.address, 0, 10)).to.deep.equal([LINK_A]);
+      expect(await integrator.getMerchantLinks(merchant2.address, 0, 10)).to.deep.equal([LINK_B]);
+    });
+
+    it("pages, and an offset past the end returns empty rather than reverting", async function () {
+      await createLink(merchant1, LINK_A, linkAmount(1));
+      await createLink(merchant1, LINK_B, linkAmount(1));
+
+      expect(await integrator.getMerchantLinkCount(merchant1.address)).to.equal(2);
+      expect((await integrator.getMerchantLinks(merchant1.address, 0, 1)).length).to.equal(1);
+      expect((await integrator.getMerchantLinks(merchant1.address, 1, 1)).length).to.equal(1);
+      // A caller paging forward does not know where the end is until it reads
+      // past it, so this must be empty, not an error.
+      expect((await integrator.getMerchantLinks(merchant1.address, 99, 10)).length).to.equal(0);
+      // offset + limit must not overflow into a wrapped range.
+      expect(
+        (await integrator.getMerchantLinks(merchant1.address, 0, ethers.MaxUint256)).length
+      ).to.equal(2);
+    });
+
+    it("still lists a link after it is revoked — membership is not status", async function () {
+      await createLink(merchant1, LINK_A, linkAmount(1));
+      await integrator.connect(merchant1).revokeLink(LINK_A);
+
+      // Append-only on purpose: removing would mean swap-and-pop, which reorders
+      // the tail under a caller paginating by offset and makes them skip a link
+      // between two pages. Callers read live status through getLink instead.
+      expect(await integrator.getMerchantLinks(merchant1.address, 0, 10)).to.deep.equal([LINK_A]);
+      expect((await integrator.getLink(LINK_A))[5]).to.equal(1); // REVOKED
+    });
+  });
+
   describe("createLink", function () {
     it("stores the link and emits its config blob for the merchant to read back", async function () {
       await expect(createLink(merchant1, LINK_A, linkAmount(3), { singleUse: true }))
