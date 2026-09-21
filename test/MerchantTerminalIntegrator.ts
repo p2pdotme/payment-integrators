@@ -3122,4 +3122,84 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await integrator.escheatableAt(merchant1.address)).to.equal(at);
     });
   });
+
+  // ─── The 256-bucket cap ───────────────────────────────────────────
+  //
+  // This branch of _creditBucket had ZERO coverage: 895 tests, and not one
+  // reached the code that runs when a merchant already holds MAX_BUCKETS
+  // settlement buckets. That matters more than a coverage number suggests,
+  // because the comments in that branch record TWO audit findings against it —
+  // round-1 "FIX D" (it re-locked a merchant's already-spendable principal) and
+  // round-2 "#7" (the fix for D then released locked funds early). Both were
+  // bugs about whether money is spendable, in code nothing executes.
+  //
+  // It is reachable. A bucket exists per DISTINCT unlock second and is removed
+  // only once fully spent, so a merchant who keeps taking payments without
+  // withdrawing accumulates one per second-of-completion. Counter QRs raise
+  // payments per merchant, so this gets nearer, not further away.
+  describe("settlement buckets at the MAX_BUCKETS cap", function () {
+    // Fill exactly MAX_BUCKETS buckets, each with its own unlock second.
+    async function fillBuckets(merchant: SignerWithAddress, upi: string, n: number) {
+      await integrator.connect(merchant).registerMerchant(upi, "Shop", INR_CODE);
+      // The daily order limit would stop this long before 256.
+      await integrator.connect(owner).setDailyLimit(100000);
+      for (let i = 0; i < n; i++) {
+        const orderId = await placeOrder(merchant, 2);
+        await mockDiamond.simulateOrderComplete(orderId);
+        await increaseTime(1); // a distinct unlock second => a distinct bucket
+      }
+    }
+
+    it("keeps every bucket's lock state honest when the cap is hit", async function () {
+      const MAX = Number(await integrator.MAX_BUCKETS());
+      await fillBuckets(merchant1, UPI_1, MAX);
+      expect((await integrator.getMerchantBuckets(merchant1.address)).length).to.equal(MAX);
+
+      const before = await integrator.getMerchantBalance(merchant1.address);
+
+      // One more credit, arriving while all existing buckets are still LOCKED.
+      const orderId = await placeOrder(merchant1, 2);
+      await mockDiamond.simulateOrderComplete(orderId);
+
+      const after = await integrator.getMerchantBalance(merchant1.address);
+
+      // Asserted on DELTAS, not on `available` directly. Buckets one second
+      // apart keep maturing while the test places and completes an order, so
+      // `available` legitimately grows on its own — comparing it to a value read
+      // before that would test the clock, not the contract.
+      const credited = after.pending + after.available - (before.pending + before.available);
+
+      // Nothing may be lost: the credit path stays infallible at the cap.
+      expect(credited).to.be.greaterThan(0n);
+      // And the new credit must still be LOCKED — it arrived inside its own
+      // settlement window, so at least that much has to be sitting in pending.
+      expect(after.pending).to.be.greaterThanOrEqual(credited);
+      // The array must not grow past the cap.
+      expect((await integrator.getMerchantBuckets(merchant1.address)).length).to.be.lessThanOrEqual(
+        MAX
+      );
+    });
+
+    it("does not re-lock already-matured funds when a new credit lands at the cap", async function () {
+      const MAX = Number(await integrator.MAX_BUCKETS());
+      await fillBuckets(merchant2, UPI_2, MAX);
+
+      // Let every bucket mature, so the whole balance is spendable.
+      await increaseTime(60 * 60 * 24);
+      const matured = await integrator.getMerchantBalance(merchant2.address);
+      expect(matured.available).to.be.greaterThan(0n);
+
+      // A fresh, still-LOCKED credit arrives while the array is full of
+      // UNLOCKED buckets — the exact mismatch the fallback path exists for.
+      const orderId = await placeOrder(merchant2, 2);
+      await mockDiamond.simulateOrderComplete(orderId);
+
+      const after = await integrator.getMerchantBalance(merchant2.address);
+      // The merchant's matured money must still be spendable. Round-1 FIX D was
+      // precisely this going wrong.
+      expect(after.available).to.be.greaterThanOrEqual(matured.available);
+      // And the new credit must NOT have become spendable early (round-2 #7).
+      expect(after.pending).to.be.greaterThan(0n);
+    });
+  });
 });
