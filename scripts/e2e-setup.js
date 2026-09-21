@@ -7,12 +7,25 @@ const { ethers } = require("hardhat");
 const fs = require("fs");
 const path = require("path");
 
-/** Deploys PaymentLinksLib and returns its address, for linking. */
-async function deployPaymentLinksLib() {
-  const Lib = await ethers.getContractFactory("PaymentLinksLib");
-  const lib = await Lib.deploy();
-  await lib.waitForDeployment();
-  return await lib.getAddress();
+/**
+ * Deploys every library MerchantTerminalIntegrator links against.
+ *
+ * There are THREE now, not one. The integrator reached the EIP-170 ceiling, so
+ * registration validation (MerchantRegistryLib) and the settlement-bucket fund
+ * helpers (SettlementLib) moved out alongside the payment-link lifecycle. A
+ * deploy that links only PaymentLinksLib fails with "missing links" — and from
+ * here that surfaces as every e2e suite dying in its fixture rather than as one
+ * legible error.
+ */
+async function deployMerchantTerminalLibs() {
+  const out = {};
+  for (const name of ["PaymentLinksLib", "MerchantRegistryLib", "SettlementLib"]) {
+    const F = await ethers.getContractFactory(name);
+    const c = await F.deploy();
+    await c.waitForDeployment();
+    out[name] = await c.getAddress();
+  }
+  return out;
 }
 
 // Resolved from THIS file, not the working directory — hardhat runs scripts
@@ -29,7 +42,7 @@ async function main() {
   ).deploy(await usdc.getAddress());
   const integrator = await (
     await ethers.getContractFactory("MerchantTerminalIntegrator", {
-      libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+      libraries: await deployMerchantTerminalLibs(),
     })
   ).deploy(await diamond.getAddress(), await usdc.getAddress(), []);
   const client = await (
@@ -41,13 +54,14 @@ async function main() {
   await client.setProductPrice(1, ethers.parseUnits("1", 6));
   await usdc.mint(await diamond.getAddress(), ethers.parseUnits("1000000", 6));
 
-  await integrator
-    .connect(merchant)
-    .registerMerchant(
-      ethers.keccak256(ethers.toUtf8Bytes("enc:ramesh@upi")),
-      "Ramesh Sarees",
-      "INR"
-    );
+  await integrator.connect(merchant).registerMerchant(
+    ethers.keccak256(ethers.toUtf8Bytes("enc:ramesh@upi")),
+    "Ramesh Sarees",
+    "INR",
+    // businessSector — required at registration, and a bytes32 rather than a
+    // string because the integrator is at the EIP-170 ceiling.
+    ethers.encodeBytes32String("Retail")
+  );
 
   // ─── The relayer-free path ────────────────────────────────────────
   //
