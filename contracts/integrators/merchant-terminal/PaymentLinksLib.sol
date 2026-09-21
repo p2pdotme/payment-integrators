@@ -112,6 +112,7 @@ library PaymentLinksLib {
      */
     function create(
         mapping(bytes32 => PaymentLink) storage links,
+        mapping(address => bytes32[]) storage ownerLinks,
         bytes32 linkId,
         uint96 amount,
         bytes32 currency,
@@ -149,7 +150,82 @@ library PaymentLinksLib {
             currency: currency
         });
 
+        // Reverse index: owner → their link ids, so `getMerchantLinks` can answer
+        // "which links does this merchant own" directly.
+        //
+        // The mapping above cannot answer that — a Solidity mapping keeps no
+        // record of which keys were written — so the only on-chain source was the
+        // LinkCreated log, and reading it meant a backward eth_getLogs scan.
+        // Providers cap that range (Base's public endpoint ~10,000 blocks, an
+        // Alchemy free-tier key TEN), so the scan had to stop at a request
+        // ceiling and return a SHORT LIST WITH NO ERROR. A merchant who cannot
+        // see a link cannot revoke it.
+        //
+        // APPEND-ONLY, DELIBERATELY. Nothing removes an id on revoke: removal
+        // from a Solidity array is either O(n) or swap-and-pop, and swap-and-pop
+        // reorders the tail under a caller paginating by offset, which would make
+        // them skip a link entirely between two pages. A revoked link stays in
+        // the array and reads as REVOKED through `getLink` — the merchant's list
+        // is built from live reads, so status is never stale.
+        //
+        // The cost is one cold SSTORE per link, borne by the merchant creating
+        // it. That is the price of the read being trustless rather than served
+        // by an indexer.
+        ownerLinks[msg.sender].push(linkId);
+
         emit LinkCreated(linkId, msg.sender, amount, currency, expiresAt, maxUses, encryptedConfig);
+    }
+
+    /**
+     * @notice One page of `owner`'s link ids.
+     *
+     * @dev Paginated because the array is unbounded and append-only. Returning
+     *      it whole would load every id into memory, so a merchant with enough
+     *      links would eventually exceed the gas limit on an `eth_call` — and it
+     *      would fail for exactly the busiest merchants, who need the list most.
+     *
+     *      Lives in the library rather than the integrator because the
+     *      integrator is 61 bytes under the EIP-170 24,576-byte ceiling. Library
+     *      code is deployed separately and reached by delegatecall, so the
+     *      integrator pays only for the call stub.
+     *
+     *      An `offset` past the end returns empty rather than reverting: a
+     *      caller paging forward does not know where the end is until it reads
+     *      past it, and making that the error case would mean every complete
+     *      pagination ends in a revert.
+     *
+     * @param offset Index to start from.
+     * @param limit  Maximum ids to return. Clamped to what remains.
+     */
+    function ownerLinksPage(
+        mapping(address => bytes32[]) storage ownerLinks,
+        address owner,
+        uint256 offset,
+        uint256 limit
+    ) public view returns (bytes32[] memory page) {
+        bytes32[] storage all = ownerLinks[owner];
+        uint256 total = all.length;
+        if (offset >= total) return new bytes32[](0);
+
+        uint256 end = offset + limit;
+        // `offset + limit` can overflow only with a caller-supplied limit near
+        // 2**256; clamping to `total` covers it without a separate check.
+        if (end > total || end < offset) end = total;
+
+        page = new bytes32[](end - offset);
+        for (uint256 i = offset; i < end; i++) {
+            page[i - offset] = all[i];
+        }
+    }
+
+    /// @notice How many links `owner` has ever created, revoked ones included.
+    /// @dev Lets a caller size its pagination in one call instead of walking
+    ///      until it gets a short page.
+    function ownerLinkCount(
+        mapping(address => bytes32[]) storage ownerLinks,
+        address owner
+    ) public view returns (uint256) {
+        return ownerLinks[owner].length;
     }
 
     /**

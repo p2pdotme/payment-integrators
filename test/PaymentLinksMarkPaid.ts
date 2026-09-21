@@ -2,12 +2,43 @@ import { expect } from "chai";
 import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
+/**
+ * Business sector, required at registration.
+ *
+ * bytes32 rather than string: the integrator sits on the EIP-170 ceiling and a
+ * dynamic string cost ~550 bytes across the storage write, the generated
+ * `merchants` getter and the event. 31 characters covers every real label.
+ */
+const SECTOR = ethers.encodeBytes32String("Retail");
+
 /** Deploys PaymentLinksLib and returns its address, for linking. */
 async function deployPaymentLinksLib(): Promise<string> {
   const Lib = await ethers.getContractFactory("PaymentLinksLib");
   const lib = await Lib.deploy();
   await lib.waitForDeployment();
   return await lib.getAddress();
+}
+
+/**
+ * Deploys every library MerchantTerminalIntegrator links against, and returns
+ * the map getContractFactory wants.
+ *
+ * There are three now, not one. The integrator reached the EIP-170 ceiling, so
+ * the registration codecs (MerchantRegistryLib) and the settlement-bucket fund
+ * helpers (SettlementLib) moved out alongside the payment-link lifecycle. A
+ * deploy that links only PaymentLinksLib fails with "missing links".
+ */
+async function deployMerchantTerminalLibs(): Promise<Record<string, string>> {
+  const out: Record<string, string> = {
+    PaymentLinksLib: await deployPaymentLinksLib(),
+  };
+  for (const name of ["MerchantRegistryLib", "SettlementLib"]) {
+    const F = await ethers.getContractFactory(name);
+    const c = await F.deploy();
+    await c.waitForDeployment();
+    out[name] = await c.getAddress();
+  }
+  return out;
 }
 
 /**
@@ -69,7 +100,7 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
     ).deploy(await mockUsdc.getAddress());
 
     const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator", {
-      libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+      libraries: await deployMerchantTerminalLibs(),
     });
     integrator = await Integrator.deploy(
       await mockDiamond.getAddress(),
@@ -88,8 +119,8 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
     await erc721Client.setProductPrice(PRODUCT_ID, UNIT_PRICE);
     await mockUsdc.mint(await mockDiamond.getAddress(), USDC(100000));
 
-    await integrator.connect(merchant1).registerMerchant(enc("m1"), "Ramesh Sarees", "INR");
-    await integrator.connect(merchant2).registerMerchant(enc("m2"), "Other Shop", "INR");
+    await integrator.connect(merchant1).registerMerchant(enc("m1"), "Ramesh Sarees", "INR", SECTOR);
+    await integrator.connect(merchant2).registerMerchant(enc("m2"), "Other Shop", "INR", SECTOR);
     await integrator.setTrustedRelayer(relayer.address);
 
     const lib = await ethers.getContractAt("PaymentLinksLib", await deployPaymentLinksLib());

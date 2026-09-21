@@ -14,6 +14,28 @@ async function deployPaymentLinksLib(): Promise<string> {
 }
 
 /**
+ * Deploys every library MerchantTerminalIntegrator links against, and returns
+ * the map getContractFactory wants.
+ *
+ * There are three now, not one. The integrator reached the EIP-170 ceiling, so
+ * the registration codecs (MerchantRegistryLib) and the settlement-bucket fund
+ * helpers (SettlementLib) moved out alongside the payment-link lifecycle. A
+ * deploy that links only PaymentLinksLib fails with "missing links".
+ */
+async function deployMerchantTerminalLibs(): Promise<Record<string, string>> {
+  const out: Record<string, string> = {
+    PaymentLinksLib: await deployPaymentLinksLib(),
+  };
+  for (const name of ["MerchantRegistryLib", "SettlementLib"]) {
+    const F = await ethers.getContractFactory(name);
+    const c = await F.deploy();
+    await c.waitForDeployment();
+    out[name] = await c.getAddress();
+  }
+  return out;
+}
+
+/**
  * Deploy MerchantTerminalIntegrator + the SimpleERC721Client price source.
  *
  * INTERNAL CUSTODY: the integrator custodies ALL merchant USDC itself — there is
@@ -75,7 +97,7 @@ async function main() {
   //    access; the deployer is also the super-admin (hand off to a multisig later).
   console.log("Deploying MerchantTerminalIntegrator (internal custody)...");
   const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator", {
-    libraries: { PaymentLinksLib: await deployPaymentLinksLib() },
+    libraries: await deployMerchantTerminalLibs(),
   });
   const integrator = await Integrator.deploy(DIAMOND_ADDRESS, USDC_ADDRESS, EXTRA_OWNERS);
   await integrator.deploymentTransaction()?.wait(3);

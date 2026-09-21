@@ -9,6 +9,9 @@ import { IOrderFlow } from "../../interfaces/IOrderFlow.sol";
 import { ICheckoutClient } from "../../interfaces/ICheckoutClient.sol";
 import { UserProxy } from "../../base/UserProxy.sol";
 import { PaymentLinksLib } from "./PaymentLinksLib.sol";
+import { MerchantRegistryLib } from "./MerchantRegistryLib.sol";
+import { MerchantTypes } from "./MerchantTypes.sol";
+import { SettlementLib } from "./SettlementLib.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
@@ -67,6 +70,15 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error InvalidAddress();
     error AlreadyRegistered();
     error NotRegistered();
+    /// @dev Withdrawal attempted before a payout handle was set. The handle is
+    ///      optional at registration and required here — see _checkWithdraw.
+    error PayoutHandleNotSet();
+    /// @dev Thrown by MerchantRegistryLib via delegatecall. Declared here as
+    ///      well so it appears in THIS contract's ABI: a library revert bubbles
+    ///      up with the library's selector, and a caller holding only the
+    ///      integrator ABI could not otherwise name it — it would surface as an
+    ///      undecodable 4-byte blob in front of a merchant.
+    error BusinessSectorRequired();
     /// @dev Named MerchantIsFrozen because events and errors share one
     ///      identifier namespace and the event MerchantFrozen keeps the
     ///      canonical name (the backend indexes events).
@@ -167,7 +179,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     // (a real UPI/PIX/bank id); emitting it — even encrypted — would bloat logs
     // and, if ever plaintext, permanently leak it. The app already knows the
     // handle it just set; indexers key off `merchant`.
-    event MerchantRegistered(address indexed merchant, string shopName, bytes32 currency);
+    event MerchantRegistered(
+        address indexed merchant,
+        string shopName,
+        bytes32 currency,
+        bytes32 businessSector
+    );
     event MerchantProfileUpdated(address indexed merchant, string shopName);
     event OrderCompleted(
         uint256 indexed orderId,
@@ -328,35 +345,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     // ─── State ────────────────────────────────────────────────────────
 
-    struct SettlementBucket {
-        uint256 amount;
-        uint256 unlockTimestamp;
-    }
-
-    struct Merchant {
-        address merchantAddr;
-        // ENCRYPTED payout handle. The raw UPI / PIX / CBU / alias must NEVER be
-        // stored on-chain in plaintext (public-chain PII leak). The app encrypts
-        // the handle CLIENT-SIDE to the merchant's relay pubkey before sending it
-        // here; the contract treats it as an opaque, non-empty blob it never
-        // decodes. The LP/app decrypts off-chain when building the payout.
-        bytes encPayoutId;
-        string shopName;
-        bytes32 currency; // offramp currency, e.g. bytes32("INR"|"BRL"|"ARS") — set once at registration
-        uint256 totalDeposited;
-        bool isFrozen;
-        uint256 dailyTxCount;
-        uint256 lastTxDate;
-        uint256 inFlightWithdrawals; // count of this merchant's unsettled SELL withdrawals
-        // UNIX time this merchant was CONTINUOUSLY frozen since (set on freeze,
-        // cleared to 0 on unfreeze). Drives the 90-day dormant-account escheat:
-        // adminEscheat is only reachable once (now - frozenAt) >= ESCHEAT_PERIOD.
-        // Placed AFTER inFlightWithdrawals (index 9) so the public `merchants`
-        // getter's earlier positional fields (0..8, which the frontend ABI reads)
-        // are unchanged; the trailing `buckets` array is omitted by the getter.
-        uint256 frozenAt;
-        SettlementBucket[] buckets;
-    }
+    // SettlementBucket and Merchant now live in MerchantTypes so the external
+    // libraries can name them. Same fields, same order, same storage slots.
 
     /// @dev Tracks an in-flight INR withdrawal (SELL order) so a Diamond-side
     ///      cancellation can be reconciled: USDC refunded to the system proxy
@@ -387,7 +377,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         can never go under-collateralized against what merchants are owed.
     uint256 public totalOwed;
 
-    mapping(address => Merchant) public merchants;
+    mapping(address => MerchantTypes.Merchant) public merchants;
     mapping(address => bool) public registered;
     mapping(uint256 => address) public orderToMerchant;
     /// @notice BUY order id => whether onOrderComplete has ALREADY credited it.
@@ -424,6 +414,19 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      generated getter for an 8-field struct is pure duplicate bytecode
     ///      in a contract that is at the EIP-170 ceiling.
     mapping(bytes32 => PaymentLinksLib.PaymentLink) internal links;
+
+    /// @dev owner => every link id they have created, in creation order.
+    ///      `links` above answers "who owns THIS link" and cannot answer the
+    ///      reverse — a mapping keeps no record of which keys were written — so
+    ///      without this the only source was the LinkCreated log, read by a
+    ///      backward eth_getLogs scan that providers range-cap and that
+    ///      therefore truncated silently. See `getMerchantLinks`.
+    ///
+    ///      Internal, not public, for the same reason `links` is: the
+    ///      auto-generated getter for an array mapping is indexed-access only
+    ///      (one id per call) and pure duplicate bytecode next to the paginated
+    ///      read below, in a contract at the EIP-170 ceiling.
+    mapping(address => bytes32[]) internal merchantLinkIds;
 
     /// @notice orderId => the link it was placed through (0 for POS orders).
     ///         Lets `onOrderCancel` give a use back and `relayerMarkPaid`
@@ -662,32 +665,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     /// @notice Pack a currency code string ("INR") into the bytes32 the Diamond
     ///         uses. Reverts on empty / >31 chars. Pure, so anyone can preview it.
-    function toCurrency(string memory code) public pure returns (bytes32 out) {
-        bytes memory b = bytes(code);
-        if (b.length == 0 || b.length > 31) revert InvalidCurrency();
-        // Reject interior NUL bytes so the value always round-trips through
-        // fromCurrency (which truncates at the first NUL). Otherwise "IN\0R"
-        // would store distinctly yet display as "IN", and two merchants could
-        // register codes that render identically but route to different circles.
-        for (uint256 i = 0; i < b.length; i++) {
-            if (b[i] == 0) revert InvalidCurrency();
-        }
-        assembly {
-            out := mload(add(b, 32))
-        }
+    function toCurrency(string memory code) public pure returns (bytes32) {
+        return MerchantRegistryLib.toCurrency(code);
     }
 
     /// @notice Unpack a bytes32 currency back to its readable code string.
     function fromCurrency(bytes32 cur) public pure returns (string memory) {
-        uint256 len = 0;
-        while (len < 32 && cur[len] != 0) {
-            len++;
-        }
-        bytes memory out = new bytes(len);
-        for (uint256 i = 0; i < len; i++) {
-            out[i] = cur[i];
-        }
-        return string(out);
+        return MerchantRegistryLib.fromCurrency(cur);
     }
 
     // ─── Merchant registration ────────────────────────────────────────
@@ -698,16 +682,24 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         as long as the protocol has a circle for it.
     /// @param encPayoutId  The merchant's payout handle (UPI/PIX/CBU/…),
     ///        ENCRYPTED CLIENT-SIDE to the merchant's relay pubkey. The contract
-    ///        stores it as an opaque, non-empty blob and NEVER decodes it — the
-    ///        raw handle must never be sent here in plaintext (public-chain PII).
+    ///        stores it as an opaque blob and NEVER decodes it — the raw handle
+    ///        must never be sent here in plaintext (public-chain PII).
+    ///        OPTIONAL: pass empty to register without one. `withdrawFiat` then
+    ///        requires it, since that is where an empty handle would mean money
+    ///        with nowhere to land.
     /// @param shopName  Display name.
     /// @param currencyCode ISO-4217-style code, e.g. "INR", "BRL". Non-empty.
+    /// @param businessSector REQUIRED, non-zero. A short label packed into bytes32
+    ///        (up to 31 chars) — use `fromCurrency` to decode it for display.
+    ///        Note this is PUBLIC and PERMANENT like every other field here —
+    ///        it must not be used to carry anything sensitive.
     function registerMerchant(
         bytes calldata encPayoutId,
         string calldata shopName,
-        string calldata currencyCode
+        string calldata currencyCode,
+        bytes32 businessSector
     ) external {
-        _register(encPayoutId, shopName, toCurrency(currencyCode));
+        _register(encPayoutId, shopName, toCurrency(currencyCode), businessSector);
     }
 
     /// @notice Same as above but takes the packed bytes32 currency directly, for
@@ -717,9 +709,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function registerMerchantRaw(
         bytes calldata encPayoutId,
         string calldata shopName,
-        bytes32 currency
+        bytes32 currency,
+        bytes32 businessSector
     ) external {
-        _register(encPayoutId, shopName, currency);
+        _register(encPayoutId, shopName, currency, businessSector);
     }
 
     /// @notice Update the caller's editable profile fields — the encrypted payout
@@ -733,7 +726,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function updateProfile(bytes calldata encPayoutId, string calldata shopName) external {
         if (!registered[msg.sender]) revert NotRegistered();
         if (encPayoutId.length == 0) revert InvalidAddress();
-        Merchant storage m = merchants[msg.sender];
+        MerchantTypes.Merchant storage m = merchants[msg.sender];
         if (m.isFrozen) revert MerchantIsFrozen(); // a frozen merchant can't edit
         m.encPayoutId = encPayoutId;
         m.shopName = shopName;
@@ -743,35 +736,35 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function _register(
         bytes calldata encPayoutId,
         string calldata shopName,
-        bytes32 currency
+        bytes32 currency,
+        bytes32 businessSector
     ) internal {
         if (registered[msg.sender]) revert AlreadyRegistered();
-        if (currency == bytes32(0)) revert InvalidCurrency();
-        // A payout target is required — without it fiat withdrawals have nowhere
-        // to land (same rule updateProfile enforces). Opaque, non-empty blob.
-        if (encPayoutId.length == 0) revert InvalidAddress();
-        // AUDIT (MED): enforce CANONICAL bytes32 form on BOTH entry points —
-        // left-aligned code, zero-padded, no non-zero byte after the first NUL.
-        // registerMerchant's toCurrency already guarantees this; without the same
-        // check here, registerMerchantRaw could smuggle "INR\0<junk>": it displays
-        // as "INR" via fromCurrency but fails the `== bytes32("INR")` compare in
-        // perTxCap, self-granting the 100 USDC default cap instead of INR's 50
-        // (and dodging any admin setPerTxCap("INR") override).
-        bool seenNul = false;
-        for (uint256 i = 0; i < 32; i++) {
-            if (currency[i] == 0) {
-                seenNul = true;
-            } else if (seenNul) {
-                revert InvalidCurrency();
-            }
-        }
-        Merchant storage m = merchants[msg.sender];
+        // Field validation (canonical currency form, sector present) lives in
+        // MerchantRegistryLib — pure, no state, and out of the integrator's
+        // bytecode, which is at the EIP-170 ceiling. The storage writes stay
+        // here so nothing about custody moves.
+        MerchantRegistryLib.validateRegistration(currency, businessSector);
+
+        MerchantTypes.Merchant storage m = merchants[msg.sender];
         m.merchantAddr = msg.sender;
+        // OPTIONAL at registration, unlike before. A merchant can sign up
+        // without having decided where fiat should land, which is the common
+        // case for someone taking crypto first and cashing out later.
+        //
+        // The check did not disappear, it MOVED to `withdrawFiat` — the point at
+        // which an empty handle actually means something (money with nowhere to
+        // go). Requiring it here instead only meant a merchant who had not
+        // chosen a payout rail could not open an account at all. Requiring it
+        // there means they cannot withdraw until they do, which is the real
+        // constraint. `updateProfile` still rejects an empty value, so this can
+        // be filled in later but never blanked back out.
         m.encPayoutId = encPayoutId;
         m.shopName = shopName;
         m.currency = currency;
+        m.businessSector = businessSector;
         registered[msg.sender] = true;
-        emit MerchantRegistered(msg.sender, shopName, currency);
+        emit MerchantRegistered(msg.sender, shopName, currency, businessSector);
     }
 
     // ─── IP2PIntegrator ───────────────────────────────────────────────
@@ -801,7 +794,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev Resolve the settlement lock for a specific merchant from their
     ///      registered currency. Single source of truth for every credit site so
     ///      the per-currency hold is applied uniformly (deposits AND re-credits).
-    function _lockFor(Merchant storage m) internal view returns (uint256) {
+    function _lockFor(MerchantTypes.Merchant storage m) internal view returns (uint256) {
         return lockPeriod(m.currency);
     }
 
@@ -832,7 +825,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         }
 
         if (!registered[subject]) revert NotRegistered();
-        Merchant storage m = merchants[subject];
+        MerchantTypes.Merchant storage m = merchants[subject];
         if (m.isFrozen) revert MerchantIsFrozen();
         // Per-tx cap keys off the merchant's REGISTERED currency, NOT the
         // caller-supplied order currency — otherwise an INR merchant (50 USDC
@@ -927,7 +920,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         address merchant = orderToMerchant[orderId];
         if (merchant == address(0)) return; // SELL or unknown — nothing to release
-        Merchant storage m = merchants[merchant];
+        MerchantTypes.Merchant storage m = merchants[merchant];
         // MED-4: only release a slot for the CURRENT day. A day-N order cancelled
         // on day N+1 must NOT decrement N+1's freshly-rolled counter (that slot
         // was never consumed today). If the day already rolled, today's count is
@@ -1051,6 +1044,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ) external whenNotPaused {
         PaymentLinksLib.create(
             links,
+            merchantLinkIds,
             linkId,
             amount,
             currency,
@@ -1059,6 +1053,45 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             _merchantView(msg.sender),
             encryptedConfig
         );
+    }
+
+    /// @notice The link ids `owner` has created, one page at a time.
+    ///
+    /// @dev The reverse lookup the `links` mapping cannot do. Before this, a
+    ///      merchant's list came from scanning `LinkCreated` logs backwards,
+    ///      which RPC providers range-cap — so the scan hit a request ceiling
+    ///      and returned a short list with NO error. A merchant who cannot see
+    ///      a link cannot revoke it.
+    ///
+    ///      Paginated, not whole: the array is append-only and unbounded, and
+    ///      returning all of it would run out of gas for exactly the merchants
+    ///      with the most links. `getMerchantLinkCount` sizes the walk.
+    ///
+    ///      Ids only, and revoked links are still listed — status is not implied
+    ///      by membership. Callers read each id's live state through `getLink`,
+    ///      so a revoked or expired link can never render as active.
+    function getMerchantLinks(
+        address owner,
+        uint256 offset,
+        uint256 limit
+    ) external view returns (bytes32[] memory) {
+        bytes32[] storage all = merchantLinkIds[owner];
+        uint256 total = all.length;
+        if (offset >= total) return new bytes32[](0);
+        uint256 end = offset + limit;
+        // offset + limit can only overflow with a caller-supplied limit near
+        // 2**256; clamping to total covers it without a separate check.
+        if (end > total || end < offset) end = total;
+        bytes32[] memory page = new bytes32[](end - offset);
+        for (uint256 i = offset; i < end; i++) {
+            page[i - offset] = all[i];
+        }
+        return page;
+    }
+
+    /// @notice How many links `owner` has ever created, revoked ones included.
+    function getMerchantLinkCount(address owner) external view returns (uint256) {
+        return merchantLinkIds[owner].length;
     }
 
     /// @notice Permanently deactivate a link. Owner or admin — deliberately NOT
@@ -1079,7 +1112,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function _merchantView(
         address merchant
     ) internal view returns (PaymentLinksLib.MerchantView memory) {
-        Merchant storage m = merchants[merchant];
+        MerchantTypes.Merchant storage m = merchants[merchant];
         return
             PaymentLinksLib.MerchantView({
                 registered: registered[merchant],
@@ -1266,7 +1299,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         string calldata pubKey,
         string calldata /* payoutOverride */
     ) external whenNotPaused nonReentrant returns (uint256 orderId) {
-        Merchant storage m = _checkWithdraw(amount);
+        MerchantTypes.Merchant storage m = _checkWithdraw(amount);
         return _withdrawFiat(m, amount, circleId, m.currency, pubKey);
     }
 
@@ -1290,7 +1323,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ) external whenNotPaused nonReentrant returns (uint256 orderId) {
         if (currency == bytes32(0)) revert InvalidCurrency();
         if (bytes(pubKey).length == 0) revert InvalidAddress();
-        Merchant storage m = _checkWithdraw(amount);
+        MerchantTypes.Merchant storage m = _checkWithdraw(amount);
         return _withdrawFiat(m, amount, circleId, currency, pubKey);
     }
 
@@ -1305,7 +1338,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///        NOT the payout id — passing a plain UPI/PIX string here makes the
     ///        LP reject the order ("invalid user pubkey").
     function _withdrawFiat(
-        Merchant storage m,
+        MerchantTypes.Merchant storage m,
         uint256 amount,
         uint256 circleId,
         bytes32 currency,
@@ -1380,7 +1413,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // HIGH-2: a frozen merchant's in-flight withdrawal must not settle.
         // Freeze is the only fraud kill-switch, so this permissionless step has
         // to honour it just like the withdraw entry point does.
-        Merchant storage m = merchants[w.merchant];
+        MerchantTypes.Merchant storage m = merchants[w.merchant];
         if (m.isFrozen) revert MerchantIsFrozen();
 
         // The Diamond pulls actualUsdtAmount (principal + fee) from order.user
@@ -1474,7 +1507,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @notice Withdraw unlocked USDC straight to the merchant's wallet.
     ///         Funds are custodied in this contract and transferred to the merchant.
     function withdrawUSDC(uint256 amount) external whenNotPaused nonReentrant {
-        Merchant storage m = _checkWithdraw(amount);
+        MerchantTypes.Merchant storage m = _checkWithdraw(amount);
         _deductUnlocked(m, amount);
 
         _vaultPull(msg.sender, amount);
@@ -1521,7 +1554,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             revert WithdrawalNotCancellable();
 
         w.settled = true;
-        Merchant storage m = merchants[w.merchant];
+        MerchantTypes.Merchant storage m = merchants[w.merchant];
         _releaseSlot(w, m); // idempotent — may already be freed by adminForceUnwedge
 
         // M-1 (cross-order fund absorption): sweep only THIS order's own capped
@@ -1581,7 +1614,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
         if (status != STATUS_COMPLETED) revert WithdrawalNotCancellable();
         w.settled = true;
-        Merchant storage m = merchants[w.merchant];
+        MerchantTypes.Merchant storage m = merchants[w.merchant];
         _releaseSlot(w, m); // idempotent — may already be freed by adminForceUnwedge
 
         // M-1: sweep only this order's own capped amount (min(owedBack, proxyBal)),
@@ -1643,7 +1676,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
         if (order.status != STATUS_COMPLETED) revert WithdrawalNotCancellable();
 
-        Merchant storage m = merchants[merchant];
+        MerchantTypes.Merchant storage m = merchants[merchant];
         // M-1 (belt-and-suspenders serialization): refuse while a SELL withdrawal is
         // in flight. An in-flight withdrawal parks its principal on this same shared
         // proxy; combined with the capped-sweep fix below either alone prevents the
@@ -1680,11 +1713,23 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         emit StrandedBuyRecovered(orderId, merchant, credit);
     }
 
-    function _checkWithdraw(uint256 amount) internal view returns (Merchant storage m) {
+    function _checkWithdraw(
+        uint256 amount
+    ) internal view returns (MerchantTypes.Merchant storage m) {
         if (!registered[msg.sender]) revert NotRegistered();
         m = merchants[msg.sender];
         if (m.isFrozen) revert MerchantIsFrozen();
         if (amount == 0) revert NothingToWithdraw();
+        // The payout handle is OPTIONAL at registration and required HERE — the
+        // one place an empty one actually means something. A SELL placed without
+        // it produces fiat with nowhere to land: the order reaches the circle,
+        // the LP has no handle to pay, and the merchant's funds sit locked in an
+        // in-flight withdrawal until someone reconciles it by hand.
+        //
+        // Deliberately in _checkWithdraw rather than in withdrawFiat, because
+        // withdrawFiatIn shares this gate and needs the same guarantee. Putting
+        // it in the caller would have left the second path open.
+        if (m.encPayoutId.length == 0) revert PayoutHandleNotSet();
     }
 
     /// @dev Append an unlocked/locked bucket, compacting fully-spent buckets
@@ -1692,135 +1737,35 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      credit into an existing bucket with the SAME unlock timestamp so a
     ///      merchant's live-bucket count cannot grow without bound (and the
     ///      credit path can never revert at the cap and strand a deposit).
-    function _creditBucket(Merchant storage m, uint256 amount, uint256 unlockTimestamp) internal {
-        if (amount == 0) return;
-        totalOwed += amount;
-        _compact(m);
-        // Fold into an existing bucket sharing this unlock window if present.
-        uint256 len = m.buckets.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (m.buckets[i].unlockTimestamp == unlockTimestamp) {
-                m.buckets[i].amount += amount;
-                return;
-            }
-        }
-        // No matching window — must append. If at the cap, fold the new credit
-        // into an existing bucket rather than revert: this keeps the credit path
-        // infallible (a completed deposit can ALWAYS be recorded).
-        //
-        // AUDIT FIX D (round 1) + #7 (round 2): the merge must never move funds
-        // across the locked/unlocked boundary in EITHER direction — it must not
-        // re-lock a merchant's already-spendable principal (the round-1 concern),
-        // and it must not make a still-locked incoming credit spendable early (the
-        // round-2 regression). We enforce that by folding ONLY into a bucket whose
-        // lock-state MATCHES the incoming credit:
-        //   • incoming LOCKED   → fold into the oldest still-LOCKED bucket, adopting
-        //     max(hostTs, incomingTs) so neither unlocks earlier than intended.
-        //   • incoming UNLOCKED → fold into the oldest already-UNLOCKED bucket,
-        //     leaving its (past) timestamp untouched — both stay spendable.
-        if (m.buckets.length >= MAX_BUCKETS) {
-            bool incomingLocked = unlockTimestamp >= block.timestamp;
-            // Find the oldest bucket whose lock-state MATCHES the incoming credit.
-            uint256 target = type(uint256).max;
-            uint256 targetTs = type(uint256).max;
-            for (uint256 i = 0; i < len; i++) {
-                uint256 ts = m.buckets[i].unlockTimestamp;
-                bool bucketLocked = ts >= block.timestamp;
-                if (bucketLocked == incomingLocked && ts < targetTs) {
-                    targetTs = ts;
-                    target = i;
-                }
-            }
-            if (target != type(uint256).max) {
-                // Same-state merge: locked→locked adopts the later unlock (never
-                // early); unlocked→unlocked keeps the past timestamp (stays
-                // spendable). The timestamp bump only ever applies to a locked
-                // host, so it can never re-lock already-spendable principal.
-                if (incomingLocked && unlockTimestamp > m.buckets[target].unlockTimestamp) {
-                    m.buckets[target].unlockTimestamp = unlockTimestamp;
-                }
-                m.buckets[target].amount += amount;
-                return;
-            }
-            // BUG FIX (#7 fallback): no same-state host exists (all 256 buckets are
-            // the OPPOSITE lock-state). Folding into a mismatched bucket would
-            // corrupt fund availability — re-locking incoming unlocked funds, or
-            // re-locking a host's already-spendable principal (the exact bugs #7/D
-            // fixed). Instead, coalesce the two oldest SAME-state EXISTING buckets
-            // (all buckets share the opposite state, so a same-state pair always
-            // exists) to free one slot, then append the incoming credit as its own
-            // correctly-timestamped bucket. Every bucket keeps its true lock-state;
-            // nothing is re-locked or unlocked early. This is a rare cap edge (256
-            // buckets all one state, incoming the other, no exact-ts match).
-            uint256 a = type(uint256).max;
-            uint256 aTs = type(uint256).max;
-            uint256 b = type(uint256).max;
-            uint256 bTs = type(uint256).max;
-            for (uint256 i = 0; i < len; i++) {
-                uint256 ts = m.buckets[i].unlockTimestamp; // all are !incomingLocked here
-                if (ts < aTs) {
-                    b = a;
-                    bTs = aTs;
-                    a = i;
-                    aTs = ts;
-                } else if (ts < bTs) {
-                    b = i;
-                    bTs = ts;
-                }
-            }
-            // Merge b into a using the safe (later) timestamp — both share the
-            // opposite lock-state, so max() never crosses the locked/unlocked line.
-            if (bTs > aTs) m.buckets[a].unlockTimestamp = bTs;
-            m.buckets[a].amount += m.buckets[b].amount;
-            m.buckets[b].amount = 0;
-            _compact(m); // drop the now-zeroed slot, freeing room to append
-        }
-        m.buckets.push(SettlementBucket({ amount: amount, unlockTimestamp: unlockTimestamp }));
+    function _creditBucket(
+        MerchantTypes.Merchant storage m,
+        uint256 amount,
+        uint256 unlockTimestamp
+    ) internal {
+        // Bucket mechanics live in SettlementLib (delegatecall) — the integrator
+        // was at the EIP-170 ceiling. The library returns what it credited and
+        // the global owed total is updated HERE, because `totalOwed` is the
+        // number the solvency invariant (balanceOf(this) >= totalOwed) is written
+        // against and it stays in the contract that owns it.
+        totalOwed += SettlementLib.creditBucket(m, amount, unlockTimestamp);
     }
 
     /// @dev Removes ALL fully-spent (amount == 0) buckets, preserving order of
-    ///      the live ones. A stable compaction: spent buckets can appear
-    ///      anywhere (a locked bucket can sit in front of a spent unlocked
-    ///      one), so a head-only pass would leave interior zeros and let the
-    ///      array drift toward MAX_BUCKETS. This pass reclaims every zero.
-    function _compact(Merchant storage m) internal {
-        uint256 len = m.buckets.length;
-        uint256 write = 0;
-        for (uint256 read = 0; read < len; read++) {
-            if (m.buckets[read].amount != 0) {
-                if (write != read) {
-                    m.buckets[write] = m.buckets[read];
-                }
-                write++;
-            }
-        }
-        // Pop the tail left after compaction (len - write spent slots).
-        while (m.buckets.length > write) {
-            m.buckets.pop();
-        }
+    ///      the live ones. See SettlementLib.compact.
+    function _compact(MerchantTypes.Merchant storage m) internal {
+        SettlementLib.compact(m);
     }
 
     /// @dev Sums unlocked buckets, reverts if short, then deducts
     ///      oldest-first (buckets are pushed chronologically).
-    function _deductUnlocked(Merchant storage m, uint256 amount) internal {
-        uint256 unlocked = 0;
-        uint256 len = m.buckets.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (m.buckets[i].unlockTimestamp < block.timestamp) {
-                unlocked += m.buckets[i].amount;
-            }
-        }
-        if (unlocked < amount) revert InsufficientAvailableBalance();
-
+    function _deductUnlocked(MerchantTypes.Merchant storage m, uint256 amount) internal {
+        // Bucket mechanics in SettlementLib; the global owed total is decremented
+        // HERE, for the same reason creditBucket adds it here — `totalOwed` is
+        // what the solvency invariant is written against and stays in the
+        // contract that owns it. The library reverts if the merchant is short,
+        // so totalOwed is only touched once the deduction is known to succeed.
+        SettlementLib.deductUnlocked(m, amount);
         totalOwed -= amount;
-        uint256 remaining = amount;
-        for (uint256 i = 0; i < len && remaining > 0; i++) {
-            SettlementBucket storage b = m.buckets[i];
-            if (b.unlockTimestamp >= block.timestamp || b.amount == 0) continue;
-            uint256 take = b.amount < remaining ? b.amount : remaining;
-            b.amount -= take;
-            remaining -= take;
-        }
     }
 
     /// @dev AUDIT FIX #10: release a withdrawal's in-flight slot exactly once.
@@ -1830,7 +1775,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      inFlightWithdrawals only on the first call. Decoupling the slot release
     ///      from `settled` lets a late PAID→CANCELLED refund still be swept and
     ///      re-credited after the channel was un-wedged.
-    function _releaseSlot(PendingWithdrawal storage w, Merchant storage m) internal {
+    function _releaseSlot(PendingWithdrawal storage w, MerchantTypes.Merchant storage m) internal {
         if (w.slotFreed) return;
         w.slotFreed = true;
         if (m.inFlightWithdrawals > 0) m.inFlightWithdrawals--;
@@ -2107,7 +2052,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      window. A subsequent unfreeze clears it, so escheat needs a CONTINUOUS
     ///      90-day freeze.
     function freezeMerchant(address merchant) external onlyRole(Role.SUPPORT) {
-        Merchant storage m = merchants[merchant];
+        MerchantTypes.Merchant storage m = merchants[merchant];
         // Idempotent: re-freezing an already-frozen merchant is a silent no-op —
         // no event, so indexers see exactly one MerchantFrozen per freeze episode
         // (and the dormancy clock is never restarted, per the escheat rules).
@@ -2122,7 +2067,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      RESETS the 90-day dormancy clock (escheat requires continuous freeze).
     ///      Idempotent — unfreezing a not-frozen merchant is a silent no-op.
     function unfreezeMerchant(address merchant) external onlyRole(Role.SUPPORT) {
-        Merchant storage m = merchants[merchant];
+        MerchantTypes.Merchant storage m = merchants[merchant];
         if (m.isFrozen) {
             m.isFrozen = false;
             m.frozenAt = 0; // reset the dormancy clock
@@ -2135,7 +2080,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         dashboard show a countdown. `block.timestamp >= this (and != 0)` ⇒
     ///         adminEscheat is callable.
     function escheatableAt(address merchant) external view returns (uint256) {
-        Merchant storage m = merchants[merchant];
+        MerchantTypes.Merchant storage m = merchants[merchant];
         if (!m.isFrozen || m.frozenAt == 0) return 0;
         return m.frozenAt + ESCHEAT_PERIOD;
     }
@@ -2165,7 +2110,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @param to       Destination for the recovered USDC (non-zero).
     function adminEscheat(address merchant, address to) external onlySuperAdmin nonReentrant {
         if (to == address(0)) revert InvalidAddress();
-        Merchant storage m = merchants[merchant];
+        MerchantTypes.Merchant storage m = merchants[merchant];
         // Must be frozen AND continuously so for the full window.
         if (!m.isFrozen || m.frozenAt == 0 || block.timestamp < m.frozenAt + ESCHEAT_PERIOD)
             revert NotEscheatable();
@@ -2243,7 +2188,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
         if (w.upiDelivered) revert FiatAlreadyDelivered();
-        Merchant storage m = merchants[w.merchant];
+        MerchantTypes.Merchant storage m = merchants[w.merchant];
         if (!m.isFrozen) revert MerchantNotFrozen(); // only for frozen accounts
 
         // Pre-PAID only (upiDelivered==false guard above): the principal still
@@ -2291,7 +2236,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (status != STATUS_CANCELLED) revert WithdrawalNotCancellable();
 
         w.settled = true;
-        Merchant storage m = merchants[w.merchant];
+        MerchantTypes.Merchant storage m = merchants[w.merchant];
         _releaseSlot(w, m); // idempotent — may already be freed by adminForceUnwedge
 
         // M-1 (admin path): capped sweep — leave any co-resident stranded funds
@@ -2341,7 +2286,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
-        Merchant storage m = merchants[w.merchant];
+        MerchantTypes.Merchant storage m = merchants[w.merchant];
         // Frozen-only, like adminAbortWithdrawal — the safety gate that makes this
         // an incident tool, not a routine one. Unlike adminAbort, it does NOT
         // refuse upiDelivered: the whole point is to close a PAID-but-never-
@@ -2416,7 +2361,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
-        Merchant storage m = merchants[w.merchant];
+        MerchantTypes.Merchant storage m = merchants[w.merchant];
         if (!m.isFrozen) revert MerchantNotFrozen();
 
         // Unconditionally close the order and free the channel — this is the whole
@@ -2448,7 +2393,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         view
         returns (uint256 pending, uint256 available, uint256 totalDeposited, bool isFrozen)
     {
-        Merchant storage m = merchants[merchant];
+        MerchantTypes.Merchant storage m = merchants[merchant];
         uint256 len = m.buckets.length;
         for (uint256 i = 0; i < len; i++) {
             if (m.buckets[i].unlockTimestamp < block.timestamp) {
@@ -2464,7 +2409,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         this exposes it for tests and the dashboard.
     function getMerchantBuckets(
         address merchant
-    ) external view returns (SettlementBucket[] memory) {
+    ) external view returns (MerchantTypes.SettlementBucket[] memory) {
         return merchants[merchant].buckets;
     }
 
@@ -2482,17 +2427,25 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             string memory shopName,
             bytes32 currency,
             bool isRegistered,
-            bool isFrozen
+            bool isFrozen,
+            bytes32 businessSector
         )
     {
-        Merchant storage m = merchants[merchant];
-        return (m.encPayoutId, m.shopName, m.currency, registered[merchant], m.isFrozen);
+        MerchantTypes.Merchant storage m = merchants[merchant];
+        return (
+            m.encPayoutId,
+            m.shopName,
+            m.currency,
+            registered[merchant],
+            m.isFrozen,
+            m.businessSector
+        );
     }
 
     function getDailyTxInfo(
         address merchant
     ) external view returns (uint256 usedToday, uint256 limit) {
-        Merchant storage m = merchants[merchant];
+        MerchantTypes.Merchant storage m = merchants[merchant];
         uint256 today = block.timestamp / 86400;
         usedToday = m.lastTxDate == today ? m.dailyTxCount : 0;
         return (usedToday, dailyLimit);
