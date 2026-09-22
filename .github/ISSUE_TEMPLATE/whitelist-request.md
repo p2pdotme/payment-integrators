@@ -25,6 +25,10 @@ labels: ["whitelist"]
 - **Sourcify link** (optional):
 - **Runtime bytecode hash**: `0x...` <!-- cast code <addr> | cast keccak -->
 - **Pinned proxyImpl**: `0x...` <!-- the UserProxy implementation address the integrator deployed -->
+- **`usdcThroughIntegrator`**: `true` / `false`
+  <!-- Pinned at registration. `true` routes BUY proceeds to the integrator on
+       completion; `false` routes direct to the order's `recipientAddr`. Must
+       match what the integrator's `onOrderComplete` was coded to expect. -->
 
 ## Operational params
 
@@ -35,6 +39,7 @@ labels: ["whitelist"]
 ## Pre-flight
 
 - [ ] Bytecode hash matches the merged commit
+- [ ] `usdcThroughIntegrator` matches what the contract's `onOrderComplete` expects
 - [ ] Etherscan source verified
 - [ ] (mainnet only) Sepolia version has been live with successful E2E orders
 - [ ] Any upstream allowlists (e.g. Megapot batch facilitator) have been set up
