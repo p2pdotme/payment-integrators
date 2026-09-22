@@ -64,7 +64,7 @@ async function deployMerchantTerminalLibs(): Promise<Record<string, string>> {
  * The third slot is left unused. It was always optional — the integrator's own
  * NatSpec calls it an "optional admin-set keeper" and says "the merchant and
  * owner can always deliver; this just adds a keeper" — and there is no keeper
- * service in this repository: nothing in `worker/src` calls `deliverFiatPayout`,
+ * service in this repository: nothing in the relayer calls `deliverFiatPayout`,
  * and every one of the 838 contract tests delivers as the merchant.
  *
  * The alternative was to give the keeper role to an owner key, which would also

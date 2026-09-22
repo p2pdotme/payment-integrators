@@ -186,7 +186,7 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       await payLink(LINK, 1);
       const orderId = await lastOrderId();
 
-      // Exactly what worker/src/relayTx.ts used to forward: paidBuyOrder signed
+      // Exactly what the relayer's relayTx.ts used to forward: paidBuyOrder signed
       // by the relayer EOA. The Diamond wants order.user and gets the relayer.
       await expect(
         mockDiamond.connect(relayer).paidBuyOrder(orderId)

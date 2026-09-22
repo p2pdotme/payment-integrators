@@ -28,10 +28,19 @@ async function deployMerchantTerminalLibs() {
   return out;
 }
 
-// Resolved from THIS file, not the working directory — hardhat runs scripts
-// from the project root, and a bare "../worker" silently resolved outside the
-// repo depending on where the contracts live.
-const OUT = path.resolve(__dirname, "..", "worker", "test", "e2e-addresses.json");
+// Where the relayer's e2e suites read their addresses from.
+//
+// The relayer used to live at ../worker inside this repo. It is its own
+// repository now (Railway deploys from a repo root), so the default points at
+// a sibling checkout — and `E2E_OUT` overrides it, because "sibling folder with
+// this exact name" is an assumption about someone's disk, not a fact.
+//
+// Resolved from THIS file, not the working directory: hardhat runs scripts from
+// the project root, and a relative path silently resolved somewhere else
+// depending on where the contracts live.
+const OUT =
+  process.env.E2E_OUT ||
+  path.resolve(__dirname, "..", "..", "payqr-relayer", "test", "e2e-addresses.json");
 
 async function main() {
   const [deployer, merchant, relayer, customer] = await ethers.getSigners();

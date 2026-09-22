@@ -64,10 +64,16 @@ Trustless and exact. Also the most expensive option on every axis:
   busiest merchants — the ones who need the list most.
 - It is new bytecode: a fresh deploy and a fresh whitelist request.
 
-`payqr/lib/paymentLinks.ts` already contains `fetchMerchantLinkIds`, written
-speculatively against this shape. It is **not deployed** on any integrator, so
-the call reverts and the caller falls through. Harmless to keep — it costs one
-failed `eth_call` and starts working by itself if this ever ships.
+**Now shipped as well**, alongside Option C. `payqr/lib/paymentLinks.ts` had
+`fetchMerchantLinkIds` written speculatively against this exact shape, so it
+started working the moment the view existed.
+
+Two of the costs above were paid rather than avoided: the array is append-only
+(nothing is removed on revoke, because swap-and-pop reorders the tail under a
+caller paginating by offset and makes them skip a link between pages), and the
+getter is paginated so it cannot load an unbounded array into memory. The third
+— new bytecode, a fresh deploy, a fresh whitelist request — was simply the
+price, and it forced the library extraction that made room for it.
 
 ## Option B — index `LinkCreated` in a subgraph
 
@@ -97,7 +103,7 @@ mlink:<merchant-lowercase>:<linkId>  →  {"at": <unix seconds>}
 `KV.list({ prefix })` then enumerates a merchant's links directly. No scanning,
 no range caps, no contract change, nothing to whitelist.
 
-Implementation: `worker/src/linkIndex.ts`, wired into `worker/src/provision.ts`,
+Implementation: the relayer's `src/linkIndex.ts`, wired into its `src/provision.ts`,
 served at `GET /api/merchants/:address/links`.
 
 ### What it is honest about
@@ -132,8 +138,8 @@ Because a signature there would protect nothing and cost real usability.
 
 `LinkCreated` declares `owner` as an indexed topic and `getLink` returns it —
 merchant→links is already derivable by anyone with an archival RPC.
-`worker/src/webhooks.ts` makes the same observation about link ownership being
-public, and handles it the right way: it does not try to hide the owner, it
+The relayer's `src/webhooks.ts` makes the same observation about link ownership
+being public, and handles it the right way: it does not try to hide the owner, it
 requires a signature for the one thing that actually matters, *writing*.
 
 Requiring one to read would put a wallet prompt in front of the merchant's own

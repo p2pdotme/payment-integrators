@@ -276,7 +276,7 @@ accept, whatever you point it at gains those two permissions on every merchant's
 withdrawal. Point it at zero, or at an address you would be content to hold
 them; do not point it at a service picked only for the link path.
 
-Then the Worker needs the account-abstraction wiring — see `worker/README.md`
+Then the Worker needs the account-abstraction wiring — see the relayer repo's `README.md`
 for the full list. Two are worth repeating because getting them wrong is
 invisible:
 
@@ -408,7 +408,7 @@ the merchant's per-transaction cap (50 USDC for INR, 100 otherwise), and every
 link sale counts against the same `dailyLimit` as a POS sale. Raise that limit
 before pointing a busy counter at it.
 
-`worker/test/stress.test.ts` asserts the queue behaviour, and that a refusal
+the relayer's `test/stress.test.ts` asserts the queue behaviour, and that a refusal
 says the link is busy rather than narrating another customer's payment.
 
 ### Also confirm before going live
