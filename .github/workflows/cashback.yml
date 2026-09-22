@@ -1,0 +1,133 @@
+name: Cashback
+
+# AUDIT F12. `cashback/` is a nested project with its own package.json and
+# hardhat.config.ts. The root workflows compile `./contracts`, test `./test`
+# and lint `contracts/**/*.sol`, and the Slither job is filtered to
+# `paths: contracts/**` — so none of them ever touched this directory. Every
+# figure quoted about this branch was self-reported until this file existed.
+#
+# Paths are filtered to cashback/** so this runs on changes here, and the
+# working directory is set once for every job.
+
+on:
+  pull_request:
+    paths:
+      - "cashback/**"
+      - ".github/workflows/cashback.yml"
+  push:
+    branches: [main]
+    paths:
+      - "cashback/**"
+      - ".github/workflows/cashback.yml"
+
+defaults:
+  run:
+    working-directory: cashback
+
+jobs:
+  build-and-test:
+    name: Compile + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: cashback/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile
+        run: npx hardhat compile
+
+      - name: Test
+        run: npx hardhat test
+
+  lint:
+    name: solhint + prettier
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: cashback/package-lock.json
+
+      - run: npm ci
+
+      - name: solhint
+        run: npm run lint
+
+      - name: prettier
+        run: npm run format:check
+
+  coverage:
+    name: Coverage gate (line >= 90%, branch >= 80%)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: cashback/package-lock.json
+
+      - run: npm ci
+
+      - name: Run coverage
+        run: npx hardhat coverage
+
+      - name: Enforce thresholds
+        run: |
+          node <<'JS'
+          const summary = require('./coverage/coverage-summary.json');
+          const total = summary.total;
+          const linePct = total.lines.pct;
+          const branchPct = total.branches.pct;
+          console.log(`lines: ${linePct}%, branches: ${branchPct}%`);
+          let bad = false;
+          if (linePct < 90) { console.error(`Line coverage ${linePct}% < 90%`); bad = true; }
+          if (branchPct < 80) { console.error(`Branch coverage ${branchPct}% < 80%`); bad = true; }
+          if (bad) process.exit(1);
+          JS
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cashback-coverage-report
+          path: cashback/coverage/
+          retention-days: 14
+
+  slither:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: cashback/package-lock.json
+
+      - run: npm ci
+
+      - name: Compile
+        run: npx hardhat compile
+
+      - name: Slither
+        uses: crytic/slither-action@v0.4.0
+        with:
+          target: cashback/
+          fail-on: high
+          slither-args: --filter-paths "contracts/test/|node_modules/"
