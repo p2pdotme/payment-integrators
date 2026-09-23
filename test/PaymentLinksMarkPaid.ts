@@ -320,9 +320,19 @@ describe("MerchantTerminalIntegrator — payment links reach PAID", function () 
       await expectCallFailedWith(payLink(LINK, 6), "ExceedsPerTxCap()");
     });
 
-    it("enforces the daily transaction count", async function () {
+    it("enforces the daily transaction count on PAID link orders (M-1)", async function () {
       await mkLink(LINK, 1, 0);
+      // 25 abandoned checkouts no longer lock the merchant out…
       for (let i = 0; i < 25; i++) await payLink(LINK, 1);
+      await expect(payLink(LINK, 1)).to.emit(integrator, "LinkOrderPlaced");
+      // …but 25 orders actually marked paid do.
+      const ids = (await integrator.queryFilter(integrator.filters.LinkOrderPlaced())).map(
+        (e: any) => e.args[1]
+      );
+      for (const id of ids.slice(0, 25)) {
+        await mockDiamond.simulateOrderAccepted(id);
+        await integrator.connect(relayer).relayerMarkPaid(LINK, id);
+      }
       await expectCallFailedWith(payLink(LINK, 1), "DailyLimitReached()");
     });
 

@@ -731,17 +731,48 @@ describe("MerchantTerminalIntegrator — payment links", function () {
       await expect(payLink(LINK_A, 1)).to.emit(integrator, "LinkOrderPlaced");
     });
 
-    it("link orders consume the same daily limit as in-person sales", async function () {
+    it("link orders share the daily limit, but count only once marked paid (M-1)", async function () {
       await integrator.setDailyLimit(2);
       await createLink(merchant1, LINK_A, linkAmount(1));
 
+      // An ABANDONED checkout (placed, never marked paid) takes no slot…
       await payLink(LINK_A, 1);
-      // A POS sale and a link sale draw on ONE shared allowance.
+      const pos = () =>
+        integrator
+          .connect(merchant1)
+          .userPlaceOrder(erc721Client.target, PRODUCT_ID, 1, INR, 0, PK);
+      await pos();
+      await pos(); // …so both POS sales still fit in a limit of 2.
+
+      // With the allowance used, placement is refused — for links too.
+      await expectCallFailedWith(payLink(LINK_A, 1), "DailyLimitReached()");
+      const [used] = await integrator.getDailyTxInfo(merchant1.address);
+      expect(used).to.equal(2n);
+    });
+
+    it("marking a link order paid takes a slot, and a cancel after that gives it back", async function () {
+      await integrator.setDailyLimit(5);
+      await createLink(merchant1, LINK_A, linkAmount(1));
+      await payLink(LINK_A, 1);
+      const orderId = await lastOrderId();
+      await mockDiamond.simulateOrderAccepted(orderId); // an LP took it
+      await integrator.connect(relayer).relayerMarkPaid(LINK_A, orderId);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(1n);
+
+      // A PAID order is cancelled by the Diamond (TTL / dispute), not the buyer.
+      await mockDiamond.simulateOrderCancelled(orderId);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(0n);
+    });
+
+    it("cancelling an UNPAID link order does not free a slot it never took", async function () {
+      await integrator.setDailyLimit(5);
+      await createLink(merchant1, LINK_A, linkAmount(1));
       await integrator
         .connect(merchant1)
-        .userPlaceOrder(erc721Client.target, PRODUCT_ID, 1, INR, 0, PK);
-
-      await expectCallFailedWith(payLink(LINK_A, 1), "DailyLimitReached()");
+        .userPlaceOrder(erc721Client.target, PRODUCT_ID, 1, INR, 0, PK); // 1 POS slot
+      await payLink(LINK_A, 1);
+      await integrator.connect(relayer).relayerCancelOrder(LINK_A, await lastOrderId());
+      expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(1n); // POS slot intact
     });
 
     it("a paused contract rejects link orders and link creation", async function () {

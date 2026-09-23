@@ -4,12 +4,12 @@ import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 import { time } from "@nomicfoundation/hardhat-network-helpers";
 
 /**
- * Proofs of concept for the merchant-terminal audit (Sept 2026).
+ * Regression tests for the merchant-terminal audit (Sept 2026).
  *
- * These tests DOCUMENT CURRENT BEHAVIOUR — each one passes today, and each
- * asserts the problematic outcome. The contract was deliberately not changed;
- * see docs/audits/merchant-terminal-2026-09.md for the suggested fixes. When a
- * fix lands, flip the matching assertion so the test pins the fixed behaviour.
+ * Each of these started life as a proof of concept that PASSED while the bug
+ * was present (see docs/audits/merchant-terminal-2026-09.md). The fixes have
+ * landed, so every assertion is flipped to pin the FIXED behaviour: if one of
+ * these fails, a finding has come back.
  */
 
 const SECTOR = ethers.encodeBytes32String("Retail");
@@ -25,7 +25,7 @@ async function deployLibs(): Promise<Record<string, string>> {
   return out;
 }
 
-describe("Audit PoCs — merchant terminal", function () {
+describe("Audit 2026-09 regressions — merchant terminal", function () {
   let owner: SignerWithAddress;
   let merchant: SignerWithAddress;
   let relayer: SignerWithAddress;
@@ -75,64 +75,61 @@ describe("Audit PoCs — merchant terminal", function () {
     return evs[evs.length - 1].args[1];
   }
 
-  // ─── M-1 ──────────────────────────────────────────────────────────
-  it("M-1: abandoned link checkouts use up the merchant's daily limit and block their own till", async function () {
-    // An unlimited, customer-entered-amount link — the standing counter QR.
-    await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+  /** Gives `merchant` an unlocked balance of `qty` USDC. */
+  async function fund(qty: number) {
+    await integrator.connect(merchant).userPlaceOrder(client.target, 1, qty, INR, 0, PK);
+    await diamond.simulateOrderComplete((await diamond.nextOrderId()) - 1n);
+    await time.increase(3600);
+  }
 
+  // ─── M-1 ──────────────────────────────────────────────────────────
+  it("M-1: abandoned link checkouts no longer block the merchant's own till", async function () {
+    await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
     const limit = Number(await integrator.dailyLimit()); // 25
-    // Each visitor who opens the pay page and walks away leaves a PLACED order.
-    // Nobody marks it paid, nobody cancels; it waits for the Diamond's own expiry.
     for (let i = 0; i < limit; i++) await placeLinkOrder(1);
 
-    // The merchant is now standing at their own counter and cannot take a sale.
-    await expect(integrator.connect(merchant).userPlaceOrder(client.target, 1, 1, INR, 0, PK)).to.be
-      .reverted; // DailyLimitReached, wrapped by UserProxy.CallFailed
-
+    // 25 walk-aways later, the merchant can still sell at the counter.
+    await expect(
+      integrator.connect(merchant).userPlaceOrder(client.target, 1, 1, INR, 0, PK)
+    ).to.emit(integrator, "OrderPlaced");
     const [used] = await integrator.getDailyTxInfo(merchant.address);
-    expect(used).to.equal(BigInt(limit));
+    expect(used).to.equal(1n);
   });
 
   // ─── H-1 ──────────────────────────────────────────────────────────
-  it("H-1: a MANAGER can make itself trustedRelayer and cancel a customer's link order without the customer's signature", async function () {
+  it("H-1: a MANAGER can no longer make itself trustedRelayer", async function () {
     await integrator.connect(owner).setRole(manager.address, 3); // MANAGER
     await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
     await placeLinkOrder(5);
     const orderId = await lastLinkOrderId();
 
-    // LinkRouter's promise: cancel needs the customer's own key. But the
-    // integrator's only gate is `msg.sender == trustedRelayer`, and a MANAGER
-    // can point that at any address it likes.
-    await integrator.connect(manager).setTrustedRelayer(manager.address);
-    await expect(integrator.connect(manager).relayerCancelOrder(LINK, orderId)).to.emit(
-      integrator,
-      "LinkOrderCancelled"
-    );
+    await expect(
+      integrator.connect(manager).setTrustedRelayer(manager.address)
+    ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+    await expect(
+      integrator.connect(manager).relayerCancelOrder(LINK, orderId)
+    ).to.be.revertedWithCustomError(integrator, "OnlyTrustedRelayer");
   });
 
-  it("H-1b: the same MANAGER passes deliverFiatPayout's authorisation, where it chooses the payout payload", async function () {
-    await integrator.connect(owner).setRole(manager.address, 3);
-    // Give the merchant an unlocked balance and a SELL waiting for delivery.
-    await integrator.connect(merchant).userPlaceOrder(client.target, 1, 20, INR, 0, PK);
-    await diamond.simulateOrderComplete((await diamond.nextOrderId()) - 1n);
-    await time.increase(3600);
+  it("H-1b: the relayer, whoever it is, cannot deliver a merchant's fiat payout", async function () {
+    await fund(20);
     const sellId = await diamond.nextOrderId();
     await integrator.connect(merchant).withdrawFiat(USDC(10), 1, PK, "");
     await diamond.acceptSellOrder(sellId, "lp");
 
-    await integrator.connect(manager).setTrustedRelayer(manager.address);
-    // `encPayout` is what the LP decrypts to know where to send the fiat.
+    // `relayer` IS the trusted relayer here, set by the super-admin.
     await expect(
-      integrator.connect(manager).deliverFiatPayout(sellId, "manager-chosen-payload")
-    ).to.emit(integrator, "WithdrawalUpiDelivered");
+      integrator.connect(relayer).deliverFiatPayout(sellId, "relayer-chosen-payload")
+    ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    await expect(integrator.connect(merchant).deliverFiatPayout(sellId, "p")).to.emit(
+      integrator,
+      "WithdrawalUpiDelivered"
+    );
   });
 
   // ─── M-2 ──────────────────────────────────────────────────────────
-  it("M-2: if setSellOrderUpi leaves the SELL in ACCEPTED, a retry charges the offramp fee twice", async function () {
-    await integrator.connect(merchant).userPlaceOrder(client.target, 1, 40, INR, 0, PK);
-    await diamond.simulateOrderComplete((await diamond.nextOrderId()) - 1n);
-    await time.increase(3600);
-
+  it("M-2: a delivery the Diamond leaves in ACCEPTED reverts, so a retry cannot double-charge", async function () {
+    await fund(40);
     const FEE = USDC(1);
     await diamond.setSellFee(FEE);
     const sellId = await diamond.nextOrderId();
@@ -140,47 +137,105 @@ describe("Audit PoCs — merchant terminal", function () {
     await diamond.acceptSellOrder(sellId, "lp");
     const availBefore = (await integrator.getMerchantBalance(merchant.address))[1];
 
-    // Diamond returns success but neither pulls nor moves the order.
     await diamond.setForceSellUpiNoOp(true);
-    await integrator.connect(merchant).deliverFiatPayout(sellId, "p");
-    await integrator.connect(merchant).deliverFiatPayout(sellId, "p"); // retry is allowed
+    for (let i = 0; i < 2; i++) {
+      await expect(
+        integrator.connect(merchant).deliverFiatPayout(sellId, "p")
+      ).to.be.revertedWithCustomError(integrator, "WithdrawalNotDeliverable");
+    }
+    expect((await integrator.getMerchantBalance(merchant.address))[1]).to.equal(availBefore);
 
-    const availAfter = (await integrator.getMerchantBalance(merchant.address))[1];
-    expect(availBefore - availAfter).to.equal(FEE * 2n); // charged twice
-    expect((await integrator.withdrawals(sellId)).feeAdvanced).to.equal(FEE); // but only one recorded
+    // Once the Diamond behaves, the SAME order delivers and charges one fee.
+    await diamond.setForceSellUpiNoOp(false);
+    await integrator.connect(merchant).deliverFiatPayout(sellId, "p");
+    expect(availBefore - (await integrator.getMerchantBalance(merchant.address))[1]).to.equal(FEE);
+    expect((await integrator.withdrawals(sellId)).feeAdvanced).to.equal(FEE);
   });
 
   // ─── L-1 ──────────────────────────────────────────────────────────
-  it("L-1: revokeLink admits owners only, not the admin roles its docs name", async function () {
-    await integrator.connect(owner).setRole(manager.address, 4); // even FINANCE
+  it("L-1: SUPPORT-tier admins and above can revoke a link; VIEWER cannot", async function () {
     await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
-    await expect(integrator.connect(manager).revokeLink(LINK)).to.be.reverted;
-    await expect(integrator.connect(owner).revokeLink(LINK)).to.emit(integrator, "LinkRevoked");
+    await integrator.connect(owner).setRole(other.address, 1); // VIEWER
+    await expect(integrator.connect(other).revokeLink(LINK)).to.be.revertedWithCustomError(
+      integrator,
+      "NotLinkOwner"
+    );
+    await integrator.connect(owner).setRole(manager.address, 2); // SUPPORT
+    await expect(integrator.connect(manager).revokeLink(LINK)).to.emit(integrator, "LinkRevoked");
   });
 
   // ─── L-2 ──────────────────────────────────────────────────────────
-  it("L-2: a lowercase currency code registers as a distinct currency with the 100 USDC default cap", async function () {
-    await integrator.connect(other).registerMerchant(UPI, "Shop2", "inr", SECTOR);
-    expect(await integrator.perTxCap(ethers.encodeBytes32String("inr"))).to.equal(USDC(100));
-    expect(await integrator.perTxCap(INR)).to.equal(USDC(50));
+  it("L-2: currency codes must be uppercase A-Z, at registration and on links", async function () {
+    for (const bad of ["inr", "In", "IN1", "I-R"]) {
+      await expect(
+        integrator.connect(other).registerMerchant(UPI, "Shop2", bad, SECTOR)
+      ).to.be.revertedWithCustomError(integrator, "InvalidCurrency");
+    }
+    await expect(
+      integrator
+        .connect(merchant)
+        .createLink(LINK, 0, ethers.encodeBytes32String("brl"), 0, 0, CONFIG)
+    ).to.be.revertedWithCustomError(integrator, "InvalidCurrency");
+    await integrator.connect(other).registerMerchant(UPI, "Shop2", "BRL", SECTOR);
   });
 
   // ─── L-3 ──────────────────────────────────────────────────────────
-  it("L-3: shop name and link config are unbounded (sponsored gas pays for it)", async function () {
-    const big = "x".repeat(20_000);
-    await integrator.connect(other).registerMerchant(UPI, big, INR_CODE, SECTOR);
-    const [, name] = await integrator.getMerchantInfo(other.address);
-    expect(name.length).to.equal(20_000);
+  it("L-3: shop name, payout blob and link config are length-capped", async function () {
+    await expect(
+      integrator.connect(other).registerMerchant(UPI, "x".repeat(129), INR_CODE, SECTOR)
+    ).to.be.revertedWithCustomError(integrator, "FieldTooLong");
+    await expect(
+      integrator
+        .connect(other)
+        .registerMerchant(ethers.hexlify(ethers.randomBytes(1025)), "Shop", INR_CODE, SECTOR)
+    ).to.be.revertedWithCustomError(integrator, "FieldTooLong");
+    await expect(
+      integrator
+        .connect(merchant)
+        .createLink(ethers.id("big"), 0, INR, 0, 0, ethers.hexlify(ethers.randomBytes(1025)))
+    ).to.be.revertedWithCustomError(integrator, "FieldTooLong");
+    await expect(
+      integrator.connect(merchant).updateProfile("0x", "x".repeat(129), SECTOR)
+    ).to.be.revertedWithCustomError(integrator, "FieldTooLong");
+
+    // At the limits, everything is accepted.
+    await integrator
+      .connect(other)
+      .registerMerchant(
+        ethers.hexlify(ethers.randomBytes(1024)),
+        "x".repeat(128),
+        INR_CODE,
+        SECTOR
+      );
     await integrator
       .connect(merchant)
-      .createLink(ethers.id("big"), 0, INR, 0, 0, ethers.hexlify(ethers.randomBytes(20_000)));
+      .createLink(ethers.id("max"), 0, INR, 0, 0, ethers.hexlify(ethers.randomBytes(1024)));
   });
 
   // ─── I-1 ──────────────────────────────────────────────────────────
-  it("I-1: a merchant who registered without a payout handle cannot fix a typo in their shop name", async function () {
+  it("I-1: a merchant without a payout handle can fix their shop name; a set handle is never blanked", async function () {
     await integrator.connect(other).registerMerchant("0x", "Tpyo", INR_CODE, SECTOR);
-    await expect(
-      integrator.connect(other).updateProfile("0x", "Typo", SECTOR)
-    ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    await integrator.connect(other).updateProfile("0x", "Typo", SECTOR);
+    expect((await integrator.getMerchantInfo(other.address))[1]).to.equal("Typo");
+
+    await integrator.connect(merchant).updateProfile("0x", "Renamed", SECTOR);
+    expect((await integrator.getMerchantInfo(merchant.address))[0]).to.equal(UPI);
+  });
+
+  // ─── I-3 ──────────────────────────────────────────────────────────
+  it("I-3: recovering a stranded LINK buy clears its false-claim strike", async function () {
+    await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+    await placeLinkOrder(3);
+    const orderId = await lastLinkOrderId();
+    await diamond.simulateOrderAccepted(orderId); // an LP took it
+    await integrator.connect(relayer).relayerMarkPaid(LINK, orderId);
+    expect((await integrator.getLink(LINK))[7]).to.equal(1n); // provisional strike
+
+    // The Diamond completes the order, but the integrator callback never runs.
+    await diamond.simulateOrderCompleteNoCallback(orderId);
+    await integrator.connect(merchant).sweepStrandedBuy(orderId);
+
+    expect((await integrator.getLink(LINK))[7]).to.equal(0n); // the claim was true
+    expect(await integrator.orderToLink(orderId)).to.equal(ethers.ZeroHash);
   });
 });

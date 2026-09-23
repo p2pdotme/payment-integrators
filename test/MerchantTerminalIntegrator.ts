@@ -174,13 +174,15 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     expect(payout).to.equal(newEnc); // opaque ciphertext round-trips
     expect(shop).to.equal("New Shop");
     expect(currency).to.equal(INR); // currency unchanged
-    // guards: unregistered can't update, empty payout reverts, frozen can't edit
+    // guards: unregistered can't update, frozen can't edit. An EMPTY payout
+    // keeps the current handle (audit 2026-09 I-1) rather than reverting.
     await expect(
       integrator.connect(merchant2).updateProfile(enc("x@upi"), "X", SECTOR)
     ).to.be.revertedWithCustomError(integrator, "NotRegistered");
-    await expect(
-      integrator.connect(merchant1).updateProfile("0x", "X", SECTOR)
-    ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+    await integrator.connect(merchant1).updateProfile("0x", "Renamed", SECTOR);
+    const [keptPayout, renamed] = await integrator.getMerchantInfo(merchant1.address);
+    expect(keptPayout).to.equal(newEnc); // not blanked
+    expect(renamed).to.equal("Renamed");
     await integrator.connect(owner).freezeMerchant(merchant1.address);
     await expect(
       integrator.connect(merchant1).updateProfile(enc("y@upi"), "Y", SECTOR)
@@ -2000,13 +2002,14 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
     };
 
-    it("MANAGER-gated set; appointed relayer can deliver; clearing re-blocks it", async function () {
-      // A no-role caller cannot appoint a relayer (MANAGER tier required).
+    it("super-admin-only set (H-1); the relayer is NOT a payout keeper", async function () {
+      // Audit 2026-09 H-1: a MANAGER could point the relayer at its own key and
+      // bypass LinkRouter. Only the super-admin may set it now.
+      await integrator.setRole(attacker.address, 3); // MANAGER
       await expect(
         integrator.connect(attacker).setTrustedRelayer(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
 
-      // Owner (implicit FINANCE ≥ MANAGER) appoints merchant2 as the keeper.
       await expect(integrator.setTrustedRelayer(merchant2.address))
         .to.emit(integrator, "TrustedRelayerSet")
         .withArgs(merchant2.address);
@@ -2019,34 +2022,14 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       );
       await mockDiamond.acceptSellOrder(wId, "lp");
 
-      // …delivered by the relayer — who is NOT the merchant and NOT an owner.
-      await expect(integrator.connect(merchant2).deliverFiatPayout(wId, "encUpi")).to.emit(
-        integrator,
-        "WithdrawalUpiDelivered"
-      );
-
-      // Close it out, set up a second withdrawal, then CLEAR the relayer:
-      // the ex-keeper must be refused on the fresh order (auth arm, not the
-      // upiDelivered replay latch).
-      await mockDiamond.completeSellOrder(wId);
-      await integrator.finalizeWithdrawal(wId);
-      const o2 = await placeOrder(merchant1, 1); // +10 USDC
-      await mockDiamond.simulateOrderComplete(o2);
-      await increaseTime(SETTLEMENT + 3600);
-      const wId2 = await fiatOrderId(
-        integrator.connect(merchant1).withdrawFiat(USDC(10), 1, PK, "")
-      );
-      await mockDiamond.acceptSellOrder(wId2, "lp");
-
-      await expect(integrator.setTrustedRelayer(ethers.ZeroAddress))
-        .to.emit(integrator, "TrustedRelayerSet")
-        .withArgs(ethers.ZeroAddress);
+      // …cannot be delivered by the relayer: whoever delivers chooses the
+      // payload that tells the LP where the fiat goes.
       await expect(
-        integrator.connect(merchant2).deliverFiatPayout(wId2, "encUpi")
+        integrator.connect(merchant2).deliverFiatPayout(wId, "encUpi")
       ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
 
-      // The merchant themself is of course still allowed.
-      await expect(integrator.connect(merchant1).deliverFiatPayout(wId2, "encUpi")).to.emit(
+      // The merchant themself is of course still allowed, and so is an owner.
+      await expect(integrator.connect(merchant1).deliverFiatPayout(wId, "encUpi")).to.emit(
         integrator,
         "WithdrawalUpiDelivered"
       );

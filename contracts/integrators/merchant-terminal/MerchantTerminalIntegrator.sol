@@ -89,6 +89,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error NothingToWithdraw();
     error InvalidQuantity();
     error ProductNotFound();
+    /// @dev A shop name or payout blob over its length cap (audit 2026-09 L-3).
+    ///      Merchant transactions are paymaster-sponsored, so an unbounded field
+    ///      was storage the operator paid for.
+    error FieldTooLong();
 
     // ─── Payment links ────────────────────────────────────────────────
     // Link lifecycle is implemented in PaymentLinksLib, but these are declared
@@ -323,6 +327,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      an unbounded-array gas-griefing / self-DoS surface.
     uint256 public constant MAX_BUCKETS = 256;
 
+    /// @dev Length caps (audit 2026-09 L-3). 128 bytes fits a long shop name in
+    ///      any script (~40 Devanagari characters); the payout blob is an ECIES
+    ///      ciphertext stored as text, ~330 bytes for a typical UPI id.
+    uint256 internal constant MAX_SHOP_NAME = 128;
+    uint256 internal constant MAX_PAYOUT_BLOB = 1024;
+
     /// @dev Dormant-account escheat window. A merchant frozen CONTINUOUSLY for at
     ///      least this long (see Merchant.frozenAt, reset on any unfreeze) can have
     ///      their remaining balance withdrawn by the super-admin via adminEscheat,
@@ -477,11 +487,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         setDailyLimit — no redeploy). Initialised to DAILY_TX_LIMIT (25).
     uint256 public dailyLimit;
 
-    /// @notice Optional admin-set keeper allowed to call deliverFiatPayout on
-    ///         behalf of merchants (e.g. a backend that watches for ACCEPTED
-    ///         SELL orders and delivers the encrypted payout). address(0) = none.
-    ///         The merchant and owner can always deliver; this just adds a keeper.
-    ///         Set via setTrustedRelayer (MANAGER tier or higher).
+    /// @notice The link relayer (the LinkRouter): the only caller of
+    ///         relayerPlaceOrder / relayerMarkPaid / relayerCancelOrder.
+    ///         address(0) = link orders off. Set by the super-admin only
+    ///         (setTrustedRelayer). It has NO payout authority — see H-1 there.
     address public trustedRelayer;
 
     /// @notice Admin set for the admin dashboard. Kept as a plain bool for
@@ -721,7 +730,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         orders are denominated in it, and changing it mid-flight could
     ///         route a settlement to the wrong circle. To change currency, a
     ///         merchant uses a fresh wallet/registration.
-    /// @param encPayoutId New payout handle, client-side ENCRYPTED (non-empty).
+    /// @param encPayoutId New payout handle, client-side ENCRYPTED. Empty keeps the current one.
     /// @param shopName New display name.
     function updateProfile(
         bytes calldata encPayoutId,
@@ -729,10 +738,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         bytes32 businessSector
     ) external {
         if (!registered[msg.sender]) revert NotRegistered();
-        if (encPayoutId.length == 0) revert InvalidAddress();
+        _checkLengths(encPayoutId, shopName);
         MerchantTypes.Merchant storage m = merchants[msg.sender];
         if (m.isFrozen) revert MerchantIsFrozen(); // a frozen merchant can't edit
-        m.encPayoutId = encPayoutId;
+        // Empty = keep the current handle (audit 2026-09 I-1). It used to revert,
+        // which left a merchant who registered without a payout rail unable to
+        // fix a typo in their shop name without also choosing one. A handle,
+        // once set, still can never be blanked back out.
+        if (encPayoutId.length != 0) m.encPayoutId = encPayoutId;
         m.shopName = shopName;
         // Editable for the same reason shopName is. It is REQUIRED at
         // registration, so without this a merchant who mistyped their sector
@@ -750,6 +763,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         bytes32 businessSector
     ) internal {
         if (registered[msg.sender]) revert AlreadyRegistered();
+        _checkLengths(encPayoutId, shopName);
         // Field validation (canonical currency form, sector present) lives in
         // MerchantRegistryLib — pure, no state, and out of the integrator's
         // bytecode, which is at the EIP-170 ceiling. The storage writes stay
@@ -775,6 +789,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         m.businessSector = businessSector;
         registered[msg.sender] = true;
         emit MerchantRegistered(msg.sender, shopName, currency, businessSector);
+    }
+
+    function _checkLengths(bytes calldata encPayoutId, string calldata shopName) internal pure {
+        if (bytes(shopName).length > MAX_SHOP_NAME || encPayoutId.length > MAX_PAYOUT_BLOB)
+            revert FieldTooLong();
     }
 
     // ─── IP2PIntegrator ───────────────────────────────────────────────
@@ -833,6 +852,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             if (_sellPlacement) return true;
             subject = proxyOwner;
         }
+        // Link BUYs are CHECKED against the daily limit here but not COUNTED
+        // (audit 2026-09 M-1). A link order is placed the moment a visitor
+        // opens the pay page, and an abandoned one sits PLACED until the
+        // Diamond expires it — so counting at placement let 25 walk-aways lock
+        // the merchant out of their own counter sales for the rest of the day.
+        // The slot is taken in relayerMarkPaid instead, once a customer claims
+        // to have actually paid.
+        bool isLinkOrder = proxyOwner != address(0);
 
         if (!registered[subject]) revert NotRegistered();
         MerchantTypes.Merchant storage m = merchants[subject];
@@ -845,14 +872,20 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // account, not of an individual sale's currency.
         if (amount > perTxCap(m.currency)) revert ExceedsPerTxCap();
 
-        uint256 today = block.timestamp / 86400;
+        _rollDay(m);
+        if (m.dailyTxCount >= dailyLimit) revert DailyLimitReached();
+        if (!isLinkOrder) m.dailyTxCount++;
+        return true;
+    }
+
+    /// @dev Reset a merchant's daily count when the UTC day has rolled over.
+    ///      Returns today's day number.
+    function _rollDay(MerchantTypes.Merchant storage m) internal returns (uint256 today) {
+        today = block.timestamp / 86400;
         if (m.lastTxDate != today) {
             m.dailyTxCount = 0;
             m.lastTxDate = today;
         }
-        if (m.dailyTxCount >= dailyLimit) revert DailyLimitReached();
-        m.dailyTxCount++;
-        return true;
     }
 
     function onOrderComplete(
@@ -879,12 +912,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         // A completed order proves the "I have paid" claim was true, so release
         // the provisional strike taken in relayerMarkPaid.
-        bytes32 linkId = orderToLink[orderId];
-        if (linkId != bytes32(0)) {
-            PaymentLinksLib.PaymentLink storage cl = links[linkId];
-            if (cl.strikes != 0) cl.strikes--;
-            delete orderToLink[orderId];
-        }
+        _clearPaidLinkClaim(orderId);
 
         // recipientAddr = the merchant's proxy (usdcThroughIntegrator =
         // false): the Diamond just sent USDC there. Pull it into this integrator,
@@ -908,6 +936,18 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         delete orderPlacementDay[orderId];
 
         emit OrderCompleted(orderId, subject, amount, unlockAt);
+    }
+
+    /// @dev A link order COMPLETED, so its "I have paid" claim was true: release
+    ///      the provisional strike relayerMarkPaid took, and drop the order→link
+    ///      binding. No-op for POS orders.
+    function _clearPaidLinkClaim(uint256 orderId) internal {
+        bytes32 linkId = orderToLink[orderId];
+        if (linkId != bytes32(0)) {
+            PaymentLinksLib.PaymentLink storage cl = links[linkId];
+            if (cl.strikes != 0) cl.strikes--;
+            delete orderToLink[orderId];
+        }
     }
 
     /// @notice Best-effort: releases the daily-count slot consumed in
@@ -1106,13 +1146,21 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     /// @notice Permanently deactivate a link. Owner or admin — deliberately NOT
     ///         the relayer, which has no authority over link lifecycle.
+    ///         "Admin" means SUPPORT tier or above (audit 2026-09 L-1) — the same
+    ///         tier that can freeze a merchant. It used to pass isOwner only, so
+    ///         a support operator answering a phishing-link report could not
+    ///         take the link down.
     function revokeLink(bytes32 linkId) external {
-        PaymentLinksLib.revoke(links, linkId, isOwner[msg.sender]);
+        PaymentLinksLib.revoke(links, linkId, _isSupport(msg.sender));
     }
 
-    /// @notice Clear a link's false-claim strikes. Owner or admin.
+    /// @notice Clear a link's false-claim strikes. Owner or admin (SUPPORT+).
     function resetLinkStrikes(bytes32 linkId) external {
-        PaymentLinksLib.resetStrikes(links, linkId, isOwner[msg.sender]);
+        PaymentLinksLib.resetStrikes(links, linkId, _isSupport(msg.sender));
+    }
+
+    function _isSupport(address who) internal view returns (bool) {
+        return uint8(_tier(who)) >= uint8(Role.SUPPORT);
     }
 
     /// @dev The merchant-side facts the link rules need, read once and handed to
@@ -1164,6 +1212,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         orderId = _placeOrder(merchant, true, total, currency, circleId, pubKey);
         orderToLink[orderId] = linkId;
+        // Not counted against the daily limit yet (M-1), so a cancel before
+        // mark-paid must not release a slot: clearing the day makes
+        // onOrderCancel's same-day check fail. relayerMarkPaid sets it.
+        delete orderPlacementDay[orderId];
         emit LinkOrderPlaced(linkId, orderId, merchant, total);
     }
 
@@ -1210,6 +1262,15 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
                 lk.strikes++;
             }
         }
+
+        // Take the daily slot now (audit 2026-09 M-1) — placement only checked
+        // it. Deliberately NOT a revert at the limit: the customer's money has
+        // already left their bank, and refusing the claim would strand it. The
+        // limit is enforced at placement, so it can only be exceeded by orders
+        // already in flight when it was reached.
+        MerchantTypes.Merchant storage m = merchants[lk.owner];
+        orderPlacementDay[orderId] = _rollDay(m);
+        m.dailyTxCount++;
 
         emit LinkOrderPaid(linkId, orderId);
     }
@@ -1420,17 +1481,18 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         could supply it, an attacker could front-run the real merchant,
     ///         mark upiDelivered with a bogus/attacker payload, brick the fiat
     ///         channel (owner-only recovery), and burn the merchant's fee. Only
-    ///         the recorded merchant, the owner, or the owner-set trusted relayer
-    ///         may deliver — all of which act on the merchant's behalf.
+    ///         the recorded merchant or an owner may deliver (the relayer was
+    ///         removed from this list in audit 2026-09 H-1).
     /// @param encPayout The Diamond-encrypted payout payload for this order
     ///        (built off-chain from the order's pubkey + the merchant's saved
     ///        payout id), same as the BUY flow supplies a pubkey.
     function deliverFiatPayout(uint256 orderId, string calldata encPayout) external nonReentrant {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert WithdrawalNotFound();
-        // Only the merchant, an owner, or the trusted relayer — never arbitrary.
-        if (msg.sender != w.merchant && !isOwner[msg.sender] && msg.sender != trustedRelayer)
-            revert OnlyOwner();
+        // Only the merchant or an owner (audit 2026-09 H-1). The caller supplies
+        // `encPayout`, which is what the LP decrypts to learn where the fiat
+        // goes — so this must not be delegable to a relayer key.
+        if (msg.sender != w.merchant && !isOwner[msg.sender]) revert OnlyOwner();
         if (w.settled) revert WithdrawalAlreadySettled();
         if (w.upiDelivered) revert WithdrawalAlreadySettled();
 
@@ -1520,11 +1582,18 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint8 postStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
         if (postStatus == STATUS_PAID) {
             emit WithdrawalUpiDelivered(orderId, needed);
-        } else {
+        } else if (postStatus == STATUS_CANCELLED) {
             // Not delivered — undo the optimistic replay latch. The order is now
             // (auto-)cancelled; the refund lands on the proxy and is recovered by
             // reconcileWithdrawal, which re-credits the merchant.
             w.upiDelivered = false;
+        } else {
+            // Audit 2026-09 M-2: neither PAID nor CANCELLED (the Diamond returned
+            // success but moved nothing). Keeping the state would leave the fee
+            // debited and the order still ACCEPTED, so a retry charged the fee a
+            // SECOND time and overwrote feeAdvanced. Revert the whole call
+            // instead: nothing is debited, and a retry starts clean.
+            revert WithdrawalNotDeliverable();
         }
     }
 
@@ -1581,17 +1650,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         MerchantTypes.Merchant storage m = merchants[w.merchant];
         _releaseSlot(w, m); // idempotent — may already be freed by adminForceUnwedge
 
-        // M-1 (cross-order fund absorption): sweep only THIS order's own capped
-        // amount off the proxy, never the whole balance. A merchant has a single
-        // shared proxy on which a second pot of funds can legitimately sit (a
-        // stranded-BUY payout, or another order's leftover). Sweeping the full
-        // balance here while re-crediting only min(owedBack, proxyBal) would
-        // silently absorb that other pot into unattributed surplus. Taking exactly
-        // `take` (== the re-credit) and leaving the remainder on the proxy keeps
-        // every pot claimable by its own recovery path — sweep == credit, always.
-        //
-        // The cap is min(owedBack, proxyBal), the same structural double-spend
-        // guard as before (no refund on the proxy → no re-credit):
+        // Sweep only THIS order's own capped amount (M-1) — see _recoverWithdrawal.
         //
         // AUDIT NOTE (informational): if the Diamond keeps the offramp fee on a
         // clawback (refunds principal only, not principal+fee), proxyBal is short
@@ -1599,19 +1658,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // outcome, the fee was genuinely spent on the offramp attempt. If instead
         // the Diamond refunds principal+fee, proxyBal covers owedBack and the full
         // amount is re-credited. The cap self-adjusts to whatever the Diamond did.
-        address merchantProxy = _ensureProxy(w.merchant);
-        uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
+        //
         // Re-lock under a fresh settlement window when the SELL had reached PAID
         // (fiat attempted) OR the merchant is FROZEN — a frozen account must not
         // get instantly-spendable funds back (mirrors adminAbortWithdrawal's
         // intent), otherwise this permissionless path would undermine the freeze.
         // Only the clean never-accepted, not-frozen case unlocks immediately.
-        uint256 unlockAt = (w.upiDelivered || m.isFrozen)
-            ? block.timestamp + _lockFor(m)
-            : block.timestamp - 1;
-        _creditBucket(m, recredit, unlockAt);
+        uint256 recredit = _recoverWithdrawal(
+            w,
+            m,
+            (w.upiDelivered || m.isFrozen) ? block.timestamp + _lockFor(m) : block.timestamp - 1
+        );
 
         emit WithdrawalReconciled(w.merchant, orderId, recredit);
     }
@@ -1644,13 +1701,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // M-1: sweep only this order's own capped amount (min(owedBack, proxyBal)),
         // never the whole proxy balance — any co-resident funds (a stranded BUY, or
         // another order's leftover) stay on the proxy for their own recovery path.
-        address merchantProxy = _ensureProxy(w.merchant);
-        uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
-        if (recredit > 0) {
-            _creditBucket(m, recredit, block.timestamp + _lockFor(m));
-        }
+        // A zero recredit credits nothing (SettlementLib.creditBucket no-ops on 0).
+        uint256 recredit = _recoverWithdrawal(w, m, block.timestamp + _lockFor(m));
         // #4: emit unconditionally — the clean (proxy-empty) COMPLETED case still
         // flips w.settled and frees the in-flight slot, a state change the backend
         // must be able to observe. recredit is 0 on the clean path.
@@ -1681,8 +1733,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///             funds to exactly this order. Credited under a fresh settlement lock
     ///             (like a normal deposit). Idempotent: it sets orderCompleted so a
     ///             second call reverts.
-    ///         Callable by the merchant, an owner, or the trusted relayer — all act
-    ///         for the merchant, who is the sole beneficiary.
+    ///         Callable by the merchant or an owner — both act for the merchant,
+    ///         who is the sole beneficiary.
     /// @param orderId The COMPLETED BUY order whose funds are stranded on the proxy.
     function sweepStrandedBuy(uint256 orderId) external nonReentrant {
         address merchant = orderToMerchant[orderId];
@@ -1691,9 +1743,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // stranded BUY (never placed here, or already cleanly completed).
         if (merchant == address(0)) revert UnknownWithdrawal();
         if (orderCompleted[orderId]) revert WithdrawalAlreadySettled();
-        // Authorization: merchant / owner / trusted relayer (mirrors deliverFiatPayout).
-        if (msg.sender != merchant && !isOwner[msg.sender] && msg.sender != trustedRelayer)
-            revert OnlyOwner();
+        // Authorization: merchant / owner (mirrors deliverFiatPayout).
+        if (msg.sender != merchant && !isOwner[msg.sender]) revert OnlyOwner();
 
         // The Diamond must report this BUY COMPLETED — proof it really sent the
         // funds and finalised. Anything else is not a stranded-completion case.
@@ -1718,6 +1769,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         orderCompleted[orderId] = true;
         delete orderToMerchant[orderId];
         delete orderPlacementDay[orderId];
+        // The order completed, so a link order's mark-paid claim was TRUE: clear
+        // its strike exactly as onOrderComplete would have (audit 2026-09 I-3).
+        _clearPaidLinkClaim(orderId);
 
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
         if (proxyBal == 0) revert NothingToWithdraw(); // nothing stranded to recover
@@ -1942,6 +1996,26 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         }
     }
 
+    /// @dev The body every withdrawal recovery path shares: sweep THIS order's
+    ///      own capped refund (`w.amount + w.feeAdvanced`, never more than the
+    ///      proxy holds) off the merchant's proxy and re-credit exactly that,
+    ///      unlocking at `unlockAt`. Six paths used to inline these lines; one
+    ///      copy keeps sweep == credit in every one of them and frees the bytes
+    ///      the audit fixes needed under EIP-170.
+    function _recoverWithdrawal(
+        PendingWithdrawal storage w,
+        MerchantTypes.Merchant storage m,
+        uint256 unlockAt
+    ) internal returns (uint256 recredit) {
+        address merchantProxy = _ensureProxy(w.merchant);
+        recredit = _sweepCapped(
+            merchantProxy,
+            w.amount + w.feeAdvanced,
+            usdc.balanceOf(merchantProxy)
+        );
+        _creditBucket(m, recredit, unlockAt);
+    }
+
     /// @dev Move `amount` USDC out of custody to `to`, straight from this
     ///      contract's own balance. The sole outward fund primitive.
     function _vaultPull(address to, uint256 amount) internal {
@@ -1963,10 +2037,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         control, use transferSuperAdmin (the real two-step handoff).
     function transferOwnership(address newOwner) external onlySuperAdmin {
         if (newOwner == address(0)) revert InvalidAddress();
-        // Guard the self-transfer foot-gun: transferOwnership(self) would fall
-        // through to the drop-caller branch below and silently REMOVE the caller
-        // (a pure self-eviction, not a handoff). A handoff to yourself is a no-op
-        // by intent, so reject it explicitly rather than strip ownership.
+        // A "transfer" to yourself is a no-op by intent; reject it explicitly so
+        // a mistaken call surfaces instead of silently doing nothing.
         if (newOwner == msg.sender) revert InvalidAddress();
         // The caller is the super-admin (onlySuperAdmin), who must ALWAYS remain an
         // owner — dropping it below would leave the super-admin not-an-owner (it
@@ -2046,10 +2118,20 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         emit LockPeriodSet(currency, period);
     }
 
-    /// @notice Set (or clear via address(0)) the keeper allowed to call
-    ///         deliverFiatPayout on merchants' behalf. Owner + merchant can
-    ///         always deliver regardless.
-    function setTrustedRelayer(address relayer) external onlyRole(Role.MANAGER) {
+    /// @notice Set (or clear via address(0)) the link relayer — the LinkRouter.
+    ///
+    ///         SUPER-ADMIN ONLY (audit 2026-09 H-1). This was MANAGER, a tier
+    ///         documented as "config". But this address is the only gate on
+    ///         relayerPlaceOrder / relayerMarkPaid / relayerCancelOrder, so a
+    ///         MANAGER could point it at its own key and bypass LinkRouter's
+    ///         customer-signature check on every link order in flight. Changing
+    ///         who may drive link orders is a root-of-trust decision.
+    ///
+    ///         It is NO LONGER a payout keeper: deliverFiatPayout and
+    ///         sweepStrandedBuy now admit only the merchant and owners, because
+    ///         whoever calls deliverFiatPayout chooses the payload that tells the
+    ///         LP where to send the merchant's fiat.
+    function setTrustedRelayer(address relayer) external onlySuperAdmin {
         trustedRelayer = relayer;
         emit TrustedRelayerSet(relayer);
     }
@@ -2208,14 +2290,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // shared proxy — never the whole balance — so a co-resident stranded BUY
         // (itself an incident artifact, MORE likely to be present exactly when an
         // incident tool runs) is left for its own recovery path instead of being
-        // absorbed into unattributed surplus. sweep == credit, via _sweepCapped.
-        address merchantProxy = _ensureProxy(w.merchant);
-        uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
-        // Re-lock under a fresh settlement window — a frozen merchant shouldn't
-        // get instantly-available funds back; unfreeze + normal flow applies.
-        _creditBucket(m, recredit, block.timestamp + _lockFor(m));
+        // absorbed into unattributed surplus. Re-locked under a fresh settlement
+        // window — a frozen merchant shouldn't get instantly-available funds back.
+        uint256 recredit = _recoverWithdrawal(w, m, block.timestamp + _lockFor(m));
 
         emit WithdrawalReconciled(w.merchant, orderId, recredit);
     }
@@ -2249,12 +2326,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         // M-1 (admin path): capped sweep — leave any co-resident stranded funds
         // on the shared proxy for their own recovery path (sweep == credit).
-        address merchantProxy = _ensureProxy(w.merchant);
-        uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
-        // Re-lock under a fresh settlement window (the order had reached PAID).
-        _creditBucket(m, recredit, block.timestamp + _lockFor(m));
+        // Re-locked under a fresh settlement window (the order had reached PAID).
+        uint256 recredit = _recoverWithdrawal(w, m, block.timestamp + _lockFor(m));
 
         emit WithdrawalReconciled(w.merchant, orderId, recredit);
     }
@@ -2308,11 +2381,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // recredit still == owedBack, and when it hasn't recredit < owedBack — the
         // cap only ever removes SURPLUS above owedBack, which was never this
         // order's to credit anyway.
-        address merchantProxy = _ensureProxy(w.merchant);
-        uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
-        _creditBucket(m, recredit, block.timestamp + _lockFor(m));
+        uint256 recredit = _recoverWithdrawal(w, m, block.timestamp + _lockFor(m));
 
         // AUDIT FIX #10: only finalise (settle + free the slot) when the FULL refund
         // has already landed and been re-credited — then nothing more is owed back
@@ -2332,7 +2401,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         //     moment the refund lands and a recovery path settles this order.
         // So: the "wedge" is fully cleared for a landed refund; for a not-yet-landed
         // refund the order stays open and safely recoverable rather than sealed.
-        if (recredit >= owedBack) {
+        if (recredit >= w.amount + w.feeAdvanced) {
             w.settled = true;
             _releaseSlot(w, m);
         }
@@ -2380,11 +2449,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // M-1 (admin path): capped sweep — re-credit only min(owedBack, proxyBal),
         // leaving any co-resident stranded funds on the shared proxy for their own
         // recovery path (fiat delivered → no refund → recredit ≈ 0).
-        address merchantProxy = _ensureProxy(w.merchant);
-        uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        uint256 owedBack = w.amount + w.feeAdvanced;
-        uint256 recredit = _sweepCapped(merchantProxy, owedBack, proxyBal);
-        _creditBucket(m, recredit, block.timestamp + _lockFor(m));
+        uint256 recredit = _recoverWithdrawal(w, m, block.timestamp + _lockFor(m));
 
         emit WithdrawalReconciled(w.merchant, orderId, recredit);
     }

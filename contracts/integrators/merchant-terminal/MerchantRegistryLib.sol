@@ -66,6 +66,8 @@ library MerchantRegistryLib {
      *      writes, so nothing about custody or accounting moves out of the
      *      integrator.
      *
+     *      Currency bytes must be uppercase A-Z (ISO-4217 style): see the loop.
+     *
      *      AUDIT (MED), preserved verbatim from the inline version: enforce
      *      CANONICAL bytes32 form on BOTH entry points — left-aligned code,
      *      zero-padded, no non-zero byte after the first NUL. `toCurrency`
@@ -85,9 +87,14 @@ library MerchantRegistryLib {
 
         bool seenNul = false;
         for (uint256 i = 0; i < 32; i++) {
-            if (currency[i] == 0) {
+            bytes1 c = currency[i];
+            if (c == 0) {
                 seenNul = true;
-            } else if (seenNul) {
+            } else if (seenNul || c < 0x41 || c > 0x5A) {
+                // Uppercase A-Z only (audit 2026-09 L-2). "inr" used to register
+                // as its own currency, distinct from "INR" — and perTxCap's
+                // == bytes32("INR") compare then fell through to the 100 USDC
+                // default instead of INR's 50.
                 revert InvalidCurrency();
             }
         }

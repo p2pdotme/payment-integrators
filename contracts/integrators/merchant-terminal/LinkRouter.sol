@@ -40,9 +40,15 @@ import { IMerchantTerminalLinks } from "../../interfaces/IMerchantTerminalLinks.
  * Placing an order needs the link's wallet key, which our backend holds.
  * Marking paid or cancelling needs BOTH that key and a signature from the
  * customer who placed that specific order — a key generated in their browser
- * which we never hold. So a total compromise of our backend can place unwanted
- * orders and nothing else: it cannot advance or cancel anyone's payment, and it
- * cannot move any asset.
+ * which we never hold. So a total compromise of our backend cannot advance or
+ * cancel a REAL customer's payment, and cannot move any asset.
+ *
+ * What it CAN still do (audit 2026-09 L-5), stated plainly: place orders whose
+ * `customer` is a key it made up, and then mark those paid or cancel them. That
+ * yields false "I have paid" claims against LPs (a reputation and strike cost,
+ * never funds) and place/cancel churn. Both are bounded off-chain by the
+ * relayer's per-link sponsorship ceiling, and on-chain by the link's own
+ * limits and the merchant's per-transaction cap.
  */
 contract LinkRouter is EIP712 {
     // ─── Immutable wiring ─────────────────────────────────────────────

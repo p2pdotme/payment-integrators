@@ -1,5 +1,24 @@
 # Merchant Terminal — audit, September 2026
 
+> **Status update: FIXED.** The fixes below have been applied. The PoC tests are now regression tests in `test/AuditFindingsMerchantTerminal.ts`, and a randomised invariant stress test is in `test/StressMerchantTerminal.ts`.
+>
+> | ID | Fix applied |
+> |----|-------------|
+> | H-1 | `setTrustedRelayer` is super-admin only. The relayer was removed from `deliverFiatPayout` and `sweepStrandedBuy`, which now admit the merchant and owners only. |
+> | M-1 | Link orders are *checked* against the daily limit at placement and *counted* in `relayerMarkPaid`, so abandoned checkouts take no slot. |
+> | M-2 | `deliverFiatPayout` reverts unless the order ends PAID or CANCELLED, so nothing is charged and a retry starts clean. |
+> | L-1 | `revokeLink` and `resetLinkStrikes` admit SUPPORT tier and above. |
+> | L-2 | Currency codes must be uppercase A–Z, at registration and on links. |
+> | L-3 | Limits: shop name 128 bytes, payout blob 1024, link config 1024 (`FieldTooLong`). |
+> | L-5, I-5 | Docs and comment corrected. |
+> | I-1 | An empty payout in `updateProfile` keeps the current handle. |
+> | I-3 | `sweepStrandedBuy` clears the link claim and strike, just as a normal completion does. |
+> | Not changed | L-4 (timed agent-cancel in LinkRouter): needs a relayer change to be useful, and M-1 already removes its daily-limit impact. I-4 is by design. |
+>
+> The six withdrawal-recovery paths now share one `_recoverWithdrawal` helper. That freed 790 bytes: the integrator is 23,926 bytes with 650 to spare, down from 63.
+>
+> **The fixed contracts need a fresh deployment and a new whitelist request.**
+
 **Scope:** `contracts/integrators/merchant-terminal/`: `MerchantTerminalIntegrator.sol`, `LinkRouter.sol`, `PaymentLinksLib.sol`, `SettlementLib.sol`, `MerchantRegistryLib.sol` and `MerchantTypes.sol` (3,453 lines).
 
 **Contract changes: none.** This document only suggests fixes. Every finding marked **PoC** has a test in `test/AuditFindingsMerchantTerminal.ts` that currently passes because it asserts the problem. When you ship a fix, flip that assertion.

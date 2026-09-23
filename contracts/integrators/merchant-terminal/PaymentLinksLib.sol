@@ -62,6 +62,12 @@ library PaymentLinksLib {
     error MerchantIsFrozen();
     error InvalidCurrency();
     error ExceedsPerTxCap();
+    error FieldTooLong();
+
+    /// @dev Cap on the emitted encrypted description (audit 2026-09 L-3). The
+    ///      merchant's transaction is sponsored, so an unbounded blob was log
+    ///      data the operator paid for. 1 KB is several times a real one.
+    uint256 internal constant MAX_CONFIG_BYTES = 1024;
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -98,6 +104,20 @@ library PaymentLinksLib {
         return keccak256(abi.encode(merchant, salt));
     }
 
+    /// @dev Non-empty, left-aligned uppercase A-Z, zero-padded — the same rule
+    ///      registration applies (audit 2026-09 L-2), so a link cannot be pinned
+    ///      to "inr" when every circle and cap is keyed on "INR".
+    function _isCurrencyCode(bytes32 currency) private pure returns (bool) {
+        if (currency == bytes32(0)) return false;
+        bool seenNul = false;
+        for (uint256 i = 0; i < 32; i++) {
+            bytes1 c = currency[i];
+            if (c == 0) seenNul = true;
+            else if (seenNul || c < 0x41 || c > 0x5A) return false;
+        }
+        return true;
+    }
+
     // ─── Lifecycle ────────────────────────────────────────────────────
 
     /**
@@ -128,7 +148,8 @@ library PaymentLinksLib {
         if (mv.frozen) revert MerchantIsFrozen();
         if (linkId == bytes32(0)) revert LinkNotFound();
         if (links[linkId].owner != address(0)) revert LinkExists();
-        if (currency == bytes32(0)) revert InvalidCurrency();
+        if (!_isCurrencyCode(currency)) revert InvalidCurrency();
+        if (encryptedConfig.length > MAX_CONFIG_BYTES) revert FieldTooLong();
         // A link already expired at creation could never be paid.
         if (expiresAt != 0 && expiresAt <= block.timestamp) revert LinkExpired();
         // A fixed amount above the per-tx cap would create a link that always
