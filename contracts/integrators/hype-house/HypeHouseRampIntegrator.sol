@@ -94,6 +94,8 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
     // ─── Events ───────────────────────────────────────────────────────
     event RampRecipientSet(address indexed user, address indexed recipient);
     event OrderPlaced(uint256 indexed orderId, address indexed user, uint256 amount);
+    /// @notice A cash-out SELL was placed. Carries no recipient: a SELL has no USDC payee.
+    event SellOrderPlaced(uint256 indexed orderId, address indexed user, uint256 amount);
     /// @notice The ONLY thing that opens a tranche in the app. Watched by the
     ///         indexer; never reported by a client callback, because a scripted
     ///         order does not call our API at all.
@@ -503,6 +505,79 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
      *         Diamond and the row it releases is the one the Diamond names.
      *         Idempotent - an unknown or already-released id is a no-op.
      */
+    /**
+     * @notice Place the SELL that returns a user's fiat principal as cash.
+     *
+     * THE OFF-RAMP MUST COME THROUGH HERE, not straight to the Diamond. A direct
+     * `placeOrder` is an ordinary consumer sell and hits `txnAmountValid`, whose
+     * per-tx ceiling is RP-derived - measured at 200 USDC for a wallet with no
+     * reputation, which every freshly minted ramp wallet is. Against a 500 USDC
+     * on-ramp cap that strands the difference. `placeB2BSellOrder` routes through
+     * `placeOrderForB2B`, which "bypasses RP per-tx limit, daily/monthly buy-count
+     * limits, yearly volume, and blacklist (the integrator owns those checks via
+     * validateOrder)" - so the caps that apply become OURS, which is the whole
+     * point of being a whitelisted integrator.
+     *
+     * NO RECIPIENT ARGUMENT, and none is needed: a SELL pulls USDC from
+     * `order.user` at `setSellOrderUpi` and pays fiat off-chain, so there is no
+     * USDC payee. That is why a real completed SELL on mainnet carries
+     * `recipientAddr = address(0)`. The user still has to be REGISTERED, because
+     * that is what proves this wallet is one we provisioned.
+     *
+     * DELIBERATELY NOT TRACKED in orderUserOf/orderAmountOf/orderDayOf. Those
+     * exist so the BUY callbacks can release an in-flight slot and refund the
+     * day's debit; a SELL consumes neither, so recording it would only give
+     * `onOrderCancel` a row to penalise - charging a user a permanent in-flight
+     * slot for a cash-out that no merchant took. The app tracks its own sells by
+     * reservation and reads the order back off the Diamond, so nothing here is
+     * load-bearing for it.
+     *
+     * The daily and per-tx caps are still CHECKED (validateOrder cannot tell a
+     * BUY from a SELL) but never DEBITED, so cashing out does not burn on-ramp
+     * headroom.
+     *
+     * @param amountUsdc      USDC principal to sell, 6 decimals.
+     * @param currency        Fiat rail, as bytes32.
+     * @param userPubKey      Relay pubkey the merchant encrypts their payment
+     *                        details against.
+     * @param circleId        Merchant circle, or 0 to let the protocol route.
+     * @param fiatAmountLimit Slippage floor - the sell must yield at least this
+     *                        much fiat. 0 disables the check.
+     */
+    function userPlaceSellOrder(
+        uint256 amountUsdc,
+        bytes32 currency,
+        string calldata userPubKey,
+        uint256 circleId,
+        uint256 fiatAmountLimit
+    ) external nonReentrant returns (uint256 orderId) {
+        address user = msg.sender;
+        _assertAllowed(user, amountUsdc);
+
+        // Same fail-closed check the BUY path makes. A wrong registration would
+        // not misdirect a sell - there is no USDC payee - but an integrator whose
+        // config says one thing while the app assumes another is a state to refuse
+        // from rather than reason about.
+        if (_routesThroughIntegrator()) revert RoutesThroughIntegrator();
+
+        // Proxy-as-placer, exactly as the BUY path: the gateway authenticates the
+        // caller by re-deriving its CREATE2 address back to this integrator.
+        address proxy = _ensureProxy(user);
+
+        bytes memory placeData = abi.encodeCall(
+            IB2BGateway.placeB2BSellOrder,
+            (user, amountUsdc, currency, userPubKey, circleId, 0, fiatAmountLimit)
+        );
+        // usdcAllowance = 0: the Diamond pulls USDC from `order.user` - the ramp
+        // wallet - at setSellOrderUpi, NOT from the proxy. The ramp wallet's own
+        // approval to the Diamond is what funds this, and its Privy policy pins
+        // that approval's spender.
+        bytes memory result = UserProxy(proxy).execute(diamond, placeData, address(usdc), 0);
+        orderId = abi.decode(result, (uint256));
+
+        emit SellOrderPlaced(orderId, user, amountUsdc);
+    }
+
     function reconcile(uint256 orderId) external {
         address user = orderUserOf[orderId];
         if (user == address(0)) return; // unknown, or already released

@@ -156,7 +156,109 @@ describe("HypeHouseRampIntegrator", function () {
       expect(order.user).to.equal(rampWallet.address);
       expect(order.recipientAddr).to.not.equal(ethers.ZeroAddress);
     });
+  });
 
+  describe("userPlaceSellOrder — the cash-out", function () {
+    // WHY THIS EXISTS AT ALL. The off-ramp originally went STRAIGHT to the
+    // Diamond's placeOrder, which is an ordinary consumer sell and therefore hits
+    // txnAmountValid - whose per-tx ceiling is RP-derived, measured at 200 USDC on
+    // Base mainnet for a wallet with no reputation. Every freshly minted ramp
+    // wallet has none, so a 500-USDC on-ramp could only be cashed out in
+    // 200-chunks. placeB2BSellOrder bypasses those limits and lets OUR caps
+    // apply, which is the point of being whitelisted.
+    const CIRCLE = 1n;
+
+    it("places a SELL through the gateway, not a BUY", async function () {
+      await integrator.setRampRecipient(rampWallet.address, rampWallet.address);
+      await integrator.connect(rampWallet).userPlaceSellOrder(USDC(400), INR, "userpk", CIRCLE, 0);
+      const sell = await mockDiamond.sellOrders(1);
+      expect(sell.user).to.equal(rampWallet.address);
+      expect(sell.amount).to.equal(USDC(400));
+    });
+
+    it("EXCEEDS the 200-USDC consumer sell ceiling, which is the whole reason", async function () {
+      // A direct placeOrder at this size would revert SellOrderAmountExceedsLimit
+      // for a zero-RP wallet. Through the gateway it is only our per-tx cap that
+      // applies, and that is 500.
+      await integrator.setRampRecipient(rampWallet.address, rampWallet.address);
+      await expect(
+        integrator.connect(rampWallet).userPlaceSellOrder(USDC(500), INR, "pk", CIRCLE, 0)
+      ).to.not.be.reverted;
+    });
+
+    it("still refuses an unregistered wallet", async function () {
+      await expect(
+        integrator.connect(stranger).userPlaceSellOrder(USDC(10), INR, "pk", CIRCLE, 0)
+      ).to.be.revertedWithCustomError(integrator, "NotRegistered");
+    });
+
+    it("still applies OUR per-tx cap", async function () {
+      await integrator.setRampRecipient(rampWallet.address, rampWallet.address);
+      await expect(
+        integrator.connect(rampWallet).userPlaceSellOrder(USDC(501), INR, "pk", CIRCLE, 0)
+      ).to.be.revertedWithCustomError(integrator, "OverPerTxCap");
+    });
+
+    it("does NOT consume the daily on-ramp budget", async function () {
+      // Cashing out must not burn the headroom to cash in. The caps are checked
+      // (validateOrder cannot tell a SELL from a BUY) but never debited.
+      await integrator.setRampRecipient(rampWallet.address, rampWallet.address);
+      await integrator.connect(rampWallet).userPlaceSellOrder(USDC(500), INR, "pk", CIRCLE, 0);
+      await integrator.connect(rampWallet).userPlaceSellOrder(USDC(500), INR, "pk", CIRCLE, 0);
+      await integrator.connect(rampWallet).userPlaceSellOrder(USDC(500), INR, "pk", CIRCLE, 0);
+      await integrator.connect(rampWallet).userPlaceSellOrder(USDC(500), INR, "pk", CIRCLE, 0);
+      // A fifth 500 would be 2500 against a 2000 daily cap if sells debited.
+      await expect(
+        integrator.connect(rampWallet).userPlaceSellOrder(USDC(500), INR, "pk", CIRCLE, 0)
+      ).to.not.be.reverted;
+    });
+
+    it("does NOT consume an in-flight slot", async function () {
+      // inFlightCap is 3. A fourth BUY would fail; four SELLs must not.
+      await integrator.setRampRecipient(rampWallet.address, rampWallet.address);
+      for (let i = 0; i < 4; i++) {
+        await integrator.connect(rampWallet).userPlaceSellOrder(USDC(10), INR, "pk", CIRCLE, 0);
+      }
+      expect(await integrator.inFlightOf(rampWallet.address)).to.equal(0);
+    });
+
+    it("is NOT recorded in the BUY bookkeeping, so a cancel cannot penalise it", async function () {
+      // orderUserOf is what onOrderCancel reads to charge a permanent in-flight
+      // slot. A cash-out no merchant took must not cost the user one.
+      await integrator.setRampRecipient(rampWallet.address, rampWallet.address);
+      await integrator.connect(rampWallet).userPlaceSellOrder(USDC(50), INR, "pk", CIRCLE, 0);
+      // orderUserOf being zero IS the property: onOrderCancel returns early on
+      // `user == address(0)`, so the penalty can never reach a cash-out. Asserted
+      // on the state rather than by driving the mock's BUY-only cancel helper.
+      expect(await integrator.orderUserOf(1)).to.equal(ethers.ZeroAddress);
+      expect(await integrator.orderAmountOf(1)).to.equal(0);
+      expect(await integrator.cancelCountOf(rampWallet.address)).to.equal(0);
+    });
+
+    it("REFUSES to place when routed through the integrator", async function () {
+      await integrator.setRampRecipient(rampWallet.address, rampWallet.address);
+      await mockDiamond.setUsdcThroughIntegrator(true);
+      await expect(
+        integrator.connect(rampWallet).userPlaceSellOrder(USDC(10), INR, "pk", CIRCLE, 0)
+      ).to.be.revertedWithCustomError(integrator, "RoutesThroughIntegrator");
+    });
+
+    it("has no recipient argument, because a SELL pays nobody in USDC", async function () {
+      // A real completed SELL on Base mainnet carries recipientAddr = 0. An
+      // overload taking one would invite somebody to pass a payee that is never read.
+      const fns = integrator.interface.fragments
+        .filter((f: { type: string }) => f.type === "function")
+        .map((f: { name?: string; inputs?: { name: string }[] }) => ({
+          n: f.name,
+          i: (f.inputs ?? []).map((x) => x.name),
+        }));
+      const sell = fns.filter((f) => f.n === "userPlaceSellOrder");
+      expect(sell).to.have.length(1);
+      expect(sell[0].i.join(",")).to.not.match(/recipient/i);
+    });
+  });
+
+  describe("settlement callbacks", function () {
     it("rejects a settlement callback from anyone but the Diamond", async function () {
       await register();
       await expect(
