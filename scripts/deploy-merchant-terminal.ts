@@ -123,6 +123,27 @@ async function main() {
     );
   }
 
+  // 1b. Previous integrators (newest first), so their merchants are carried over
+  //     instead of registering again — and arrive frozen if frozen there. This
+  //     can be set ONLY ONCE, so it happens here, at deployment, from
+  //     PREVIOUS_INTEGRATORS (comma-separated). Leave it empty for a first-ever
+  //     deployment with no predecessors.
+  const PREVIOUS = (process.env.PREVIOUS_INTEGRATORS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (PREVIOUS.length) {
+    for (const p of PREVIOUS) {
+      if (!ethers.isAddress(p)) throw new Error(`PREVIOUS_INTEGRATORS: not an address: ${p}`);
+      if ((await ethers.provider.getCode(p)) === "0x")
+        throw new Error(`PREVIOUS_INTEGRATORS: no contract at ${p}`);
+    }
+    console.log(`Setting previous integrators (newest first): ${PREVIOUS.join(", ")}`);
+    await (await (integrator as any).setPreviousIntegrators(PREVIOUS)).wait(2);
+  } else {
+    console.log("No PREVIOUS_INTEGRATORS — merchants must register on this integrator.");
+  }
+
   // 2. Price source.
   console.log("Deploying SimpleERC721Client (price source)...");
   const Client = await ethers.getContractFactory("SimpleERC721Client");
