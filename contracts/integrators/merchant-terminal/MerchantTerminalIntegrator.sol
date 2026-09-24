@@ -12,6 +12,7 @@ import { PaymentLinksLib } from "./PaymentLinksLib.sol";
 import { MerchantRegistryLib } from "./MerchantRegistryLib.sol";
 import { MerchantTypes } from "./MerchantTypes.sol";
 import { SettlementLib } from "./SettlementLib.sol";
+import { MerchantImportLib } from "./MerchantImportLib.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
@@ -190,6 +191,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         bytes32 businessSector
     );
     event MerchantProfileUpdated(address indexed merchant, string shopName);
+    /// @notice Emitted from MerchantImportLib (by delegatecall, so from this
+    ///         address): a merchant's record was copied from a previous integrator.
+    event MerchantImported(address indexed merchant, address indexed fromIntegrator, bool frozen);
+    event PreviousIntegratorsSet(address[] previous);
     event OrderCompleted(
         uint256 indexed orderId,
         address indexed merchant,
@@ -303,29 +308,29 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev Per-transaction cap depends on the sale currency: India (INR) is
     ///      capped lower than other markets. `perTxCap(currency)` resolves it.
     ///      PER_TX_CAP is kept as the INR cap for source/ABI compatibility.
-    uint256 public constant PER_TX_CAP = 50 * 1e6; // INR: 50 USDC
+    uint256 internal constant PER_TX_CAP = 50 * 1e6; // INR: 50 USDC
     uint256 public constant PER_TX_CAP_INR = 50 * 1e6; // India: 50 USDC
     uint256 public constant PER_TX_CAP_DEFAULT = 100 * 1e6; // other markets: 100 USDC
     /// @dev Default daily order limit. The LIVE limit is the mutable `dailyLimit`
     ///      below (admin-settable via setDailyLimit), initialised to this. The
     ///      constant is kept for source/ABI reference.
-    uint256 public constant DAILY_TX_LIMIT = 25;
+    uint256 internal constant DAILY_TX_LIMIT = 25;
     /// @dev DEFAULT settlement lock. The LIVE lock is the mutable `settlementPeriod`
     ///      (super-admin-settable via setSettlementPeriod), optionally overridden
     ///      per-currency via setLockPeriod — so hold times are tunable per country
     ///      from the dashboard with NO redeploy. This constant is the initial global
     ///      default and is kept for source/ABI reference.
-    uint256 public constant SETTLEMENT_PERIOD = 10 minutes;
+    uint256 internal constant SETTLEMENT_PERIOD = 10 minutes;
     /// @dev Safety bounds on any admin-set settlement lock. The lock is the
     ///      solvency/fraud window: too short collapses it (funds unlock before a
     ///      dispute can surface), too long strands merchants' funds. Any value set
     ///      via setSettlementPeriod / setLockPeriod must fall within [MIN,MAX].
-    uint256 public constant MIN_SETTLEMENT_PERIOD = 1 minutes;
-    uint256 public constant MAX_SETTLEMENT_PERIOD = 30 days;
+    uint256 internal constant MIN_SETTLEMENT_PERIOD = 1 minutes;
+    uint256 internal constant MAX_SETTLEMENT_PERIOD = 30 days;
     /// @dev Hard ceiling on a merchant's stored buckets. Withdrawals compact
     ///      spent buckets, so this bounds the per-call loop cost and prevents
     ///      an unbounded-array gas-griefing / self-DoS surface.
-    uint256 public constant MAX_BUCKETS = 256;
+    uint256 internal constant MAX_BUCKETS = 256;
 
     /// @dev Length caps (audit 2026-09 L-3). 128 bytes fits a long shop name in
     ///      any script (~40 Devanagari characters); the payout blob is an ECIES
@@ -339,12 +344,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      their remaining balance withdrawn by the super-admin via adminEscheat,
     ///      so funds behind a permanently-abandoned/blocked account are never lost.
     ///      90 days gives ample time for a legitimate merchant to be unfrozen first.
-    uint256 public constant ESCHEAT_PERIOD = 90 days;
+    uint256 internal constant ESCHEAT_PERIOD = 90 days;
 
     /// @dev How long a proposed super-admin handoff stays acceptable. Long enough
     ///      for any real multisig/HSM ceremony, short enough that a forgotten
     ///      proposal can't be redeemed months later by a since-compromised key.
-    uint256 public constant SUPER_ADMIN_HANDOFF_TTL = 7 days;
+    uint256 internal constant SUPER_ADMIN_HANDOFF_TTL = 7 days;
 
     /// @dev Mirrors OrderProcessorStorage.OrderStatus on the Diamond — used
     ///      by reconcileWithdrawal to read the authoritative terminal state.
@@ -403,7 +408,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @notice BUY order id => the UTC day it was placed, so onOrderCancel only
     ///         releases a daily-count slot for the CURRENT day (a stale cross-day
     ///         cancel must not decrement a freshly-rolled counter).
-    mapping(uint256 => uint256) public orderPlacementDay;
+    mapping(uint256 => uint256) internal orderPlacementDay;
 
     // ─── Payment links ────────────────────────────────────────────────
     //
@@ -518,6 +523,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         FINANCE
     }
     mapping(address => Role) public adminRole;
+
+    /// @dev Earlier integrators, newest first, whose merchants are carried over
+    ///      on first use — so an upgrade never makes a merchant register again,
+    ///      and a merchant frozen there arrives frozen here. Set once by the
+    ///      super-admin; see setPreviousIntegrators and MerchantImportLib.
+    address[] internal previousIntegrators;
 
     // ─── Reentrancy guard ─────────────────────────────────────────────
     uint256 private _locked = 1;
@@ -684,6 +695,31 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         return MerchantRegistryLib.fromCurrency(cur);
     }
 
+    // ─── Carry-over from previous integrators ─────────────────────────
+
+    /// @notice SUPER-ADMIN, ONCE: the earlier integrators to carry merchants
+    ///         over from, newest first (max 5). Set once at deployment and never
+    ///         again, so the source of imported records cannot be swapped later.
+    ///         Validation and the event live in MerchantImportLib (size).
+    function setPreviousIntegrators(address[] calldata list) external onlySuperAdmin {
+        MerchantImportLib.setPrevious(previousIntegrators, list);
+    }
+
+    /// @notice Copy `merchant` from a previous integrator now. Permissionless:
+    ///         it only ever copies that merchant's own record from our own
+    ///         earlier contracts, and it happens anyway on their first action.
+    ///         Lets the app (or an admin) import ahead of time so views are
+    ///         populated. No-op if already registered here or unknown.
+    function importMerchant(address merchant) external returns (bool) {
+        return MerchantImportLib.importFrom(merchants, registered, previousIntegrators, merchant);
+    }
+
+    function _ensureMerchant(address merchant) internal {
+        if (!registered[merchant] && previousIntegrators.length != 0) {
+            MerchantImportLib.importFrom(merchants, registered, previousIntegrators, merchant);
+        }
+    }
+
     // ─── Merchant registration ────────────────────────────────────────
 
     /// @notice Register the calling merchant with a human-readable currency
@@ -738,6 +774,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         string calldata shopName,
         bytes32 businessSector
     ) external {
+        // Not imported here: the app imports a returning merchant on login
+        // (importMerchant), before any profile edit is possible.
         if (!registered[msg.sender]) revert NotRegistered();
         _checkLengths(encPayoutId, shopName);
         MerchantTypes.Merchant storage m = merchants[msg.sender];
@@ -763,6 +801,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         bytes32 currency,
         bytes32 businessSector
     ) internal {
+        // A merchant who exists on a previous integrator is IMPORTED, never
+        // registered fresh — otherwise a frozen merchant could register again
+        // here and walk out of their freeze. The import makes them registered,
+        // so the check below then refuses the fresh registration.
+        _ensureMerchant(msg.sender);
         if (registered[msg.sender]) revert AlreadyRegistered();
         _checkLengths(encPayoutId, shopName);
         // Field validation (canonical currency form, sector present) lives in
@@ -1006,6 +1049,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // and re-credits their OWN funds — there is no cross-merchant or pool
         // impact. If authoritative product pricing is ever needed, allowlist
         // `client` (or pin it) and re-verify price*quantity at completion.
+        _ensureMerchant(msg.sender);
         uint256 total = _quote(client, productId, quantity);
         orderId = _placeOrder(msg.sender, false, total, currency, circleId, pubKey);
     }
@@ -1096,6 +1140,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint32 maxUses,
         bytes calldata encryptedConfig
     ) external whenNotPaused {
+        _ensureMerchant(msg.sender);
         PaymentLinksLib.create(
             links,
             merchantLinkIds,
@@ -1803,6 +1848,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function _checkWithdraw(
         uint256 amount
     ) internal view returns (MerchantTypes.Merchant storage m) {
+        // No import here: a merchant never imported has no balance on this
+        // contract, so there is nothing a withdrawal could take.
         if (!registered[msg.sender]) revert NotRegistered();
         m = merchants[msg.sender];
         if (m.isFrozen) revert MerchantIsFrozen();

@@ -7,6 +7,12 @@ dotenv.config();
 
 const config: HardhatUserConfig = {
   networks: {
+    // A LOCAL fork of Base Sepolia, for checks against real deployed contracts
+    // without touching the live network:
+    //   npx hardhat node --port 8546 --fork <BASE_SEPOLIA_RPC>
+    fork: {
+      url: "http://127.0.0.1:8546",
+    },
     baseSepolia: {
       url: process.env.BASE_SEPOLIA_RPC || "https://sepolia.base.org",
       accounts: process.env.DEPLOYER_PRIVATE_KEY

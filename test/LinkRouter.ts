@@ -32,7 +32,7 @@ async function deployMerchantTerminalLibs(): Promise<Record<string, string>> {
   const out: Record<string, string> = {
     PaymentLinksLib: await deployPaymentLinksLib(),
   };
-  for (const name of ["MerchantRegistryLib", "SettlementLib"]) {
+  for (const name of ["MerchantRegistryLib", "SettlementLib", "MerchantImportLib"]) {
     const F = await ethers.getContractFactory(name);
     const c = await F.deploy();
     await c.waitForDeployment();

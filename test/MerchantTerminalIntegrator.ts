@@ -33,7 +33,7 @@ async function deployMerchantTerminalLibs(): Promise<Record<string, string>> {
   const out: Record<string, string> = {
     PaymentLinksLib: await deployPaymentLinksLib(),
   };
-  for (const name of ["MerchantRegistryLib", "SettlementLib"]) {
+  for (const name of ["MerchantRegistryLib", "SettlementLib", "MerchantImportLib"]) {
     const F = await ethers.getContractFactory(name);
     const c = await F.deploy();
     await c.waitForDeployment();
@@ -94,7 +94,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await mockUsdc.getAddress(),
       [] // extra owners (deployer is always the first owner)
     );
-    SETTLEMENT = Number(await integrator.SETTLEMENT_PERIOD());
+    SETTLEMENT = Number(await integrator.settlementPeriod());
 
     const Client = await ethers.getContractFactory("SimpleERC721Client");
     erc721Client = await Client.deploy(
@@ -539,8 +539,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
 
     // ── bounds: reject out-of-range values on both setters ──
-    const MIN = Number(await integrator.MIN_SETTLEMENT_PERIOD());
-    const MAX = Number(await integrator.MAX_SETTLEMENT_PERIOD());
+    const MIN = 60; // MIN_SETTLEMENT_PERIOD (internal constant);
+    const MAX = 30 * 86400; // MAX_SETTLEMENT_PERIOD (internal constant);
     await expect(integrator.setSettlementPeriod(MIN - 1)).to.be.revertedWithCustomError(
       integrator,
       "InvalidLockPeriod"
@@ -3226,7 +3226,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     });
 
     it("handoff TTL: an expired super-admin proposal cannot be accepted; a fresh one can", async function () {
-      const TTL = Number(await integrator.SUPER_ADMIN_HANDOFF_TTL());
+      const TTL = 7 * 86400; // SUPER_ADMIN_HANDOFF_TTL (internal constant);
       await integrator.connect(owner).transferSuperAdmin(merchant2.address);
       expect(await integrator.pendingSuperAdminExpiry()).to.be.gt(0);
 
@@ -3311,7 +3311,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     }
 
     it("keeps every bucket's lock state honest when the cap is hit", async function () {
-      const MAX = Number(await integrator.MAX_BUCKETS());
+      const MAX = 256; // MAX_BUCKETS (internal constant);
       await fillBuckets(merchant1, UPI_1, MAX);
       expect((await integrator.getMerchantBuckets(merchant1.address)).length).to.equal(MAX);
 
@@ -3341,7 +3341,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     });
 
     it("does not re-lock already-matured funds when a new credit lands at the cap", async function () {
-      const MAX = Number(await integrator.MAX_BUCKETS());
+      const MAX = 256; // MAX_BUCKETS (internal constant);
       await fillBuckets(merchant2, UPI_2, MAX);
 
       // Let every bucket mature, so the whole balance is spendable.

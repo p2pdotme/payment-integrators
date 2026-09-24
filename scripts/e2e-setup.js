@@ -19,7 +19,12 @@ const path = require("path");
  */
 async function deployMerchantTerminalLibs() {
   const out = {};
-  for (const name of ["PaymentLinksLib", "MerchantRegistryLib", "SettlementLib"]) {
+  for (const name of [
+    "PaymentLinksLib",
+    "MerchantRegistryLib",
+    "SettlementLib",
+    "MerchantImportLib",
+  ]) {
     const F = await ethers.getContractFactory(name);
     const c = await F.deploy();
     await c.waitForDeployment();
@@ -162,7 +167,7 @@ async function main() {
     sponsorKey: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
     // Hardhat account #4: submits handleOps, as a bundler's operational key.
     bundlerKey: "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
-    settlementPeriod: Number(await integrator.SETTLEMENT_PERIOD()),
+    settlementPeriod: Number(await integrator.settlementPeriod()),
   };
 
   fs.mkdirSync(path.dirname(OUT), { recursive: true });

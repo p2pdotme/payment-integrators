@@ -26,7 +26,7 @@ async function deployMerchantTerminalLibs(): Promise<Record<string, string>> {
   const out: Record<string, string> = {
     PaymentLinksLib: await deployPaymentLinksLib(),
   };
-  for (const name of ["MerchantRegistryLib", "SettlementLib"]) {
+  for (const name of ["MerchantRegistryLib", "SettlementLib", "MerchantImportLib"]) {
     const F = await ethers.getContractFactory(name);
     const c = await F.deploy();
     await c.waitForDeployment();
@@ -154,10 +154,10 @@ async function main() {
   console.log(`Super-admin:           ${await integrator.superAdmin()}`);
   console.log(`Owners (count):        ${(await integrator.ownerCount()).toString()}`);
   console.log(
-    `PER_TX_CAP:            ${ethers.formatUnits(await integrator.PER_TX_CAP(), 6)} USDC`
+    `PER_TX_CAP:            ${ethers.formatUnits(await integrator.perTxCap(ethers.encodeBytes32String("INR")), 6)} USDC`
   );
-  console.log(`DAILY_TX_LIMIT:        ${(await integrator.DAILY_TX_LIMIT()).toString()} per day`);
-  const settlement = await integrator.SETTLEMENT_PERIOD();
+  console.log(`DAILY_TX_LIMIT:        ${(await integrator.dailyLimit()).toString()} per day`);
+  const settlement = await integrator.settlementPeriod();
   console.log(
     `SETTLEMENT_PERIOD:     ${settlement.toString()} seconds (${(Number(settlement) / 60).toString()} min)`
   );

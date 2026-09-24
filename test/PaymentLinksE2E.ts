@@ -33,7 +33,7 @@ async function deployMerchantTerminalLibs(): Promise<Record<string, string>> {
   const out: Record<string, string> = {
     PaymentLinksLib: await deployPaymentLinksLib(),
   };
-  for (const name of ["MerchantRegistryLib", "SettlementLib"]) {
+  for (const name of ["MerchantRegistryLib", "SettlementLib", "MerchantImportLib"]) {
     const F = await ethers.getContractFactory(name);
     const c = await F.deploy();
     await c.waitForDeployment();
@@ -88,7 +88,7 @@ describe("MerchantTerminalIntegrator — payment links, end to end", function ()
         libraries: await deployMerchantTerminalLibs(),
       })
     ).deploy(await mockDiamond.getAddress(), await mockUsdc.getAddress(), []);
-    SETTLEMENT = Number(await integrator.SETTLEMENT_PERIOD());
+    SETTLEMENT = Number(await integrator.settlementPeriod());
 
     client = await (
       await ethers.getContractFactory("SimpleERC721Client")

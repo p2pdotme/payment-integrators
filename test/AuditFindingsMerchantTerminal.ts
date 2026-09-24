@@ -16,7 +16,12 @@ const SECTOR = ethers.encodeBytes32String("Retail");
 
 async function deployLibs(): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
-  for (const name of ["PaymentLinksLib", "MerchantRegistryLib", "SettlementLib"]) {
+  for (const name of [
+    "PaymentLinksLib",
+    "MerchantRegistryLib",
+    "SettlementLib",
+    "MerchantImportLib",
+  ]) {
     const F = await ethers.getContractFactory(name);
     const c = await F.deploy();
     await c.waitForDeployment();
