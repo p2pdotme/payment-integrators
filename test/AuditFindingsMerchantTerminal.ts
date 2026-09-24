@@ -238,4 +238,22 @@ describe("Audit 2026-09 regressions — merchant terminal", function () {
     expect((await integrator.getLink(LINK))[7]).to.equal(0n); // the claim was true
     expect(await integrator.orderToLink(orderId)).to.equal(ethers.ZeroHash);
   });
+
+  // ─── Re-audit R-2 ─────────────────────────────────────────────────
+  it("R-2: the order and fiat-withdrawal paths cap pubKey at 256 bytes", async function () {
+    await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+    const long = "04" + "ab".repeat(128); // 258 chars
+    await expect(
+      integrator.connect(relayer).relayerPlaceOrder(LINK, client.target, 1, 1, INR, 0, long)
+    ).to.be.revertedWithCustomError(integrator, "FieldTooLong");
+    await expect(
+      integrator.connect(merchant).userPlaceOrder(client.target, 1, 1, INR, 0, long)
+    ).to.be.revertedWithCustomError(integrator, "FieldTooLong");
+    await fund(10);
+    await expect(
+      integrator.connect(merchant).withdrawFiat(USDC(5), 1, long, "")
+    ).to.be.revertedWithCustomError(integrator, "FieldTooLong");
+    // A real key (130 hex chars) still works everywhere.
+    await expect(placeLinkOrder(1)).to.emit(integrator, "LinkOrderPlaced");
+  });
 });

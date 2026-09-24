@@ -332,6 +332,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      ciphertext stored as text, ~330 bytes for a typical UPI id.
     uint256 internal constant MAX_SHOP_NAME = 128;
     uint256 internal constant MAX_PAYOUT_BLOB = 1024;
+    uint256 internal constant MAX_PUBKEY = 256;
 
     /// @dev Dormant-account escheat window. A merchant frozen CONTINUOUSLY for at
     ///      least this long (see Merchant.frozenAt, reset on any unfreeze) can have
@@ -1040,6 +1041,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint256 circleId,
         string calldata pubKey
     ) internal returns (uint256 orderId) {
+        // A secp256k1 public key is 128-132 hex chars. Capped because the link
+        // path is sponsored and pubKey is forwarded (and stored) by the Diamond.
+        if (bytes(pubKey).length > MAX_PUBKEY) revert FieldTooLong();
         address proxy = _ensureProxy(merchant);
         address orderUser = userIsProxy ? proxy : merchant;
         // recipientAddr = the merchant's proxy: with usdcThroughIntegrator =
@@ -1431,6 +1435,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (m.encPayoutId.length == 0) revert PayoutHandleNotSet();
         if (circleId == 0) revert InvalidCircle(); // friendly local guard
         if (bytes(pubKey).length == 0) revert InvalidAddress(); // need a real relay key
+        if (bytes(pubKey).length > MAX_PUBKEY) revert FieldTooLong();
         // MED-1: serialize a merchant's fiat withdrawals. The merchant has ONE
         // proxy, so two concurrent SELLs would commingle principals on it and a
         // per-order top-up/reconcile (which key off the proxy's aggregate
@@ -1580,7 +1585,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // latch back so reconcileWithdrawal can make the merchant whole and the
         // event stream never reports a delivery that didn't happen.
         uint8 postStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
-        if (postStatus == STATUS_PAID) {
+        // COMPLETED counts as delivered too: a Diamond that settles in the same
+        // call has certainly delivered, and treating it as "moved nothing"
+        // (the M-2 revert below) would make the withdrawal undeliverable
+        // forever. finalizeWithdrawal then closes it out as usual.
+        if (postStatus == STATUS_PAID || postStatus == STATUS_COMPLETED) {
             emit WithdrawalUpiDelivered(orderId, needed);
         } else if (postStatus == STATUS_CANCELLED) {
             // Not delivered — undo the optimistic replay latch. The order is now
