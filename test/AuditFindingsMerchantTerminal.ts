@@ -261,4 +261,82 @@ describe("Audit 2026-09 regressions — merchant terminal", function () {
     // A real key (130 hex chars) still works everywhere.
     await expect(placeLinkOrder(1)).to.emit(integrator, "LinkOrderPlaced");
   });
+
+  // ─── PR #108 review, blocker #3 — link orders are bounded again ────
+  describe("review #3: pending link orders keep link sales under dailyLimit", function () {
+    // The reviewer's PoC, flipped: it used to pass with dailyTxCount = 100.
+    it("orders placed before mark-paid can no longer complete past dailyLimit", async function () {
+      await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG); // unlimited uses
+      const limit = Number(await integrator.dailyLimit()); // 25
+      const ids: bigint[] = [];
+      for (let i = 0; i < limit * 4; i++) {
+        try {
+          await placeLinkOrder(1);
+          ids.push(await lastLinkOrderId());
+        } catch {
+          // refused once paid + pending reaches the limit
+        }
+      }
+      expect(ids.length).to.equal(limit); // only `limit` placements got through
+      for (const id of ids) {
+        await diamond.simulateOrderAccepted(id);
+        await integrator.connect(relayer).relayerMarkPaid(LINK, id);
+        await diamond.simulateOrderComplete(id);
+      }
+      const [used] = await integrator.getDailyTxInfo(merchant.address);
+      expect(used).to.equal(BigInt(limit)); // was 100 before the fix
+    });
+
+    it("abandoned link orders never block counter (POS) sales", async function () {
+      await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+      for (let i = 0; i < 25; i++) await placeLinkOrder(1);
+      await expect(placeLinkOrder(1)).to.be.reverted; // link room used up (pending)
+      await expect(
+        integrator.connect(merchant).userPlaceOrder(client.target, 1, 1, INR, 0, PK)
+      ).to.emit(integrator, "OrderPlaced"); // the till still works
+    });
+
+    it("a cancelled pending order frees its reservation", async function () {
+      await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+      for (let i = 0; i < 25; i++) await placeLinkOrder(1);
+      await expect(placeLinkOrder(1)).to.be.reverted;
+      await diamond.simulateOrderCancelled(await lastLinkOrderId()); // the Diamond's cancel callback
+      await expect(placeLinkOrder(1)).to.emit(integrator, "LinkOrderPlaced");
+    });
+
+    it("pending reservations expire with the UTC day", async function () {
+      await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+      for (let i = 0; i < 25; i++) await placeLinkOrder(1);
+      await expect(placeLinkOrder(1)).to.be.reverted;
+      await time.increase(86400);
+      await expect(placeLinkOrder(1)).to.emit(integrator, "LinkOrderPlaced");
+    });
+
+    it("a link order completed WITHOUT mark-paid (dispute path) still frees its reservation", async function () {
+      await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+      for (let i = 0; i < 25; i++) await placeLinkOrder(1);
+      await diamond.simulateOrderComplete(await lastLinkOrderId()); // no relayerMarkPaid
+      await expect(placeLinkOrder(1)).to.emit(integrator, "LinkOrderPlaced");
+    });
+  });
+
+  // ─── PR #108 review, blocker #4 — hard ceilings on the limit setters ─
+  it("review #4: per-tx cap and daily limit can only be LOWERED, never raised", async function () {
+    await integrator.connect(owner).setRole(manager.address, 3); // MANAGER
+    await expect(
+      integrator.connect(manager).setPerTxCap(INR, USDC(100) + 1n)
+    ).to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
+    await expect(
+      integrator.connect(owner).setPerTxCap(ethers.encodeBytes32String("BRL"), USDC(1000))
+    ).to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap"); // not even an owner
+    await expect(integrator.connect(manager).setDailyLimit(26)).to.be.revertedWithCustomError(
+      integrator,
+      "InvalidQuantity"
+    );
+    // Lowering works, and the ceiling values themselves are accepted.
+    await integrator.connect(manager).setPerTxCap(INR, USDC(20));
+    await integrator.connect(manager).setPerTxCap(INR, USDC(100));
+    await integrator.connect(manager).setDailyLimit(10);
+    await integrator.connect(manager).setDailyLimit(25);
+  });
 });

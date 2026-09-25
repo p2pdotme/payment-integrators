@@ -191,11 +191,18 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
   // ─── multi-country: currency naming + per-country registration ─────
 
-  it("2a. toCurrency / fromCurrency round-trip for any country code", async function () {
-    for (const code of ["INR", "BRL", "ARS", "MXN", "NGN", "COP"]) {
-      const packed = await integrator.toCurrency(code);
-      expect(packed).to.equal(ethers.encodeBytes32String(code));
-      expect(await integrator.fromCurrency(packed)).to.equal(code);
+  it("2a. currency codes round-trip for any country (register → getMerchantCurrency)", async function () {
+    // The public toCurrency/fromCurrency wrappers were removed for size; the
+    // codecs live in MerchantRegistryLib and registration uses them directly.
+    const signers = await ethers.getSigners();
+    const codes = ["INR", "BRL", "ARS", "MXN", "NGN", "COP"];
+    for (let i = 0; i < codes.length; i++) {
+      const who = signers[10 + i];
+      await integrator.connect(who).registerMerchant(UPI_1, "Shop", codes[i], SECTOR);
+      expect((await integrator.getMerchantInfo(who.address))[2]).to.equal(
+        ethers.encodeBytes32String(codes[i])
+      );
+      expect(await integrator.getMerchantCurrency(who.address)).to.equal(codes[i]);
     }
   });
 
@@ -435,9 +442,14 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     await expect(
       integrator.connect(diamond).validateOrder(merchant1.address, UNIT_PRICE, INR)
     ).to.be.revertedWithCustomError(integrator, "DailyLimitReached"); // 3rd blocked at limit 2
-    // admin raises to 50
-    await integrator.connect(owner).setDailyLimit(50);
-    expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(50n);
+    // admin raises back to the ceiling (25)…
+    await integrator.connect(owner).setDailyLimit(25);
+    expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(25n);
+    // …but never above it: DAILY_TX_LIMIT is a hard ceiling (review #4).
+    await expect(integrator.connect(owner).setDailyLimit(26)).to.be.revertedWithCustomError(
+      integrator,
+      "InvalidQuantity"
+    );
     // guards: zero rejected, non-admin rejected
     await expect(integrator.connect(owner).setDailyLimit(0)).to.be.revertedWithCustomError(
       integrator,
@@ -639,7 +651,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       integrator,
       "MerchantUnfrozen"
     );
-    await expect(integrator.setDailyLimit(30)).to.emit(integrator, "DailyLimitSet");
+    await expect(integrator.setDailyLimit(20)).to.emit(integrator, "DailyLimitSet");
 
     // unpause resumes activity
     await expect(integrator.unpause()).to.emit(integrator, "UnpausedSet").withArgs(owner.address);
@@ -1167,7 +1179,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await integrator.isAdmin(merchant2.address)).to.equal(false);
 
       // Owner adds merchant2 as an admin.
-      await expect(integrator.connect(owner).addAdmin(merchant2.address))
+      await expect(integrator.connect(owner).setRole(merchant2.address, 4))
         .to.emit(integrator, "AdminAdded")
         .withArgs(merchant2.address);
       expect(await integrator.isAdmin(merchant2.address)).to.equal(true);
@@ -1181,14 +1193,14 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       // But an admin CANNOT add/remove admins or transfer ownership (super-admin only).
       await expect(
-        integrator.connect(merchant2).addAdmin(attacker.address)
+        integrator.connect(merchant2).setRole(attacker.address, 4)
       ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       await expect(
-        integrator.connect(merchant2).transferOwnership(attacker.address)
+        integrator.connect(merchant2).addOwner(attacker.address)
       ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
 
       // Owner removes the admin → can no longer freeze.
-      await integrator.connect(owner).removeAdmin(merchant2.address);
+      await integrator.connect(owner).setRole(merchant2.address, 0);
       expect(await integrator.isAdmin(merchant2.address)).to.equal(false);
       await expect(
         integrator.connect(merchant2).freezeMerchant(merchant1.address)
@@ -1267,7 +1279,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         integrator.connect(admin).setRole(attacker.address, 2)
       ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       await expect(
-        integrator.connect(admin).transferOwnership(attacker.address)
+        integrator.connect(admin).addOwner(attacker.address)
       ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
 
       // ── Revoke (0). ──
@@ -1283,34 +1295,33 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await integrator.isManager(owner.address)).to.equal(true);
       expect(await integrator.isFinance(owner.address)).to.equal(true);
 
-      // Back-compat: addAdmin grants the full (FINANCE) tier.
-      await integrator.connect(owner).addAdmin(attacker.address);
+      // setRole(FINANCE) is the full admin tier (the addAdmin/removeAdmin
+      // shims were removed for size).
+      await integrator.connect(owner).setRole(attacker.address, 4);
       expect(await integrator.roleOf(attacker.address)).to.equal(4);
-      await integrator.connect(owner).removeAdmin(attacker.address);
+      await integrator.connect(owner).setRole(attacker.address, 0);
       expect(await integrator.roleOf(attacker.address)).to.equal(0);
     });
 
-    it("transferOwnership adds new owner but NEVER drops the super-admin caller", async function () {
-      // Only the super-admin (deployer) may call; a non-super-admin owner cannot.
+    it("owner-set changes go through addOwner / transferSuperAdmin only (legacy shims removed)", async function () {
+      // transferOwnership / addAdmin / removeAdmin were back-compat shims, removed
+      // for size. Their jobs: addOwner, setRole, and transferSuperAdmin for root.
+      expect((integrator as any).transferOwnership).to.equal(undefined);
+      expect((integrator as any).addAdmin).to.equal(undefined);
+      expect((integrator as any).removeAdmin).to.equal(undefined);
       await integrator.connect(owner).addOwner(merchant2.address);
       await expect(
-        integrator.connect(merchant2).transferOwnership(attacker.address)
+        integrator.connect(merchant2).addOwner(attacker.address)
       ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       await expect(
-        integrator.connect(attacker).transferOwnership(attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
-      await expect(
-        integrator.connect(owner).transferOwnership(ethers.ZeroAddress)
+        integrator.connect(owner).addOwner(ethers.ZeroAddress)
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
-      // Super-admin "hands off" to merchant1 — merchant1 becomes an owner, but the
-      // super-admin is NOT dropped (root control must stay with the super-admin).
-      await integrator.connect(owner).transferOwnership(merchant1.address);
+      await integrator.connect(owner).addOwner(merchant1.address);
       expect(await integrator.isOwner(merchant1.address)).to.equal(true);
       expect(await integrator.isOwner(owner.address)).to.equal(true); // super-admin retained
       expect(await integrator.superAdmin()).to.equal(owner.address);
-      // The new owner still cannot manage admins — that's super-admin only.
       await expect(
-        integrator.connect(merchant1).addAdmin(attacker.address)
+        integrator.connect(merchant1).setRole(attacker.address, 4)
       ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
     });
 
@@ -1336,10 +1347,10 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         integrator.connect(merchant2).removeOwner(owner.address)
       ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       await expect(
-        integrator.connect(merchant2).addAdmin(attacker.address)
+        integrator.connect(merchant2).setRole(attacker.address, 4)
       ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       await expect(
-        integrator.connect(merchant2).removeAdmin(attacker.address)
+        integrator.connect(merchant2).setRole(attacker.address, 0)
       ).to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       // ...BUT a non-super-admin owner DOES keep every FINANCE-tier OPERATIONAL
       // power (the re-gating lifted only GOVERNANCE to the super-admin — it must
@@ -1350,9 +1361,9 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await expect(integrator.connect(merchant2).unfreezeMerchant(merchant1.address))
         .to.emit(integrator, "MerchantUnfrozen")
         .withArgs(merchant1.address);
-      await expect(integrator.connect(merchant2).setDailyLimit(30))
+      await expect(integrator.connect(merchant2).setDailyLimit(20))
         .to.emit(integrator, "DailyLimitSet")
-        .withArgs(30);
+        .withArgs(20);
       // ...and canNOT manage the owner set (governance: super-admin only).
       await expect(
         integrator.connect(merchant2).addOwner(attacker.address)
@@ -1441,15 +1452,13 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await ig2.ownerCount()).to.equal(3);
     });
 
-    it("AUDIT-FIX: transferOwnership(self) is rejected, not a silent self-eviction", async function () {
-      // Two owners so the drop-caller branch is live.
+    it("adding an existing owner (incl. yourself) is rejected, and the set is unchanged", async function () {
       await integrator.connect(owner).addOwner(merchant2.address);
       expect(await integrator.ownerCount()).to.equal(2);
-      // Owner hands off "to self" — must revert, NOT strip the caller.
-      await expect(
-        integrator.connect(owner).transferOwnership(owner.address)
-      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
-      // Caller is still an owner; set is unchanged.
+      await expect(integrator.connect(owner).addOwner(owner.address)).to.be.revertedWithCustomError(
+        integrator,
+        "AlreadyRegistered"
+      );
       expect(await integrator.isOwner(owner.address)).to.equal(true);
       expect(await integrator.ownerCount()).to.equal(2);
     });
@@ -2825,10 +2834,9 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
     it("INFO-2: a currency code with an interior NUL byte is rejected", async function () {
       const withNul = "IN" + String.fromCharCode(0) + "R";
-      await expect(integrator.toCurrency(withNul)).to.be.revertedWithCustomError(
-        integrator,
-        "InvalidCurrency"
-      );
+      await expect(
+        integrator.connect(merchant1).registerMerchant(UPI_1, "Shop", withNul, SECTOR)
+      ).to.be.revertedWithCustomError(integrator, "InvalidCurrency");
     });
 
     it("NEW-2: a reconcile re-credit (past-dated) never unlocks a merchant's other STILL-LOCKED funds", async function () {
@@ -3301,13 +3309,16 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     // Fill exactly MAX_BUCKETS buckets, each with its own unlock second.
     async function fillBuckets(merchant: SignerWithAddress, upi: string, n: number) {
       await integrator.connect(merchant).registerMerchant(upi, "Shop", INR_CODE, SECTOR);
-      // The daily order limit would stop this long before 256.
-      await integrator.connect(owner).setDailyLimit(100000);
+      // The daily limit is capped at 25 (review #4), so fill over several UTC
+      // days. A 30-day lock keeps every bucket LOCKED across those ~11 days.
+      await integrator.connect(owner).setSettlementPeriod(30 * 86400);
       for (let i = 0; i < n; i++) {
+        if (i > 0 && i % 25 === 0) await increaseTime(86400); // next day, fresh count
         const orderId = await placeOrder(merchant, 2);
         await mockDiamond.simulateOrderComplete(orderId);
         await increaseTime(1); // a distinct unlock second => a distinct bucket
       }
+      await increaseTime(86400); // a fresh day for the test's own extra order
     }
 
     it("keeps every bucket's lock state honest when the cap is hit", async function () {
@@ -3344,8 +3355,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       const MAX = 256; // MAX_BUCKETS (internal constant);
       await fillBuckets(merchant2, UPI_2, MAX);
 
-      // Let every bucket mature, so the whole balance is spendable.
-      await increaseTime(60 * 60 * 24);
+      // Let every bucket mature (30-day lock), so the whole balance is spendable.
+      await increaseTime(31 * 60 * 60 * 24);
       const matured = await integrator.getMerchantBalance(merchant2.address);
       expect(matured.available).to.be.greaterThan(0n);
 

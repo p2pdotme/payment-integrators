@@ -63,6 +63,7 @@ library PaymentLinksLib {
     error InvalidCurrency();
     error ExceedsPerTxCap();
     error FieldTooLong();
+    error DailyLimitReached();
 
     /// @dev Cap on the emitted encrypted description (audit 2026-09 L-3). The
     ///      merchant's transaction is sponsored, so an unbounded blob was log
@@ -116,6 +117,47 @@ library PaymentLinksLib {
             else if (seenNul || c < 0x41 || c > 0x5A) return false;
         }
         return true;
+    }
+
+    // ─── Daily limit for link orders ─────────────────────────────────
+    //
+    // A link order is PLACED the moment a customer opens the pay page, but it is
+    // only a sale once marked paid. Counting it at placement let abandoned taps
+    // fill the merchant's daily limit and lock out their own counter sales;
+    // counting it only at mark-paid removed the ceiling on link sales entirely
+    // (orders placed while under the limit could all complete past it).
+    //
+    // So link orders take a PENDING reservation for the day: placement requires
+    // paid-today + pending-today < dailyLimit, mark-paid turns the reservation
+    // into a counted sale, and a cancel (or completion without mark-paid)
+    // releases it. Counter (POS) sales only look at paid-today, so pending link
+    // orders never block the till. Pending resets with the UTC day.
+    //
+    // Packed per merchant: (day << 128) | count.
+
+    /// @notice Reserve a pending link order for `merchant` today, or revert.
+    function reservePending(
+        mapping(address => uint256) storage pending,
+        address merchant,
+        uint256 paidToday,
+        uint256 dailyLimit
+    ) public {
+        uint256 today = block.timestamp / 86400;
+        uint256 p = pending[merchant];
+        uint256 count = (p >> 128) == today ? uint128(p) : 0;
+        if (paidToday + count >= dailyLimit) revert DailyLimitReached();
+        pending[merchant] = (today << 128) | (count + 1);
+    }
+
+    /// @notice Release one pending reservation taken on `day` (no-op once the
+    ///         day has rolled over — the reservation died with it).
+    function releasePending(
+        mapping(address => uint256) storage pending,
+        address merchant,
+        uint256 day
+    ) public {
+        uint256 p = pending[merchant];
+        if ((p >> 128) == day && uint128(p) != 0) pending[merchant] = p - 1;
     }
 
     // ─── Lifecycle ────────────────────────────────────────────────────

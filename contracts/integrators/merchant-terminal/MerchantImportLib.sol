@@ -96,7 +96,7 @@ library MerchantImportLib {
             m.merchantAddr = merchant;
             m.encPayoutId = encPayoutId;
             m.shopName = shopName;
-            m.currency = currency;
+            m.currency = _upper(currency);
             m.businessSector = _sectorOn(prev, merchant);
             if (frozen) {
                 m.isFrozen = true;
@@ -107,6 +107,17 @@ library MerchantImportLib {
             return true;
         }
         return false;
+    }
+
+    /// @dev Lowercase a-z → A-Z, so a record imported from an integrator that
+    ///      predates the uppercase rule ("inr") lands as "INR" and gets INR's
+    ///      cap. Anything else is left as it was.
+    function _upper(bytes32 c) private pure returns (bytes32 out) {
+        bytes memory b = abi.encodePacked(c);
+        for (uint256 i = 0; i < 32; i++) {
+            if (b[i] >= 0x61 && b[i] <= 0x7a) b[i] = bytes1(uint8(b[i]) - 32);
+        }
+        out = bytes32(b);
     }
 
     function _isRegisteredOn(address prev, address merchant) private view returns (bool) {

@@ -31,6 +31,9 @@ async function deployMerchantTerminalLibs(): Promise<Record<string, string>> {
     const c = await F.deploy();
     await c.waitForDeployment();
     out[name] = await c.getAddress();
+    // Every library address is needed for the whitelist request and explorer
+    // verification, not only PaymentLinksLib.
+    console.log(`${name} deployed: ${out[name]}`);
   }
   return out;
 }

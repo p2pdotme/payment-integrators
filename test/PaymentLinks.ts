@@ -309,7 +309,7 @@ describe("MerchantTerminalIntegrator — payment links", function () {
       // merchant create a link that passes creation and then reverts in front
       // of a customer — the exact failure this check exists to prevent.
       await integrator.setPerTxCap(INR, USDC(20)); // registered currency
-      await integrator.setPerTxCap(BRL, USDC(500)); // link currency, generous
+      await integrator.setPerTxCap(BRL, USDC(100)); // link currency, generous (100 = the ceiling)
 
       // 100 USDC is under the BRL cap but way over the INR one.
       await expect(

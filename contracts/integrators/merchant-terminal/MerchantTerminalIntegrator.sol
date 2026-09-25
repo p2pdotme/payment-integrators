@@ -530,6 +530,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      super-admin; see setPreviousIntegrators and MerchantImportLib.
     address[] internal previousIntegrators;
 
+    /// @dev Pending link orders per merchant for the current UTC day, packed
+    ///      (day << 128) | count. See PaymentLinksLib.reservePending.
+    mapping(address => uint256) internal linkPending;
+
+    /// @dev Set on orderPlacementDay for a link order that is still PENDING
+    ///      (placed, not yet marked paid): the low bits hold the day it reserved.
+    ///      Never collides with a real day number, so onOrderCancel's same-day
+    ///      check can't mistake it for a counted sale.
+    uint256 internal constant LINK_PENDING = 1 << 255;
+
     // ─── Reentrancy guard ─────────────────────────────────────────────
     uint256 private _locked = 1;
 
@@ -684,16 +694,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     // Any country is supported as long as the p2p protocol has a circle for that
     // currency code — adding one needs NO contract change.
 
-    /// @notice Pack a currency code string ("INR") into the bytes32 the Diamond
-    ///         uses. Reverts on empty / >31 chars. Pure, so anyone can preview it.
-    function toCurrency(string memory code) public pure returns (bytes32) {
-        return MerchantRegistryLib.toCurrency(code);
-    }
-
-    /// @notice Unpack a bytes32 currency back to its readable code string.
-    function fromCurrency(bytes32 cur) public pure returns (string memory) {
-        return MerchantRegistryLib.fromCurrency(cur);
-    }
+    // (The string ⇄ bytes32 codecs live in MerchantRegistryLib — toCurrency /
+    // fromCurrency — and are called directly; the public wrappers were removed
+    // for size, and nothing outside tests read them.)
 
     // ─── Carry-over from previous integrators ─────────────────────────
 
@@ -745,7 +748,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         string calldata currencyCode,
         bytes32 businessSector
     ) external {
-        _register(encPayoutId, shopName, toCurrency(currencyCode), businessSector);
+        _register(
+            encPayoutId,
+            shopName,
+            MerchantRegistryLib.toCurrency(currencyCode),
+            businessSector
+        );
     }
 
     /// @notice Same as above but takes the packed bytes32 currency directly, for
@@ -896,13 +904,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             if (_sellPlacement) return true;
             subject = proxyOwner;
         }
-        // Link BUYs are CHECKED against the daily limit here but not COUNTED
-        // (audit 2026-09 M-1). A link order is placed the moment a visitor
-        // opens the pay page, and an abandoned one sits PLACED until the
-        // Diamond expires it — so counting at placement let 25 walk-aways lock
-        // the merchant out of their own counter sales for the rest of the day.
-        // The slot is taken in relayerMarkPaid instead, once a customer claims
-        // to have actually paid.
+        // Link BUYs take a PENDING reservation instead of a counted slot: a link
+        // order is placed the moment a visitor opens the pay page, and counting
+        // it then let abandoned taps lock the merchant out of their own counter
+        // sales (audit M-1). The reservation keeps link sales under the daily
+        // limit (paid + pending < dailyLimit) and becomes a counted sale at
+        // mark-paid; POS sales never look at it. See PaymentLinksLib.reservePending.
         bool isLinkOrder = proxyOwner != address(0);
 
         if (!registered[subject]) revert NotRegistered();
@@ -917,8 +924,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (amount > perTxCap(m.currency)) revert ExceedsPerTxCap();
 
         _rollDay(m);
+        if (isLinkOrder) {
+            // Reserve against the day's room; counted at mark-paid.
+            PaymentLinksLib.reservePending(linkPending, subject, m.dailyTxCount, dailyLimit);
+            return true;
+        }
         if (m.dailyTxCount >= dailyLimit) revert DailyLimitReached();
-        if (!isLinkOrder) m.dailyTxCount++;
+        m.dailyTxCount++;
         return true;
     }
 
@@ -930,6 +942,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             m.dailyTxCount = 0;
             m.lastTxDate = today;
         }
+    }
+
+    /// @dev If `placedDay` marks a PENDING link order, release its reservation
+    ///      and return true; otherwise false (a counted sale, or not a link order).
+    function _releasePending(address merchant, uint256 placedDay) internal returns (bool) {
+        if (placedDay & LINK_PENDING == 0) return false;
+        PaymentLinksLib.releasePending(linkPending, merchant, placedDay ^ LINK_PENDING);
+        return true;
     }
 
     function onOrderComplete(
@@ -976,6 +996,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // SAME id is a no-op (merchant==0), exactly like the second cancel of an
         // order already is. Without this, a stray cancel callback after
         // completion would wrongly decrement the merchant's daily-tx count.
+        // A link order that completed WITHOUT our mark-paid (e.g. the Diamond's
+        // dispute path) still holds a pending reservation — release it.
+        _releasePending(subject, orderPlacementDay[orderId]);
         delete orderToMerchant[orderId];
         delete orderPlacementDay[orderId];
 
@@ -1020,7 +1043,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // was never consumed today). If the day already rolled, today's count is
         // effectively 0 for the stale order, so we skip the decrement.
         uint256 placedDay = orderPlacementDay[orderId];
-        if (m.lastTxDate == placedDay && m.dailyTxCount > 0) {
+        if (
+            !_releasePending(merchant, placedDay) && m.lastTxDate == placedDay && m.dailyTxCount > 0
+        ) {
             m.dailyTxCount--;
         }
         delete orderToMerchant[orderId];
@@ -1261,10 +1286,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         orderId = _placeOrder(merchant, true, total, currency, circleId, pubKey);
         orderToLink[orderId] = linkId;
-        // Not counted against the daily limit yet (M-1), so a cancel before
-        // mark-paid must not release a slot: clearing the day makes
-        // onOrderCancel's same-day check fail. relayerMarkPaid sets it.
-        delete orderPlacementDay[orderId];
+        // PENDING until marked paid: it holds a reservation (taken in
+        // validateOrder), not a counted slot.
+        orderPlacementDay[orderId] = LINK_PENDING | (block.timestamp / 86400);
         emit LinkOrderPlaced(linkId, orderId, merchant, total);
     }
 
@@ -1318,6 +1342,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // limit is enforced at placement, so it can only be exceeded by orders
         // already in flight when it was reached.
         MerchantTypes.Merchant storage m = merchants[lk.owner];
+        _releasePending(lk.owner, orderPlacementDay[orderId]);
         orderPlacementDay[orderId] = _rollDay(m);
         m.dailyTxCount++;
 
@@ -1821,6 +1846,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // Mark processed BEFORE the external sweep (CEI) — a revert rolls it back so
         // a legitimate retry still works; success makes a second call a no-op.
         orderCompleted[orderId] = true;
+        _releasePending(merchant, orderPlacementDay[orderId]);
         delete orderToMerchant[orderId];
         delete orderPlacementDay[orderId];
         // The order completed, so a link order's mark-paid claim was TRUE: clear
@@ -1924,19 +1950,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (role == Role.NONE && wasAdmin) emit AdminRemoved(who);
     }
 
-    /// @notice SUPER-ADMIN-ONLY: add an admin. Back-compat shim — grants FINANCE
-    ///         (the full admin tier, matching the previous flat-admin behaviour
-    ///         where a single admin could do everything). Use setRole(who, <tier>)
-    ///         for a narrower role (e.g. Role.SUPPORT for freeze-only, Role.VIEWER
-    ///         for read-only).
-    function addAdmin(address who) external onlySuperAdmin {
-        setRole(who, Role.FINANCE);
-    }
-
-    /// @notice SUPER-ADMIN-ONLY: remove an admin (revoke all roles).
-    function removeAdmin(address who) external onlySuperAdmin {
-        setRole(who, Role.NONE);
-    }
+    // (addAdmin / removeAdmin were back-compat shims over setRole — use
+    // setRole(who, Role.FINANCE) and setRole(who, Role.NONE). Removed for size.)
 
     /// @notice SUPER-ADMIN-ONLY: add another main owner (full access). Only the
     ///         super-admin may grow the owner set — a regular owner cannot add or
@@ -2084,28 +2099,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         return usdc.balanceOf(address(this));
     }
 
-    /// @notice Back-compat shim: transferOwnership here only ADDS `newOwner` to the
-    ///         owner set — it does NOT drop the caller (the caller is the super-admin,
-    ///         who must always remain an owner). Nothing is actually "transferred", so
-    ///         it emits OwnerAdded (via _addOwner), NOT OwnershipTransferred, to avoid
-    ///         misleading indexers into recording a handoff that never happened. With
-    ///         multi-owner, prefer addOwner / removeOwner directly. To move ROOT
-    ///         control, use transferSuperAdmin (the real two-step handoff).
-    function transferOwnership(address newOwner) external onlySuperAdmin {
-        if (newOwner == address(0)) revert InvalidAddress();
-        // A "transfer" to yourself is a no-op by intent; reject it explicitly so
-        // a mistaken call surfaces instead of silently doing nothing.
-        if (newOwner == msg.sender) revert InvalidAddress();
-        // The caller is the super-admin (onlySuperAdmin), who must ALWAYS remain an
-        // owner — dropping it below would leave the super-admin not-an-owner (it
-        // would lose FINANCE-tier owner powers while still gating governance). So
-        // add the new owner but do NOT evict the super-admin caller. Root handoff
-        // is transferSuperAdmin's job, not this shim's.
-        // #6: _addOwner emits OwnerAdded — the accurate event for what happened. We
-        // deliberately do NOT emit OwnershipTransferred: the caller is never dropped,
-        // so no ownership actually transfers, and emitting it would mislead indexers.
-        if (!isOwner[newOwner]) _addOwner(newOwner);
-    }
+    // (transferOwnership was a back-compat shim that only called _addOwner —
+    // use addOwner. Root control moves with transferSuperAdmin. Removed for size.)
 
     // NOTE: there is intentionally NO setVault / flushToVault / migrateState.
     // Custody lives inside this contract, so there is no external vault to point
@@ -2123,6 +2118,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @param cap      Per-tx cap in USDC 6-decimals (e.g. 75 * 1e6). 0 = clear.
     function setPerTxCap(bytes32 currency, uint256 cap) external onlyRole(Role.MANAGER) {
         if (currency == bytes32(0)) revert InvalidCurrency();
+        // Hard ceiling: an override may only LOWER a cap, never lift it above the
+        // 100 USDC default (review #4). Immutable — no admin can raise it.
+        if (cap > PER_TX_CAP_DEFAULT) revert ExceedsPerTxCap();
         perTxCapOverride[currency] = cap;
         emit PerTxCapSet(currency, cap);
     }
@@ -2133,7 +2131,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         limit simply can't place more today.
     /// @param newLimit New max orders per merchant per UTC day.
     function setDailyLimit(uint256 newLimit) external onlyRole(Role.MANAGER) {
-        if (newLimit == 0) revert InvalidQuantity();
+        // 1..DAILY_TX_LIMIT: the limit may only be LOWERED from its 25/day
+        // default, never raised (review #4). Immutable ceiling.
+        if (newLimit == 0 || newLimit > DAILY_TX_LIMIT) revert InvalidQuantity();
         dailyLimit = newLimit;
         emit DailyLimitSet(newLimit);
     }
@@ -2583,7 +2583,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @notice The merchant's offramp currency as a readable code ("INR",
     ///         "BRL", …) — so the UI never has to decode a bytes32.
     function getMerchantCurrency(address merchant) external view returns (string memory) {
-        return fromCurrency(merchants[merchant].currency);
+        return MerchantRegistryLib.fromCurrency(merchants[merchant].currency);
     }
 
     // ─── Proxy helpers (mirror ExampleIntegrator exactly) ─────────────

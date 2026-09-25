@@ -162,6 +162,19 @@ describe("MerchantImport — no re-registration after an upgrade", function () {
     );
   });
 
+  it("an imported lowercase currency is normalised to uppercase (review)", async function () {
+    const [, , , , , , , legacy] = await ethers.getSigners();
+    await oldest.seed(
+      legacy.address,
+      "0x",
+      "Legacy Shop",
+      ethers.encodeBytes32String("inr"),
+      false
+    );
+    await newI.importMerchant(legacy.address);
+    expect((await newI.getMerchantInfo(legacy.address))[2]).to.equal(INR);
+  });
+
   it("import is idempotent and never overwrites a record already here", async function () {
     await newI.importMerchant(shopA.address);
     await newI.connect(shopA).updateProfile("0x", "Renamed Here", SECTOR);

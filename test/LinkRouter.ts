@@ -444,7 +444,13 @@ describe("LinkRouter — payments without a funded relayer key", function () {
       // instruction stream properly: PUSH immediates are data, so a naive byte
       // search reports opcodes that are not there.
       const art = require("../artifacts/contracts/integrators/merchant-terminal/LinkRouter.sol/LinkRouter.json");
-      const code = Buffer.from(art.deployedBytecode.slice(2), "hex");
+      const full = Buffer.from(art.deployedBytecode.slice(2), "hex");
+      // Strip the CBOR metadata trailer before walking opcodes: its length is
+      // the last 2 bytes, and its bytes are data, not code. Read as opcodes they
+      // can look like CREATE2 & co. — and they change with every comment edit,
+      // which is why this failed under coverage (instrumented metadata) only.
+      const metaLen = full.readUInt16BE(full.length - 2);
+      const code = full.subarray(0, full.length - 2 - metaLen);
       const found = new Set<number>();
       for (let i = 0; i < code.length; ) {
         const op = code[i];
