@@ -47,6 +47,8 @@ contract MockDiamond {
         address recipientAddr;
         bool completed;
         bool cancelled;
+        bool paid; // set by paidBuyOrder — a claim, not a settlement
+        bool accepted; // an LP has taken the order; required before PAID
     }
 
     struct SellOrder {
@@ -222,7 +224,9 @@ contract MockDiamond {
             currency: currency,
             recipientAddr: recipientAddr,
             completed: false,
-            cancelled: false
+            cancelled: false,
+            paid: false,
+            accepted: false
         });
 
         emit MockOrderPlaced(orderId, effectiveIntegrator, user, amount);
@@ -344,6 +348,77 @@ contract MockDiamond {
         }
 
         emit MockOrderCompleted(orderId);
+    }
+
+    // ─── Buyer-driven transitions (the REAL order.user gate) ──────────
+    //
+    // These mirror the live Diamond, which authorises `paidBuyOrder` and
+    // `cancelOrder` against `order.user` — NOT against the placer, and NOT
+    // against `recipientAddr`. Verified by eth_call on both the Base mainnet
+    // Diamond (0x4cad6eC90e65baBec9335cAd728DDC610c316368) and the Base Sepolia
+    // Diamond (0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9): from `order.user`
+    // the call clears the ACL and fails only on a status/expiry check, while
+    // every other caller — including the order's own `recipientAddr` — reverts
+    // NotAuthorized() (0xea8e4eb5).
+    //
+    // Their ABSENCE from this mock is why a payment link could be placed and
+    // never paid, with the entire test suite green: nothing here could refuse
+    // the relayer, so nothing here noticed that the real Diamond does.
+
+    error NotAuthorized();
+    error OrderStatusInvalid();
+
+    /// @notice An LP takes the order. Required before it can be marked paid,
+    ///         because there is no one to have sent fiat to until then.
+    function simulateOrderAccepted(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        require(order.integrator != address(0), "Unknown order");
+        require(!order.completed && !order.cancelled, "Terminal");
+        order.accepted = true;
+    }
+
+    event MockOrderPaid(uint256 orderId, address caller);
+    event MockOrderCancelledBy(uint256 orderId, address caller);
+
+    /// @notice Marks a BUY order's fiat leg as sent. PAID is a CLAIM: it moves
+    ///         no USDC. Settlement is `simulateOrderComplete`, which on the real
+    ///         Diamond only the accepting LP can trigger.
+    /// @dev Requires ACCEPTED, matching the live Diamond. A PLACED order has no
+    ///      LP yet, so there is nobody the fiat could have been sent to — the
+    ///      earlier version of this mock allowed PLACED and let tests exercise
+    ///      a transition production would reject.
+    function paidBuyOrder(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        if (order.integrator == address(0)) revert OrderStatusInvalid();
+        if (msg.sender != order.user) revert NotAuthorized();
+        if (order.completed || order.cancelled || order.paid) revert OrderStatusInvalid();
+        if (!order.accepted) revert OrderStatusInvalid();
+
+        order.paid = true;
+        emit MockOrderPaid(orderId, msg.sender);
+    }
+
+    /// @notice Buyer-driven cancellation, under the same `order.user` gate.
+    /// @dev A BUY is user-cancellable in PLACED and ACCEPTED only. Once PAID it
+    ///      is out of the buyer's hands — the live Diamond allows that transition
+    ///      to self/admin, not to `order.user`, and the refund branch belongs to
+    ///      SELL/PAY rather than BUY. Modelling it here let the strike tests
+    ///      exercise a path the relayer cannot take in production; the real
+    ///      sources of a strike are the keeper's TTL cancel and admin/dispute.
+    function cancelOrder(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        if (order.integrator == address(0)) revert OrderStatusInvalid();
+        if (msg.sender != order.user) revert NotAuthorized();
+        if (order.completed || order.cancelled) revert OrderStatusInvalid();
+        if (order.paid) revert OrderStatusInvalid();
+
+        order.cancelled = true;
+        try IP2PIntegrator(order.integrator).onOrderCancel(orderId) {
+            // ok
+        } catch (bytes memory reason) {
+            emit MockIntegratorCallbackFailed(orderId, order.integrator, reason);
+        }
+        emit MockOrderCancelledBy(orderId, msg.sender);
     }
 
     /**

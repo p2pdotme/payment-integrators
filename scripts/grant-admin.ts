@@ -1,9 +1,9 @@
 /**
  * Grant FULL ADMIN (Role.FINANCE) to an address on the deployed integrator.
  *
- * `addAdmin(who)` is SUPER-ADMIN-ONLY and sets Role.FINANCE — the top tier, matching
+ * `setRole(who, Role.FINANCE)` is SUPER-ADMIN-ONLY and sets Role.FINANCE — the top tier, matching
  * the old flat-admin "can do everything" behaviour. This is high-privilege and on-chain.
- * Undo later with `removeAdmin(who)` (also super-admin-only), but any action the grantee
+ * Undo later with `setRole(who, Role.NONE)` (also super-admin-only), but any action the grantee
  * takes before you revoke still stands.
  *
  * Env (addresses are NOT hardcoded — repo convention forbids it):
@@ -57,7 +57,7 @@ async function main() {
   }
   if (signer.address.toLowerCase() !== onChainSuperAdmin.toLowerCase()) {
     throw new Error(
-      `Signer ${signer.address} is NOT the super-admin ${onChainSuperAdmin}. addAdmin would revert. Use the super-admin key.`
+      `Signer ${signer.address} is NOT the super-admin ${onChainSuperAdmin}. setRole would revert. Use the super-admin key.`
     );
   }
 
@@ -69,8 +69,8 @@ async function main() {
     return;
   }
 
-  console.log("\nSending addAdmin(...) — grants Role.FINANCE (full admin tier)...");
-  const tx = await integrator.addAdmin(GRANTEE);
+  console.log("\nSending setRole(grantee, FINANCE) — grants the full admin tier...");
+  const tx = await integrator.setRole(GRANTEE, 4); // Role.FINANCE (addAdmin shim was removed)
   console.log("tx hash:", tx.hash);
   const rcpt = await tx.wait();
   console.log("Mined in block:", rcpt?.blockNumber);

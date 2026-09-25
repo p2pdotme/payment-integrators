@@ -63,6 +63,143 @@ failure mode structurally. See **Upgrades** below.
    `transferERC20ToIntegrator` (it now sits in the integrator's own custody) and
    records a `SettlementBucket {amount, unlockTimestamp = now + lockPeriod(currency)}`.
 
+### BUY via a payment link (customer has no wallet)
+
+`userPlaceOrder` credits `msg.sender`, so only the merchant's own signer can call
+it. That works at the counter, where the merchant's device signs while the
+customer pays fiat beside them — but not for a link the customer opens on their
+own phone, with no wallet, while the merchant is away.
+
+1. Merchant calls `createLink(linkId, amount, currency, expiresAt, maxUses,
+   encryptedConfig)` from their own signer. `owner` is taken from `msg.sender`,
+   so a link can only ever be created for oneself. `linkId` MUST come from
+   `PaymentLinksLib.computeLinkId(merchant, salt)`.
+2. The customer opens the link and taps Pay. Their browser generates a throwaway
+   keypair, and the link's own account-abstraction wallet — bound to that link by
+   `LinkRouter.registerAgent`, holding nothing, its gas paid by a paymaster —
+   calls `LinkRouter.place(...)`, which calls
+   `relayerPlaceOrder(linkId, client, productId, quantity, currency, circleId,
+   pubKey)` on the merchant's behalf. The Router is the `trustedRelayer`; there
+   is no funded relayer key anywhere on this path.
+3. The customer pays fiat to the LP, then taps "I have paid". That needs TWO
+   credentials — the link wallet AND the customer's own browser key, which we
+   never hold — and `LinkRouter.markPaid` verifies the second before calling
+   `relayerMarkPaid(linkId, orderId)` to move the order to PAID.
+4. The LP confirms receipt and completes. From there the order settles
+   **identically to a counter sale**: same `onOrderComplete` sweep, same
+   `SettlementBucket`. Payment links change nothing about custody or unlock
+   timing.
+
+#### Why a link order's `order.user` is the merchant's PROXY
+
+The Diamond authorises `paidBuyOrder` against **`order.user`** — not the placer,
+and not `recipientAddr`. Verified by `eth_call` against both the Base mainnet
+Diamond (`0x4cad…6368`) and the Base Sepolia Diamond (`0xeb0B…beb9`): from
+`order.user` the call clears the ACL and fails only on a status/expiry check,
+while every other caller — including the order's own `recipientAddr` — reverts
+`NotAuthorized()`.
+
+So a link order that recorded the MERCHANT as `order.user` could never be marked
+paid: the merchant is absent by construction, and their key is the only one the
+Diamond would accept. The customer's fiat would be gone and the order would sit
+until TTL and cancel.
+
+`_placeOrder` therefore takes a `userIsProxy` flag:
+
+| path | `order.user` | who advances it |
+| --- | --- | --- |
+| `userPlaceOrder` (POS) | the merchant | the merchant's own device, directly |
+| `relayerPlaceOrder` (link) | the merchant's `UserProxy` | this contract, via `relayerMarkPaid` |
+
+The POS shape is unchanged, so the shipped `@p2pdotme/widgets` flow still signs
+`paidBuyOrder` itself.
+
+Two consequences fall out of that, and both are handled explicitly:
+
+- **`validateOrder`** sees a proxy as `order.user` for BOTH a SELL placement and
+  a link BUY. The old blanket `proxyMerchant[user] != 0 → return true` carve-out
+  would have silently disabled the per-tx cap, the daily count and the
+  frozen-merchant switch on the one flow open to anonymous customers. It is now
+  narrowed to a `transient _sellPlacement` flag set only around our own SELL
+  placement, and a link BUY **resolves** the proxy back to its owner so the
+  merchant's real limits apply.
+- **`onOrderComplete`** receives the proxy as `user`, so it resolves
+  proxy → merchant before touching money. Without this, `proxyAddress(proxy)`
+  is an address that was never deployed and the USDC sweep reverts — after the
+  customer has already paid.
+
+#### Link lifecycle
+
+`maxUses` is how many **successful** payments a link accepts; `0` is unlimited
+and `1` is the old single-use link. A cancelled or abandoned order releases its
+use in `onOrderCancel` (via `orderToLink`), so a customer who taps Pay and walks
+away does not retire the merchant's link.
+
+`revokeLink(linkId)` is callable by the link's owner or an `isOwner[]` admin —
+deliberately **not** by the relayer, which has no authority over link lifecycle.
+Because status, expiry, and use count are all checked inside `relayerPlaceOrder`
+itself, a revocation and the next payment attempt can never diverge.
+
+`setLinkOrdersEnabled(bool)` (MANAGER) is a kill switch scoped to link orders
+only: flipping it off stops `relayerPlaceOrder` and `relayerMarkPaid` while
+leaving the relayer's unrelated keeper duties — and every merchant's fiat
+withdrawal — working.
+
+#### False payment claims (`strikes`)
+
+PAID is a **claim**, not a settlement: no USDC moves, and the LP still settles
+against their own bank. A customer who lies cannot steal — but they can waste
+the LP's escrowed capital and dispute time for free.
+
+`relayerMarkPaid` takes a provisional strike, and `onOrderComplete` releases it
+when the claim proves true. An order marked paid and then CANCELLED therefore
+leaves exactly one permanent strike, with no per-order storage.
+
+Strikes are **advisory on-chain**: the contract records them so the merchant can
+see a link attracting false claims, and never blocks on them. Blocking the link
+would let anyone kill any merchant's link with two taps — a worse griefing
+surface than the one it closes. Throttling the CLAIMANT is the relayer service's
+job, because only it can see an IP. `resetLinkStrikes(linkId)` clears the
+counter (owner or admin).
+
+**Relayer blast radius.** The relayer is never a registered merchant, so
+`withdrawUSDC`, `withdrawFiat`, and `updateProfile` all reject it on
+`msg.sender`. Both relayer entry points require `orderToLink[orderId] == linkId`,
+so it cannot touch an order that did not come from the link it names. The worst
+a fully compromised relayer key can do is place spurious orders that **credit**
+merchants, and claim payment on a genuine link order that was not in fact paid —
+which the LP rejects, because the LP settles against their own bank.
+
+**Two limits on that claim, stated because the short version reads stronger than
+what the contract enforces** (round-4 L8):
+
+- "Our backend cannot settle a payment" holds for orders placed by REAL
+  customers, whose browser key the backend never sees. It does **not** hold for
+  an order the backend places while naming a customer key it generated itself:
+  it can then mark that order paid. No USDC moves — the LP still settles against
+  their own bank statement — but it burns LP escrow and the merchant's daily
+  allowance. The IP strike system that bounds this runs in the same backend, so
+  a full compromise removes the bound along with the guarantee.
+- The guarantee also assumes the **pay page's origin is not compromised
+  alongside the Worker**, since that origin serves the JavaScript that generates
+  the customer key. An attacker holding both can produce customer signatures
+  directly, and the two-credential split stops meaning anything.
+
+Both are acceptable — neither moves money, and the LP's bank check is the
+backstop in both cases — but they are the real boundary, not "the backend can do
+nothing."
+
+#### Contract size
+
+This contract sits against the 24,576-byte EIP-170 ceiling. Payment-link
+lifecycle lives in `PaymentLinksLib`, an external (delegatecall) library, and
+`hardhat.config.ts` carries a **per-file** optimizer override (`runs: 50`) for
+this contract alone. Even so the margin is 61 bytes — 24,515 of 24,576, the
+figure "The contract is at its size ceiling" below gives, and this line
+previously disagreed with it. The next feature here
+needs the withdrawal / fund-helper sections (~44% of the contract) moved into
+their own library, or a facet split.
+
 ### SELL (merchant withdraws fiat)
 
 1. Merchant calls `withdrawFiat(amount, circleId, pubKey, encPayout)` against
@@ -70,6 +207,20 @@ failure mode structurally. See **Upgrades** below.
 2. The integrator funds the **merchant's own proxy** and places `placeB2BSellOrder`
    with the merchant's relay pubkey as `userPubKey`. The payout handle (UPI/PIX) is
    delivered later, encrypted, via `deliverFiatPayout` → `setSellOrderUpi`.
+
+   **Who calls step 2: the MERCHANT, from the merchant app, once the LP accepts.**
+   The integrator permits `merchant || owner || trustedRelayer`, and
+   `trustedRelayer` is the LinkRouter, which has no such function — so there is
+   no keeper service, and the merchant path is the only routine one. The third
+   slot is deliberately left unused: an operational keeper would have to be
+   either the LinkRouter (which cannot) or an owner (which would also hold
+   `pause`, `unpause` and `revokeLink` — far too much authority for a payout
+   service).
+
+   If the merchant does not deliver in time the Diamond cancels the SELL. That
+   is recoverable, not a loss: `reconcileWithdrawal(orderId)` sweeps the refund
+   back into custody and re-credits the merchant, so the outcome is a withdrawal
+   to retry. `withdrawUSDC` is unaffected either way.
 3. If the Diamond cancels the SELL order, `reconcileWithdrawal(orderId)` reads the
    authoritative status from the Diamond, sweeps the refunded USDC back off the proxy
    into custody (capped at the recorded amount), and re-credits the merchant — so no
@@ -77,6 +228,212 @@ failure mode structurally. See **Upgrades** below.
 
 `withdrawUSDC(amount)` sends unlocked USDC straight to the merchant wallet from the
 integrator's own balance.
+
+
+## The contract is at its size ceiling
+
+`MerchantTerminalIntegrator` measures **24,515 of the 24,576 bytes** EIP-170
+allows — 61 bytes of headroom, at `runs: 50` for this file only.
+
+This is a standing constraint on the contract, not a note about one change. Any
+addition to it needs a plan for where the space comes from: relocating the
+withdrawal and fund-helper sections into a library (~44% of the contract), or
+splitting into facets. Both touch audited custody code and belong in their own
+reviewed change.
+
+Everything in the payment-links work is additive — `LinkRouter` is a separate
+contract with its own budget — so none of it consumed that headroom.
+
+## Deployment and whitelisting checklist
+
+Payment links depend on three things that live OUTSIDE this repository. All
+three are silent when missing — nothing reverts, nothing logs, the feature
+simply does not work — so they are listed here rather than discovered later.
+
+### 0. LinkRouter must be deployed and wired (required)
+
+Every link payment goes through `LinkRouter`. Without it the integrator's
+`trustedRelayer` still points at whatever it pointed at before, and no link
+payment can be placed at all.
+
+```
+INTEGRATOR=0x… npx hardhat run scripts/deploy-link-router.ts --network base
+```
+
+That deploys `LinkRouter(integrator)` and calls `setTrustedRelayer(router)`,
+which needs the MANAGER role. Pass `SKIP_WIRE=1` to deploy only, when the
+manager is a different key.
+
+**Rollback.** Prefer `linkOrdersEnabled = false` (MANAGER tier). It stops link
+orders instantly and disturbs nothing else — which is exactly why the contract
+carries it as a separate switch rather than expecting you to clear the relayer
+slot.
+
+`setTrustedRelayer` is the heavier rollback: pointing it back at the previous
+address also stops every link payment, but it retargets the slot itself. Since
+that slot is ALSO the third address `deliverFiatPayout` and `sweepStrandedBuy`
+accept, whatever you point it at gains those two permissions on every merchant's
+withdrawal. Point it at zero, or at an address you would be content to hold
+them; do not point it at a service picked only for the link path.
+
+Then the Worker needs the account-abstraction wiring — see the relayer repo's `README.md`
+for the full list. Two are worth repeating because getting them wrong is
+invisible:
+
+- **`ACCOUNT_FACTORY_KIND`** — `thirdweb` takes `(address, bytes)`,
+  the ERC-4337 reference factory takes `(address, uint256)`. Different
+  argument types mean different SELECTORS, so the wrong value does not fail
+  loudly; it calls a function the factory does not have. This shipped wrong once.
+- **`SPONSOR_VERIFIER_SECRET`** — `/api/sponsor-check` FAILS CLOSED without
+  it. That is deliberate: unauthenticated, an outsider can exhaust a link's
+  sponsorship allowance without ever sending a transaction.
+
+Finally, the provider's sponsorship policy must allowlist **this Router and
+nothing else**, and point its server verifier at `/api/sponsor-check`. Without
+the allowlist a leaked client id sponsors strangers' transactions on your bill.
+
+### 0a. Creating a link is two calls, in this order
+
+A link needs a wallet before it can be paid, and the merchant app must mint one:
+
+```
+POST /api/links/:linkId/wallet   →  { account }        (merchant-signed)
+then batch, IN THIS ORDER:
+  integrator.createLink(linkId, …)
+  router.registerAgent(linkId, account)
+```
+
+`registerAgent` reads `getLink` to check ownership, so `createLink` has to land
+first within the batch. Reversed, the batch reverts. **Omitted entirely, the
+link looks completely correct** — on-chain, owned by the merchant, active,
+correct amount — and can never be paid, with nothing before the first payment
+attempt to say so.
+
+`registerAgent` is write-once. A link whose wallet is lost cannot be re-bound;
+revoke it and issue a new one.
+
+**This assumes merchants hold smart accounts, and they do** — confirmed for
+production during the round-5 review. Both halves depend on it: batching the
+two calls into one atomic operation, and sponsoring the gas so the merchant
+needs no ETH. On a plain EOA neither holds — the batch becomes two separate
+transactions the merchant pays for and can half-complete, which produces
+exactly the silent, unpayable link described above. If that ever changes, this
+flow needs redesigning, not adjusting.
+
+### 1. The cancel callback must be switched on (required)
+
+`onOrderCancel` is only delivered if a p2p super-admin has run
+`setIntegratorCancelCallback(integrator, true)`. It is per-integrator and
+defaults to OFF. Without it, on the real Diamond:
+
+- a link's `uses` is never released, so a `maxUses = 1` link is burned by the
+  first abandoned tap and no later customer can pay it;
+- the merchant's daily slot is never released on cancellation or expiry;
+- `OrderCancelled` never fires, so the relayer's false-claim sweep records
+  nothing and the per-claimant block is dead code.
+
+This integrator meets the callback's requirements: `onOrderCancel` is
+idempotent, `onOrderComplete` does not revert on a re-opened CANCELLED → PAID
+order, and both are well inside the 250k gas ceiling.
+
+### 2. Fraud screening must be wired to the pay page (required for INR)
+
+The merchant app only accepts an order that has an approved screening record,
+keyed by order id, and INR BUY orders are not auto-approved. An unscreened
+order sits at PLACED until it expires. Testnet demo bots do not enforce this,
+so a green testnet run says nothing about it.
+
+The screening call must be EIP-191 signed by "the user", and `order.user` for a
+link order is the merchant's proxy, which cannot sign. The workable path is the
+one `<Checkout>` already supports: the pay page passes the screening prop and
+gives its signer stub a `signMessage` backed by the customer's ephemeral key —
+the same key it already generates for `pubKey` — so the screening subject is
+that ephemeral address. That also satisfies the engine's one-in-flight-per-
+wallet rule, which the relayer as subject would trip immediately.
+
+Also needed: a fraud-engine CORS entry for the pay-page origin, and the shared
+key handover.
+
+### 3. Deploy is two contracts, and the optimizer setting is not standard
+
+`PaymentLinksLib` is an external library and must be deployed and linked before
+the integrator. The whitelist request needs BOTH addresses, and Basescan
+verification of the integrator needs the library address too.
+
+This contract also carries a per-file optimizer override (`runs: 50`) because it
+sits against the size ceiling. That has a consequence worth stating plainly:
+the constructor deploys a `UserProxy`, and an overridden file is compiled
+together with its imports, so the `proxyImpl` this integrator deploys is built
+at `runs: 50` rather than the `runs: 200` used by every other integrator. Since
+whitelisting checks `proxyImpl` against the canonical `UserProxy` bytecode and
+`proxyImpl` is set-once on the Diamond, this needs either an explicit exception
+with a reproducible build recipe, or the size problem solved structurally so
+the override can be dropped.
+
+### 4. Standing counter QRs are supported
+
+A link with `amount = 0` and `maxUses = 0` is a counter QR: the customer scans
+it, types their own amount, and pays. The contract always allowed this shape —
+`PaymentLinksLib.consume` skips the amount match for a variable link and lets
+`validateOrder`'s per-transaction cap bound it — but three worker ceilings,
+each sized for one invoice with one payer, made it unusable in practice. All
+three are now sized for the shared case.
+
+**The lock queues instead of refusing.** `/api/pay` still takes a per-link lock
+and still must: the link's account has its own nonce sequence, read from the
+EntryPoint while the operation is assembled, so two payments built at the same
+instant would collide on it. That is correctness, not only cost. What changed
+is what happens to the loser of the race — `acquireWithWait` waits for a turn
+(`LINK_LOCK_WAIT_MS`, default 6s; a normal hold is the length of one request,
+since the lock is released in a `finally`). A caller who never gets a turn is
+told the **link** is busy, not that their payment is already being processed —
+the old message described a stranger's transaction to whoever tapped second.
+
+**The sponsorship allowance is per day, not per lifetime.** It was a lifetime
+counter on a key whose 30-day expiry was refreshed on every write, so a link in
+active use never reset: at two sponsored operations per payment, a printed QR
+stopped working at roughly its tenth customer, permanently, with nothing
+on-chain to explain it. It is now a per-UTC-day window, defaulting to 60 —
+above the 50 a merchant's own `dailyLimit` of 25 orders could spend. What the
+counter defends against is the place-then-cancel loop (cancelling returns the
+use), and a loop is bounded just as well per day as per lifetime.
+
+**Rate limits key on the source.** `linkPerHour` was 20, which read "popular"
+as "attacked" and shut a busy shop down mid-queue. The tight limit is now
+`ipLinkPerHour` (12) — one address against one link — with `linkPerHour` (240)
+kept only as a ceiling on total noise reaching a single link.
+
+Still true, and worth stating to the merchant: a variable link is bounded by
+the merchant's per-transaction cap (50 USDC for INR, 100 otherwise), and every
+link sale counts against the same `dailyLimit` as a POS sale. Raise that limit
+before pointing a busy counter at it.
+
+the relayer's `test/stress.test.ts` asserts the queue behaviour, and that a refusal
+says the link is busy rather than narrating another customer's payment.
+
+### Also confirm before going live
+
+- `setTrustedRelayer` points at the **LinkRouter, and nothing else**. There is
+  ONE such slot, it means the link path, and it has no second role. Merchants
+  deliver their own fiat payouts — see "SELL (merchant withdraws fiat)".
+  (An earlier version of this line named `setLinkRelayer` "for each relaying
+  key". No such function exists; it described a two-slot contract that was never
+  built. Round-4 review, N1.)
+- `ALLOWED_ORIGINS` set to the real pay-page origins, not the `*` fallback.
+- Worker secrets stored with `--env production`; bindings repeated under
+  `[env.production]` (they are not inherited).
+- **Turnstile is configured**: `wrangler secret put TURNSTILE_SECRET --env
+  production`, and the pay page renders the widget and sends the token (header
+  `cf-turnstile-response`, or `turnstileToken` in the body) on both `/api/pay`
+  and `/api/relay-tx`.
+
+  Order placement is anonymous and the relayer pays for it, so rate limits
+  ration the wrong thing — requests are free to an attacker and each one that
+  lands costs a real transaction and a real slot out of a merchant's daily
+  limit. `REQUIRE_TURNSTILE = "true"` is already set for production, so a
+  missing secret is a loud 503 rather than an open door; `GET /health` reports
+  `turnstile: true` once the gate is live. Confirm that before announcing a
+  link publicly.
 
 ## Limits (enforced in `validateOrder`)
 
@@ -91,8 +448,17 @@ sets the global default and `setLockPeriod(currency, seconds)` overrides per cur
 (both super-admin-only, both bounded). Lock changes apply to **new** credits only;
 existing buckets keep their original unlock timestamp.
 
+Link payments consume the **same** allowance as counter sales — one shared
+per-tx cap and one shared daily count per merchant, because both paths reach
+`validateOrder` through the same `_placeOrder` helper. A link order arrives at
+`validateOrder` with the merchant's proxy as `user`, and is resolved back to the
+merchant there, so the limits that apply are the merchant's own.
+
 The merchant's own proxy is carved out of `validateOrder` so SELL/withdrawal
-placements do not hit buy-side limits. The daily counter resets when the UTC day
+placements do not hit buy-side limits — but only while `_sellPlacement` is set,
+i.e. for the duration of a withdrawal this contract is itself placing. A link
+BUY also arrives with a proxy as `order.user` and is deliberately NOT carved
+out. The daily counter resets when the UTC day
 (`block.timestamp / 86400`) changes; `onOrderCancel` releases a consumed slot for the
 current day only.
 
@@ -157,8 +523,17 @@ dormant-leftover recovery via escheat).
 - `validateOrder` / `onOrderComplete` / `onOrderCancel` are `onlyDiamond`.
 - Settlement buckets are compacted (spent buckets dropped) and bounded by
   `MAX_BUCKETS = 256` to keep withdrawal gas bounded.
-- `nonReentrant` + CEI on `userPlaceOrder`, every withdrawal, and all
-  reconcile/recovery paths.
+- `nonReentrant` + CEI on `userPlaceOrder`, `relayerPlaceOrder`, every
+  withdrawal, and all reconcile/recovery paths. `relayerPlaceOrder` increments
+  the link's use counter **before** the external call, so a single-use link is
+  consumed at commit time independently of the reentrancy guard.
+- Payment links pin what the merchant committed to: a fixed amount must match
+  exactly (`LinkAmountMismatch`), and the currency is fixed at creation
+  (`InvalidCurrency`), so even a compromised relayer cannot re-price a link into
+  another currency's cap or lock-period regime. `createLink` also rejects an
+  amount above the merchant's per-tx cap — keyed off their **registered**
+  currency, matching what `validateOrder` enforces at pay time — so a link
+  cannot be created that would only fail once a customer tries to pay it.
 - The offramp fee is charged to the withdrawing merchant (debited from their own
   buckets), never sourced from the commingled pool.
 - The merchant payout handle is **client-side encrypted** to the merchant's relay

@@ -1,4 +1,44 @@
 import { ethers, network } from "hardhat";
+import { applyRoles, logsProviderFor, planRoles } from "./lib/copyRoles";
+import { checkMultisig, MAINNET_CHAIN_IDS } from "./lib/superAdmin";
+
+/** Deploys PaymentLinksLib and returns its address, for linking. */
+async function deployPaymentLinksLib(): Promise<string> {
+  const Lib = await ethers.getContractFactory("PaymentLinksLib");
+  const lib = await Lib.deploy();
+  await lib.waitForDeployment();
+  const address = await lib.getAddress();
+  // Printed because two separate steps need it and neither can proceed
+  // without it: Basescan verification of the integrator, and the whitelist
+  // request, which has to list both deployed addresses.
+  console.log(`PaymentLinksLib deployed: ${address}`);
+  return address;
+}
+
+/**
+ * Deploys every library MerchantTerminalIntegrator links against, and returns
+ * the map getContractFactory wants.
+ *
+ * There are three now, not one. The integrator reached the EIP-170 ceiling, so
+ * the registration codecs (MerchantRegistryLib) and the settlement-bucket fund
+ * helpers (SettlementLib) moved out alongside the payment-link lifecycle. A
+ * deploy that links only PaymentLinksLib fails with "missing links".
+ */
+async function deployMerchantTerminalLibs(): Promise<Record<string, string>> {
+  const out: Record<string, string> = {
+    PaymentLinksLib: await deployPaymentLinksLib(),
+  };
+  for (const name of ["MerchantRegistryLib", "SettlementLib", "MerchantImportLib"]) {
+    const F = await ethers.getContractFactory(name);
+    const c = await F.deploy();
+    await c.waitForDeployment();
+    out[name] = await c.getAddress();
+    // Every library address is needed for the whitelist request and explorer
+    // verification, not only PaymentLinksLib.
+    console.log(`${name} deployed: ${out[name]}`);
+  }
+  return out;
+}
 
 /**
  * Deploy MerchantTerminalIntegrator + the SimpleERC721Client price source.
@@ -52,6 +92,30 @@ async function main() {
   }
 
   const [deployer] = await ethers.getSigners();
+  const { chainId } = await ethers.provider.getNetwork();
+
+  // The super-admin is root of trust (it sets trustedRelayer). It starts as the
+  // deployer only so this script and deploy-link-router.ts can finish setup;
+  // deploy-link-router.ts then proposes the handoff to SUPER_ADMIN_MULTISIG.
+  // On mainnet, check the multisig NOW — before spending gas on a deploy that
+  // would otherwise be left with a single-key root.
+  const MULTISIG = process.env.SUPER_ADMIN_MULTISIG || "";
+  if (MULTISIG || MAINNET_CHAIN_IDS.has(chainId)) {
+    if (!MULTISIG) {
+      throw new Error(
+        "Mainnet deploy refused: set SUPER_ADMIN_MULTISIG. The super-admin sets trustedRelayer " +
+          "(root of trust) and must be a multisig, not the deployer key."
+      );
+    }
+    const ms = await checkMultisig(ethers.provider, MULTISIG, {
+      chainId,
+      allowSingleSigner: !!process.env.ALLOW_SINGLE_SIGNER,
+      deployer: deployer.address,
+    });
+    console.log(
+      `Super-admin will be handed to multisig ${ms.address} (${ms.threshold}-of-${ms.owners.length})`
+    );
+  }
   console.log("Deployer (first owner + super-admin):", await deployer.getAddress());
   console.log("Diamond:", DIAMOND_ADDRESS);
   console.log("USDC:", USDC_ADDRESS);
@@ -61,7 +125,9 @@ async function main() {
   // 1. Integrator (internal custody). Deployer + any extra owners each get full
   //    access; the deployer is also the super-admin (hand off to a multisig later).
   console.log("Deploying MerchantTerminalIntegrator (internal custody)...");
-  const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
+  const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator", {
+    libraries: await deployMerchantTerminalLibs(),
+  });
   const integrator = await Integrator.deploy(DIAMOND_ADDRESS, USDC_ADDRESS, EXTRA_OWNERS);
   await integrator.deploymentTransaction()?.wait(3);
   const address = await integrator.getAddress();
@@ -84,6 +150,43 @@ async function main() {
     throw new Error(
       `integrator.diamond() (${boundDiamond}) != DIAMOND_ADDRESS (${DIAMOND_ADDRESS}) — wrong Diamond bound. ABORT.`
     );
+  }
+
+  // 1b. Previous integrators (newest first), so their merchants are carried over
+  //     instead of registering again — and arrive frozen if frozen there. This
+  //     can be set ONLY ONCE, so it happens here, at deployment, from
+  //     PREVIOUS_INTEGRATORS (comma-separated). Leave it empty for a first-ever
+  //     deployment with no predecessors.
+  const PREVIOUS = (process.env.PREVIOUS_INTEGRATORS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (PREVIOUS.length) {
+    for (const p of PREVIOUS) {
+      if (!ethers.isAddress(p)) throw new Error(`PREVIOUS_INTEGRATORS: not an address: ${p}`);
+      if ((await ethers.provider.getCode(p)) === "0x")
+        throw new Error(`PREVIOUS_INTEGRATORS: no contract at ${p}`);
+    }
+    console.log(`Setting previous integrators (newest first): ${PREVIOUS.join(", ")}`);
+    await (await (integrator as any).setPreviousIntegrators(PREVIOUS)).wait(2);
+
+    // 1c. Carry over every admin role and owner from the previous integrators, so
+    //     nobody has to be re-granted by hand. Current state only: an admin who
+    //     was revoked there is not copied. Needs the super-admin, so it runs now,
+    //     before the multisig handoff.
+    console.log("Copying admin roles and owners from previous integrators…");
+    const plan = await planRoles(
+      ethers.provider,
+      PREVIOUS,
+      deployer.address,
+      Number(process.env.LOG_CHUNK || 1000),
+      console.log,
+      logsProviderFor(chainId, ethers.provider)
+    );
+    await applyRoles(integrator as any, plan, console.log);
+    console.log(`  ${plan.length} address(es) carried over.`);
+  } else {
+    console.log("No PREVIOUS_INTEGRATORS — merchants must register on this integrator.");
   }
 
   // 2. Price source.
@@ -117,10 +220,15 @@ async function main() {
   console.log(`Super-admin:           ${await integrator.superAdmin()}`);
   console.log(`Owners (count):        ${(await integrator.ownerCount()).toString()}`);
   console.log(
-    `PER_TX_CAP:            ${ethers.formatUnits(await integrator.PER_TX_CAP(), 6)} USDC`
+    `PER_TX_CAP:            ${ethers.formatUnits(await integrator.perTxCap(ethers.encodeBytes32String("INR")), 6)} USDC`
   );
-  console.log(`DAILY_TX_LIMIT:        ${(await integrator.DAILY_TX_LIMIT()).toString()} per day`);
-  const settlement = await integrator.SETTLEMENT_PERIOD();
+  console.log(`DAILY_TX_LIMIT:        ${(await integrator.dailyLimit()).toString()} per day`);
+  const [minD, maxD, minC, maxC] = await integrator.limitBounds();
+  console.log(
+    `LIMIT RANGE:           ${minD}-${maxD} orders/day, ${ethers.formatUnits(minC, 6)}-${ethers.formatUnits(maxC, 6)} USDC/sale` +
+      ` (FINANCE/owners change it with setLimitBounds; MANAGER moves limits inside it)`
+  );
+  const settlement = await integrator.settlementPeriod();
   console.log(
     `SETTLEMENT_PERIOD:     ${settlement.toString()} seconds (${(Number(settlement) / 60).toString()} min)`
   );
@@ -158,8 +266,14 @@ async function main() {
   console.log("     shows a 'Previous terminal balance' card and merchants can drain funds");
   console.log("     still held on the old contract (incl. balances that unlock AFTER the");
   console.log("     switch). Clear it once the old contract is fully drained/retired.");
-  console.log("  4. (H-3) hand the super-admin to a multisig via");
-  console.log("     integrator.transferSuperAdmin(multisig) → multisig.acceptSuperAdmin().");
+  console.log("  4. Deploy the LinkRouter from THIS deployer key (it sets trustedRelayer, a");
+  console.log("     super-admin power), passing the multisig so it proposes the handoff:");
+  console.log(
+    `       INTEGRATOR=${address} SUPER_ADMIN_MULTISIG=${MULTISIG || "0x<safe>"} npx hardhat run scripts/deploy-link-router.ts --network ${network.name}`
+  );
+  console.log(
+    "     then submit the printed Safe batch (acceptSuperAdmin + removeOwner(deployer))."
+  );
   console.log("  5. UPGRADE (later): deploy a fresh integrator for NEW orders; leave THIS one");
   console.log("     live so merchants drain their balances from it. No fund migration exists");
   console.log("     or is needed — dormant leftovers are recovered via adminEscheat.");
