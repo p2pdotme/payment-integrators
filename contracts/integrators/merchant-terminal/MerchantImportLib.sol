@@ -92,11 +92,20 @@ library MerchantImportLib {
                 bool frozen
             ) = abi.decode(ret, (address, bytes, string, bytes32, uint256, bool));
 
+            // PR #108 review: carried-over currencies are re-checked against the
+            // uppercase A-Z rule. "inr" is fixed by uppercasing; a code that is
+            // still invalid ("US$") is NOT carried over — currency can't be
+            // edited later, so the merchant registers fresh with a valid one.
+            // Except when frozen: that record is imported as-is so a freeze can
+            // never be escaped by re-registering.
+            currency = _upper(currency);
+            if (!frozen && !_isCurrencyCode(currency)) continue;
+
             MerchantTypes.Merchant storage m = merchants[merchant];
             m.merchantAddr = merchant;
             m.encPayoutId = encPayoutId;
             m.shopName = shopName;
-            m.currency = _upper(currency);
+            m.currency = currency;
             m.businessSector = _sectorOn(prev, merchant);
             if (frozen) {
                 m.isFrozen = true;
@@ -118,6 +127,19 @@ library MerchantImportLib {
             if (b[i] >= 0x61 && b[i] <= 0x7a) b[i] = bytes1(uint8(b[i]) - 32);
         }
         out = bytes32(b);
+    }
+
+    /// @dev Non-empty, left-aligned uppercase A-Z, zero-padded — the rule
+    ///      registration applies (same as PaymentLinksLib._isCurrencyCode).
+    function _isCurrencyCode(bytes32 c) private pure returns (bool) {
+        if (c == bytes32(0)) return false;
+        bool seenNul = false;
+        for (uint256 i = 0; i < 32; i++) {
+            bytes1 x = c[i];
+            if (x == 0) seenNul = true;
+            else if (seenNul || x < 0x41 || x > 0x5A) return false;
+        }
+        return true;
     }
 
     function _isRegisteredOn(address prev, address merchant) private view returns (bool) {

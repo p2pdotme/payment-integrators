@@ -442,14 +442,12 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     await expect(
       integrator.connect(diamond).validateOrder(merchant1.address, UNIT_PRICE, INR)
     ).to.be.revertedWithCustomError(integrator, "DailyLimitReached"); // 3rd blocked at limit 2
-    // admin raises back to the ceiling (25)…
+    // admin raises it — to any number, there is no hard ceiling (owner decision)…
     await integrator.connect(owner).setDailyLimit(25);
     expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(25n);
-    // …but never above it: DAILY_TX_LIMIT is a hard ceiling (review #4).
-    await expect(integrator.connect(owner).setDailyLimit(26)).to.be.revertedWithCustomError(
-      integrator,
-      "InvalidQuantity"
-    );
+    await integrator.connect(owner).setDailyLimit(1000);
+    expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(1000n);
+    await integrator.connect(diamond).validateOrder(merchant1.address, UNIT_PRICE, INR); // 3rd now fine
     // guards: zero rejected, non-admin rejected
     await expect(integrator.connect(owner).setDailyLimit(0)).to.be.revertedWithCustomError(
       integrator,

@@ -12,6 +12,7 @@ const config: HardhatUserConfig = {
     //   npx hardhat node --port 8546 --fork <BASE_SEPOLIA_RPC>
     fork: {
       url: "http://127.0.0.1:8546",
+      timeout: 600_000, // a cold fork fetches remote state on first touch
     },
     baseSepolia: {
       url: process.env.BASE_SEPOLIA_RPC || "https://sepolia.base.org",

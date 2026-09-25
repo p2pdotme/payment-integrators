@@ -321,22 +321,30 @@ describe("Audit 2026-09 regressions — merchant terminal", function () {
   });
 
   // ─── PR #108 review, blocker #4 — hard ceilings on the limit setters ─
-  it("review #4: per-tx cap and daily limit can only be LOWERED, never raised", async function () {
+  // Owner decision on review #4: NO hard ceiling. A MANAGER (or above) sets any
+  // value; only zero is refused for the daily limit (it would block all sales).
+  it("limits: a MANAGER can raise or lower the per-tx cap and daily limit to any value", async function () {
     await integrator.connect(owner).setRole(manager.address, 3); // MANAGER
-    await expect(
-      integrator.connect(manager).setPerTxCap(INR, USDC(100) + 1n)
-    ).to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap");
-    await expect(
-      integrator.connect(owner).setPerTxCap(ethers.encodeBytes32String("BRL"), USDC(1000))
-    ).to.be.revertedWithCustomError(integrator, "ExceedsPerTxCap"); // not even an owner
-    await expect(integrator.connect(manager).setDailyLimit(26)).to.be.revertedWithCustomError(
+    await integrator.connect(manager).setPerTxCap(INR, USDC(5000));
+    expect(await integrator.perTxCap(INR)).to.equal(USDC(5000));
+    await integrator.connect(manager).setDailyLimit(1000);
+    expect(await integrator.dailyLimit()).to.equal(1000n);
+    await expect(integrator.connect(manager).setDailyLimit(0)).to.be.revertedWithCustomError(
       integrator,
       "InvalidQuantity"
     );
-    // Lowering works, and the ceiling values themselves are accepted.
-    await integrator.connect(manager).setPerTxCap(INR, USDC(20));
-    await integrator.connect(manager).setPerTxCap(INR, USDC(100));
-    await integrator.connect(manager).setDailyLimit(10);
-    await integrator.connect(manager).setDailyLimit(25);
+    // Lower tiers still can't.
+    await integrator.connect(owner).setRole(other.address, 2); // SUPPORT
+    await expect(integrator.connect(other).setDailyLimit(5)).to.be.revertedWithCustomError(
+      integrator,
+      "NotAuthorized"
+    );
+  });
+
+  it("link sales follow whatever dailyLimit the admin sets (review #3 bound moves with it)", async function () {
+    await integrator.connect(owner).setDailyLimit(40);
+    await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+    for (let i = 0; i < 40; i++) await placeLinkOrder(1);
+    await expect(placeLinkOrder(1)).to.be.reverted; // 41st refused at the NEW limit
   });
 });

@@ -2118,9 +2118,6 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @param cap      Per-tx cap in USDC 6-decimals (e.g. 75 * 1e6). 0 = clear.
     function setPerTxCap(bytes32 currency, uint256 cap) external onlyRole(Role.MANAGER) {
         if (currency == bytes32(0)) revert InvalidCurrency();
-        // Hard ceiling: an override may only LOWER a cap, never lift it above the
-        // 100 USDC default (review #4). Immutable — no admin can raise it.
-        if (cap > PER_TX_CAP_DEFAULT) revert ExceedsPerTxCap();
         perTxCapOverride[currency] = cap;
         emit PerTxCapSet(currency, cap);
     }
@@ -2131,9 +2128,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         limit simply can't place more today.
     /// @param newLimit New max orders per merchant per UTC day.
     function setDailyLimit(uint256 newLimit) external onlyRole(Role.MANAGER) {
-        // 1..DAILY_TX_LIMIT: the limit may only be LOWERED from its 25/day
-        // default, never raised (review #4). Immutable ceiling.
-        if (newLimit == 0 || newLimit > DAILY_TX_LIMIT) revert InvalidQuantity();
+        // Any value above zero: the business sets the limit, raising or lowering
+        // it from the dashboard with no redeploy (owner decision on PR #108
+        // review #4 — no hard ceiling).
+        if (newLimit == 0) revert InvalidQuantity();
         dailyLimit = newLimit;
         emit DailyLimitSet(newLimit);
     }

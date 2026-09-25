@@ -175,6 +175,31 @@ describe("MerchantImport — no re-registration after an upgrade", function () {
     expect((await newI.getMerchantInfo(legacy.address))[2]).to.equal(INR);
   });
 
+  it("an imported currency still invalid after uppercasing is not carried over; the merchant registers fresh (review)", async function () {
+    const signers = await ethers.getSigners();
+    const bad = signers[8];
+    await oldest.seed(bad.address, "0x", "Dollar Shop", ethers.encodeBytes32String("US$"), false);
+    expect(await newI.importMerchant.staticCall(bad.address)).to.equal(false);
+    expect(await newI.registered(bad.address)).to.equal(false);
+    // Not blocked as "already registered" — they register with a valid code.
+    await newI.connect(bad).registerMerchant("0x", "Dollar Shop", "USD", SECTOR);
+    expect((await newI.getMerchantInfo(bad.address))[2]).to.equal(
+      ethers.encodeBytes32String("USD")
+    );
+  });
+
+  it("…but a FROZEN merchant with an invalid code is still imported frozen, so the freeze can't be escaped", async function () {
+    const signers = await ethers.getSigners();
+    const badFrozen = signers[9];
+    await oldest.seed(badFrozen.address, "0x", "Frozen $", ethers.encodeBytes32String("us$"), true);
+    await newI.importMerchant(badFrozen.address);
+    const info = await newI.getMerchantInfo(badFrozen.address);
+    expect(info[4]).to.equal(true); // frozen
+    await expect(
+      newI.connect(badFrozen).registerMerchant("0x", "Again", "USD", SECTOR)
+    ).to.be.revertedWithCustomError(newI, "AlreadyRegistered");
+  });
+
   it("import is idempotent and never overwrites a record already here", async function () {
     await newI.importMerchant(shopA.address);
     await newI.connect(shopA).updateProfile("0x", "Renamed Here", SECTOR);

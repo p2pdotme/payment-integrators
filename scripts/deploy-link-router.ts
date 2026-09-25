@@ -1,4 +1,5 @@
 import { ethers } from "hardhat";
+import { checkMultisig, MAINNET_CHAIN_IDS, printSafeBatch, proposeHandoff } from "./lib/superAdmin";
 
 /**
  * Deploys LinkRouter and points the integrator at it.
@@ -20,6 +21,11 @@ import { ethers } from "hardhat";
  *
  * Usage:
  *   INTEGRATOR=0x… npx hardhat run scripts/deploy-link-router.ts --network base
+ *
+ * SUPER_ADMIN_MULTISIG=0x… (required on mainnet): after wiring, propose handing
+ * the super-admin to this multisig and print the Safe batch that completes it.
+ * setTrustedRelayer is a super-admin power, so this is the last step the
+ * deployer key does; after the multisig accepts, the deployer holds nothing.
  *
  * Set SKIP_WIRE=1 to deploy only — useful when the deployer is not the manager
  * and step 2 has to be done from a different key.
@@ -57,6 +63,19 @@ async function main() {
   console.log(`network    : ${net.name} (${net.chainId})`);
   console.log(`deployer   : ${deployer.address}`);
   console.log(`integrator : ${integrator}`);
+
+  const MULTISIG = process.env.SUPER_ADMIN_MULTISIG || "";
+  if (!MULTISIG && MAINNET_CHAIN_IDS.has(net.chainId)) {
+    throw new Error("Mainnet: set SUPER_ADMIN_MULTISIG — the super-admin must end up a multisig.");
+  }
+  // Check before deploying anything, so a bad address fails for free.
+  const ms = MULTISIG
+    ? await checkMultisig(ethers.provider, MULTISIG, {
+        chainId: net.chainId,
+        allowSingleSigner: !!process.env.ALLOW_SINGLE_SIGNER,
+        deployer: deployer.address,
+      })
+    : null;
 
   // Refuse to deploy against something that is not the integrator. A Router
   // bound to the wrong address is immutable and therefore unrecoverable —
@@ -104,6 +123,14 @@ async function main() {
       "setTrustedRelayer did not take"
     );
     console.log(`trustedRelayer is now ${now}`);
+  }
+
+  if (ms) {
+    console.log("");
+    await proposeHandoff(probe as any, ms.address);
+    printSafeBatch(integrator, deployer.address, ms.address);
+  } else {
+    console.log("\nNo SUPER_ADMIN_MULTISIG: the deployer key is still super-admin (testnet only).");
   }
 
   console.log(
