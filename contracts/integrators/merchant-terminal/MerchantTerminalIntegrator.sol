@@ -119,6 +119,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error OfframpInsufficientPool();
     error WithdrawalNotFound();
     error InvalidCurrency();
+    /// @dev A limit outside the allowed [min, max] range, or a range with
+    ///      min > max / min = 0.
+    error LimitOutOfBounds();
     error WithdrawalInFlight();
     error FiatAlreadyDelivered();
     /// @dev deliverFiatPayout called on an order the Diamond no longer holds in
@@ -235,6 +238,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     event ExcessSkimmed(address indexed to, uint256 amount);
     event PerTxCapSet(bytes32 indexed currency, uint256 cap);
     event DailyLimitSet(uint256 newLimit);
+    /// @notice FINANCE/owners changed the range the limits must stay within.
+    event LimitBoundsSet(uint256 minDaily, uint256 maxDaily, uint256 minCap, uint256 maxCap);
     /// @notice The GLOBAL settlement lock (default for currencies with no override)
     ///         was changed. `newPeriod` is in seconds.
     event SettlementPeriodSet(uint256 newPeriod);
@@ -308,9 +313,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev Per-transaction cap depends on the sale currency: India (INR) is
     ///      capped lower than other markets. `perTxCap(currency)` resolves it.
     ///      PER_TX_CAP is kept as the INR cap for source/ABI compatibility.
-    uint256 internal constant PER_TX_CAP = 50 * 1e6; // INR: 50 USDC
-    uint256 public constant PER_TX_CAP_INR = 50 * 1e6; // India: 50 USDC
-    uint256 public constant PER_TX_CAP_DEFAULT = 100 * 1e6; // other markets: 100 USDC
+    uint256 internal constant PER_TX_CAP = MerchantRegistryLib.PER_TX_CAP_INR; // INR: 50 USDC
+    uint256 internal constant PER_TX_CAP_INR = MerchantRegistryLib.PER_TX_CAP_INR; // India: 50 USDC
+    uint256 internal constant PER_TX_CAP_DEFAULT = MerchantRegistryLib.PER_TX_CAP_DEFAULT; // other markets: 100 USDC
     /// @dev Default daily order limit. The LIVE limit is the mutable `dailyLimit`
     ///      below (admin-settable via setDailyLimit), initialised to this. The
     ///      constant is kept for source/ABI reference.
@@ -474,7 +479,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         no override (fall back to the INR/default rule). This lets a NEW
     ///         country get any cap on-chain from the admin dashboard WITHOUT a
     ///         contract change or redeploy — adding a country never touches code.
-    mapping(bytes32 => uint256) public perTxCapOverride;
+    mapping(bytes32 => uint256) internal perTxCapOverride;
 
     /// @notice Live GLOBAL settlement lock (super-admin-settable via
     ///         setSettlementPeriod — no redeploy). Initialised to SETTLEMENT_PERIOD
@@ -487,11 +492,20 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         duration (e.g. INR 10 min, BRL 30 min) entirely from the dashboard —
     ///         onboarding or re-tuning a country never needs a contract change.
     ///         Resolved per merchant via `lockPeriod(currency)`.
-    mapping(bytes32 => uint256) public lockPeriodOverride;
+    mapping(bytes32 => uint256) internal lockPeriodOverride;
 
     /// @notice Live daily order limit per merchant (admin-settable via
     ///         setDailyLimit — no redeploy). Initialised to DAILY_TX_LIMIT (25).
     uint256 public dailyLimit;
+
+    /// @notice The range the limits must stay within (PR #108 review #4):
+    ///         (minDaily, maxDaily, minCap, maxCap), caps in USDC 6-decimals for
+    ///         every currency. FINANCE admins, owners and the super-admin set the
+    ///         range with setLimitBounds; MANAGER admins (and above) set the
+    ///         limits inside it with setDailyLimit / setPerTxCap. Both change from
+    ///         the dashboard with no redeploy. Two tiers so the max is a real
+    ///         ceiling for MANAGERs: they can move a limit, not its max.
+    MerchantTypes.LimitBounds public limitBounds;
 
     /// @notice The link relayer (the LinkRouter): the only caller of
     ///         relayerPlaceOrder / relayerMarkPaid / relayerCancelOrder.
@@ -674,6 +688,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             if (_owners[i] != address(0) && !isOwner[_owners[i]]) _addOwner(_owners[i]);
         }
         dailyLimit = DAILY_TX_LIMIT; // live limit starts at the default (25)
+        // Starting range: 1-25 orders a day, 1-100 USDC a sale (the old fixed
+        // values as the max). FINANCE/owners widen or narrow it any time.
+        limitBounds = MerchantTypes.LimitBounds(
+            1,
+            uint64(DAILY_TX_LIMIT),
+            1e6,
+            uint64(PER_TX_CAP_DEFAULT)
+        );
         settlementPeriod = SETTLEMENT_PERIOD; // live lock starts at the default (10 min)
         // Deploy the canonical UserProxy implementation. Every per-user clone
         // is a `cloneDeterministicWithImmutableArgs` of this address, with
@@ -856,10 +878,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         NEW country works with no contract change: it gets 100 USDC by
     ///         default, or any owner-set amount via setPerTxCap — never a redeploy.
     ///         View (reads the override mapping), so the UI can preview it.
+    ///         Always inside the super-admin's [minCap, maxCap]: narrowing the
+    ///         range takes effect at once for defaults and existing overrides.
     function perTxCap(bytes32 currency) public view returns (uint256) {
-        uint256 ov = perTxCapOverride[currency];
-        if (ov != 0) return ov;
-        return currency == bytes32("INR") ? PER_TX_CAP_INR : PER_TX_CAP_DEFAULT;
+        return MerchantRegistryLib.perTxCap(perTxCapOverride, limitBounds, currency);
     }
 
     /// @notice Settlement lock (seconds) for a given currency. A per-currency
@@ -2116,24 +2138,52 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         clear the override and fall back to the INR/default rule.
     /// @param currency The sale currency (bytes32, e.g. bytes32("MXN")).
     /// @param cap      Per-tx cap in USDC 6-decimals (e.g. 75 * 1e6). 0 = clear.
+    ///                 Otherwise must be within limitBounds [minCap, maxCap].
     function setPerTxCap(bytes32 currency, uint256 cap) external onlyRole(Role.MANAGER) {
-        if (currency == bytes32(0)) revert InvalidCurrency();
-        perTxCapOverride[currency] = cap;
-        emit PerTxCapSet(currency, cap);
+        MerchantRegistryLib.setPerTxCap(perTxCapOverride, limitBounds, currency, cap);
     }
 
     /// @notice Set the live daily order limit per merchant (admin-settable — no
-    ///         redeploy). Must be non-zero (0 would block all orders). Applies
-    ///         from the next order; a merchant already at/over the new lower
-    ///         limit simply can't place more today.
+    ///         redeploy). Must be within limitBounds [minDaily, maxDaily]; minDaily
+    ///         is at least 1, so 0 (which would block all orders) never passes.
+    ///         Applies from the next order; a merchant already at/over the new
+    ///         lower limit simply can't place more today.
     /// @param newLimit New max orders per merchant per UTC day.
     function setDailyLimit(uint256 newLimit) external onlyRole(Role.MANAGER) {
-        // Any value above zero: the business sets the limit, raising or lowering
-        // it from the dashboard with no redeploy (owner decision on PR #108
-        // review #4 — no hard ceiling).
-        if (newLimit == 0) revert InvalidQuantity();
+        MerchantRegistryLib.checkDailyLimit(limitBounds, newLimit);
         dailyLimit = newLimit;
         emit DailyLimitSet(newLimit);
+    }
+
+    /// @notice FINANCE admins, owners and the super-admin: set the range the
+    ///         limits must stay within (review #4). MANAGER admins then move the
+    ///         limits inside it, so a MANAGER can never lift a limit past the max
+    ///         the higher tier chose.
+    ///         The live daily limit is pulled into the new range at once; per-tx
+    ///         caps are clamped on read (see perTxCap), so narrowing the range
+    ///         takes effect immediately everywhere.
+    /// @param minDaily Lowest allowed daily order limit (at least 1).
+    /// @param maxDaily Highest allowed daily order limit.
+    /// @param minCap   Lowest allowed per-tx cap, USDC 6-decimals (at least 1 unit).
+    /// @param maxCap   Highest allowed per-tx cap, USDC 6-decimals.
+    function setLimitBounds(
+        uint256 minDaily,
+        uint256 maxDaily,
+        uint256 minCap,
+        uint256 maxCap
+    ) external onlyRole(Role.FINANCE) {
+        uint256 d = MerchantRegistryLib.setBounds(
+            limitBounds,
+            minDaily,
+            maxDaily,
+            minCap,
+            maxCap,
+            dailyLimit
+        );
+        if (d != dailyLimit) {
+            dailyLimit = d;
+            emit DailyLimitSet(d);
+        }
     }
 
     /// @notice SUPER-ADMIN-ONLY: set the GLOBAL settlement lock (the default hold

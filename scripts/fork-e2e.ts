@@ -4,6 +4,11 @@
  *   npx hardhat node --port 8546 --fork <BASE_SEPOLIA_RPC>
  *   npx hardhat run scripts/fork-e2e.ts --network fork
  *
+ * Against the contracts ALREADY deployed on Base Sepolia (the exact bytecode
+ * in the whitelist request), instead of a fresh copy:
+ *   FORK_INTEGRATOR=0x… FORK_ROUTER=0x… FORK_CLIENT=0x… FORK_PAYMENT_LINKS_LIB=0x… \
+ *     npx hardhat run scripts/fork-e2e.ts --network fork
+ *
  * Nothing here touches the live network. On a local fork it:
  *   - deploys the integrator + LinkRouter exactly as the deploy scripts do;
  *   - copies admin roles/owners from the REAL previous integrators;
@@ -83,7 +88,13 @@ const tx = async (p: Promise<any>) => (await p).wait();
 async function main() {
   if (network.name !== "fork") throw new Error("fork only — never run against a live network");
   await network.provider.send("evm_mine", []); // the fork needs one local block before calls
-  const [deployer, agent, customer, s1, s2, s3, stranger] = await ethers.getSigners();
+  const [localDeployer, agent, customer, s1, s2, s3, stranger] = await ethers.getSigners();
+  // DEPLOYED mode (FORK_INTEGRATOR, FORK_ROUTER, FORK_CLIENT, FORK_PAYMENT_LINKS_LIB set): run every
+  // check against the contracts ALREADY deployed on Base Sepolia — the exact
+  // bytecode awaiting whitelist — acting as their real super-admin (impersonated
+  // on the fork). Otherwise deploy a fresh copy.
+  const DEPLOYED = !!process.env.FORK_INTEGRATOR;
+  let deployer: any = localDeployer;
   const diamond: any = new ethers.Contract(DIAMOND, DIAMOND_ABI, ethers.provider);
   const usdc: any = new ethers.Contract(
     USDC,
@@ -91,33 +102,54 @@ async function main() {
     ethers.provider
   );
 
-  console.log("\n1. Deploy (as the deploy scripts do)");
+  let I: any, client: any, router: any, IA: string;
   const libs: Record<string, string> = {};
-  for (const n of [
-    "PaymentLinksLib",
-    "MerchantRegistryLib",
-    "SettlementLib",
-    "MerchantImportLib",
-  ]) {
-    const c = await (await ethers.getContractFactory(n)).deploy();
-    libs[n] = await c.getAddress();
+  if (DEPLOYED) {
+    console.log("\n1. Attach to the DEPLOYED contracts (exact live bytecode)");
+    IA = ethers.getAddress(process.env.FORK_INTEGRATOR!);
+    const probe: any = await ethers.getContractAt("MerchantTerminalIntegrator", IA);
+    deployer = await as(await probe.superAdmin());
+    I = probe.connect(deployer);
+    router = (await ethers.getContractAt("LinkRouter", process.env.FORK_ROUTER!)).connect(deployer);
+    client = await ethers.getContractAt("SimpleERC721Client", process.env.FORK_CLIENT!);
+    libs.PaymentLinksLib = process.env.FORK_PAYMENT_LINKS_LIB!;
+    check(
+      (await ethers.provider.getCode(IA)).length / 2 - 1 <= 24576,
+      `integrator ${IA} fits EIP-170`
+    );
+    check(
+      (await I.trustedRelayer()) === (await router.getAddress()),
+      "deployed LinkRouter is its trustedRelayer"
+    );
+    check((await router.integrator()) === IA, "deployed LinkRouter points back at it");
+  } else {
+    console.log("\n1. Deploy (as the deploy scripts do)");
+    for (const n of [
+      "PaymentLinksLib",
+      "MerchantRegistryLib",
+      "SettlementLib",
+      "MerchantImportLib",
+    ]) {
+      const c = await (await ethers.getContractFactory(n)).deploy();
+      libs[n] = await c.getAddress();
+    }
+    I = await (
+      await ethers.getContractFactory("MerchantTerminalIntegrator", { libraries: libs })
+    ).deploy(DIAMOND, USDC, []);
+    IA = await I.getAddress();
+    check((await ethers.provider.getCode(IA)).length / 2 - 1 <= 24576, "integrator fits EIP-170");
+    await tx(I.setPreviousIntegrators(PREVIOUS));
+    client = await (
+      await ethers.getContractFactory("SimpleERC721Client")
+    ).deploy(IA, USDC, "Merchant Terminal Item", "MTI");
+    await tx(client.setProductPrice(2, 1));
+    router = await (await ethers.getContractFactory("LinkRouter")).deploy(IA);
+    await tx(I.setTrustedRelayer(await router.getAddress()));
+    check(
+      (await I.trustedRelayer()) === (await router.getAddress()),
+      "LinkRouter wired as trustedRelayer"
+    );
   }
-  const I: any = await (
-    await ethers.getContractFactory("MerchantTerminalIntegrator", { libraries: libs })
-  ).deploy(DIAMOND, USDC, []);
-  const IA = await I.getAddress();
-  check((await ethers.provider.getCode(IA)).length / 2 - 1 <= 24576, "integrator fits EIP-170");
-  await tx(I.setPreviousIntegrators(PREVIOUS));
-  const client: any = await (
-    await ethers.getContractFactory("SimpleERC721Client")
-  ).deploy(IA, USDC, "Merchant Terminal Item", "MTI");
-  await tx(client.setProductPrice(2, 1));
-  const router: any = await (await ethers.getContractFactory("LinkRouter")).deploy(IA);
-  await tx(I.setTrustedRelayer(await router.getAddress()));
-  check(
-    (await I.trustedRelayer()) === (await router.getAddress()),
-    "LinkRouter wired as trustedRelayer"
-  );
 
   console.log("\n2. Copy admin roles + owners from the REAL previous integrators");
   const logs = new ethers.JsonRpcProvider(
@@ -133,6 +165,19 @@ async function main() {
     console.log,
     logs
   );
+  if (DEPLOYED) {
+    // The deploy script already copied them: every planned role must be there
+    // BEFORE applying anything here.
+    for (const p of plan)
+      check(
+        p.owner ? await I.isOwner(p.address) : Number(await I.roleOf(p.address)) === p.role,
+        `deploy already copied ${p.address}`
+      );
+    check(
+      true,
+      `${plan.length} role holder(s) besides the super-admin; the deploy copied all of them`
+    );
+  }
   await applyRoles(I, plan, console.log);
   for (const p of plan) {
     if (p.owner) check(await I.isOwner(p.address), `owner ${p.address} carried over`);
@@ -149,7 +194,8 @@ async function main() {
     if (p.owner)
       check(await old.isOwner(p.address), `…and ${p.address} really is an owner on ${p.from}`);
   }
-  check(plan.length > 0, `${plan.length} role holder(s) found on the old integrators`);
+  if (!DEPLOYED)
+    check(plan.length > 0, `${plan.length} role holder(s) found on the old integrators`);
 
   console.log("\n3. Whitelist on the REAL Diamond (fork only: impersonating its super-admin)");
   const dAdmin = await as(await diamond.owner());
@@ -300,23 +346,42 @@ async function main() {
   check((await status(c2)) === "PLACED", "…so the link can be paid by the next customer");
   await tx(router.connect(agent).cancel(LINK2, c2, await sig("Cancel", LINK2, c2)));
 
-  console.log("\n8. Daily limit binds link sales — and an admin can raise it to any number");
+  console.log("\n8. Limits: MANAGER moves them inside a range that FINANCE/owners set");
+  const all = await ethers.getSigners();
+  const manager = all[7];
+  const finance = all[8];
+  await tx(I.setRole(manager.address, 3)); // MANAGER
+  await tx(I.setRole(finance.address, 4)); // FINANCE
+  const [minD, maxD, minC, maxC] = await I.limitBounds();
+  check(
+    minD === 1n && maxD === 25n && minC === USDC6(1) && maxC === USDC6(100),
+    "starting range: 1-25 orders a day, 1-100 USDC a sale"
+  );
   const LINK3 = await lib.computeLinkId(REAL_MERCHANT, ethers.id("fork-e2e-3"));
   await tx(I.connect(m).createLink(LINK3, 0, INR, 0, 0, "0x")); // any amount, unlimited uses
   await tx(router.connect(m).registerAgent(LINK3, agent.address));
   const [used] = await I.getDailyTxInfo(REAL_MERCHANT); // 2 paid today (POS + link)
-  await tx(I.setDailyLimit(used + 2n));
+  await tx(I.connect(manager).setDailyLimit(used + 2n));
   await place(LINK3);
   await place(LINK3); // two pending reservations fill the limit
   await reverts(place(LINK3), `link placement refused at the daily limit (${used + 2n})`);
-  await tx(I.setDailyLimit(500));
-  check((await I.dailyLimit()) === 500n, "limit raised to 500 — no ceiling");
+  await reverts(I.connect(manager).setDailyLimit(500), "MANAGER cannot go past the max (25)");
+  await reverts(
+    I.connect(manager).setLimitBounds(1, 1000, USDC6(1), USDC6(1000)),
+    "MANAGER cannot change the range"
+  );
+  await tx(I.connect(finance).setLimitBounds(1, 1000, USDC6(1), USDC6(1000)));
+  check((await I.limitBounds())[1] === 1000n, "FINANCE admin widened the range to 1-1000 a day");
+  await tx(I.connect(manager).setDailyLimit(500));
+  check((await I.dailyLimit()) === 500n, "…then MANAGER raised the daily limit to 500");
   await place(LINK3);
   check(true, "placement works again after the raise");
-  await tx(I.setPerTxCap(INR, USDC6(1000)));
-  check((await I.perTxCap(INR)) === USDC6(1000), "per-tx cap raised to 1000 USDC — no ceiling");
-  await tx(I.setDailyLimit(25));
-  await tx(I.setPerTxCap(INR, USDC6(50)));
+  await tx(I.connect(manager).setPerTxCap(INR, USDC6(1000)));
+  check((await I.perTxCap(INR)) === USDC6(1000), "MANAGER raised the per-tx cap to 1000 USDC");
+  await tx(I.connect(finance).setLimitBounds(1, 25, USDC6(1), USDC6(100)));
+  check((await I.dailyLimit()) === 25n, "narrowing the range pulled the daily limit back to 25");
+  check((await I.perTxCap(INR)) === USDC6(100), "…and the 1000 USDC cap back to 100 at once");
+  await tx(I.connect(manager).setPerTxCap(INR, 0)); // back to the INR default
 
   console.log("\n9. Freeze on an OLD integrator carries over (real old contract)");
   const oldI: any = new ethers.Contract(
@@ -436,8 +501,15 @@ async function main() {
     "deployer can no longer add owners"
   );
   await reverts(I.connect(deployer).setDailyLimit(1000), "deployer can no longer change limits");
+  await safeExec(
+    IA,
+    I.interface.encodeFunctionData("setLimitBounds", [1, 200, USDC6(1), USDC6(500)])
+  );
   await safeExec(IA, I.interface.encodeFunctionData("setDailyLimit", [100]));
-  check((await I.dailyLimit()) === 100n, "the Safe (2 of 3 signing) can raise the limit");
+  check(
+    (await I.dailyLimit()) === 100n,
+    "the Safe (2 of 3 signing) can widen the range and raise the limit"
+  );
 
   console.log(
     `\nALL ${passed} CHECKS PASSED on a fork of Base Sepolia (block ${await ethers.provider.getBlockNumber()}).`

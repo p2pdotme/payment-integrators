@@ -442,16 +442,22 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     await expect(
       integrator.connect(diamond).validateOrder(merchant1.address, UNIT_PRICE, INR)
     ).to.be.revertedWithCustomError(integrator, "DailyLimitReached"); // 3rd blocked at limit 2
-    // admin raises it — to any number, there is no hard ceiling (owner decision)…
+    // admin raises it up to the range's max (25 to start)…
     await integrator.connect(owner).setDailyLimit(25);
     expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(25n);
+    // …and past it once the range is widened (setLimitBounds, no redeploy).
+    await expect(integrator.connect(owner).setDailyLimit(1000)).to.be.revertedWithCustomError(
+      integrator,
+      "LimitOutOfBounds"
+    );
+    await integrator.connect(owner).setLimitBounds(1, 1000, USDC(1), USDC(100));
     await integrator.connect(owner).setDailyLimit(1000);
     expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(1000n);
     await integrator.connect(diamond).validateOrder(merchant1.address, UNIT_PRICE, INR); // 3rd now fine
     // guards: zero rejected, non-admin rejected
     await expect(integrator.connect(owner).setDailyLimit(0)).to.be.revertedWithCustomError(
       integrator,
-      "InvalidQuantity"
+      "LimitOutOfBounds"
     );
     await expect(integrator.connect(attacker).setDailyLimit(10)).to.be.revertedWithCustomError(
       integrator,
@@ -537,8 +543,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     // defaults: global == SETTLEMENT_PERIOD (10 min build), no per-currency override
     expect(await integrator.settlementPeriod()).to.equal(SETTLEMENT);
     expect(await integrator.lockPeriod(INR)).to.equal(SETTLEMENT);
-    expect(await integrator.lockPeriodOverride(BRL)).to.equal(0);
-    expect(await integrator.lockPeriod(BRL)).to.equal(SETTLEMENT); // falls back to global
+    expect(await integrator.lockPeriod(BRL)).to.equal(SETTLEMENT); // no override: falls back to global
 
     // ── access control: only the super-admin may change locks ──
     await expect(

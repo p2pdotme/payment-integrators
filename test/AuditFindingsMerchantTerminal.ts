@@ -320,31 +320,108 @@ describe("Audit 2026-09 regressions — merchant terminal", function () {
     });
   });
 
-  // ─── PR #108 review, blocker #4 — hard ceilings on the limit setters ─
-  // Owner decision on review #4: NO hard ceiling. A MANAGER (or above) sets any
-  // value; only zero is refused for the daily limit (it would block all sales).
-  it("limits: a MANAGER can raise or lower the per-tx cap and daily limit to any value", async function () {
-    await integrator.connect(owner).setRole(manager.address, 3); // MANAGER
-    await integrator.connect(manager).setPerTxCap(INR, USDC(5000));
-    expect(await integrator.perTxCap(INR)).to.equal(USDC(5000));
-    await integrator.connect(manager).setDailyLimit(1000);
-    expect(await integrator.dailyLimit()).to.equal(1000n);
-    await expect(integrator.connect(manager).setDailyLimit(0)).to.be.revertedWithCustomError(
-      integrator,
-      "InvalidQuantity"
-    );
-    // Lower tiers still can't.
-    await integrator.connect(owner).setRole(other.address, 2); // SUPPORT
-    await expect(integrator.connect(other).setDailyLimit(5)).to.be.revertedWithCustomError(
-      integrator,
-      "NotAuthorized"
-    );
-  });
+  // ─── PR #108 review, blocker #4 — a range around the limits ──────
+  // FINANCE admins / owners / super-admin set a [min, max] range; MANAGER
+  // admins move the limits inside it. Starting range 1-25 a day, 1-100 USDC.
+  describe("review #4: limit range (min/max) set by FINANCE/owners, limits by MANAGER", function () {
+    let finance: SignerWithAddress;
+    beforeEach(async function () {
+      finance = (await ethers.getSigners())[6];
+      await integrator.connect(owner).setRole(manager.address, 3); // MANAGER
+      await integrator.connect(owner).setRole(finance.address, 4); // FINANCE
+    });
 
-  it("link sales follow whatever dailyLimit the admin sets (review #3 bound moves with it)", async function () {
-    await integrator.connect(owner).setDailyLimit(40);
-    await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
-    for (let i = 0; i < 40; i++) await placeLinkOrder(1);
-    await expect(placeLinkOrder(1)).to.be.reverted; // 41st refused at the NEW limit
+    it("starts at 1-25 orders a day and 1-100 USDC a sale", async function () {
+      const [minD, maxD, minC, maxC] = await integrator.limitBounds();
+      expect([minD, maxD, minC, maxC]).to.deep.equal([1n, 25n, USDC(1), USDC(100)]);
+    });
+
+    it("a MANAGER moves limits inside the range, never outside it", async function () {
+      await integrator.connect(manager).setDailyLimit(10);
+      await integrator.connect(manager).setDailyLimit(25); // = max: fine
+      await integrator.connect(manager).setPerTxCap(INR, USDC(100)); // = max: fine
+      await integrator.connect(manager).setPerTxCap(INR, USDC(1)); // = min: fine
+      for (const bad of [0, 26, 1000])
+        await expect(integrator.connect(manager).setDailyLimit(bad)).to.be.revertedWithCustomError(
+          integrator,
+          "LimitOutOfBounds"
+        );
+      for (const bad of [USDC("0.5"), USDC("100.000001"), USDC(5000)])
+        await expect(
+          integrator.connect(manager).setPerTxCap(INR, bad)
+        ).to.be.revertedWithCustomError(integrator, "LimitOutOfBounds");
+      await integrator.connect(manager).setPerTxCap(INR, 0); // clearing an override is always allowed
+      expect(await integrator.perTxCap(INR)).to.equal(USDC(50)); // back to the INR default
+    });
+
+    it("a MANAGER cannot change the range — so the max is a real ceiling for them", async function () {
+      await expect(
+        integrator.connect(manager).setLimitBounds(1, 1000, USDC(1), USDC(5000))
+      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await integrator.connect(owner).setRole(other.address, 2); // SUPPORT
+      await expect(
+        integrator.connect(other).setLimitBounds(1, 1000, USDC(1), USDC(5000))
+      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(
+        integrator.connect(merchant).setLimitBounds(1, 1000, USDC(1), USDC(5000))
+      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+    });
+
+    it("a FINANCE admin, an owner and the super-admin can all change the range", async function () {
+      await expect(integrator.connect(finance).setLimitBounds(1, 1000, USDC(1), USDC(5000)))
+        .to.emit(integrator, "LimitBoundsSet")
+        .withArgs(1, 1000, USDC(1), USDC(5000));
+      await integrator.connect(owner).addOwner(other.address);
+      await integrator.connect(other).setLimitBounds(2, 500, USDC(2), USDC(2000));
+      await integrator.connect(owner).setLimitBounds(1, 800, USDC(1), USDC(3000)); // super-admin
+      expect((await integrator.limitBounds())[1]).to.equal(800n);
+    });
+
+    it("raising the max lets a MANAGER raise the limit — any number the range allows", async function () {
+      await integrator.connect(finance).setLimitBounds(1, 1000, USDC(1), USDC(5000));
+      await integrator.connect(manager).setDailyLimit(1000);
+      await integrator.connect(manager).setPerTxCap(INR, USDC(5000));
+      expect(await integrator.dailyLimit()).to.equal(1000n);
+      expect(await integrator.perTxCap(INR)).to.equal(USDC(5000));
+      // …and link sales follow the new limit (review #3 bound moves with it).
+      await integrator.connect(manager).setDailyLimit(40);
+      await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+      for (let i = 0; i < 40; i++) await placeLinkOrder(1);
+      await expect(placeLinkOrder(1)).to.be.reverted; // 41st refused at the new limit
+    });
+
+    it("narrowing the range takes effect at once, for the daily limit and every per-tx cap", async function () {
+      await integrator.connect(manager).setDailyLimit(20);
+      const BRL = ethers.encodeBytes32String("BRL");
+      await integrator.connect(manager).setPerTxCap(BRL, USDC(90)); // an existing override
+      await expect(integrator.connect(finance).setLimitBounds(1, 5, USDC(1), USDC(30)))
+        .to.emit(integrator, "DailyLimitSet")
+        .withArgs(5); // the live limit is pulled down into the range
+      expect(await integrator.dailyLimit()).to.equal(5n);
+      expect(await integrator.perTxCap(INR)).to.equal(USDC(30)); // default 50 → capped at 30
+      expect(await integrator.perTxCap(BRL)).to.equal(USDC(30)); // override 90 → capped at 30
+      await integrator.connect(merchant).createLink(LINK, 0, INR, 0, 0, CONFIG);
+      await expect(placeLinkOrder(31)).to.be.reverted; // over the new cap
+      await placeLinkOrder(30);
+      // Raising the min pulls limits up the same way.
+      await integrator.connect(finance).setLimitBounds(10, 50, USDC(40), USDC(100));
+      expect(await integrator.dailyLimit()).to.equal(10n);
+      expect(await integrator.perTxCap(INR)).to.equal(USDC(50)); // default back inside [40, 100]
+    });
+
+    it("refuses a broken range", async function () {
+      const bad: [number | bigint, number | bigint, bigint, bigint][] = [
+        [0, 10, USDC(1), USDC(100)], // min daily 0 would allow blocking every sale
+        [11, 10, USDC(1), USDC(100)], // min > max
+        [1, 10, 0n, USDC(100)], // min cap 0
+        [1, 10, USDC(101), USDC(100)], // min > max
+        [1, 2n ** 64n, USDC(1), USDC(100)], // does not fit the stored uint64
+        [1, 10, USDC(1), 2n ** 64n],
+      ];
+      for (const [a, b, c, d] of bad)
+        await expect(
+          integrator.connect(finance).setLimitBounds(a, b, c, d)
+        ).to.be.revertedWithCustomError(integrator, "LimitOutOfBounds");
+    });
   });
 });

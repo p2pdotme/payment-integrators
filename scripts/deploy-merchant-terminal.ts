@@ -223,6 +223,11 @@ async function main() {
     `PER_TX_CAP:            ${ethers.formatUnits(await integrator.perTxCap(ethers.encodeBytes32String("INR")), 6)} USDC`
   );
   console.log(`DAILY_TX_LIMIT:        ${(await integrator.dailyLimit()).toString()} per day`);
+  const [minD, maxD, minC, maxC] = await integrator.limitBounds();
+  console.log(
+    `LIMIT RANGE:           ${minD}-${maxD} orders/day, ${ethers.formatUnits(minC, 6)}-${ethers.formatUnits(maxC, 6)} USDC/sale` +
+      ` (FINANCE/owners change it with setLimitBounds; MANAGER moves limits inside it)`
+  );
   const settlement = await integrator.settlementPeriod();
   console.log(
     `SETTLEMENT_PERIOD:     ${settlement.toString()} seconds (${(Number(settlement) / 60).toString()} min)`

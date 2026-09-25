@@ -56,4 +56,14 @@ library MerchantTypes {
         bytes32 businessSector;
         SettlementBucket[] buckets;
     }
+
+    /// @dev The range the merchant limits must stay within (PR #108 review #4).
+    ///      Set by FINANCE admins / owners; MANAGER admins move the limits
+    ///      inside it. Caps are USDC 6-decimals and apply to every currency.
+    struct LimitBounds {
+        uint64 minDaily;
+        uint64 maxDaily;
+        uint64 minCap;
+        uint64 maxCap;
+    }
 }
