@@ -57,9 +57,13 @@ Reviewers:
 2. Confirm verified source on Etherscan matches the merged commit.
 3. Confirm the integrator's pinned `proxyImpl` matches the canonical `UserProxy` bytecode. This is an **off-chain review check** — the Diamond does not re-verify proxy bytecode on `registerIntegrator`; it only stores the address. If a non-canonical `proxyImpl` is registered, the CREATE2 auth path still works (clones of the non-canonical impl will pass `msg.sender` derivation) but the proxy's USDC-trapping behavior would be whatever the non-canonical impl implements. The off-chain bytecode-match is therefore the actual security gate.
 4. Confirm constructor parameters (Diamond address, USDC address, per-tx and daily limits, etc.) are correct.
-5. Submit `registerIntegrator(integrator, usdcThroughIntegrator, proxyImpl)` on the Diamond (gated by `onlySuperAdmin`).
+5. Decide whether the integrator gets the `onOrderCancel` notification (`cancelCallbackEnabled`). It defaults to **off**. Turn it on only if all three hold:
+   1. `onOrderComplete` does **not** revert for an order it has already seen cancelled. A cancelled BUY is not final: a dispute the user wins re-opens it to PAID and then COMPLETED.
+   2. `onOrderCancel` is idempotent and only releases what `validateOrder` consumed.
+   3. `onOrderCancel` fits in the 250k gas cap.
+6. Submit `registerIntegrator(integrator, usdcThroughIntegrator, proxyImpl, cancelCallbackEnabled)` on the Diamond (gated by `onlySuperAdmin`). On a Diamond that has not yet taken contracts-v4 #492, the call is the 3-argument `registerIntegrator(integrator, usdcThroughIntegrator, proxyImpl)` followed, if the callback is wanted, by `setIntegratorCancelCallback(integrator, true)`. `scripts/lib/diamond.ts` `registerIntegrator` picks the right form automatically.
 
-**`proxyImpl` is set-once per integrator.** Re-registering the same integrator address with a different `proxyImpl` reverts with `B2BProxyImplLocked` — this is the on-chain enforcement that prevents a registered integrator from later rotating its proxy implementation under existing clones. The other fields (`isActive`, `usdcThroughIntegrator`) can be re-asserted by calling `registerIntegrator` again with the same `proxyImpl`. To take an integrator offline, use `deactivateIntegrator(integrator)`; in-flight orders continue to complete, only new placements fail.
+**`proxyImpl` is set-once per integrator.** Re-registering the same integrator address with a different `proxyImpl` reverts with `B2BProxyImplLocked` — this is the on-chain enforcement that prevents a registered integrator from later rotating its proxy implementation under existing clones. The other fields (`isActive`, `usdcThroughIntegrator`, `cancelCallbackEnabled`) can be re-asserted by calling `registerIntegrator` again with the same `proxyImpl`. The 4-argument form **rewrites every one of them**, so read `getIntegratorConfig` first and pass the live values for anything you are not deliberately changing. To take an integrator offline, use `deactivateIntegrator(integrator)`; in-flight orders continue to complete, only new placements fail.
 
 ### 5. Smoke-test on Sepolia first
 

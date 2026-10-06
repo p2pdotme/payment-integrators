@@ -1,5 +1,5 @@
 import { ethers } from "hardhat";
-import { getIntegratorConfig } from "./lib/diamond";
+import { getIntegratorConfig, registerIntegrator } from "./lib/diamond";
 
 /**
  * Deploy + whitelist OwnCheckoutIntegrator — the fiat -> Base USDC onramp for
@@ -71,10 +71,6 @@ const CAP_ABROAD = process.env.CAP_ABROAD || "200000000"; // $200
 const DAILY_TX_COUNT_LIMIT = process.env.DAILY_TX_COUNT_LIMIT || "5";
 const SKIP_REGISTER = process.env.SKIP_REGISTER === "true";
 const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
-
-const REGISTER_ABI = [
-  "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-];
 
 /*
  * Reading the registration back goes through scripts/lib/diamond.ts (#60),
@@ -256,7 +252,6 @@ async function main() {
   // ── 2. Register on the Diamond — usdcThroughIntegrator = FALSE ──────────
   if (!SKIP_REGISTER) {
     console.log("\nRegistering on the Diamond (usdcThroughIntegrator=false)…");
-    const b2b = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI, deployer);
     const before = await getIntegratorConfig(ethers.provider, DIAMOND_ADDRESS, integratorAddr);
     if (
       before.proxyImpl !== ethers.ZeroAddress &&
@@ -264,9 +259,16 @@ async function main() {
     ) {
       throw new Error(`proxyImpl already locked to ${before.proxyImpl}; refusing to re-register`);
     }
-    const tx = await b2b.registerIntegrator(integratorAddr, false, proxyImpl);
-    await tx.wait(1);
-    console.log("  registerIntegrator tx:", tx.hash);
+    // Own takes no onOrderCancel notification; a re-run keeps whatever an admin
+    // set rather than rewriting it (the 4-arg form rewrites the flag every call).
+    const hashes = await registerIntegrator(deployer, DIAMOND_ADDRESS, {
+      integrator: integratorAddr,
+      usdcThroughIntegrator: false,
+      proxyImpl,
+      cancelCallback:
+        before.proxyImpl === ethers.ZeroAddress ? false : before.cancelCallbackEnabled,
+    });
+    console.log("  registerIntegrator tx:", hashes.join(", "));
 
     const cfg = await getIntegratorConfig(ethers.provider, DIAMOND_ADDRESS, integratorAddr);
     console.log(

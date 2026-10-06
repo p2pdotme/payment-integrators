@@ -67,9 +67,12 @@ async function main() {
   console.log(
     "  2. File a Whitelist request issue (see docs/WHITELISTING.md). The P2P team will call:"
   );
-  console.log(`       registerIntegrator(integrator = ${address},`);
-  console.log(`                          proxyImpl  = ${proxyImpl},`);
-  console.log(`                          source     = bytes32("<your-source-tag>"))`);
+  console.log(`       registerIntegrator(integrator            = ${address},`);
+  console.log(`                          usdcThroughIntegrator = false,`);
+  console.log(`                          proxyImpl             = ${proxyImpl},`);
+  console.log(`                          cancelCallbackEnabled = false)`);
+  console.log("     (cancelCallbackEnabled=true only after the onOrderCancel review checklist;");
+  console.log("      on a Diamond that predates contracts-v4 #492 it is a separate setter call.)");
   console.log("     on the Diamond once verification passes.");
   console.log("  3. Register your business clients on the integrator: registerClient(clientAddr).");
   console.log("  4. Set per-currency RP rates: setRpToUsdc(currency, usdcPerRp).");

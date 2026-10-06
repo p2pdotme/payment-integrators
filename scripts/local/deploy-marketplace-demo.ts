@@ -1,4 +1,5 @@
 import { ethers } from "hardhat";
+import { registerIntegrator } from "../lib/diamond";
 
 /**
  * Deploy + wire the marketplace demo stack on Base Sepolia:
@@ -29,10 +30,6 @@ const PRODUCTS: Array<[number, bigint]> = [
   [1, 5_000_000n], // Common  — 5 USDC
   [2, 10_000_000n], // Rare    — 10 USDC
   [3, 25_000_000n], // Legendary — 25 USDC
-];
-
-const REGISTER_ABI = [
-  "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
 ];
 
 const f = (n: bigint) => ethers.formatUnits(n, 6);
@@ -68,8 +65,12 @@ async function main() {
 
   // 3. Register on the Diamond — usdcThroughIntegrator = FALSE (USDC → proxy).
   console.log("\nRegistering integrator on the Diamond (usdcThroughIntegrator=false)…");
-  const b2b = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI, deployer);
-  await (await b2b.registerIntegrator(integratorAddr, false, proxyImpl)).wait(1);
+  await registerIntegrator(deployer, DIAMOND_ADDRESS, {
+    integrator: integratorAddr,
+    usdcThroughIntegrator: false,
+    proxyImpl,
+    cancelCallback: false,
+  });
 
   // 4. Client ↔ integrator wiring + recipes + prices.
   console.log("Wiring marketplace + recipes…");

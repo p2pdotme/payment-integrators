@@ -1,4 +1,10 @@
 import { ethers } from "hardhat";
+import {
+  detectRegisterForm,
+  registerIntegrator,
+  REGISTER_LEGACY,
+  REGISTER_WITH_CALLBACK,
+} from "../lib/diamond";
 
 /**
  * Deploy + whitelist ShowdownCheckoutIntegrator: a two-way fiat <-> USDC ramp
@@ -136,7 +142,6 @@ const SKIP_REGISTER = process.env.SKIP_REGISTER === "true";
 const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 
 const REGISTER_ABI = [
-  "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
   // 5 fields, not 4: contracts-v4 #362 (merged + deployed to Base mainnet
   // 2026-08-05) added `cancelCallbackEnabled`. A stale 4-field ABI does NOT
   // revert — it silently reads `proxyImpl` off `activeOrderCount`, i.e. always
@@ -415,11 +420,23 @@ async function main() {
   // NB: probed by staticCall rather than a superAdmin() getter — the mainnet
   // Diamond's facet set has no such getter ("Function does not exist"), so the
   // only reliable authorization test is simulating the registration itself.
+  // Showdown's onOrderCancel passed the review checklist (#362), so it is
+  // registered WITH the cancel callback. After contracts-v4 #492's cut that is
+  // one 4-arg call; before it, the 3-arg register plus the separate setter.
+  const form = await detectRegisterForm(ethers.provider, DIAMOND_ADDRESS);
   let canRegister = !SKIP_REGISTER;
   if (canRegister) {
-    const probe = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI, deployer);
+    const probe = new ethers.Contract(
+      DIAMOND_ADDRESS,
+      [`function ${REGISTER_WITH_CALLBACK}`, `function ${REGISTER_LEGACY}`],
+      deployer
+    );
     try {
-      await probe.registerIntegrator.staticCall(integratorAddr, false, proxyImpl);
+      if (form === "with-callback") {
+        await probe[REGISTER_WITH_CALLBACK].staticCall(integratorAddr, false, proxyImpl, true);
+      } else {
+        await probe[REGISTER_LEGACY].staticCall(integratorAddr, false, proxyImpl);
+      }
     } catch (e: unknown) {
       // Only an on-chain revert means "this signer cannot register" (#96). An
       // RPC blip must not print the same diagnosis and silently degrade a
@@ -432,8 +449,14 @@ async function main() {
       console.log("  Expected on mainnet: registration is onlySuperAdmin (held by p2p), while the");
       console.log("  deploy signer is the Showdown owner EOA. p2p completes the whitelist");
       console.log("  (WHITELISTING.md steps 3-4):");
-      console.log(`    1. registerIntegrator(${integratorAddr}, false, ${proxyImpl})`);
-      console.log(`    2. setIntegratorCancelCallback(${integratorAddr}, true)   // gate D9`);
+      if (form === "with-callback") {
+        console.log(
+          `    registerIntegrator(${integratorAddr}, false, ${proxyImpl}, true)   // gate D9`
+        );
+      } else {
+        console.log(`    1. registerIntegrator(${integratorAddr}, false, ${proxyImpl})`);
+        console.log(`    2. setIntegratorCancelCallback(${integratorAddr}, true)   // gate D9`);
+      }
     }
   }
   if (canRegister) {
@@ -446,15 +469,23 @@ async function main() {
     ) {
       throw new Error(`proxyImpl already locked to ${before.proxyImpl}; refusing to re-register`);
     }
-    const tx = await b2b.registerIntegrator(integratorAddr, false, proxyImpl);
-    await tx.wait(1);
-    console.log("  registerIntegrator tx:", tx.hash);
+    const hashes = await registerIntegrator(deployer, DIAMOND_ADDRESS, {
+      integrator: integratorAddr,
+      usdcThroughIntegrator: false,
+      proxyImpl,
+      cancelCallback: true, // gate D9
+    });
+    console.log("  registerIntegrator tx:", hashes.join(", "));
 
     const cfg = await b2b.getIntegratorConfig(integratorAddr);
     console.log(
       `  config: isActive=${cfg.isActive} usdcThroughIntegrator=${cfg.usdcThroughIntegrator} proxyImpl=${cfg.proxyImpl}`
     );
-    if (!cfg.isActive || cfg.usdcThroughIntegrator !== false) {
+    if (
+      !cfg.isActive ||
+      cfg.usdcThroughIntegrator !== false ||
+      cfg.cancelCallbackEnabled !== true
+    ) {
       throw new Error("unexpected integrator config after registration");
     }
   }
