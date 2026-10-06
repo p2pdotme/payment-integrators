@@ -1,5 +1,5 @@
 import { ethers } from "hardhat";
-import { getIntegratorConfig } from "../lib/diamond";
+import { getIntegratorConfig, registerIntegrator } from "../lib/diamond";
 
 /**
  * Deploy + wire the USDC-direct onramp demo on Base Sepolia:
@@ -44,10 +44,6 @@ const DAILY_USDC_VOLUME_CAP = process.env.DAILY_USDC_VOLUME_CAP || "0"; // 0 = d
 const LIVENESS_ATTESTOR = process.env.LIVENESS_ATTESTOR || "";
 const KYC_ATTESTOR = process.env.KYC_ATTESTOR || "";
 
-const REGISTER_ABI = [
-  "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-];
-
 const f = (n: bigint) => ethers.formatUnits(n, 6);
 
 async function main() {
@@ -82,8 +78,12 @@ async function main() {
   // 2. Register on the Diamond — usdcThroughIntegrator = FALSE (USDC → recipient
   //    = user EOA on completion).
   console.log("\nRegistering integrator on the Diamond (usdcThroughIntegrator=false)…");
-  const b2b = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI, deployer);
-  await (await b2b.registerIntegrator(integratorAddr, false, proxyImpl)).wait(1);
+  await registerIntegrator(deployer, DIAMOND_ADDRESS, {
+    integrator: integratorAddr,
+    usdcThroughIntegrator: false,
+    proxyImpl,
+    cancelCallback: false,
+  });
 
   // 3. Optional owner ceilings.
   if (BigInt(PER_TX_USDC_CAP) > 0n) {

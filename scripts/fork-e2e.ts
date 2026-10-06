@@ -26,6 +26,7 @@
  */
 import { ethers, network } from "hardhat";
 import { applyRoles, planRoles } from "./lib/copyRoles";
+import { registerIntegrator } from "./lib/diamond";
 import { checkMultisig, handoffStatus, proposeHandoff, safeBatch } from "./lib/superAdmin";
 
 const DIAMOND = "0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9";
@@ -52,8 +53,6 @@ const USDC6 = (n: number) => BigInt(Math.round(n * 1e6));
 
 const DIAMOND_ABI = [
   "function owner() view returns (address)",
-  "function registerIntegrator(address,bool,address)",
-  "function setIntegratorCancelCallback(address,bool)",
   "function getIntegratorConfig(address) view returns (bytes)",
   "function acceptOrder(uint256,string,string)",
   "function completeOrder(uint256,string)",
@@ -199,8 +198,13 @@ async function main() {
 
   console.log("\n3. Whitelist on the REAL Diamond (fork only: impersonating its super-admin)");
   const dAdmin = await as(await diamond.owner());
-  await tx(diamond.connect(dAdmin).registerIntegrator(IA, false, await I.proxyImpl()));
-  await tx(diamond.connect(dAdmin).setIntegratorCancelCallback(IA, true));
+  // One 4-arg call after contracts-v4 #492's cut, register + setter before it.
+  await registerIntegrator(dAdmin, DIAMOND, {
+    integrator: IA,
+    usdcThroughIntegrator: false,
+    proxyImpl: await I.proxyImpl(),
+    cancelCallback: true,
+  });
   const cfgOf = async (who: string) =>
     (
       await ethers.provider.call({

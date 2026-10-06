@@ -131,7 +131,13 @@ async function main() {
   console.log("");
   console.log("Next steps:");
   console.log(`  1. Register on Diamond (super-admin):`);
-  console.log(`       registerIntegrator(${address}, false, ${proxyImpl})`);
+  console.log(`       registerIntegrator(${address}, false, ${proxyImpl}, false)`);
+  console.log(
+    `     - cancelCallbackEnabled MUST be false: LotPot latches a cancel and refuses onOrderComplete,`
+  );
+  console.log(
+    `       so a dispute the user won (CANCELLED -> PAID -> COMPLETED) would deliver nothing.`
+  );
   console.log(
     `     - usdcThroughIntegrator=false: Diamond routes USDC to recipientAddr (= proxy) on completion.`
   );

@@ -1,5 +1,5 @@
 import { ethers } from "hardhat";
-import { getIntegratorConfig } from "../lib/diamond";
+import { getIntegratorConfig, registerIntegrator } from "../lib/diamond";
 
 /**
  * Whitelist the v2 integrator on the live Diamond's B2BGatewayFacet
@@ -11,10 +11,6 @@ import { getIntegratorConfig } from "../lib/diamond";
  *     [USDC_THROUGH_INTEGRATOR=true] \
  *     npx hardhat run scripts/register-v2.ts --network baseSepolia
  */
-const REGISTER_ABI = [
-  "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-  "function isActiveIntegrator(address) view returns (bool)",
-];
 
 async function main() {
   const DIAMOND = process.env.DIAMOND_ADDRESS!;
@@ -37,7 +33,6 @@ async function main() {
     through
   );
 
-  const b2b = new ethers.Contract(DIAMOND, REGISTER_ABI, admin);
   const before = await getIntegratorConfig(ethers.provider, DIAMOND, INTEGRATOR);
   console.log("before:", { isActive: before.isActive, proxyImpl: before.proxyImpl });
   if (
@@ -49,9 +44,16 @@ async function main() {
     );
   }
 
-  const tx = await b2b.registerIntegrator(INTEGRATOR, through, PROXY_IMPL);
-  const r = await tx.wait();
-  console.log("registerIntegrator tx:", r?.hash);
+  // cancelCallback MUST stay false for this integrator: it latches a cancel in
+  // onOrderCancel and then refuses onOrderComplete, so with the callback on, a
+  // dispute the user WON (CANCELLED -> PAID -> COMPLETED) would deliver nothing.
+  const hashes = await registerIntegrator(admin, DIAMOND, {
+    integrator: INTEGRATOR,
+    usdcThroughIntegrator: through,
+    proxyImpl: PROXY_IMPL,
+    cancelCallback: false,
+  });
+  console.log("registerIntegrator tx:", hashes.join(", "));
 
   const cfg = await getIntegratorConfig(ethers.provider, DIAMOND, INTEGRATOR);
   console.log("after:", {

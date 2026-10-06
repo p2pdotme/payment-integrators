@@ -86,3 +86,129 @@ export async function getIntegratorConfig(
         proxyImpl: v[3] as string,
       };
 }
+
+/*
+ * ─── Registration ──────────────────────────────────────────────────────────
+ *
+ * Same rollout problem as the struct above, on the write side. contracts-v4
+ * #492 gives registerIntegrator a 4th argument (cancelCallbackEnabled) and
+ * REMOVES the 3-arg form; #493 removes setIntegratorCancelCallback. Until a
+ * network takes that cut it routes only the legacy pair, afterwards only the
+ * 4-arg form, so a hardcoded call is wrong on one of them — and the failure is
+ * an opaque "Diamond: Function does not exist" mid-script. Pick by routing.
+ */
+
+/** registerIntegrator with the callback flag (contracts-v4 #492). */
+export const REGISTER_WITH_CALLBACK = "registerIntegrator(address,bool,address,bool)";
+/** registerIntegrator before #492 — the flag needs the separate setter. */
+export const REGISTER_LEGACY = "registerIntegrator(address,bool,address)";
+/** The separate setter, removed by contracts-v4 #493. */
+export const SET_CANCEL_CALLBACK = "setIntegratorCancelCallback(address,bool)";
+
+export type RegisterForm = "with-callback" | "legacy";
+
+export interface RegistrationRequest {
+  integrator: string;
+  usdcThroughIntegrator: boolean;
+  proxyImpl: string;
+  /**
+   * The onOrderCancel opt-in. Enable only after the review checklist on
+   * contracts-v4 B2BGatewayFacet.registerIntegrator (onOrderComplete must not
+   * refuse an order it has seen cancelled). There is deliberately no default:
+   * the 4-arg form rewrites the flag on every call.
+   */
+  cancelCallback: boolean;
+}
+
+export interface RegistrationCall {
+  signature: string;
+  args: (string | boolean)[];
+}
+
+const LOUPE = new ethers.Interface(["function facetAddress(bytes4) view returns (address)"]);
+const REGISTRATION = new ethers.Interface([
+  `function ${REGISTER_WITH_CALLBACK}`,
+  `function ${REGISTER_LEGACY}`,
+  `function ${SET_CANCEL_CALLBACK}`,
+]);
+
+/** Which registration surface the Diamond routes; throws if neither is complete. */
+export async function detectRegisterForm(
+  provider: ethers.Provider,
+  diamond: string
+): Promise<RegisterForm> {
+  const routed = async (sig: string) => {
+    const raw = await provider.call({
+      to: diamond,
+      data: LOUPE.encodeFunctionData("facetAddress", [REGISTRATION.getFunction(sig)!.selector]),
+    });
+    return LOUPE.decodeFunctionResult("facetAddress", raw)[0] !== ethers.ZeroAddress;
+  };
+  if (await routed(REGISTER_WITH_CALLBACK)) return "with-callback";
+  // The legacy surface counts only whole: a 3-arg register without the setter
+  // would "succeed" while silently unable to set the flag that was asked for.
+  if ((await routed(REGISTER_LEGACY)) && (await routed(SET_CANCEL_CALLBACK))) return "legacy";
+  throw new Error(
+    `Diamond ${diamond} routes neither ${REGISTER_WITH_CALLBACK} nor the legacy pair ` +
+      `${REGISTER_LEGACY} + ${SET_CANCEL_CALLBACK}.`
+  );
+}
+
+/**
+ * The calls that converge an integrator onto `req`. Pure, so it is unit-tested
+ * without a chain. `live` is the current config, or null if never registered.
+ *
+ * "with-callback": one call, always, carrying every field.
+ * "legacy": the 3-arg register (which never touches the flag; a new entry
+ * starts false), then the setter only if the flag must move — in that order,
+ * because the setter reverts on an unregistered address.
+ */
+export function planRegistration(
+  form: RegisterForm,
+  req: RegistrationRequest,
+  live: IntegratorConfig | null
+): RegistrationCall[] {
+  if (form === "with-callback") {
+    return [
+      {
+        signature: REGISTER_WITH_CALLBACK,
+        args: [req.integrator, req.usdcThroughIntegrator, req.proxyImpl, req.cancelCallback],
+      },
+    ];
+  }
+  const calls: RegistrationCall[] = [
+    {
+      signature: REGISTER_LEGACY,
+      args: [req.integrator, req.usdcThroughIntegrator, req.proxyImpl],
+    },
+  ];
+  if (req.cancelCallback !== (live?.cancelCallbackEnabled ?? false)) {
+    calls.push({ signature: SET_CANCEL_CALLBACK, args: [req.integrator, req.cancelCallback] });
+  }
+  return calls;
+}
+
+/**
+ * Register (or re-assert) an integrator on whichever surface the Diamond
+ * routes, waiting for each transaction. The signer must be a Diamond super
+ * admin. Returns the transaction hashes in order.
+ */
+export async function registerIntegrator(
+  signer: ethers.Signer,
+  diamond: string,
+  req: RegistrationRequest
+): Promise<string[]> {
+  const provider = signer.provider;
+  if (!provider) throw new Error("registerIntegrator: signer has no provider");
+  const form = await detectRegisterForm(provider, diamond);
+  const live = await getIntegratorConfig(provider, diamond, req.integrator);
+  const calls = planRegistration(form, req, live.proxyImpl === ethers.ZeroAddress ? null : live);
+  const contract = new ethers.Contract(diamond, REGISTRATION, signer);
+  const hashes: string[] = [];
+  for (const call of calls) {
+    const tx = await contract[call.signature](...call.args);
+    await tx.wait(1);
+    hashes.push(tx.hash);
+  }
+  return hashes;
+}

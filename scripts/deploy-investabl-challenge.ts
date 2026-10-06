@@ -92,7 +92,8 @@ async function main() {
   console.log("  2. File a Whitelist request issue (docs/WHITELISTING.md). The P2P team calls:");
   console.log(`       registerIntegrator(integrator = ${address},`);
   console.log(`                          usdcThroughIntegrator = false,`);
-  console.log(`                          proxyImpl  = ${proxyImpl})`);
+  console.log(`                          proxyImpl  = ${proxyImpl},`);
+  console.log(`                          cancelCallbackEnabled = false)`);
   console.log(
     "  3. Optionally setTreasury(<Base treasury>) if proceeds should not accrue to owner."
   );

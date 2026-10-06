@@ -1,5 +1,5 @@
 import { ethers } from "hardhat";
-import { getIntegratorConfig } from "../lib/diamond";
+import { getIntegratorConfig, registerIntegrator } from "../lib/diamond";
 
 /**
  * Whitelist PikerOnrampIntegrator on the Base Sepolia test Diamond via
@@ -10,9 +10,6 @@ import { getIntegratorConfig } from "../lib/diamond";
  *     USDC_THROUGH_INTEGRATOR=false \
  *     npx hardhat run scripts/local/register-piker.ts --network baseSepolia
  */
-const ABI = [
-  "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-];
 const EXPECTED_SUPERADMIN = "0x9DE9772AfCdf3AFa03CC689fE7AFA5b631088aB9";
 
 async function main() {
@@ -40,7 +37,6 @@ async function main() {
     throw new Error("signer is not the expected super-admin — aborting");
   if (bal === 0n) throw new Error("signer has no ETH for gas — aborting");
 
-  const c = new ethers.Contract(DIAMOND, ABI, admin);
   const before = await getIntegratorConfig(ethers.provider, DIAMOND, INTEGRATOR);
   console.log("before:", {
     isActive: before.isActive,
@@ -59,14 +55,15 @@ async function main() {
     return;
   }
 
-  // Dry-run first: estimateGas reverts if the signer isn't authorized or args are bad.
-  const est = await c.registerIntegrator.estimateGas(INTEGRATOR, through, PROXY_IMPL);
-  console.log("estimateGas OK:", est.toString(), "— broadcasting…");
-
-  const tx = await c.registerIntegrator(INTEGRATOR, through, PROXY_IMPL);
-  console.log("tx sent:", tx.hash);
-  const r = await tx.wait();
-  console.log("mined in block:", r?.blockNumber);
+  // Piker takes no onOrderCancel notification. registerIntegrator picks the
+  // 4-arg form or the legacy pair, whichever the Diamond routes.
+  const hashes = await registerIntegrator(admin, DIAMOND, {
+    integrator: INTEGRATOR,
+    usdcThroughIntegrator: through,
+    proxyImpl: PROXY_IMPL,
+    cancelCallback: false,
+  });
+  console.log("tx:", hashes.join(", "));
 
   const after = await getIntegratorConfig(ethers.provider, DIAMOND, INTEGRATOR);
   console.log("after:", {
