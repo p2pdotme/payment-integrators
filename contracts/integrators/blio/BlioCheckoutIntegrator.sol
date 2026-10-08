@@ -52,6 +52,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     error OrderValidationMissing();
     error OrderIdAlreadyUsed();
     error RenounceDisabled();
+    /// @notice An owner-settable limit was set above its immutable ceiling.
+    error CapExceedsCeiling();
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -106,6 +108,14 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     address public immutable proxyImpl;
     /// @notice Where the Diamond settles the USDC. Never this contract.
     address public immutable treasury;
+
+    // ─── Immutable policy ceilings ────────────────────────────────────
+    // Compiled into the bytecode. The constructor and every owner setter are
+    // bounded by these, so no limit can ever exceed its ceiling — not by a
+    // compromised owner key. Movement below a ceiling is free in both
+    // directions.
+    uint256 public constant MAX_BASE_TX_LIMIT = 5_000e6; // $5,000 per tx
+    uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 100; // placements/user/day
 
     // ─── Configurable limits ──────────────────────────────────────────
 
@@ -186,6 +196,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
             _owner == address(0)
         ) revert InvalidAddress();
         if (_dailyTxCount == 0) revert InvalidQuantity();
+        if (_baseTxLimit > MAX_BASE_TX_LIMIT) revert CapExceedsCeiling();
+        if (_dailyTxCount > MAX_DAILY_TX_COUNT_LIMIT) revert CapExceedsCeiling();
 
         diamond = _diamond;
         usdc = IERC20(_usdc);
@@ -209,17 +221,20 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     }
 
     function setBaseTxLimit(uint256 limit) external onlyOwner {
+        if (limit > MAX_BASE_TX_LIMIT) revert CapExceedsCeiling();
         baseTxLimit = limit;
         emit BaseTxLimitUpdated(limit);
     }
 
     function setMaxTxLimit(bytes32 currency, uint256 cap) external onlyOwner {
+        if (cap > MAX_BASE_TX_LIMIT) revert CapExceedsCeiling();
         maxTxLimit[currency] = cap;
         emit MaxTxLimitUpdated(currency, cap);
     }
 
     function setDailyTxCountLimit(uint256 count) external onlyOwner {
         if (count == 0) revert InvalidQuantity();
+        if (count > MAX_DAILY_TX_COUNT_LIMIT) revert CapExceedsCeiling();
         dailyTxCountLimit = count;
         emit DailyTxCountLimitUpdated(count);
     }
