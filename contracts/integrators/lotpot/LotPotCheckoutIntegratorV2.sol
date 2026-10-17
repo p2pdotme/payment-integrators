@@ -9,6 +9,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 import { GrantVault } from "../../base/GrantVault.sol";
+import { LivenessGate } from "../../base/LivenessGate.sol";
 
 /**
  * @title LotPotCheckoutIntegrator
@@ -54,7 +55,7 @@ import { GrantVault } from "../../base/GrantVault.sol";
  *      time. V1 behavior (skipped-fulfillment credit, _route, _redeemFromCredit,
  *      batch fulfillment, RP/limits) is preserved.
  */
-contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
+contract LotPotCheckoutIntegratorV2 is IP2PIntegrator, LivenessGate {
     using SafeERC20 for IERC20;
 
     // ─── Errors ───────────────────────────────────────────────────────
@@ -348,6 +349,12 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         _;
     }
 
+    /// @dev LivenessGate hook — only the owner manages the liveness gate
+    ///      (setLivenessAttestor / setLivenessRequired).
+    function _authorizeLivenessAdmin() internal view override {
+        if (msg.sender != owner) revert OnlyOwner();
+    }
+
     // ─── Constructor ──────────────────────────────────────────────────
 
     constructor(
@@ -599,6 +606,9 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         address[] calldata referrers,
         uint256[] calldata referralSplit
     ) external returns (uint256 orderId) {
+        // Anti-sybil gate (no-op until the owner enables it). Clear revert here;
+        // validateOrder re-checks authoritatively when the Diamond calls back.
+        if (!_livenessOk(msg.sender)) revert NotLivenessVerified();
         if (quantity == 0) revert InvalidQuantity();
         // Type-level safety net: the batch path casts quantity to uint64
         // when calling createBatchOrder, so anything above uint64 max would
@@ -742,6 +752,9 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         address[] calldata referrers,
         uint256[] calldata referralSplit
     ) external returns (uint256 orderId) {
+        // Anti-sybil gate (no-op until the owner enables it). Clear revert here;
+        // validateOrder re-checks authoritatively when the Diamond calls back.
+        if (!_livenessOk(msg.sender)) revert NotLivenessVerified();
         uint256 quantity = tickets.length;
         if (quantity == 0) revert InvalidQuantity();
         // Same uint64 safety net as userPlaceOrder — batch path narrows
@@ -932,6 +945,11 @@ contract LotPotCheckoutIntegratorV2 is IP2PIntegrator {
         uint256 amount,
         bytes32 currency
     ) external onlyDiamond returns (bool allowed) {
+        // Anti-sybil gate. No-op while livenessRequired == false (the default),
+        // so existing behavior is unchanged until the owner enables it; when on,
+        // only liveness-verified humans pass (one human = one verified wallet).
+        if (!_livenessOk(user)) return false;
+
         uint256 txLimit = getUserTxLimit(user, currency);
         if (amount > txLimit) return false;
 
