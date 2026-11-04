@@ -327,6 +327,11 @@ async function main() {
     const o2 = await paidLinkOrder();
     await cancelAfterPaying(o2);
     await warp(15 * 60 + 5);
+    await refused(
+      () => I.connect(merchant).raiseLinkDispute(o2, 1234n),
+      "the merchant before 6 hours (the customer goes first)"
+    );
+    await warp(6 * 3600);
     await tx(I.connect(merchant).raiseLinkDispute(o2, 1234n));
     const d2 = (await order(o2)).disputeInfo;
     check(
@@ -342,6 +347,14 @@ async function main() {
     const late = await refused(
       () => router.connect(agent).dispute(LINK, o3, LAST4, s3),
       "dispute more than 24 hours after placement"
+    );
+    // The paid-then-cancelled order held its link use; with the window closed
+    // and no dispute, anyone can give it back.
+    const usesBefore = (await I.getLink(LINK)).uses;
+    await tx(I.connect(stranger).releaseLinkClaim(o3));
+    check(
+      (await I.getLink(LINK)).uses === usesBefore - 1n,
+      `after 24 h with no dispute, releaseLinkClaim gave the link use back (${usesBefore} → ${usesBefore - 1n})`
     );
 
     console.log(`\nThe REAL Diamond's refusal after 24 h → ${late}`);

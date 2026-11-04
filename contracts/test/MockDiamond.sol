@@ -475,6 +475,16 @@ contract MockDiamond {
         emit MockDisputeRaised(orderId, msg.sender, redactTransId);
     }
 
+    /// @notice p2p.me's admin settles a BUY dispute: it is no longer open
+    ///         (status 2 here; the integrator only tests for "open" = 1). For a
+    ///         MERCHANT-fault ruling the order then completes — call
+    ///         simulateOrderComplete, which reopens a cancelled BUY as the real
+    ///         Diamond's dispute path does. A USER-fault ruling leaves it cancelled.
+    function simulateDisputeSettled(uint256 orderId) external {
+        if (buyDisputeStatus[orderId] != 1) revert DisputeNotAllowed();
+        buyDisputeStatus[orderId] = 2;
+    }
+
     /**
      * @notice Simulates B2BGatewayFacet.onB2BOrderCancelled: gateway-side
      *         cancellation calls the integrator's onOrderCancel under

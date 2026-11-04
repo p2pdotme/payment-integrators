@@ -61,6 +61,8 @@ describe("Link-order disputes", function () {
   const PK = "04" + "ab".repeat(64);
   const CONFIG = ethers.hexlify(ethers.toUtf8Bytes("cfg"));
   const LAST4 = 4821n;
+  /** The merchant's own dispute opens 6 h after placement (the customer goes first). */
+  const MERCHANT_DELAY = 6 * 3600;
 
   let LINK: string;
   let LINK2: string;
@@ -351,15 +353,31 @@ describe("Link-order disputes", function () {
   // ─── The merchant's own dispute ───────────────────────────────────
 
   describe("the merchant disputes their own link order", function () {
-    it("files it through their proxy", async function () {
+    it("files it through their proxy, from 6 hours after placement", async function () {
       const orderId = await cancelledAfterPaying();
+      await time.increase(MERCHANT_DELAY);
       await expect(integrator.connect(merchant1).raiseLinkDispute(orderId, LAST4))
         .to.emit(mockDiamond, "MockDisputeRaised")
         .withArgs(orderId, await integrator.proxyAddress(merchant1.address), LAST4);
     });
 
+    it("not before 6 hours: the customer gets the first chance (review #118, 2)", async function () {
+      const orderId = await cancelledAfterPaying(); // 15 min after placement
+      await expect(
+        integrator.connect(merchant1).raiseLinkDispute(orderId, 1111n)
+      ).to.be.revertedWithCustomError(integrator, "DisputeTooEarly");
+      // The customer can file in that time, with their own digits.
+      await router.connect(agent1).dispute(LINK, orderId, LAST4, await disputeSig(LINK, orderId));
+      expect((await mockDiamond.getOrdersById(orderId)).disputeInfo.redactTransId).to.equal(LAST4);
+      // Later the merchant cannot replace it: the Diamond takes one dispute per order.
+      await time.increase(MERCHANT_DELAY);
+      await expect(integrator.connect(merchant1).raiseLinkDispute(orderId, 1111n)).to.be.reverted;
+      expect((await mockDiamond.getOrdersById(orderId)).disputeInfo.redactTransId).to.equal(LAST4);
+    });
+
     it("cannot dispute another merchant's order: the Diamond refuses their proxy", async function () {
       const orderId = await cancelledAfterPaying();
+      await time.increase(MERCHANT_DELAY);
       // Without a proxy at all (never sold anything), the call has nothing to reach.
       await expect(integrator.connect(attacker).raiseLinkDispute(orderId, LAST4)).to.be.reverted;
       await expect(integrator.connect(merchant2).raiseLinkDispute(orderId, LAST4)).to.be.reverted;
@@ -397,6 +415,135 @@ describe("Link-order disputes", function () {
         .connect(agent2)
         .dispute(LINK_M2, orderId, LAST4, await disputeSig(LINK_M2, orderId));
       expect((await mockDiamond.getOrdersById(orderId)).disputeInfo.status).to.equal(1);
+    });
+  });
+
+  // ─── Review #118, finding 1: link orders only ────────────────────
+
+  describe("a fiat withdrawal cannot be disputed through this contract", function () {
+    it("refuses the merchant's own withdrawal, though their proxy owns it too", async function () {
+      // A balance to withdraw: a counter sale, settled and past the 10 min lock.
+      await integrator
+        .connect(merchant1)
+        .userPlaceOrder(erc721Client.target, PRODUCT_ID, 3, INR, 1, "");
+      const sale = (await integrator.queryFilter(integrator.filters.OrderPlaced())).at(-1)!.args
+        .orderId;
+      await mockDiamond.simulateOrderComplete(sale);
+      await time.increase(11 * 60);
+
+      const rcpt = await (
+        await integrator.connect(merchant1).withdrawFiat(USDC(5), 1, PK, "")
+      ).wait();
+      const w = rcpt.logs
+        .map((l: any) => {
+          try {
+            return integrator.interface.parseLog(l);
+          } catch {
+            return null;
+          }
+        })
+        .find((l: any) => l?.name === "WithdrawalFiat");
+      const withdrawalId = w.args.orderId;
+      // Its order.user IS the merchant's proxy, so without the guard the Diamond
+      // would take the dispute, and a won one strands the refund on the proxy.
+      expect((await mockDiamond.getOrdersById(withdrawalId)).user).to.equal(
+        await integrator.proxyAddress(merchant1.address)
+      );
+      await time.increase(MERCHANT_DELAY);
+      await expect(
+        integrator.connect(merchant1).raiseLinkDispute(withdrawalId, LAST4)
+      ).to.be.revertedWithCustomError(integrator, "NotALinkOrder");
+    });
+  });
+
+  // ─── Review #118, finding 3: the link's records ──────────────────
+
+  describe("a paid-then-cancelled order keeps its link use until it cannot come back", function () {
+    let ONE: string;
+    beforeEach(async function () {
+      ONE = ethers.keccak256(
+        ethers.AbiCoder.defaultAbiCoder().encode(
+          ["address", "bytes32"],
+          [merchant1.address, ethers.id("single-use")]
+        )
+      );
+      await integrator.connect(merchant1).createLink(ONE, UNIT_PRICE, INR, 0, 1, CONFIG);
+      await register(ONE, agent2);
+    });
+    const uses = async () => (await integrator.getLink(ONE)).uses;
+    const strikes = async () => (await integrator.getLink(ONE)).strikes;
+    const placeOne = () =>
+      router
+        .connect(agent2)
+        .place(ONE, erc721Client.target, PRODUCT_ID, 1, INR, 0, PK, customer.address);
+
+    it("a single-use link cannot be paid twice while a dispute is possible", async function () {
+      await cancelledAfterPaying(ONE, agent2);
+      expect(await uses()).to.equal(1);
+      await expect(placeOne()).to.be.revertedWithCustomError(integrator, "LinkAlreadyUsed");
+    });
+
+    it("a won dispute completes it: use stays counted, strike cleared, merchant paid", async function () {
+      const orderId = await cancelledAfterPaying(ONE, agent2);
+      expect(await strikes()).to.equal(1);
+      await router.connect(agent2).dispute(ONE, orderId, LAST4, await disputeSig(ONE, orderId));
+      await mockDiamond.simulateDisputeSettled(orderId); // merchant fault, so…
+      await mockDiamond.simulateOrderComplete(orderId); // …the order reopens and completes
+      expect(await uses()).to.equal(1);
+      expect(await strikes()).to.equal(0);
+      expect((await integrator.getMerchantBalance(merchant1.address)).totalDeposited).to.equal(
+        UNIT_PRICE
+      );
+      await expect(integrator.releaseLinkClaim(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "LinkNotFound"
+      );
+    });
+
+    it("no dispute: after the 24 h window anyone can give the use back (the strike stays)", async function () {
+      const orderId = await cancelledAfterPaying(ONE, agent2);
+      await expect(
+        integrator.connect(attacker).releaseLinkClaim(orderId)
+      ).to.be.revertedWithCustomError(integrator, "ClaimStillDisputable");
+      await time.increase(24 * 3600);
+      await integrator.connect(attacker).releaseLinkClaim(orderId);
+      expect(await uses()).to.equal(0);
+      expect(await strikes()).to.equal(1); // a claim that never came true
+      await placeOne(); // the link takes a new payment
+      await expect(integrator.releaseLinkClaim(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "LinkNotFound"
+      );
+    });
+
+    it("an open dispute holds it past 24 h; a lost one lets it go", async function () {
+      const orderId = await cancelledAfterPaying(ONE, agent2);
+      await router.connect(agent2).dispute(ONE, orderId, LAST4, await disputeSig(ONE, orderId));
+      await time.increase(24 * 3600);
+      await expect(integrator.releaseLinkClaim(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "ClaimStillDisputable"
+      );
+      await mockDiamond.simulateDisputeSettled(orderId); // user fault: stays cancelled
+      await integrator.releaseLinkClaim(orderId);
+      expect(await uses()).to.equal(0);
+    });
+
+    it("an order still in flight cannot be released", async function () {
+      const orderId = await paidOrder(ONE, agent2);
+      await time.increase(24 * 3600);
+      await expect(integrator.releaseLinkClaim(orderId)).to.be.revertedWithCustomError(
+        integrator,
+        "ClaimStillDisputable"
+      );
+    });
+
+    it("an order the customer never marked paid still frees its use at once", async function () {
+      await placeOne();
+      const orderId = await lastOrderId();
+      await mockDiamond.simulateOrderCancelled(orderId);
+      expect(await uses()).to.equal(0);
+      await placeOne();
     });
   });
 
