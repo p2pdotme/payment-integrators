@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { ethers } from "hardhat";
+import hre, { ethers } from "hardhat";
 import { time } from "@nomicfoundation/hardhat-network-helpers";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 
@@ -551,6 +551,9 @@ describe("Link-order disputes", function () {
 
   describe("the integrator stays deployable", function () {
     it("keeps at least 200 bytes under the EIP-170 limit", async function () {
+      // Under `hardhat coverage` the artifact is instrumented (a counter in every
+      // branch, about 3x the size), so its size says nothing about what deploys.
+      if ((hre as any).__SOLIDITY_COVERAGE_RUNNING) this.skip();
       const art = require("../artifacts/contracts/integrators/merchant-terminal/MerchantTerminalIntegrator.sol/MerchantTerminalIntegrator.json");
       const size = (art.deployedBytecode.length - 2) / 2;
       expect(size).to.be.at.most(24576 - 200);
