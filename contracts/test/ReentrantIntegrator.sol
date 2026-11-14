@@ -109,7 +109,7 @@ contract ReentrantIntegrator is IMerchantTerminalLinks {
     function relayerCancelOrder(bytes32, uint256) external {}
 
     // solhint-disable-next-line no-empty-blocks
-    function relayerRaiseDispute(bytes32, uint256, uint256) external {}
+    function linkDispute(bytes32, uint256, uint256, bool) external {}
 
     function getLink(
         bytes32

@@ -485,6 +485,27 @@ contract MockDiamond {
         buyDisputeStatus[orderId] = 2;
     }
 
+    // ─── Dispute ladder (DisputeFacet.appealDispute, Base mainnet) ────────
+    /// @notice Each open dispute's tier: 1 once raised, +1 per appeal, max 3.
+    ///         Models the live rules the integrator depends on: `order.user`
+    ///         only, an open dispute only, not past tier 3. (The appeal window
+    ///         and decision SLA are the Diamond's own; not modelled here.)
+    mapping(uint256 => uint8) public disputeTierOf;
+    error NotDisputeUser();
+    error DisputeNotRaised();
+    error DisputeAtFinalTier();
+    event MockDisputeAppealed(uint256 orderId, address caller, uint8 toTier);
+
+    function appealDispute(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        if (msg.sender != order.user) revert NotDisputeUser();
+        if (buyDisputeStatus[orderId] != 1) revert DisputeNotRaised();
+        uint8 tier = disputeTierOf[orderId] == 0 ? 1 : disputeTierOf[orderId];
+        if (tier >= 3) revert DisputeAtFinalTier();
+        disputeTierOf[orderId] = tier + 1;
+        emit MockDisputeAppealed(orderId, msg.sender, tier + 1);
+    }
+
     /**
      * @notice Simulates B2BGatewayFacet.onB2BOrderCancelled: gateway-side
      *         cancellation calls the integrator's onOrderCancel under

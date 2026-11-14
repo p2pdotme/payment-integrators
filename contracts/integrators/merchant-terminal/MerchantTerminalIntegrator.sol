@@ -1475,49 +1475,71 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         emit LinkOrderCancelled(linkId, orderId);
     }
 
-    /// @notice Raise the Diamond's dispute on a link order, for its customer.
-    /// @dev The Router calls this only after checking the order's own customer
-    ///      signed this dispute (LinkRouter.dispute), so it is relayer-gated.
-    ///      The Diamond accepts a dispute only from `order.user`, which for a
+    /// @notice Raise, or appeal, the Diamond's dispute on a link order — the one
+    ///         dispute entry point, for both the customer and the merchant.
+    ///         (p2p.me's dispute ladder: circle -> country admin -> operations;
+    ///         an appeal moves a raised dispute up one tier.)
+    /// @param linkId The order's link — read only when the Router calls.
+    /// @param redactTransId Raise only: the last 4 digits of the customer's
+    ///        bank transfer. Ignored for an appeal.
+    /// @param appeal False to raise the dispute, true to appeal it.
+    /// @dev One function, not three, to keep the integrator under EIP-170.
+    ///
+    ///      WHO
+    ///        - The Router (`trustedRelayer`) acts for `linkId`'s owner, after
+    ///          checking the order's own customer signed it (LinkRouter.dispute
+    ///          / LinkRouter.appeal).
+    ///        - Any other caller acts as ITSELF, through its own proxy, so
+    ///          `linkId` is ignored and another merchant's order reverts on the
+    ///          Diamond. A frozen merchant cannot.
+    ///      The Diamond accepts both calls only from `order.user`, which for a
     ///      link order is the merchant's proxy: this is the one route to it.
     ///
     ///      Not `_relayForward`: a dispute is for a CANCELLED order, and
-    ///      cancellation deletes `orderToLink`. The order and link are matched
-    ///      by the Router's own record instead, and the Diamond itself refuses
-    ///      a dispute from any proxy but the order's, so another merchant's
-    ///      order cannot be reached through this link.
+    ///      cancellation deletes `orderToLink`. The Router's own record matches
+    ///      order and link instead, and the Diamond refuses any proxy but the
+    ///      order's own.
+    ///
+    ///      A merchant RAISE only from MERCHANT_DISPUTE_DELAY after placement:
+    ///      the Diamond takes one dispute per order, and the customer — who can
+    ///      file from 15 min — must not lose theirs to a merchant filing first
+    ///      with other digits (review #118, finding 2). No delay on an appeal:
+    ///      it does not use up the order's one dispute.
     ///
     ///      Like mark-paid, neither paused nor kill-switch gated: it protects a
-    ///      customer who paid. The Diamond enforces the rest (cancelled after
-    ///      being marked paid, 15 min to 24 h after placement).
-    ///
-    ///      No event of its own: the Diamond records and emits the dispute, and
-    ///      the Router emits `OrderDisputed`, so the integrator's bytes go to the
-    ///      checks instead.
-    function relayerRaiseDispute(
+    ///      customer who paid. Link orders only (withdrawals refused). The Diamond
+    ///      enforces the rest (cancelled after being marked paid, 15 min to 24 h
+    ///      after placement; an appeal only while one is due, never past tier 3).
+    ///      No event of its own: the Diamond records and emits it, and the Router
+    ///      emits `OrderDisputed` / `OrderAppealed`.
+    function linkDispute(
         bytes32 linkId,
         uint256 orderId,
-        uint256 redactTransId
+        uint256 redactTransId,
+        bool appeal
     ) external nonReentrant {
-        if (msg.sender != trustedRelayer) revert OnlyTrustedRelayer();
-        address owner = links[linkId].owner;
-        if (owner == address(0)) revert LinkNotFound();
-        _raiseDispute(owner, orderId, redactTransId);
-    }
-
-    /// @notice The merchant raises the Diamond's dispute on one of their own
-    ///         link orders (their proxy is its `order.user`; anyone else's order
-    ///         reverts on the Diamond). A frozen merchant cannot.
-    /// @dev Only from MERCHANT_DISPUTE_DELAY after placement: the Diamond takes
-    ///      one dispute per order, and the customer — who can file from 15 min —
-    ///      must not lose theirs to a merchant filing first with other digits
-    ///      (review #118, finding 2). The merchant path stays for a customer who
-    ///      lost their key.
-    function raiseLinkDispute(uint256 orderId, uint256 redactTransId) external nonReentrant {
-        if (merchants[msg.sender].isFrozen) revert MerchantIsFrozen();
-        if (block.timestamp < _diamondOrder(orderId).placedTimestamp + MERCHANT_DISPUTE_DELAY)
-            revert DisputeTooEarly();
-        _raiseDispute(msg.sender, orderId, redactTransId);
+        address merchant = msg.sender;
+        if (merchant == trustedRelayer) {
+            merchant = links[linkId].owner;
+            if (merchant == address(0)) revert LinkNotFound();
+        } else {
+            if (merchants[merchant].isFrozen) revert MerchantIsFrozen();
+            if (
+                !appeal &&
+                block.timestamp < _diamondOrder(orderId).placedTimestamp + MERCHANT_DISPUTE_DELAY
+            ) revert DisputeTooEarly();
+        }
+        // Link orders only. A fiat withdrawal (SELL) is also owned by the
+        // merchant's proxy, and the Diamond would accept a dispute on it — but a
+        // won one refunds to the proxy with no path back to the merchant
+        // (review #118, finding 1). Withdrawal records are never deleted.
+        if (withdrawals[orderId].merchant != address(0)) revert NotALinkOrder();
+        _viaProxy(
+            merchant,
+            appeal
+                ? abi.encodeCall(IOrderFlow.appealDispute, (orderId))
+                : abi.encodeCall(IOrderFlow.raiseDispute, (orderId, redactTransId))
+        );
     }
 
     /// @notice Give back the link use a paid-then-cancelled order still holds,
@@ -1544,22 +1566,6 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      it: each inline external call carries its own encode/decode code.
     function _diamondOrder(uint256 orderId) private view returns (IOrderFlow.OrderView memory) {
         return IOrderFlow(diamond).getOrdersById(orderId);
-    }
-
-    /// @dev Both dispute entry points: `merchant`'s proxy raises it (LinkDisputeLib).
-    function _raiseDispute(address merchant, uint256 orderId, uint256 redactTransId) private {
-        // Link orders only. A fiat withdrawal (SELL) is also owned by the
-        // merchant's proxy, and the Diamond would accept a dispute on it — but a
-        // won one refunds to the proxy with no path back to the merchant
-        // (review #118, finding 1). Withdrawal records are never deleted.
-        if (withdrawals[orderId].merchant != address(0)) revert NotALinkOrder();
-        LinkDisputeLib.raise(
-            proxyAddress(merchant),
-            diamond,
-            address(usdc),
-            orderId,
-            redactTransId
-        );
     }
 
     /// @notice Whether a link can be paid right now — the pay page's precheck.

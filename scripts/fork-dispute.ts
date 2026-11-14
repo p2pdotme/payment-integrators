@@ -291,11 +291,11 @@ async function main() {
       "dispute sent by a wallet that is not the link's"
     );
     await refused(
-      () => I.connect(stranger).relayerRaiseDispute(LINK, o1, LAST4),
-      "the integrator's relayer entry point called directly"
+      () => I.connect(stranger).linkDispute(LINK, o1, LAST4, false),
+      "a stranger naming the link on the integrator directly (acts as itself)"
     );
     await refused(
-      () => I.connect(otherMerchant).raiseLinkDispute(o1, LAST4),
+      () => I.connect(otherMerchant).linkDispute(ethers.ZeroHash, o1, LAST4, false),
       "another merchant disputing this merchant's order"
     );
 
@@ -328,11 +328,11 @@ async function main() {
     await cancelAfterPaying(o2);
     await warp(15 * 60 + 5);
     await refused(
-      () => I.connect(merchant).raiseLinkDispute(o2, 1234n),
+      () => I.connect(merchant).linkDispute(ethers.ZeroHash, o2, 1234n, false),
       "the merchant before 6 hours (the customer goes first)"
     );
     await warp(6 * 3600);
-    await tx(I.connect(merchant).raiseLinkDispute(o2, 1234n));
+    await tx(I.connect(merchant).linkDispute(ethers.ZeroHash, o2, 1234n, false));
     const d2 = (await order(o2)).disputeInfo;
     check(
       Number(d2.status) !== 0 && d2.redactTransId === 1234n,

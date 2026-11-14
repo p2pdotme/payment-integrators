@@ -289,19 +289,30 @@ describe("Link-order disputes", function () {
       ).to.be.revertedWithCustomError(router, "UnknownOrder");
     });
 
-    it("nobody but the Router can call the integrator's relayer entry point", async function () {
-      const orderId = await cancelledAfterPaying();
+    it("only the Router acts for a link's owner: anyone else acts as itself", async function () {
+      const orderId = await cancelledAfterPaying(); // 15 min after placement
+      // Naming the link does not make a caller its merchant: as themselves they
+      // are held to the merchant's 6 h wait — the owner included, so the
+      // customer-first rule cannot be skipped by naming one's own link.
       for (const who of [attacker, merchant1, agent1]) {
         await expect(
-          integrator.connect(who).relayerRaiseDispute(LINK, orderId, LAST4)
-        ).to.be.revertedWithCustomError(integrator, "OnlyTrustedRelayer");
+          integrator.connect(who).linkDispute(LINK, orderId, LAST4, false)
+        ).to.be.revertedWithCustomError(integrator, "DisputeTooEarly");
       }
+      // After it, a stranger's call still goes through their OWN proxy, which
+      // is not this order's user: nothing is filed.
+      await time.increase(MERCHANT_DELAY);
+      for (const who of [attacker, agent1]) {
+        await expect(integrator.connect(who).linkDispute(LINK, orderId, LAST4, false)).to.be
+          .reverted;
+      }
+      expect((await mockDiamond.getOrdersById(orderId)).disputeInfo.status).to.equal(0);
     });
 
     it("the relayer entry point refuses a link that does not exist", async function () {
       await integrator.setTrustedRelayer(owner.address);
       await expect(
-        integrator.relayerRaiseDispute(ethers.id("no-such-link"), 1n, LAST4)
+        integrator.linkDispute(ethers.id("no-such-link"), 1n, LAST4, false)
       ).to.be.revertedWithCustomError(integrator, "LinkNotFound");
     });
   });
@@ -356,7 +367,9 @@ describe("Link-order disputes", function () {
     it("files it through their proxy, from 6 hours after placement", async function () {
       const orderId = await cancelledAfterPaying();
       await time.increase(MERCHANT_DELAY);
-      await expect(integrator.connect(merchant1).raiseLinkDispute(orderId, LAST4))
+      await expect(
+        integrator.connect(merchant1).linkDispute(ethers.ZeroHash, orderId, LAST4, false)
+      )
         .to.emit(mockDiamond, "MockDisputeRaised")
         .withArgs(orderId, await integrator.proxyAddress(merchant1.address), LAST4);
     });
@@ -364,14 +377,16 @@ describe("Link-order disputes", function () {
     it("not before 6 hours: the customer gets the first chance (review #118, 2)", async function () {
       const orderId = await cancelledAfterPaying(); // 15 min after placement
       await expect(
-        integrator.connect(merchant1).raiseLinkDispute(orderId, 1111n)
+        integrator.connect(merchant1).linkDispute(ethers.ZeroHash, orderId, 1111n, false)
       ).to.be.revertedWithCustomError(integrator, "DisputeTooEarly");
       // The customer can file in that time, with their own digits.
       await router.connect(agent1).dispute(LINK, orderId, LAST4, await disputeSig(LINK, orderId));
       expect((await mockDiamond.getOrdersById(orderId)).disputeInfo.redactTransId).to.equal(LAST4);
       // Later the merchant cannot replace it: the Diamond takes one dispute per order.
       await time.increase(MERCHANT_DELAY);
-      await expect(integrator.connect(merchant1).raiseLinkDispute(orderId, 1111n)).to.be.reverted;
+      await expect(
+        integrator.connect(merchant1).linkDispute(ethers.ZeroHash, orderId, 1111n, false)
+      ).to.be.reverted;
       expect((await mockDiamond.getOrdersById(orderId)).disputeInfo.redactTransId).to.equal(LAST4);
     });
 
@@ -379,8 +394,11 @@ describe("Link-order disputes", function () {
       const orderId = await cancelledAfterPaying();
       await time.increase(MERCHANT_DELAY);
       // Without a proxy at all (never sold anything), the call has nothing to reach.
-      await expect(integrator.connect(attacker).raiseLinkDispute(orderId, LAST4)).to.be.reverted;
-      await expect(integrator.connect(merchant2).raiseLinkDispute(orderId, LAST4)).to.be.reverted;
+      await expect(integrator.connect(attacker).linkDispute(ethers.ZeroHash, orderId, LAST4, false))
+        .to.be.reverted;
+      await expect(
+        integrator.connect(merchant2).linkDispute(ethers.ZeroHash, orderId, LAST4, false)
+      ).to.be.reverted;
 
       // With a real proxy of their own, it is the Diamond that says no.
       await mkLink(LINK_M2, merchant2);
@@ -390,7 +408,9 @@ describe("Link-order disputes", function () {
         .place(LINK_M2, erc721Client.target, PRODUCT_ID, 1, INR, 0, PK, customer.address);
       const proxy2 = await proxyOf(merchant2);
       const diamondErr = mockDiamond.interface.encodeErrorResult("NotAuthorized", []);
-      await expect(integrator.connect(merchant2).raiseLinkDispute(orderId, LAST4))
+      await expect(
+        integrator.connect(merchant2).linkDispute(ethers.ZeroHash, orderId, LAST4, false)
+      )
         .to.be.revertedWithCustomError(proxy2, "CallFailed")
         .withArgs(diamondErr);
     });
@@ -399,7 +419,7 @@ describe("Link-order disputes", function () {
       const orderId = await cancelledAfterPaying();
       await integrator.freezeMerchant(merchant1.address);
       await expect(
-        integrator.connect(merchant1).raiseLinkDispute(orderId, LAST4)
+        integrator.connect(merchant1).linkDispute(ethers.ZeroHash, orderId, LAST4, false)
       ).to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
     });
 
@@ -451,8 +471,182 @@ describe("Link-order disputes", function () {
       );
       await time.increase(MERCHANT_DELAY);
       await expect(
-        integrator.connect(merchant1).raiseLinkDispute(withdrawalId, LAST4)
+        integrator.connect(merchant1).linkDispute(ethers.ZeroHash, withdrawalId, LAST4, false)
       ).to.be.revertedWithCustomError(integrator, "NotALinkOrder");
+      // Nor appealed: same rule, same guard.
+      await expect(
+        integrator.connect(merchant1).linkDispute(ethers.ZeroHash, withdrawalId, 0n, true)
+      ).to.be.revertedWithCustomError(integrator, "NotALinkOrder");
+    });
+  });
+
+  // ─── Dispute ladder: appeals (p2p.me, Base mainnet 9 Nov 2026) ───
+
+  /**
+   * p2p.me now decides a dispute in up to three tiers, and only `order.user`
+   * may appeal a tier's decision. For a link order that is the merchant's proxy,
+   * so — as with raise — only this contract can appeal, for the customer
+   * (through the Router, customer-signed) or the merchant (directly).
+   */
+  describe("appeals on a link order's dispute", function () {
+    const APPEAL_TYPES = {
+      Appeal: [...ORDER_TYPES, { name: "appealNumber", type: "uint8" }],
+    };
+
+    async function appealSig(id: string, orderId: bigint, n: number, who = customer) {
+      return who.signTypedData(await domain(), APPEAL_TYPES, {
+        linkId: id,
+        orderId,
+        appealNumber: n,
+      });
+    }
+
+    /** A dispute the customer has raised and a tier can now rule on. */
+    async function disputed(): Promise<bigint> {
+      const orderId = await cancelledAfterPaying();
+      await router.connect(agent1).dispute(LINK, orderId, LAST4, await disputeSig(LINK, orderId));
+      return orderId;
+    }
+
+    it("the customer appeals through the Router: the merchant's proxy escalates it", async function () {
+      const orderId = await disputed();
+      await expect(router.connect(agent1).appeal(LINK, orderId, await appealSig(LINK, orderId, 1)))
+        .to.emit(router, "OrderAppealed")
+        .withArgs(LINK, orderId, 1)
+        .and.to.emit(mockDiamond, "MockDisputeAppealed")
+        .withArgs(orderId, await integrator.proxyAddress(merchant1.address), 2);
+      expect(await router.appealsFiled(orderId)).to.equal(1);
+      expect(await mockDiamond.disputeTierOf(orderId)).to.equal(2);
+    });
+
+    it("the digest is the one the pay page signs, and moves to the next appeal number", async function () {
+      const orderId = await disputed();
+      const hash = async (n: number) =>
+        ethers.TypedDataEncoder.hash(await domain(), APPEAL_TYPES, {
+          linkId: LINK,
+          orderId,
+          appealNumber: n,
+        });
+      expect(await router.appealDigest(LINK, orderId)).to.equal(await hash(1));
+      await router.connect(agent1).appeal(LINK, orderId, await appealSig(LINK, orderId, 1));
+      expect(await router.appealDigest(LINK, orderId)).to.equal(await hash(2));
+    });
+
+    it("each signature escalates once: the link wallet cannot replay it to reach tier 3", async function () {
+      const orderId = await disputed();
+      const first = await appealSig(LINK, orderId, 1);
+      await router.connect(agent1).appeal(LINK, orderId, first);
+      await expect(
+        router.connect(agent1).appeal(LINK, orderId, first)
+      ).to.be.revertedWithCustomError(router, "BadCustomerSignature");
+      expect(await mockDiamond.disputeTierOf(orderId)).to.equal(2);
+
+      // The customer's own second appeal goes through, to the final tier.
+      await router.connect(agent1).appeal(LINK, orderId, await appealSig(LINK, orderId, 2));
+      expect(await mockDiamond.disputeTierOf(orderId)).to.equal(3);
+
+      // Tier 3 is final: the Diamond refuses, and the Router's count rolls back.
+      const finalErr = mockDiamond.interface.encodeErrorResult("DisputeAtFinalTier", []);
+      await expect(router.connect(agent1).appeal(LINK, orderId, await appealSig(LINK, orderId, 3)))
+        .to.be.revertedWithCustomError(proxy1, "CallFailed")
+        .withArgs(finalErr);
+      expect(await router.appealsFiled(orderId)).to.equal(2);
+    });
+
+    it("only the order's own customer can authorise it, and only for an appeal", async function () {
+      const orderId = await disputed();
+      for (const who of [attacker, agent1, merchant1]) {
+        await expect(
+          router.connect(agent1).appeal(LINK, orderId, await appealSig(LINK, orderId, 1, who))
+        ).to.be.revertedWithCustomError(router, "BadCustomerSignature");
+      }
+      for (const s of [
+        await disputeSig(LINK, orderId),
+        await sig("MarkPaid", LINK, orderId),
+        await sig("Cancel", LINK, orderId),
+      ]) {
+        await expect(router.connect(agent1).appeal(LINK, orderId, s)).to.be.revertedWithCustomError(
+          router,
+          "BadCustomerSignature"
+        );
+      }
+    });
+
+    it("only this link's wallet can send it, and only for this link's orders", async function () {
+      const orderId = await disputed();
+      const s = await appealSig(LINK, orderId, 1);
+      await expect(router.connect(attacker).appeal(LINK, orderId, s)).to.be.revertedWithCustomError(
+        router,
+        "NotLinkAgent"
+      );
+      await mkLink(LINK2);
+      await register(LINK2, agent2);
+      await expect(
+        router.connect(agent2).appeal(LINK2, orderId, await appealSig(LINK2, orderId, 1))
+      ).to.be.revertedWithCustomError(router, "OrderLinkMismatch");
+      await expect(
+        router.connect(agent1).appeal(LINK, 999n, await appealSig(LINK, 999n, 1))
+      ).to.be.revertedWithCustomError(router, "UnknownOrder");
+    });
+
+    it("nothing to appeal before a dispute is raised: the Diamond refuses", async function () {
+      const orderId = await cancelledAfterPaying();
+      const err = mockDiamond.interface.encodeErrorResult("DisputeNotRaised", []);
+      await expect(router.connect(agent1).appeal(LINK, orderId, await appealSig(LINK, orderId, 1)))
+        .to.be.revertedWithCustomError(proxy1, "CallFailed")
+        .withArgs(err);
+      expect(await router.appealsFiled(orderId)).to.equal(0);
+    });
+
+    it("works while paused and with link orders switched off — it protects a customer who paid", async function () {
+      const orderId = await disputed();
+      await integrator.pause();
+      await integrator.setLinkOrdersEnabled(false);
+      await router.connect(agent1).appeal(LINK, orderId, await appealSig(LINK, orderId, 1));
+      expect(await mockDiamond.disputeTierOf(orderId)).to.equal(2);
+    });
+
+    it("the merchant appeals their own link order directly, with no delay", async function () {
+      const orderId = await disputed(); // 15 min after placement: no 6 h wait for an appeal
+      await expect(integrator.connect(merchant1).linkDispute(ethers.ZeroHash, orderId, 0n, true))
+        .to.emit(mockDiamond, "MockDisputeAppealed")
+        .withArgs(orderId, await integrator.proxyAddress(merchant1.address), 2);
+    });
+
+    it("a merchant appeals only as themselves: linkId is ignored, the Diamond refuses another's order", async function () {
+      const orderId = await disputed();
+      // No proxy at all: nothing to reach.
+      await expect(integrator.connect(attacker).linkDispute(LINK, orderId, 0n, true)).to.be
+        .reverted;
+      // A real proxy of their own, naming merchant1's link: still their OWN proxy calls.
+      await mkLink(LINK_M2, merchant2);
+      await register(LINK_M2, agent2, merchant2);
+      await router
+        .connect(agent2)
+        .place(LINK_M2, erc721Client.target, PRODUCT_ID, 1, INR, 0, PK, customer.address);
+      const proxy2 = await proxyOf(merchant2);
+      const err = mockDiamond.interface.encodeErrorResult("NotDisputeUser", []);
+      await expect(integrator.connect(merchant2).linkDispute(LINK, orderId, 0n, true))
+        .to.be.revertedWithCustomError(proxy2, "CallFailed")
+        .withArgs(err);
+      expect(await mockDiamond.disputeTierOf(orderId)).to.equal(0);
+    });
+
+    it("a frozen merchant cannot appeal; their customer still can", async function () {
+      const orderId = await disputed();
+      await integrator.freezeMerchant(merchant1.address);
+      await expect(
+        integrator.connect(merchant1).linkDispute(ethers.ZeroHash, orderId, 0n, true)
+      ).to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
+      await router.connect(agent1).appeal(LINK, orderId, await appealSig(LINK, orderId, 1));
+      expect(await mockDiamond.disputeTierOf(orderId)).to.equal(2);
+    });
+
+    it("the relayer entry point acts for the link's owner, and refuses a link that does not exist", async function () {
+      await integrator.setTrustedRelayer(owner.address);
+      await expect(
+        integrator.linkDispute(ethers.id("no-such-link"), 1n, 0n, true)
+      ).to.be.revertedWithCustomError(integrator, "LinkNotFound");
     });
   });
 
