@@ -49,8 +49,8 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *         Limits enforced in validateOrder: a per-transaction cap of 50 USDC for
  *         INR merchants / 100 USDC default (perTxCap, admin-tunable via setPerTxCap)
  *         and DAILY_TX_LIMIT = 25 orders per merchant per UTC day (admin-tunable via
- *         setDailyLimit). The system proxy is carved out so withdrawals never hit
- *         merchant buy-side limits.
+ *         setDailyLimit, and per merchant via setMerchantDailyLimit). The system
+ *         proxy is carved out so withdrawals never hit merchant buy-side limits.
  */
 contract MerchantTerminalIntegrator is IP2PIntegrator {
     using SafeERC20 for IERC20;
@@ -135,6 +135,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error LimitOutOfBounds();
     /// @dev Raised by MerchantRegistryLib: only the super-admin may raise a max.
     error RaiseNeedsSuperAdmin();
+    /// @dev Raised by MerchantRegistryLib: setMerchantDailyLimit on address(0).
+    error InvalidMerchant();
     error WithdrawalInFlight();
     error FiatAlreadyDelivered();
     /// @dev deliverFiatPayout called on an order the Diamond no longer holds in
@@ -251,6 +253,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     event ExcessSkimmed(address indexed to, uint256 amount);
     event PerTxCapSet(bytes32 indexed currency, uint256 cap);
     event DailyLimitSet(uint256 newLimit);
+    /// @notice A MANAGER gave `merchant` their own daily order limit, or cleared
+    ///         it (limit 0 = back on the global `dailyLimit`). Emitted by
+    ///         MerchantRegistryLib; declared here for the ABI.
+    event MerchantDailyLimitSet(address indexed merchant, uint256 limit);
     /// @notice An owner (lowering) or the super-admin changed the range the
     ///         limits must stay within.
     event LimitBoundsSet(uint256 minDaily, uint256 maxDaily, uint256 minCap, uint256 maxCap);
@@ -533,6 +539,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         ceiling for MANAGERs: they can move a limit, not its max.
     MerchantTypes.LimitBounds public limitBounds;
 
+    /// @notice One merchant's own daily order limit, as a MANAGER set it with
+    ///         setMerchantDailyLimit. 0 = none: the merchant follows the global
+    ///         `dailyLimit`. The limit that APPLIES (this, pulled inside
+    ///         `limitBounds`, or the global one) is `getDailyTxInfo(m).limit`.
+    mapping(address => uint256) public merchantDailyLimit;
+
     /// @notice The link relayer (the LinkRouter): the only caller of
     ///         relayerPlaceOrder / relayerMarkPaid / relayerCancelOrder.
     ///         address(0) = link orders off. Set by the super-admin only
@@ -551,7 +563,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         • VIEWER  (1): read-only — all views, no writes. For auditors /
     ///                        support staff who only need to SEE merchant activity.
     ///         • SUPPORT (2): + freeze / unfreeze a merchant (the safety switch).
-    ///         • MANAGER (3): + config — setPerTxCap, setDailyLimit, setTrustedRelayer.
+    ///         • MANAGER (3): + config — setPerTxCap, setDailyLimit,
+    ///                        setMerchantDailyLimit, setTrustedRelayer.
     ///         • FINANCE (4): + money recovery — adminAbortWithdrawal, adminForceSettle.
     ///         The OWNER sits above all tiers (implicitly FINANCE) and is the ONLY
     ///         one who can assign roles, add/remove admins, or transfer ownership.
@@ -869,15 +882,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // Empty = keep the current handle (audit 2026-09 I-1). It used to revert,
         // which left a merchant who registered without a payout rail unable to
         // fix a typo in their shop name without also choosing one. A handle,
-        // once set, still can never be blanked back out.
-        if (encPayoutId.length != 0) m.encPayoutId = encPayoutId;
-        m.shopName = shopName;
-        // Editable for the same reason shopName is. It is REQUIRED at
-        // registration, so without this a merchant who mistyped their sector
-        // was stuck with it permanently and could not blank it either — an
-        // asymmetry with shopName that had no justification.
+        // once set, still can never be blanked back out (keepEmptyPayout).
+        //
+        // The sector is editable for the same reason shopName is. It is
+        // REQUIRED at registration, so without this a merchant who mistyped
+        // their sector was stuck with it permanently and could not blank it
+        // either — an asymmetry with shopName that had no justification.
         MerchantRegistryLib.validateSector(businessSector);
-        m.businessSector = businessSector;
+        MerchantRegistryLib.writeProfile(m, encPayoutId, shopName, businessSector, true);
         emit MerchantProfileUpdated(msg.sender, shopName);
     }
 
@@ -896,8 +908,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         _checkLengths(encPayoutId, shopName);
         // Field validation (canonical currency form, sector present) lives in
         // MerchantRegistryLib — pure, no state, and out of the integrator's
-        // bytecode, which is at the EIP-170 ceiling. The storage writes stay
-        // here so nothing about custody moves.
+        // bytecode, which is at the EIP-170 ceiling. So does the copy of the
+        // profile fields into storage (writeProfile, for size); everything
+        // about custody, and every check, stays here.
         MerchantRegistryLib.validateRegistration(currency, businessSector);
 
         MerchantTypes.Merchant storage m = merchants[msg.sender];
@@ -913,10 +926,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // there means they cannot withdraw until they do, which is the real
         // constraint. `updateProfile` still rejects an empty value, so this can
         // be filled in later but never blanked back out.
-        m.encPayoutId = encPayoutId;
-        m.shopName = shopName;
+        MerchantRegistryLib.writeProfile(m, encPayoutId, shopName, businessSector, false);
         m.currency = currency;
-        m.businessSector = businessSector;
         registered[msg.sender] = true;
         emit MerchantRegistered(msg.sender, shopName, currency, businessSector);
     }
@@ -1002,12 +1013,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (amount > perTxCap(m.currency)) revert ExceedsPerTxCap();
 
         _rollDay(m);
+        // The merchant's own limit if a MANAGER set one, else the global one.
+        uint256 limit = _dailyLimitOf(subject);
         if (isLinkOrder) {
             // Reserve against the day's room; counted at mark-paid.
-            PaymentLinksLib.reservePending(linkPending, subject, m.dailyTxCount, dailyLimit);
+            PaymentLinksLib.reservePending(linkPending, subject, m.dailyTxCount, limit);
             return true;
         }
-        if (m.dailyTxCount >= dailyLimit) revert DailyLimitReached();
+        if (m.dailyTxCount >= limit) revert DailyLimitReached();
         m.dailyTxCount++;
         return true;
     }
@@ -2318,6 +2331,19 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         emit DailyLimitSet(newLimit);
     }
 
+    /// @notice Give one merchant their own daily order limit, or clear it
+    ///         (limit = 0) so they follow the global `dailyLimit` again. Same
+    ///         tier and the same range as the global limit: inside limitBounds
+    ///         [minDaily, maxDaily], so a MANAGER can move it but never past the
+    ///         ceiling the owners set. Applies from the next order. The library
+    ///         emits `MerchantDailyLimitSet(merchant, limit)`.
+    function setMerchantDailyLimit(
+        address merchant,
+        uint256 limit
+    ) external onlyRole(Role.MANAGER) {
+        MerchantRegistryLib.setMerchantDailyLimit(merchantDailyLimit, limitBounds, merchant, limit);
+    }
+
     /// @notice Owners and the super-admin: set the range the limits must stay
     ///         within (review #4). Any owner may LOWER a max; only the
     ///         super-admin may RAISE one (RaiseNeedsSuperAdmin), so no single
@@ -2790,7 +2816,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         MerchantTypes.Merchant storage m = merchants[merchant];
         uint256 today = block.timestamp / 86400;
         usedToday = m.lastTxDate == today ? m.dailyTxCount : 0;
-        return (usedToday, dailyLimit);
+        return (usedToday, _dailyLimitOf(merchant));
+    }
+
+    /// @dev The daily order limit that applies to `merchant` (MerchantRegistryLib).
+    function _dailyLimitOf(address merchant) private view returns (uint256) {
+        return
+            MerchantRegistryLib.dailyLimitOf(merchantDailyLimit, limitBounds, merchant, dailyLimit);
     }
 
     /// @notice The merchant's offramp currency as a readable code ("INR",
