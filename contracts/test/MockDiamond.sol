@@ -197,7 +197,7 @@ contract MockDiamond {
         uint256 amount,
         bytes32 currency,
         address recipientAddr,
-        string calldata /* pubKey */,
+        string calldata pubKey,
         uint256 /* circleId */,
         uint256 /* preferredPaymentChannelConfigId */,
         uint256 /* fiatAmountLimit */
@@ -217,6 +217,11 @@ contract MockDiamond {
         }
 
         orderId = forceOrderId != 0 ? forceOrderId : nextOrderId++;
+        placedAtOf[orderId] = block.timestamp;
+        buyPubKeyOf[orderId] = pubKey;
+        // What the real Diamond records as the order's fiatAmount: the USDC
+        // principal at the currency's buy price (6 decimals both).
+        fiatAmountOf[orderId] = (amount * buyPriceOf[currency]) / 1e6;
         orders[orderId] = Order({
             integrator: effectiveIntegrator,
             user: user,
@@ -375,6 +380,28 @@ contract MockDiamond {
         require(order.integrator != address(0), "Unknown order");
         require(!order.completed && !order.cancelled, "Terminal");
         order.accepted = true;
+        acceptedAtOf[orderId] = block.timestamp;
+        acceptedByOf[orderId] = msg.sender;
+    }
+
+    /// @notice An LP takes the order AND shares where to pay: `encUpi` is the
+    ///         payout address encrypted to the customer's key (`buyPubKeyOf`),
+    ///         as on the real Diamond. Lets the customer's pay-to-UPI screen be
+    ///         tested in a browser against a local node.
+    function simulateOrderAcceptedWithUpi(uint256 orderId, string calldata encUpi) external {
+        Order storage order = orders[orderId];
+        require(order.integrator != address(0), "Unknown order");
+        require(!order.completed && !order.cancelled && !order.paid, "Terminal");
+        order.accepted = true;
+        acceptedAtOf[orderId] = block.timestamp;
+        acceptedByOf[orderId] = msg.sender;
+        encUpiOf[orderId] = encUpi;
+        // What the customer is charged once matched: principal plus the
+        // small-order fee, at the buy price (the real Diamond's actualFiatAmount).
+        uint256 fee = order.amount < smallOrderThresholdOf[order.currency]
+            ? smallOrderFixedFeeBuyOf[order.currency]
+            : 0;
+        actualFiatOf[orderId] = ((order.amount + fee) * buyPriceOf[order.currency]) / 1e6;
     }
 
     event MockOrderPaid(uint256 orderId, address caller);
@@ -395,6 +422,7 @@ contract MockDiamond {
         if (!order.accepted) revert OrderStatusInvalid();
 
         order.paid = true;
+        paidAtOf[orderId] = block.timestamp;
         emit MockOrderPaid(orderId, msg.sender);
     }
 
@@ -419,6 +447,63 @@ contract MockDiamond {
             emit MockIntegratorCallbackFailed(orderId, order.integrator, reason);
         }
         emit MockOrderCancelledBy(orderId, msg.sender);
+    }
+
+    // ─── BUY disputes (OrderProcessorFacet.raiseDispute) ──────────────────
+    /// @notice Each BUY's dispute state (Diamond's Dispute.status: 0 = none,
+    ///         1 = raised) and the transfer's last 4 digits. `raisedBy` stays 0:
+    ///         that is the USER value, as the Base Sepolia Diamond records a
+    ///         dispute from `order.user` (fork-checked, scripts/fork-dispute.ts).
+    mapping(uint256 => uint8) public buyDisputeStatus;
+    mapping(uint256 => uint256) public buyDisputeTransId;
+    error DisputeNotAllowed();
+    event MockDisputeRaised(uint256 orderId, address caller, uint256 redactTransId);
+
+    /// @notice Under the same `order.user` gate as `paidBuyOrder`, and the
+    ///         live Diamond's rules: a BUY cancelled after being marked paid,
+    ///         15 min to 24 h after placement, once.
+    function raiseDispute(uint256 orderId, uint256 redactTransId) external {
+        Order storage order = orders[orderId];
+        if (order.integrator == address(0)) revert OrderStatusInvalid();
+        if (msg.sender != order.user) revert NotAuthorized();
+        if (!order.cancelled || paidAtOf[orderId] == 0) revert OrderStatusInvalid();
+        uint256 age = block.timestamp - placedAtOf[orderId];
+        if (age < 15 minutes || age > 24 hours || buyDisputeStatus[orderId] != 0)
+            revert DisputeNotAllowed();
+        buyDisputeStatus[orderId] = 1;
+        buyDisputeTransId[orderId] = redactTransId;
+        emit MockDisputeRaised(orderId, msg.sender, redactTransId);
+    }
+
+    /// @notice p2p.me's admin settles a BUY dispute: it is no longer open
+    ///         (status 2 here; the integrator only tests for "open" = 1). For a
+    ///         MERCHANT-fault ruling the order then completes — call
+    ///         simulateOrderComplete, which reopens a cancelled BUY as the real
+    ///         Diamond's dispute path does. A USER-fault ruling leaves it cancelled.
+    function simulateDisputeSettled(uint256 orderId) external {
+        if (buyDisputeStatus[orderId] != 1) revert DisputeNotAllowed();
+        buyDisputeStatus[orderId] = 2;
+    }
+
+    // ─── Dispute ladder (DisputeFacet.appealDispute, Base mainnet) ────────
+    /// @notice Each open dispute's tier: 1 once raised, +1 per appeal, max 3.
+    ///         Models the live rules the integrator depends on: `order.user`
+    ///         only, an open dispute only, not past tier 3. (The appeal window
+    ///         and decision SLA are the Diamond's own; not modelled here.)
+    mapping(uint256 => uint8) public disputeTierOf;
+    error NotDisputeUser();
+    error DisputeNotRaised();
+    error DisputeAtFinalTier();
+    event MockDisputeAppealed(uint256 orderId, address caller, uint8 toTier);
+
+    function appealDispute(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        if (msg.sender != order.user) revert NotDisputeUser();
+        if (buyDisputeStatus[orderId] != 1) revert DisputeNotRaised();
+        uint8 tier = disputeTierOf[orderId] == 0 ? 1 : disputeTierOf[orderId];
+        if (tier >= 3) revert DisputeAtFinalTier();
+        disputeTierOf[orderId] = tier + 1;
+        emit MockDisputeAppealed(orderId, msg.sender, tier + 1);
     }
 
     /**
@@ -623,6 +708,64 @@ contract MockDiamond {
         sellOrders[orderId].disputeStatus = status;
     }
 
+    // ─── Prices (test-only; for the relayer's checkout-session suites) ───────
+    /// @notice The BUY price per currency, 6-dec fiat per USDC, and the
+    ///         small-order fee rule — read by the relayer to price a session
+    ///         amount in USDC, exactly as it reads the live Diamond's
+    ///         PriceConfigFacet. 0 = no price: the relayer then refuses to price.
+    mapping(bytes32 => uint256) public buyPriceOf;
+    mapping(bytes32 => uint256) public smallOrderThresholdOf;
+    mapping(bytes32 => uint256) public smallOrderFixedFeeBuyOf;
+    /// @notice When each BUY was placed, its fiat amount, and when it was
+    ///         marked paid — the real Diamond's placedTimestamp, fiatAmount
+    ///         and paidTimestamp.
+    mapping(uint256 => uint256) public placedAtOf;
+    mapping(uint256 => uint256) public fiatAmountOf;
+    mapping(uint256 => uint256) public paidAtOf;
+    /// @notice BUY orders: the customer's key, when an LP accepted, who, and
+    ///         the payout address the LP shared (encrypted to that key).
+    mapping(uint256 => string) public buyPubKeyOf;
+    mapping(uint256 => uint256) public acceptedAtOf;
+    mapping(uint256 => address) public acceptedByOf;
+    mapping(uint256 => string) public encUpiOf;
+    mapping(uint256 => uint256) public actualFiatOf;
+
+    struct PriceConfig {
+        uint256 buyPrice;
+        uint256 sellPrice;
+        int256 buyPriceOffset;
+        uint256 baseSpread;
+    }
+
+    function setBuyPrice(
+        bytes32 currency,
+        uint256 price,
+        uint256 smallThreshold,
+        uint256 smallFee
+    ) external {
+        buyPriceOf[currency] = price;
+        smallOrderThresholdOf[currency] = smallThreshold;
+        smallOrderFixedFeeBuyOf[currency] = smallFee;
+    }
+
+    function getPriceConfig(bytes32 currency) external view returns (PriceConfig memory) {
+        return
+            PriceConfig({
+                buyPrice: buyPriceOf[currency],
+                sellPrice: 0,
+                buyPriceOffset: 0,
+                baseSpread: 0
+            });
+    }
+
+    function getSmallOrderThreshold(bytes32 currency) external view returns (uint256) {
+        return smallOrderThresholdOf[currency];
+    }
+
+    function getSmallOrderFixedFeeBuy(bytes32 currency) external view returns (uint256) {
+        return smallOrderFixedFeeBuyOf[currency];
+    }
+
     function getAdditionalOrderDetails(
         uint256 orderId
     ) external view returns (AdditionalOrderDetailsView memory) {
@@ -630,15 +773,15 @@ contract MockDiamond {
             AdditionalOrderDetailsView({
                 fixedFeePaid: uint64(_sellFee(sellOrders[orderId].amount)),
                 tipsPaid: 0,
-                acceptedTimestamp: 0,
-                paidTimestamp: 0,
+                acceptedTimestamp: uint128(acceptedAtOf[orderId]),
+                paidTimestamp: uint128(paidAtOf[orderId]),
                 reserved2: 0,
                 actualUsdtAmount: additionalOrderDetailsFeeUnready
                     ? 0
                     : actualUsdtAmountOverride[orderId] != 0
                         ? actualUsdtAmountOverride[orderId]
                         : sellOrders[orderId].amount + _sellFee(sellOrders[orderId].amount),
-                actualFiatAmount: 0
+                actualFiatAmount: actualFiatOf[orderId]
             });
     }
 
@@ -730,15 +873,22 @@ contract MockDiamond {
         // otherwise fall through to the SELL view (reconcile/finalize/etc.).
         Order storage b = orders[orderId];
         if (b.integrator != address(0)) {
-            // Map the BUY flags to the Diamond's OrderStatus codes (COMPLETED=3,
-            // CANCELLED=4, else PLACED=0). Mirrors how a real completed BUY reads.
-            o.status = b.completed ? 3 : (b.cancelled ? 4 : 0);
+            // Map the BUY flags to the Diamond's OrderStatus codes (PLACED=0,
+            // ACCEPTED=1, PAID=2, COMPLETED=3, CANCELLED=4), as a real BUY reads.
+            o.status = b.completed ? 3 : (b.cancelled ? 4 : (b.paid ? 2 : (b.accepted ? 1 : 0)));
+            o.pubkey = buyPubKeyOf[orderId];
+            o.encUpi = encUpiOf[orderId];
+            o.acceptedMerchant = acceptedByOf[orderId];
             o.orderType = 0; // BUY
             o.amount = b.amount;
+            o.fiatAmount = fiatAmountOf[orderId];
+            o.placedTimestamp = placedAtOf[orderId];
             o.user = b.user;
             o.recipientAddr = b.recipientAddr;
             o.currency = b.currency;
             o.id = orderId;
+            o.disputeInfo.status = buyDisputeStatus[orderId];
+            o.disputeInfo.redactTransId = buyDisputeTransId[orderId];
             return o;
         }
         SellOrder storage s = sellOrders[orderId];

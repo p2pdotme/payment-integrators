@@ -83,6 +83,13 @@ contract LinkRouter is EIP712 {
     }
     mapping(uint256 => Order) public orders;
 
+    /// @notice orderId => how many customer appeals this Router has filed on it.
+    /// @dev An appeal is the one customer action that is NOT one-shot: the
+    ///      Diamond allows two (tier 1 -> 2, tier 2 -> 3). The customer signs
+    ///      the appeal's NUMBER, so the link wallet cannot replay the first
+    ///      appeal's signature to push the dispute on to tier 3 by itself.
+    mapping(uint256 => uint8) public appealsFiled;
+
     /// @dev Reentrancy flag. `place` cannot follow checks-effects-interactions
     ///      because the orderId it must record only exists after the external
     ///      call. Transient storage (EIP-1153) rather than a storage slot: the
@@ -96,11 +103,21 @@ contract LinkRouter is EIP712 {
     ///      mark-paid, nor moved to another order. The EIP-712 domain binds the
     ///      chain id and this contract's address, so it cannot be replayed on
     ///      another chain or against another deployment. No nonce is needed:
-    ///      both actions are terminal for an order, so a replay reverts
-    ///      downstream on state that has already moved.
+    ///      every action is one-shot for an order, so a replay reverts
+    ///      downstream on state that has already moved (the Diamond accepts one
+    ///      dispute per order). The exception is an appeal, which can happen
+    ///      twice; it binds its own number instead (`appealsFiled`).
     bytes32 private constant MARK_PAID_TYPEHASH =
         keccak256("MarkPaid(bytes32 linkId,uint256 orderId)");
     bytes32 private constant CANCEL_TYPEHASH = keccak256("Cancel(bytes32 linkId,uint256 orderId)");
+    /// @dev Also binds the last 4 digits, so the link wallet cannot file the
+    ///      customer's dispute with digits they did not give.
+    bytes32 private constant DISPUTE_TYPEHASH =
+        keccak256("Dispute(bytes32 linkId,uint256 orderId,uint256 redactTransId)");
+    /// @dev Binds which appeal this is (1 = first, 2 = second), so each
+    ///      signature escalates the dispute at most once.
+    bytes32 private constant APPEAL_TYPEHASH =
+        keccak256("Appeal(bytes32 linkId,uint256 orderId,uint8 appealNumber)");
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -108,6 +125,8 @@ contract LinkRouter is EIP712 {
     event OrderPlaced(bytes32 indexed linkId, uint256 indexed orderId, address customer);
     event OrderMarkedPaid(bytes32 indexed linkId, uint256 indexed orderId);
     event OrderCancelled(bytes32 indexed linkId, uint256 indexed orderId);
+    event OrderDisputed(bytes32 indexed linkId, uint256 indexed orderId);
+    event OrderAppealed(bytes32 indexed linkId, uint256 indexed orderId, uint8 appealNumber);
 
     // ─── Errors ───────────────────────────────────────────────────────
 
@@ -213,7 +232,12 @@ contract LinkRouter is EIP712 {
         uint256 orderId,
         bytes calldata signature
     ) external nonReentrant {
-        _authorise(linkId, orderId, MARK_PAID_TYPEHASH, signature);
+        _authorise(
+            linkId,
+            orderId,
+            keccak256(abi.encode(MARK_PAID_TYPEHASH, linkId, orderId)),
+            signature
+        );
         integrator.relayerMarkPaid(linkId, orderId);
         emit OrderMarkedPaid(linkId, orderId);
     }
@@ -231,9 +255,64 @@ contract LinkRouter is EIP712 {
         uint256 orderId,
         bytes calldata signature
     ) external nonReentrant {
-        _authorise(linkId, orderId, CANCEL_TYPEHASH, signature);
+        _authorise(
+            linkId,
+            orderId,
+            keccak256(abi.encode(CANCEL_TYPEHASH, linkId, orderId)),
+            signature
+        );
         integrator.relayerCancelOrder(linkId, orderId);
         emit OrderCancelled(linkId, orderId);
+    }
+
+    /**
+     * @notice Raise the Diamond's dispute on an order — the customer paid but
+     *         the order was cancelled.
+     * @param redactTransId The last 4 digits of the customer's bank transfer.
+     * @dev Customer-signed like the others: a dispute is the customer's claim,
+     *      so the link wallet alone cannot file one. The order's link comes from
+     *      this contract's own record, which cancellation does not clear. The
+     *      Diamond enforces when a dispute is allowed.
+     */
+    function dispute(
+        bytes32 linkId,
+        uint256 orderId,
+        uint256 redactTransId,
+        bytes calldata signature
+    ) external nonReentrant {
+        _authorise(
+            linkId,
+            orderId,
+            keccak256(abi.encode(DISPUTE_TYPEHASH, linkId, orderId, redactTransId)),
+            signature
+        );
+        integrator.linkDispute(linkId, orderId, redactTransId, false);
+        emit OrderDisputed(linkId, orderId);
+    }
+
+    /**
+     * @notice Appeal the Diamond's dispute on an order to the next tier — a
+     *         tier decided against the customer, or did not decide in time.
+     * @dev Customer-signed over (link, order, appeal number). The number is
+     *      this Router's count of appeals already filed plus one, so a used
+     *      signature never works again (see `appealsFiled`). The Diamond
+     *      decides whether an appeal is due and refuses it at tier 3.
+     */
+    function appeal(
+        bytes32 linkId,
+        uint256 orderId,
+        bytes calldata signature
+    ) external nonReentrant {
+        uint8 n = appealsFiled[orderId] + 1;
+        _authorise(
+            linkId,
+            orderId,
+            keccak256(abi.encode(APPEAL_TYPEHASH, linkId, orderId, n)),
+            signature
+        );
+        appealsFiled[orderId] = n;
+        integrator.linkDispute(linkId, orderId, 0, true);
+        emit OrderAppealed(linkId, orderId, n);
     }
 
     // ─── Views ────────────────────────────────────────────────────────
@@ -255,15 +334,36 @@ contract LinkRouter is EIP712 {
         return _hashTypedDataV4(keccak256(abi.encode(CANCEL_TYPEHASH, linkId, orderId)));
     }
 
+    /// @notice The EIP-712 digest a customer signs to dispute an order.
+    function disputeDigest(
+        bytes32 linkId,
+        uint256 orderId,
+        uint256 redactTransId
+    ) external view returns (bytes32) {
+        return
+            _hashTypedDataV4(
+                keccak256(abi.encode(DISPUTE_TYPEHASH, linkId, orderId, redactTransId))
+            );
+    }
+
+    /// @notice The EIP-712 digest a customer signs for the NEXT appeal on an
+    ///         order (appeal number = appeals already filed + 1).
+    function appealDigest(bytes32 linkId, uint256 orderId) external view returns (bytes32) {
+        return
+            _hashTypedDataV4(
+                keccak256(abi.encode(APPEAL_TYPEHASH, linkId, orderId, appealsFiled[orderId] + 1))
+            );
+    }
+
     // ─── Internal ─────────────────────────────────────────────────────
 
-    /// @dev The three checks shared by mark-paid and cancel: the caller is this
-    ///      link's wallet, the order really belongs to this link, and the
-    ///      order's own customer signed this exact action.
+    /// @dev The three checks shared by every customer action: the caller is
+    ///      this link's wallet, the order really belongs to this link, and the
+    ///      order's own customer signed this exact action (`structHash`).
     function _authorise(
         bytes32 linkId,
         uint256 orderId,
-        bytes32 typeHash,
+        bytes32 structHash,
         bytes calldata signature
     ) private view {
         if (msg.sender != linkAgent[linkId]) revert NotLinkAgent();
@@ -272,7 +372,7 @@ contract LinkRouter is EIP712 {
         if (o.customer == address(0)) revert UnknownOrder();
         if (o.linkId != linkId) revert OrderLinkMismatch();
 
-        bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(typeHash, linkId, orderId)));
+        bytes32 digest = _hashTypedDataV4(structHash);
         // ECDSA.recover reverts on a malformed or malleable (high-s) signature
         // rather than returning a junk address, so a bad signature can never be
         // mistaken for a valid one from an unexpected signer.

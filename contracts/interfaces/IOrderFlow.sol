@@ -51,10 +51,28 @@ interface IOrderFlow {
     function paidBuyOrder(uint256 orderId) external;
 
     /// @notice Cancels an order. Same `order.user` gate as `paidBuyOrder`.
-    /// @dev Succeeds from `order.user` in PLACED and ACCEPTED, and also while
-    ///      PAID (cancel-while-PAID refunds the escrowed USDC). Terminal states
-    ///      revert OrderStatusInvalid() (0x181b1b2e).
+    /// @dev Succeeds from `order.user` in PLACED and ACCEPTED. A PAID BUY is
+    ///      out of `order.user`'s hands: on the Base Sepolia Diamond it reverts
+    ///      NotAuthorized() (0xea8e4eb5) for `order.user` and the LP alike, and
+    ///      only the Diamond's admin can cancel it (fork-checked by
+    ///      scripts/fork-dispute.ts). Terminal states revert
+    ///      OrderStatusInvalid() (0x181b1b2e).
     function cancelOrder(uint256 orderId) external;
+
+    /// @notice Raises a dispute on an order. Same `order.user` gate as
+    ///         `paidBuyOrder` (OrderProcessorFacet.raiseDispute).
+    /// @dev Only for a BUY that was CANCELLED after being marked paid
+    ///      (`paidTimestamp != 0`), 15 min to 24 h after placement.
+    ///      `redactTransId` is the last 4 digits of the payer's bank transfer.
+    function raiseDispute(uint256 orderId, uint256 redactTransId) external;
+
+    /// @notice Appeals an open dispute to the next tier (DisputeFacet,
+    ///         live on Base mainnet since 9 Nov 2026). `order.user` only —
+    ///         anyone else reverts NotDisputeUser() (0x69ac4b4e).
+    /// @dev Allowed while a tier-1/2 decision is pending and its appeal window
+    ///      is open, or when the current tier missed its decision SLA. Not at
+    ///      tier 3. The Base Sepolia Diamond does not have it yet.
+    function appealDispute(uint256 orderId) external;
 
     /// @notice Subset of GetterFacet.getAdditionalOrderDetails the integrator
     ///         needs to fund the system proxy correctly before setSellOrderUpi.

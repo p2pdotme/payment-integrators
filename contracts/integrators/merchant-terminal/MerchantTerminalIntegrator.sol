@@ -13,6 +13,7 @@ import { MerchantRegistryLib } from "./MerchantRegistryLib.sol";
 import { MerchantTypes } from "./MerchantTypes.sol";
 import { SettlementLib } from "./SettlementLib.sol";
 import { MerchantImportLib } from "./MerchantImportLib.sol";
+import { LinkDisputeLib } from "./LinkDisputeLib.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
@@ -110,6 +111,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error NotLinkOwner();
     error LinkOrdersDisabled();
     error OnlyTrustedRelayer();
+    /// @dev Disputes through this contract are for LINK orders only. A fiat
+    ///      withdrawal is also owned by the merchant's proxy, and a won dispute
+    ///      on it would strand the refund there (review #118, finding 1).
+    error NotALinkOrder();
+    /// @dev The merchant's own dispute opens MERCHANT_DISPUTE_DELAY after
+    ///      placement, so the customer gets the first chance (finding 2).
+    error DisputeTooEarly();
+    /// @dev releaseLinkClaim while the order can still be disputed: p2p.me's
+    ///      window is open, a dispute is open, or the order is not cancelled.
+    error ClaimStillDisputable();
     error Reentrancy();
     error UnknownWithdrawal();
     error WithdrawalNotCancellable();
@@ -366,6 +377,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     uint8 internal constant STATUS_PAID = 2;
     uint8 internal constant STATUS_COMPLETED = 3;
     uint8 internal constant STATUS_CANCELLED = 4;
+    /// @dev Diamond `Dispute.status` while a dispute is open (0 = none).
+    uint8 internal constant DISPUTE_OPEN = 1;
+
+    /// @dev The merchant may file their own link dispute only this long after
+    ///      placement. The customer can file from 15 min, so they go first and
+    ///      the merchant cannot use up the order's one dispute with wrong digits.
+    uint256 internal constant MERCHANT_DISPUTE_DELAY = 6 hours;
+    /// @dev p2p.me's dispute window: a dispute can be raised up to 24 h after
+    ///      placement. Past it, a paid-then-cancelled link order cannot come
+    ///      back, so the link use it holds may be released (releaseLinkClaim).
+    uint256 internal constant DISPUTE_WINDOW = 24 hours;
 
     // ─── State ────────────────────────────────────────────────────────
 
@@ -562,10 +584,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     uint256 private _locked = 1;
 
     modifier nonReentrant() {
-        if (_locked != 1) revert Reentrancy();
-        _locked = 2;
+        _enter();
         _;
         _locked = 1;
+    }
+
+    /// @dev The guard's check-and-take, out of line: a modifier body is copied
+    ///      into every function that uses it, and this one guards 21.
+    function _enter() private {
+        if (_locked != 1) revert Reentrancy();
+        _locked = 2;
     }
 
     /// @dev A SECOND, independent guard for the Diamond's callbacks.
@@ -589,10 +617,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     bool transient _cbLocked;
 
     modifier nonReentrantCallback() {
-        if (_cbLocked) revert Reentrancy();
-        _cbLocked = true;
+        _enterCallback();
         _;
         _cbLocked = false;
+    }
+
+    function _enterCallback() private {
+        if (_cbLocked) revert Reentrancy();
+        _cbLocked = true;
     }
 
     // ─── Break-glass pause ────────────────────────────────────────────
@@ -607,28 +639,44 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev Gate NEW-activity entry points. Recovery/admin/Diamond-callback paths
     ///      are deliberately NOT gated (see `paused`).
     modifier whenNotPaused() {
-        if (paused) revert Paused();
+        _whenNotPaused();
         _;
+    }
+
+    function _whenNotPaused() private view {
+        if (paused) revert Paused();
     }
 
     // ─── Access modifiers ─────────────────────────────────────────────
 
     modifier onlyDiamond() {
-        if (msg.sender != diamond) revert OnlyDiamond();
+        _onlyDiamond();
         _;
     }
 
+    function _onlyDiamond() private view {
+        if (msg.sender != diamond) revert OnlyDiamond();
+    }
+
     modifier onlyOwner() {
-        if (!isOwner[msg.sender]) revert OnlyOwner();
+        _onlyOwner();
         _;
+    }
+
+    function _onlyOwner() private view {
+        if (!isOwner[msg.sender]) revert OnlyOwner();
     }
 
     /// @dev Restricts an action to the single super-admin. Used for the root of
     ///      access control: owner-set management (add/remove owners) and role
     ///      assignment. Owners below the super-admin cannot perform these.
     modifier onlySuperAdmin() {
-        if (msg.sender != superAdmin) revert OnlySuperAdmin();
+        _onlySuperAdmin();
         _;
+    }
+
+    function _onlySuperAdmin() private view {
+        if (msg.sender != superAdmin) revert OnlySuperAdmin();
     }
 
     /// @dev Any owner's EFFECTIVE tier is FINANCE (the top admin tier), so a
@@ -641,9 +689,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      action at MANAGER also admits FINANCE and the owner. Reverts
     ///      NotAuthorized with the required and actual tiers for a clear panel msg.
     modifier onlyRole(Role min) {
+        _onlyRole(min);
+        _;
+    }
+
+    function _onlyRole(Role min) private view {
         Role have = _tier(msg.sender);
         if (uint8(have) < uint8(min)) revert NotAuthorized(uint8(min), uint8(have));
-        _;
     }
 
     /// @notice True if `who` can perform ANY admin action (an owner or any role).
@@ -1054,8 +1106,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // absent and unable to see why. The strike taken in relayerMarkPaid is
         // deliberately NOT released here: a marked-then-cancelled order is
         // exactly the false claim the counter exists to record.
+        //
+        // Only for a link order the customer never marked paid (its placement day
+        // still carries LINK_PENDING). A marked-paid one may be disputed and come
+        // back COMPLETED, so it keeps its use and its order→link binding: a won
+        // dispute then completes it through onOrderComplete (the use stays
+        // counted, the strike is released), and releaseLinkClaim gives the use
+        // back once the dispute window has passed. Releasing it here let a
+        // single-use link be paid twice while a dispute was open (review #118, 3).
         bytes32 linkId = orderToLink[orderId];
-        if (linkId != bytes32(0)) {
+        if (linkId != bytes32(0) && orderPlacementDay[orderId] & LINK_PENDING != 0) {
             PaymentLinksLib.PaymentLink storage cl = links[linkId];
             if (cl.uses != 0) cl.uses--;
             delete orderToLink[orderId];
@@ -1381,7 +1441,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function _relayForward(bytes32 linkId, uint256 orderId, bytes memory data) internal {
         if (msg.sender != trustedRelayer) revert OnlyTrustedRelayer();
         if (linkId == bytes32(0) || orderToLink[orderId] != linkId) revert LinkNotFound();
-        UserProxy(proxyAddress(links[linkId].owner)).execute(diamond, data, address(usdc), 0);
+        _viaProxy(links[linkId].owner, data);
+    }
+
+    /// @dev Calls the Diamond as `merchant`'s proxy — the `order.user` of every
+    ///      link order of theirs, and the only caller the Diamond accepts for it.
+    function _viaProxy(address merchant, bytes memory data) internal {
+        LinkDisputeLib.callDiamond(proxyAddress(merchant), diamond, address(usdc), data);
     }
 
     /// @notice Cancel a link order, on the absent merchant's behalf.
@@ -1407,6 +1473,99 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (!linkOrdersEnabled) revert LinkOrdersDisabled();
         _relayForward(linkId, orderId, abi.encodeCall(IOrderFlow.cancelOrder, (orderId)));
         emit LinkOrderCancelled(linkId, orderId);
+    }
+
+    /// @notice Raise, or appeal, the Diamond's dispute on a link order — the one
+    ///         dispute entry point, for both the customer and the merchant.
+    ///         (p2p.me's dispute ladder: circle -> country admin -> operations;
+    ///         an appeal moves a raised dispute up one tier.)
+    /// @param linkId The order's link — read only when the Router calls.
+    /// @param redactTransId Raise only: the last 4 digits of the customer's
+    ///        bank transfer. Ignored for an appeal.
+    /// @param appeal False to raise the dispute, true to appeal it.
+    /// @dev One function, not three, to keep the integrator under EIP-170.
+    ///
+    ///      WHO
+    ///        - The Router (`trustedRelayer`) acts for `linkId`'s owner, after
+    ///          checking the order's own customer signed it (LinkRouter.dispute
+    ///          / LinkRouter.appeal).
+    ///        - Any other caller acts as ITSELF, through its own proxy, so
+    ///          `linkId` is ignored and another merchant's order reverts on the
+    ///          Diamond. A frozen merchant cannot.
+    ///      The Diamond accepts both calls only from `order.user`, which for a
+    ///      link order is the merchant's proxy: this is the one route to it.
+    ///
+    ///      Not `_relayForward`: a dispute is for a CANCELLED order, and
+    ///      cancellation deletes `orderToLink`. The Router's own record matches
+    ///      order and link instead, and the Diamond refuses any proxy but the
+    ///      order's own.
+    ///
+    ///      A merchant RAISE only from MERCHANT_DISPUTE_DELAY after placement:
+    ///      the Diamond takes one dispute per order, and the customer — who can
+    ///      file from 15 min — must not lose theirs to a merchant filing first
+    ///      with other digits (review #118, finding 2). No delay on an appeal:
+    ///      it does not use up the order's one dispute.
+    ///
+    ///      Like mark-paid, neither paused nor kill-switch gated: it protects a
+    ///      customer who paid. Link orders only (withdrawals refused). The Diamond
+    ///      enforces the rest (cancelled after being marked paid, 15 min to 24 h
+    ///      after placement; an appeal only while one is due, never past tier 3).
+    ///      No event of its own: the Diamond records and emits it, and the Router
+    ///      emits `OrderDisputed` / `OrderAppealed`.
+    function linkDispute(
+        bytes32 linkId,
+        uint256 orderId,
+        uint256 redactTransId,
+        bool appeal
+    ) external nonReentrant {
+        address merchant = msg.sender;
+        if (merchant == trustedRelayer) {
+            merchant = links[linkId].owner;
+            if (merchant == address(0)) revert LinkNotFound();
+        } else {
+            if (merchants[merchant].isFrozen) revert MerchantIsFrozen();
+            if (
+                !appeal &&
+                block.timestamp < _diamondOrder(orderId).placedTimestamp + MERCHANT_DISPUTE_DELAY
+            ) revert DisputeTooEarly();
+        }
+        // Link orders only. A fiat withdrawal (SELL) is also owned by the
+        // merchant's proxy, and the Diamond would accept a dispute on it — but a
+        // won one refunds to the proxy with no path back to the merchant
+        // (review #118, finding 1). Withdrawal records are never deleted.
+        if (withdrawals[orderId].merchant != address(0)) revert NotALinkOrder();
+        _viaProxy(
+            merchant,
+            appeal
+                ? abi.encodeCall(IOrderFlow.appealDispute, (orderId))
+                : abi.encodeCall(IOrderFlow.raiseDispute, (orderId, redactTransId))
+        );
+    }
+
+    /// @notice Give back the link use a paid-then-cancelled order still holds,
+    ///         once that order can no longer be disputed: it is CANCELLED, p2p.me's
+    ///         dispute window has passed, and no dispute is open on it.
+    /// @dev Permissionless: it frees only what the rules already say is free. A
+    ///      won dispute never reaches here — it completes the order, and
+    ///      onOrderComplete clears the binding with the use still counted.
+    function releaseLinkClaim(uint256 orderId) external {
+        bytes32 linkId = orderToLink[orderId];
+        if (linkId == bytes32(0)) revert LinkNotFound();
+        IOrderFlow.OrderView memory o = _diamondOrder(orderId);
+        if (
+            o.status != STATUS_CANCELLED ||
+            block.timestamp < o.placedTimestamp + DISPUTE_WINDOW ||
+            o.disputeInfo.status == DISPUTE_OPEN
+        ) revert ClaimStillDisputable();
+        PaymentLinksLib.PaymentLink storage cl = links[linkId];
+        if (cl.uses != 0) cl.uses--;
+        delete orderToLink[orderId];
+    }
+
+    /// @dev The Diamond's record of `orderId`. One call site for every read of
+    ///      it: each inline external call carries its own encode/decode code.
+    function _diamondOrder(uint256 orderId) private view returns (IOrderFlow.OrderView memory) {
+        return IOrderFlow(diamond).getOrdersById(orderId);
     }
 
     /// @notice Whether a link can be paid right now — the pay page's precheck.
@@ -1630,7 +1789,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // `feeAdvanced`, so reconcile could only ever re-credit one of them),
         // relying solely on the Diamond to reject the stale setSellOrderUpi.
         // Enforce it here instead of trusting the facet's internal state checks.
-        uint8 preStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
+        uint8 preStatus = _diamondOrder(orderId).status;
         if (preStatus != STATUS_ACCEPTED) revert WithdrawalNotDeliverable();
 
         // CEI: set the replay flag before the external call; a revert rolls it
@@ -1680,7 +1839,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // Diamond actually moved the order to PAID. If it auto-cancelled, roll the
         // latch back so reconcileWithdrawal can make the merchant whole and the
         // event stream never reports a delivery that didn't happen.
-        uint8 postStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
+        uint8 postStatus = _diamondOrder(orderId).status;
         // COMPLETED counts as delivered too: a Diamond that settles in the same
         // call has certainly delivered, and treating it as "moved nothing"
         // (the M-2 revert below) would make the withdrawal undeliverable
@@ -1744,7 +1903,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
 
-        IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
+        IOrderFlow.OrderView memory order = _diamondOrder(orderId);
         if (order.status != STATUS_CANCELLED) revert WithdrawalNotCancellable();
         // Refuse on any recorded dispute — a disputed order may have had fiat
         // delivered; leave those to off-chain/admin resolution.
@@ -1797,7 +1956,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
-        uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
+        uint8 status = _diamondOrder(orderId).status;
         if (status != STATUS_COMPLETED) revert WithdrawalNotCancellable();
         w.settled = true;
         MerchantTypes.Merchant storage m = merchants[w.merchant];
@@ -1853,7 +2012,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         // The Diamond must report this BUY COMPLETED — proof it really sent the
         // funds and finalised. Anything else is not a stranded-completion case.
-        IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
+        IOrderFlow.OrderView memory order = _diamondOrder(orderId);
         if (order.status != STATUS_COMPLETED) revert WithdrawalNotCancellable();
 
         MerchantTypes.Merchant storage m = merchants[merchant];
@@ -2427,7 +2586,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (w.settled) revert WithdrawalAlreadySettled();
 
         // Only for orders the Diamond clawed back — never a completed payout.
-        uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
+        uint8 status = _diamondOrder(orderId).status;
         if (status != STATUS_CANCELLED) revert WithdrawalNotCancellable();
 
         w.settled = true;
