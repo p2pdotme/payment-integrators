@@ -6,20 +6,29 @@
 
 ## 1. Valores que hay que fijar antes de desplegar
 
-| Parámetro | Producción (a confirmar) | Notas |
+El script `scripts/deploy-blio.ts` trae los presets de Base mainnet ya
+verificados on-chain; solo hay que confirmar lo que **no** está en el preset.
+
+| Parámetro | Valor | Notas |
 |---|---|---|
-| `DIAMOND` | `0x4cad6eC90e65baBec9335cAd728DDC610c316368` | Base mainnet (verificado 13-nov-2026) |
-| `USDC` | **pendiente** | USDC nativo de Base; confirmar dirección con p2p |
-| `TREASURY` | Safe de blio | Debe ser una Safe (no EOA) |
-| `OWNER` | Safe de blio (o multisig operativa) | El owner puede cambiar límites y pausar |
-| `DAILY_TX_COUNT` | 5 | Tope diario por usuario |
-| `LIVENESS_ATTESTOR` | `0x6cC780E44f9Ac850e6D6B8f52A5663286F1A2978` | El de Sepolia; **pedir confirmación del de mainnet** |
-| `KYC_ATTESTOR` | `0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda` | Idem |
+| `DIAMOND_ADDRESS` | `0x4cad6eC90e65baBec9335cAd728DDC610c316368` | Preset. Verificado on-chain el 13-nov-2026 (334 B de runtime). |
+| `USDC_ADDRESS` | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | Preset. USDC nativo de Base: 1.852 B de runtime y **6 decimales**, checksum EIP-55 correcto. |
+| `RECIPIENT_ADDR` | `0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47` | Preset: Safe de blio. Tiene que seguir siendo una Safe (no EOA) y coincidir con `P2P_SAFE_TREASURY` del Worker. |
+| `DEPLOY_OWNER` | Safe de blio (o multisig operativa) | **Obligatorio en mainnet**: el script se niega a usar la EOA del deployer. El owner cambia límites, productos, pausa y barre USDC suelto. |
+| `DAILY_TX_COUNT_LIMIT` | `5` | Tope diario de **colocaciones** por usuario (cancelar y reintentar también consume el cupo). |
+| `LIVENESS_ATTESTOR` | `0x6cC780E44f9Ac850e6D6B8f52A5663286F1A2978` | Valor de **Sepolia**. En Base mainnet hoy es una **EOA vacía** (0 B, nonce 0). |
+| `KYC_ATTESTOR` | `0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda` | Igual: EOA vacía en Base mainnet. |
+
+⚠️ **Los dos attestors son inmutables en el constructor.** Si no son los de
+mainnet, hay que desplegar otra vez y pagar gas de nuevo. No desplegar sin
+**confirmación por escrito de p2p**.
 
 ## 2. Checklist previo
 
+- [ ] p2p confirma **por escrito** los `LIVENESS_ATTESTOR` y `KYC_ATTESTOR` de **Base mainnet** (no los de Sepolia) y el `tenant` de producción.
 - [ ] p2p confirma **divisas** permitidas y que el integrador se whitelistea en mainnet.
-- [ ] p2p confirma los **attestors de mainnet** (liveness y KYC) y los **tenants** de producción.
+- [ ] p2p confirma el **TTL de attestation** que espera. El contrato usa `ATTESTATION_TTL = 180 days` también para Passport; una cartera comprometida conserva su tope medio año.
+- [ ] p2p confirma que el **nullifier es estable** entre tenants/servicios (el anti-sybil y el tope de 5/día dependen de eso).
 - [ ] Safe de tesorería y owner creadas y con firmantes suficientes.
 - [ ] `P2P_TREASURY_ADDRESS` de producción **coincide** con la Safe (el código la pinea contra `P2P_SAFE_TREASURY`).
 - [ ] Fondos de gas en la cuenta de despliegue (solo creación; los userOps van por Pimlico).
@@ -28,28 +37,50 @@
 
 ## 3. Deploy
 
+El único camino válido es **Hardhat** (`scripts/deploy-blio.ts`). El repo no
+tiene `foundry.toml`, así que `forge` no puede compilar ni desplegar esto.
+
 ```bash
 cd /home/xolvora/p2p/payment-integrators
-export BASE_RPC_URL="https://mainnet.base.org"       # o RPC propio
-export PRIVATE_KEY="0x..."                            # cuenta de deploy (no la Safe)
-export DIAMOND=0x4cad6eC90e65baBec9335cAd728DDC610c316368
-export USDC=0x...           # CONFIRMAR
-export TREASURY=0x...       # Safe
-export OWNER=0x...          # Safe / multisig
-export LIVENESS_ATTESTOR=0x...
-export KYC_ATTESTOR=0x...
-./scripts/deploy-mainnet-blio.sh
+
+# hardhat.config.ts lee BASE_RPC y DEPLOYER_PRIVATE_KEY (o MNEMONIC_KEY).
+export BASE_RPC="https://mainnet.base.org"        # o un RPC propio
+export DEPLOYER_PRIVATE_KEY="0x..."               # cuenta de deploy (no la Safe)
+
+# El resto se pasa al script; DIAMOND/USDC/RECIPIENT salen del preset si se omiten.
+export DEPLOY_OWNER=0x...                         # Safe / multisig (obligatorio)
+export LIVENESS_ATTESTOR=0x...                    # CONFIRMAR con p2p (mainnet)
+export KYC_ATTESTOR=0x...                         # CONFIRMAR con p2p (mainnet)
+export DAILY_TX_COUNT_LIMIT=5
+
+# 1) Simulación sin gas
+DRY_RUN=1 ./node_modules/.bin/hardhat run scripts/deploy-blio.ts --network base
+
+# 2) Deploy real
+./node_modules/.bin/hardhat run scripts/deploy-blio.ts --network base
+
+# 3) Opcional: registrar en el Diamond desde el mismo signer
+REGISTER=1 ./node_modules/.bin/hardhat run scripts/deploy-blio.ts --network base
 ```
 
-El script imprime: dirección del integrador, tx hash y los comandos de
-verificación en Blockscout y de comprobación de tamaño (límite 24.576 B).
+> En este servidor `npx` está roto (`npx-cli.js` no existe en la ruta vieja de
+> npm): usar siempre `./node_modules/.bin/hardhat`.
+
+El script imprime la **dirección del integrador**, el `proxyImpl`, el **hash del
+bytecode** desplegado, las variables para el `.env` de la app y los comandos de
+verificación (Hardhat y Blockscout). **No** imprime una comprobación de tamaño:
+el tamaño se mide en `hardhat test` (`BlioCheckoutIntegrator deployment size`,
+hoy 10.515 B, límite EIP-170 24.576 B).
 
 ## 4. Después del deploy
 
-- [ ] Verificar el contrato en Blockscout (Base).
-- [ ] Comprobar `runtime size <= 24576` y que el creation code coincide con el auditado.
-- [ ] Pedir a p2p el **whitelist en mainnet** con `usdcThroughIntegrator` y
-      `cancelCallback` **iguales** a los de Sepolia (salvo cambio de flujo).
+- [ ] Verificar el contrato en Blockscout (Base) con el comando que imprime el script.
+- [ ] Comparar el `bytecode hash` impreso con el de la corrida de `hardhat test`
+      y confirmar `runtime size <= 24576`.
+- [ ] Pedir a p2p el **whitelist en mainnet** con `usdcThroughIntegrator=false` y
+      `cancelCallbackEnabled=false` (el script lo verifica después de registrar:
+      con `usdcThroughIntegrator=true` el USDC se quedaría en el integrador, que no
+      tiene ruta de reenvío).
 - [ ] Configurar el Worker de producción:
       `P2P_CHAIN_ID=8453`, `P2P_INTEGRATOR_ADDRESS`, `P2P_DIAMOND_ADDRESS`,
       `P2P_TREASURY_ADDRESS`, `P2P_RPC_URL`, `P2P_LIVENESS_*`, `P2P_KYC_*`.

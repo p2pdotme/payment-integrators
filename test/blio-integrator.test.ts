@@ -780,6 +780,24 @@ describe("BlioCheckoutIntegrator", function () {
       expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(200));
     });
 
+    it("rejects the zero nullifier so one wallet cannot burn the slot", async function () {
+      const a = await signLiveness({ wallet: user2.address, nullifier: ethers.ZeroHash });
+      await expect(submitLiveness(user2, a)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidNullifier"
+      );
+      const kyc = await signKyc({ wallet: user2.address, nullifier: ethers.ZeroHash });
+      await expect(submitKyc(user2, kyc)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidNullifier"
+      );
+      // A normal nullifier still works afterwards: the slot was never taken.
+      await expect(submitLiveness(user2, await signLiveness({ wallet: user2.address }))).to.emit(
+        integrator,
+        "AttestationSubmitted"
+      );
+    });
+
     it("reverts AttestationExpired when the signed expiry has already passed", async function () {
       const a = await signKyc({ wallet: user2.address, expiry: (await now()) - 60n });
       await expect(submitKyc(user2, a)).to.be.revertedWithCustomError(

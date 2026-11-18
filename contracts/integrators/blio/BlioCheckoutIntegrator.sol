@@ -77,6 +77,10 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     error AttestationExpired();
     /// @notice The nullifier was already consumed by a previous attestation.
     error NullifierUsed();
+    /// @notice The nullifier is the zero hash, which is reserved for "unset".
+    ///         Accepting it would let the first wallet burn the slot and lock
+    ///         every other wallet out of the tier forever.
+    error InvalidNullifier();
     /// @notice The signature did not recover to the matching immutable attestor.
     error InvalidSignature();
     /// @notice An attestation can only raise the tier, never lower it.
@@ -511,6 +515,7 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         Tier tier
     ) internal {
         if (wallet == address(0)) revert InvalidAddress();
+        if (nullifier == bytes32(0)) revert InvalidNullifier();
         if (block.timestamp >= expiry) revert AttestationExpired();
         if (expiry > block.timestamp + MAX_ATTESTATION_DEADLINE) revert DeadlineTooFar();
         address nw = nullifierWallet[nullifier];
