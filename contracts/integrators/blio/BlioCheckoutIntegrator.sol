@@ -515,7 +515,7 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         if (expiry > block.timestamp + MAX_ATTESTATION_DEADLINE) revert DeadlineTooFar();
         address nw = nullifierWallet[nullifier];
         if (nw != address(0) && nw != wallet) revert NullifierUsed();
-        if (uint8(tier) < uint8(tierOf[wallet])) revert TierDowngrade();
+        if (uint8(tier) < uint8(_tierOf(wallet))) revert TierDowngrade();
 
         bytes32 structHash = keccak256(abi.encode(typeHash, wallet, nullifier, limit, expiry));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domain, structHash));

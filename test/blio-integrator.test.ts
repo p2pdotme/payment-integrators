@@ -1113,7 +1113,7 @@ describe("BlioCheckoutIntegrator", function () {
   });
 
   describe("Deployment footprint", function () {
-    it("stays under EIP-170 and reports placement gas", async function () {
+    (process.argv.some((a) => a.includes("coverage")) ? it.skip : it)("stays under EIP-170 and reports placement gas", async function () {
       const art = require("../artifacts/contracts/integrators/blio/BlioCheckoutIntegrator.sol/BlioCheckoutIntegrator.json");
       const size = (art.deployedBytecode.length - 2) / 2;
       console.log(`      BlioCheckoutIntegrator deployment size: ${size} bytes`);
