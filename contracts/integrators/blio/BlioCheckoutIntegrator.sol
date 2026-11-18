@@ -81,6 +81,10 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     ///         Accepting it would let the first wallet burn the slot and lock
     ///         every other wallet out of the tier forever.
     error InvalidNullifier();
+    /// @notice A passport attestation landed on a wallet without a liveness anchor.
+    error LivenessRequired();
+    /// @notice The attestor signed a per-tx limit of zero.
+    error InvalidLimit();
     /// @notice The signature did not recover to the matching immutable attestor.
     error InvalidSignature();
     /// @notice An attestation can only raise the tier, never lower it.
@@ -101,8 +105,9 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     event UsdcSwept(address indexed to, uint256 amount);
 
     /// @notice A buyer's verification tier was recorded from a valid attestor
-    ///         signature. `nullifier` is stable per person and bound to the
-    ///         wallet, so re-verification is allowed but another wallet is not.
+    ///         signature. `nullifier` is stable per (tenant, person) and bound
+    ///         to the wallet, so re-verification is allowed but another wallet
+    ///         is not.
     event AttestationSubmitted(address indexed user, uint8 indexed tier, bytes32 nullifier);
 
     /// @notice Emitted for every accepted placement so the widget / backend can
@@ -237,6 +242,11 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     ///         re-attest or upgrade tiers with it, while another wallet can
     ///         never replay it.
     mapping(bytes32 => address) public nullifierWallet;
+
+    /// @notice Liveness nullifier recorded for each wallet, i.e. the
+    ///         one-per-person anchor. A passport can only upgrade a wallet
+    ///         that already holds one (see `submitKycAttestation`).
+    mapping(address => bytes32) public livenessNullifier;
 
     // ─── Products ─────────────────────────────────────────────────────
 
@@ -436,7 +446,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
      *         that claim and lives for `ATTESTATION_TTL` from acceptance.
      *
      * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
-     * @param limit     Attested per-tx USDC ceiling (6dp). 0 = use policy.
+     *                  Becomes this wallet's liveness anchor.
+     * @param limit     Attested per-tx USDC ceiling (6dp); must be > 0.
      * @param expiry    Unix seconds; the claim must land strictly before this.
      * @param signature 65-byte secp256k1 signature (r ‖ s ‖ v) from the service.
      */
@@ -457,6 +468,7 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
             livenessAttestor,
             Tier.Liveness
         );
+        livenessNullifier[msg.sender] = nullifier;
     }
 
     /**
@@ -474,7 +486,8 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
      *
      * @param wallet    Buyer the attestation is for (bound in the signature).
      * @param nullifier Per-(tenant, human) Sybil nullifier from the service.
-     * @param limit     Attested per-tx USDC ceiling (6dp). Clamped to policy.
+     *                  Only used for replay protection here.
+     * @param limit     Attested per-tx USDC ceiling (6dp); must be > 0.
      * @param expiry    Unix seconds; the claim must land strictly before this.
      * @param signature 65-byte secp256k1 signature (r ‖ s ‖ v) from the service.
      */
@@ -516,6 +529,7 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
     ) internal {
         if (wallet == address(0)) revert InvalidAddress();
         if (nullifier == bytes32(0)) revert InvalidNullifier();
+        if (limit == 0) revert InvalidLimit();
         if (block.timestamp >= expiry) revert AttestationExpired();
         if (expiry > block.timestamp + MAX_ATTESTATION_DEADLINE) revert DeadlineTooFar();
         address nw = nullifierWallet[nullifier];
@@ -525,6 +539,13 @@ contract BlioCheckoutIntegrator is IP2PIntegrator, Ownable2Step, ReentrancyGuard
         bytes32 structHash = keccak256(abi.encode(typeHash, wallet, nullifier, limit, expiry));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domain, structHash));
         if (_recover(digest, signature) != attestor_) revert InvalidSignature();
+        // The passport tenant issues a nullifier unrelated to the liveness
+        // tenant, so the passport alone would let one person attest a second
+        // wallet and double the daily cap. Anchoring on the liveness nullifier
+        // keeps it at one wallet per person.
+        if (tier == Tier.Passport && livenessNullifier[wallet] == bytes32(0)) {
+            revert LivenessRequired();
+        }
 
         nullifierWallet[nullifier] = wallet;
         tierOf[wallet] = tier;

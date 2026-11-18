@@ -46,7 +46,7 @@ describe("BlioCheckoutIntegrator — PoC del revisor", function () {
     return BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
   }
 
-  async function attest(who: SignerWithAddress, limit = 0n) {
+  async function attest(who: SignerWithAddress, limit = USDC(1000)) {
     const nullifier = ethers.keccak256(
       ethers.toUtf8Bytes(`poc:${who.address}:${Date.now()}:${Math.random()}`)
     );

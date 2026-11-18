@@ -96,7 +96,7 @@ describe("BlioCheckoutIntegrator", function () {
     const value = {
       wallet: opts.wallet,
       nullifier,
-      limit: opts.limit ?? 0n,
+      limit: opts.limit ?? USDC(1000),
       expiry,
     };
     const domain = await livenessDomain(opts.domain);
@@ -121,7 +121,7 @@ describe("BlioCheckoutIntegrator", function () {
     const value = {
       wallet: opts.wallet,
       nullifier,
-      limit: opts.limit ?? 0n,
+      limit: opts.limit ?? USDC(1000),
       expiry,
     };
     const domain = await kycDomain(opts.domain);
@@ -147,6 +147,11 @@ describe("BlioCheckoutIntegrator", function () {
       .submitKycAttestation(a.wallet, a.nullifier, a.limit, a.expiry, a.signature);
   }
 
+  /** Anchors the liveness nullifier a passport upgrades from. */
+  async function anchor(who: SignerWithAddress) {
+    return submitLiveness(who, await signLiveness({ wallet: who.address }));
+  }
+
   async function attest(
     who: SignerWithAddress,
     tier = TIER_LIVENESS,
@@ -156,6 +161,10 @@ describe("BlioCheckoutIntegrator", function () {
       const a = await signLiveness({ wallet: who.address, ...opts });
       await submitLiveness(who, a);
       return a;
+    }
+    // A passport only upgrades a wallet that already anchored its liveness.
+    if ((await integrator.livenessNullifier(who.address)) === ethers.ZeroHash) {
+      await submitLiveness(who, await signLiveness({ wallet: who.address }));
     }
     const a = await signKyc({ wallet: who.address, ...opts });
     await submitKyc(who, a);
@@ -643,6 +652,51 @@ describe("BlioCheckoutIntegrator", function () {
       expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(50));
     });
 
+    it("records the liveness nullifier as the one-per-person anchor", async function () {
+      const a = await signLiveness({ wallet: user2.address });
+      await submitLiveness(user2, a);
+      expect(await integrator.livenessNullifier(user2.address)).to.equal(a.nullifier);
+    });
+
+    it("rejects a passport on a wallet that never anchored liveness", async function () {
+      const kyc = await signKyc({ wallet: user2.address });
+      await expect(submitKyc(user2, kyc)).to.be.revertedWithCustomError(
+        integrator,
+        "LivenessRequired"
+      );
+      expect(await integrator.tierOf(user2.address)).to.equal(0n);
+      expect(await integrator.nullifierWallet(kyc.nullifier)).to.equal(ethers.ZeroAddress);
+
+      // Once the wallet anchors liveness, a fresh passport lands.
+      await attest(user2, TIER_LIVENESS);
+      const again = await signKyc({ wallet: user2.address });
+      await expect(submitKyc(user2, again)).to.emit(integrator, "AttestationSubmitted");
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
+    });
+
+    it("stops the same person from attesting a second wallet (the 10/day exploit)", async function () {
+      // Wallet A anchors the person's liveness nullifier.
+      await attest(user2, TIER_LIVENESS);
+      const anchor = await integrator.livenessNullifier(user2.address);
+
+      // The passport tenant issues an unrelated nullifier for the same person,
+      // so a passport for wallet B cannot be submitted on its own.
+      const other = (await ethers.getSigners())[5];
+      const kyc = await signKyc({ wallet: other.address });
+      await expect(submitKyc(other, kyc)).to.be.revertedWithCustomError(
+        integrator,
+        "LivenessRequired"
+      );
+
+      // And wallet B cannot anchor the same liveness nullifier either.
+      const stolen = await signLiveness({ wallet: other.address, nullifier: anchor });
+      await expect(submitLiveness(other, stolen)).to.be.revertedWithCustomError(
+        integrator,
+        "NullifierUsed"
+      );
+      expect(await integrator.tierOf(other.address)).to.equal(0n);
+    });
+
     it("applies the passport limits for INR and for the rest", async function () {
       await attest(user2, TIER_PASSPORT);
 
@@ -729,6 +783,7 @@ describe("BlioCheckoutIntegrator", function () {
       const t = await now();
       const a = await signKyc({ wallet: user2.address, expiry: t + 3600n });
 
+      await anchor(user2);
       await expect(submitKyc(user2, a)).to.emit(integrator, "AttestationSubmitted");
       expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
       expect(await integrator.nullifierWallet(a.nullifier)).to.equal(user2.address);
@@ -818,6 +873,7 @@ describe("BlioCheckoutIntegrator", function () {
 
     it("accepts a KYC expiry within the cap", async function () {
       const a = await signKyc({ wallet: user2.address, expiry: (await now()) + 600n });
+      await anchor(user2);
       await expect(submitKyc(user2, a)).to.not.be.reverted;
       expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
     });
@@ -825,6 +881,7 @@ describe("BlioCheckoutIntegrator", function () {
     it("outlives the signed claim expiry: the grant lasts ATTESTATION_TTL", async function () {
       const claimExpiry = (await now()) + 600n;
       const a = await signKyc({ wallet: user2.address, expiry: claimExpiry });
+      await anchor(user2);
       await submitKyc(user2, a);
 
       const attestedAt = await integrator.attestedAt(user2.address);
@@ -883,10 +940,20 @@ describe("BlioCheckoutIntegrator", function () {
       );
     });
 
-    it("treats a zero KYC limit as 'use the policy'", async function () {
-      await attest(user2, TIER_PASSPORT, { limit: 0n });
-      expect(await integrator.userTxLimitFor(user2.address, INR)).to.equal(USDC(100));
-      expect(await integrator.userTxLimitFor(user2.address, BRL)).to.equal(USDC(200));
+    it("rejects a signed limit of zero for both services", async function () {
+      const liveness = await signLiveness({ wallet: user2.address, limit: 0n });
+      await expect(submitLiveness(user2, liveness)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidLimit"
+      );
+
+      await attest(user2, TIER_LIVENESS);
+      const kyc = await signKyc({ wallet: user2.address, limit: 0n });
+      await expect(submitKyc(user2, kyc)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidLimit"
+      );
+      expect(await integrator.tierOf(user2.address)).to.equal(TIER_LIVENESS);
     });
 
     it("also clamps a liveness limit to its policy ceiling", async function () {
@@ -917,6 +984,7 @@ describe("BlioCheckoutIntegrator", function () {
 
     it("lets a relayer submit the KYC attestor's signature for the buyer", async function () {
       const a = await signKyc({ wallet: user2.address });
+      await anchor(user2);
       await expect(submitKyc(owner, a)).to.emit(integrator, "AttestationSubmitted");
       expect(await integrator.tierOf(user2.address)).to.equal(TIER_PASSPORT);
     });
