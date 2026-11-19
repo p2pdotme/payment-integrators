@@ -114,6 +114,8 @@ function warn(message: string): void {
 }
 
 async function main() {
+  // Un DRY_RUN no debe necesitar la clave de deploy: así se comprueba mainnet
+  // (presets, guard del owner, code del Diamond/USDC) sin acercar la clave.
   const [deployer] = await ethers.getSigners();
   const net = await ethers.provider.getNetwork();
   const chainId = Number(net.chainId);
@@ -128,13 +130,13 @@ async function main() {
     process.env.RECIPIENT_ADDR || process.env.TREASURY || preset.recipient || "";
   const LIVENESS_ATTESTOR = process.env.LIVENESS_ATTESTOR || "";
   const KYC_ATTESTOR = process.env.KYC_ATTESTOR || "";
-  const DEPLOY_OWNER = process.env.DEPLOY_OWNER || deployer.address;
+  const DEPLOY_OWNER = process.env.DEPLOY_OWNER || deployer?.address;
 
   console.log(`\n=== BlioCheckoutIntegrator — ${preset.label} (${chainId}) ===`);
-  console.log("Deployer:", deployer.address);
+  console.log("Deployer:", deployer?.address ?? "(sin clave — DRY_RUN)");
   console.log(
     "Balance: ",
-    ethers.formatEther(await ethers.provider.getBalance(deployer.address)),
+    deployer ? ethers.formatEther(await ethers.provider.getBalance(deployer.address)) : "n/d",
     "ETH"
   );
 
@@ -164,6 +166,9 @@ async function main() {
     throw new Error("LIVENESS_ATTESTOR and KYC_ATTESTOR must be different signers");
   }
 
+  if (!DRY_RUN && !deployer) {
+    throw new Error("Falta la clave de deploy: define DEPLOYER_PRIVATE_KEY (o MNEMONIC_KEY)");
+  }
   if (isMainnet && !process.env.DEPLOY_OWNER) {
     throw new Error(
       "DEPLOY_OWNER is required on mainnet — pass the blio Safe. Defaulting to the " +
@@ -203,10 +208,10 @@ async function main() {
 
   console.log("\nConfig:");
   console.log(
-    `  recipientAddr:    ${recipient}${recipient === deployer.address ? "  (⚠️ DEPLOYER EOA — use a Safe)" : ""}`
+    `  recipientAddr:    ${recipient}${recipient === deployer?.address ? "  (⚠️ DEPLOYER EOA — use a Safe)" : ""}`
   );
   console.log(
-    `  owner:            ${DEPLOY_OWNER}${DEPLOY_OWNER === deployer.address ? "  (⚠️ DEPLOYER EOA — use a Safe)" : ""}`
+    `  owner:            ${DEPLOY_OWNER}${DEPLOY_OWNER === deployer?.address ? "  (⚠️ DEPLOYER EOA — use a Safe)" : ""}`
   );
   console.log(`  livenessAttestor: ${livenessAttestor}`);
   console.log(`  kycAttestor:      ${kycAttestor}`);

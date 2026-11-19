@@ -62,8 +62,13 @@ export LIVENESS_ATTESTOR=0x6cC780E44f9Ac850e6D6B8f52A5663286F1A2978
 export KYC_ATTESTOR=0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda
 export DAILY_TX_COUNT_LIMIT=5
 
-# 1) Simulación sin gas
-DRY_RUN=1 npx hardhat run scripts/deploy-blio.ts --network base
+# 1) Simulación sin gas y SIN clave de deploy (solo getCode: presets, guard
+#    del owner y metadata del USDC). Así la clave no viaja hasta el paso 2.
+env -u DEPLOYER_PRIVATE_KEY DRY_RUN=1 \
+  DEPLOY_OWNER=0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47 \
+  LIVENESS_ATTESTOR=0x6cC780E44f9Ac850e6D6B8f52A5663286F1A2978 \
+  KYC_ATTESTOR=0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda \
+  npx hardhat run scripts/deploy-blio.ts --network base
 
 # 2) Deploy real
 npx hardhat run scripts/deploy-blio.ts --network base
