@@ -177,6 +177,22 @@ async function main() {
   }
   if (process.env.DEPLOY_OWNER) requireChecksummed("DEPLOY_OWNER", DEPLOY_OWNER);
 
+  // En mainnet las dos direcciones inmutables que pueden costar un redespliegue
+  // (o un cobro sin Premium) se pinean a la Safe de blio. El resto (limites,
+  // productos, cupo, pausa) es owner-settable y no obliga a redesplegar.
+  if (isMainnet) {
+    if (recipient.toLowerCase() !== BLIO_SAFE.toLowerCase()) {
+      throw new Error(
+        `RECIPIENT_ADDR must be the blio Safe (${BLIO_SAFE}) on mainnet, got ${recipient}`,
+      );
+    }
+    if (DEPLOY_OWNER.toLowerCase() !== BLIO_SAFE.toLowerCase()) {
+      throw new Error(
+        `DEPLOY_OWNER must be the blio Safe (${BLIO_SAFE}) on mainnet, got ${DEPLOY_OWNER}`,
+      );
+    }
+  }
+
   if (isMainnet && (await ethers.provider.getCode(DEPLOY_OWNER)) === "0x") {
     throw new Error(
       `DEPLOY_OWNER ${DEPLOY_OWNER} has no code on mainnet — it is an EOA. Pass the blio Safe.`
