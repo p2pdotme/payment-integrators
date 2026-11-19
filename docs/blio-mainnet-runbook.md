@@ -93,7 +93,43 @@ pero ese paso no es nuestro).
 - [ ] Compra real pequeña (mensual, 9,99) → verificar orden, activación y suscripción.
 - [ ] Solo entonces, abrir el checkout al público.
 
-## 5. Mantener el integrador de Sepolia
+## 5. Integrador de Sepolia (staging)
+
+Desplegado el **19-11-2026** con el código `1ee7a69` (10.694 B), para el
+end-to-end del checkout antes de mainnet.
+
+| Dato | Valor |
+|---|---|
+| `BlioCheckoutIntegrator` | `0xb63Ba8185e6e45561D77eF0070a609228A3aE990` |
+| `proxyImpl` | `0xC94D30aF42f031BEBA250CA9E70932Facb0d8aF7` |
+| Hash del bytecode | `0x438662572fd5548b24cafd5e0aeecf2819832d463a398e8b21b5bee75e6f1751` |
+| `owner` (deployer) | `0x58B1F3090386d5c2220FE1985f0fFcB1877B32d2` |
+| `treasury` | `0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47` (la Safe de blio) |
+| Attestors | los de mainnet (`0x6cC7…2978`, `0xA0bE…3Eda`) |
+| Productos | 1..4 con 9,99 / 26,99 / 49,99 / 79,99 y activos |
+
+**Pendiente de p2p** (no se puede probar el checkout hasta tenerlo):
+- Registrar `0xb63Ba8…` en el Diamond de Sepolia:
+  `registerIntegrator(0xb63Ba8…, proxyImpl, false)` con
+  `cancelCallbackEnabled = false`. Hoy `getIntegratorConfig` devuelve
+  `isActive = false`.
+- **Tenants nuevos** de liveness y pasaporte atados a esa dirección (los
+  tenants cuelgan del contrato).
+
+**A tener en cuenta:**
+- El integrador viejo (`0x415627D9…`) tenía `treasury = 0x58B1…`, que **no
+  coincide** con `P2P_TREASURY_ADDRESS` (`0xFB25…`): `verifyP2PTreasury`
+  bloqueaba la entrega de Premium en staging. El nuevo apunta a la Safe y lo
+  arregla.
+- Los productos ya están puestos, pero `setProductPrice`/`setProductActive` son
+  `onlyOwner` y el owner es la EOA del deployer: en mainnet hay que hacerlo por
+  Safe (MODE=safe) o con el owner que se elija.
+- Al cambiar el integrador en staging hay que tocar **dos** sitios y rebuild:
+  `apps/api/wrangler.staging.jsonc` (`P2P_INTEGRATOR_ADDRESS`) y el valor por
+  defecto de `NEXT_PUBLIC_P2P_INTEGRATOR` en `scripts/deploy-staging.sh` (es
+  build-time, `NEXT_PUBLIC_*`).
+
+## 6. Mantener el integrador de Sepolia
 
 No borrar ni desactivar el de Sepolia: staging lo sigue usando para KYC, límites,
 disputas (cuando exista la escalera) y regresiones. Sus órdenes en vuelo pueden
