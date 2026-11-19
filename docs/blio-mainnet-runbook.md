@@ -13,8 +13,8 @@ verificados on-chain; solo hay que confirmar lo que **no** está en el preset.
 |---|---|---|
 | `DIAMOND_ADDRESS` | `0x4cad6eC90e65baBec9335cAd728DDC610c316368` | Preset. Verificado on-chain el 13-nov-2026 (334 B de runtime). |
 | `USDC_ADDRESS` | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | Preset. USDC nativo de Base: 1.852 B de runtime y **6 decimales**, checksum EIP-55 correcto. |
-| `RECIPIENT_ADDR` | `0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47` | Preset: Safe de blio. Tiene que seguir siendo una Safe (no EOA) y coincidir con `P2P_SAFE_TREASURY` del Worker. |
-| `DEPLOY_OWNER` | Safe de blio (o multisig operativa) | **Obligatorio en mainnet**: el script se niega a usar la EOA del deployer. El owner cambia límites, productos, pausa y barre USDC suelto. |
+| `RECIPIENT_ADDR` | `0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47` | Preset: Safe de blio. **La misma dirección en Base mainnet y en Sepolia** (Safe v1.5.0 **2-de-3**, owners `0xC9b6…fd12`, `0xb097…8Ee6`, `0x768b…778B`). Tiene que seguir siendo una Safe (no EOA) y coincidir con `P2P_SAFE_TREASURY` del Worker. |
+| `DEPLOY_OWNER` | Safe de blio (`0xFB25…df47`) | **Obligatorio en mainnet**: el script se niega a usar la EOA del deployer. El owner cambia límites, productos, pausa y barre USDC suelto, así que en mainnet debe ser la Safe. ⚠️ La EOA del deployer (`0x58B1…32d2`) **no es owner de la Safe**: cada cambio de admin necesita **2 de 3** firmas (`MODE=safe` genera el lote para el Transaction Builder). |
 | `DAILY_TX_COUNT_LIMIT` | `5` | Tope diario de **colocaciones** por usuario (cancelar y reintentar también consume el cupo). |
 | `LIVENESS_ATTESTOR` | `0x6cC780E44f9Ac850e6D6B8f52A5663286F1A2978` | **Mismo valor en Base mainnet y en Sepolia.** Confirmado por escrito por p2p. |
 | `KYC_ATTESTOR` | `0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda` | **Mismo valor en Base mainnet y en Sepolia.** Confirmado por escrito por p2p. |
@@ -117,10 +117,16 @@ end-to-end del checkout antes de mainnet.
   tenants cuelgan del contrato).
 
 **A tener en cuenta:**
+- La Safe de tesorería es **la misma dirección en Sepolia y en mainnet**
+  (`0xFB25…df47`, Safe v1.5.0 **2-de-3**), así que el `treasury()` del
+  integrador y el `P2P_TREASURY_ADDRESS` del Worker coinciden en las dos
+  cadenas y el USDC liquidado en Sepolia también es recuperable.
 - El integrador viejo (`0x415627D9…`) tenía `treasury = 0x58B1…`, que **no
-  coincide** con `P2P_TREASURY_ADDRESS` (`0xFB25…`): `verifyP2PTreasury`
-  bloqueaba la entrega de Premium en staging. El nuevo apunta a la Safe y lo
-  arregla.
+  coincide** con la Safe: `verifyP2PTreasury` bloqueaba la entrega de Premium en
+  staging. El nuevo apunta a la Safe y lo arregla.
+- El `owner` en Sepolia es la **EOA del deployer** para iterar rápido; antes de
+  mainnet se puede pasar a la Safe con `transferOwnership` + `acceptOwnership`
+  (2 de 3 firmas) para ensayar el flujo real.
 - Los productos ya están puestos, pero `setProductPrice`/`setProductActive` son
   `onlyOwner` y el owner es la EOA del deployer: en mainnet hay que hacerlo por
   Safe (MODE=safe) o con el owner que se elija.
