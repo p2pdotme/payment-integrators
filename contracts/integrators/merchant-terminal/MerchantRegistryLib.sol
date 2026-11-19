@@ -37,6 +37,8 @@ library MerchantRegistryLib {
     event PerTxCapSet(bytes32 indexed currency, uint256 cap);
     /// @dev limit 0 = cleared: the merchant follows the global `dailyLimit`.
     event MerchantDailyLimitSet(address indexed merchant, uint256 limit);
+    /// @dev The ceiling every merchant's own daily limit must stay under.
+    event MerchantDailyCeilingSet(uint256 ceiling);
     event LimitBoundsSet(uint256 minDaily, uint256 maxDaily, uint256 minCap, uint256 maxCap);
 
     // ─── Merchant limits and their range (PR #108 review #4) ──────────
@@ -89,35 +91,57 @@ library MerchantRegistryLib {
 
     /// @notice Give one merchant their own daily order limit (limit > 0), or
     ///         clear it (0) so they follow the global `dailyLimit` again. A set
-    ///         limit must be inside [minDaily, maxDaily], like the global one, so
-    ///         a MANAGER can move a merchant's limit but never past the ceiling.
+    ///         limit must be inside [minDaily, ceiling]: a MANAGER can move a
+    ///         merchant's limit but never past the ceiling the owners set.
+    /// @param ceiling The per-merchant ceiling (`merchantDailyCeiling`), its OWN
+    ///        maximum, apart from `maxDaily` (the contract PR's review, round 3,
+    ///        note 1): one merchant can be given more than the global maximum
+    ///        without widening the global limit's range for every MANAGER.
     function setMerchantDailyLimit(
         mapping(address => uint256) storage overrides,
         MerchantTypes.LimitBounds storage b,
+        uint256 ceiling,
         address merchant,
         uint256 limit
     ) public {
         if (merchant == address(0)) revert InvalidMerchant();
-        if (limit != 0) checkDailyLimit(b, limit);
+        if (limit != 0 && (limit < b.minDaily || limit > ceiling)) revert LimitOutOfBounds();
         overrides[merchant] = limit;
         emit MerchantDailyLimitSet(merchant, limit);
     }
 
     /// @notice `merchant`'s daily order limit: their own if one is set, else the
-    ///         global limit. An own limit is pulled inside [minDaily, maxDaily] on
-    ///         read, so narrowing the range (an owner lowering the max in an
-    ///         emergency) takes effect at once for every merchant, as it does for
-    ///         the global limit and the per-tx caps.
+    ///         global limit. An own limit is pulled inside [minDaily, ceiling] on
+    ///         read, so an owner lowering the ceiling in an emergency (or raising
+    ///         minDaily) takes effect at once for every merchant.
     function dailyLimitOf(
         mapping(address => uint256) storage overrides,
         MerchantTypes.LimitBounds storage b,
+        uint256 ceiling,
         address merchant,
         uint256 globalLimit
     ) public view returns (uint256 limit) {
         limit = overrides[merchant];
         if (limit == 0) return globalLimit;
-        if (limit > b.maxDaily) limit = b.maxDaily;
+        if (limit > ceiling) limit = ceiling;
         if (limit < b.minDaily) limit = b.minDaily;
+    }
+
+    /// @notice Validate a new per-merchant ceiling and return it (the caller
+    ///         stores it). The same rule as the limits' range (setBounds): any
+    ///         owner may LOWER it, only the super-admin may RAISE it, so no single
+    ///         admin key can lift what one merchant may take in a day. Never
+    ///         below minDaily.
+    function setMerchantCeiling(
+        MerchantTypes.LimitBounds storage b,
+        uint256 current,
+        uint256 ceiling,
+        bool callerIsSuperAdmin
+    ) public returns (uint256) {
+        if (ceiling < b.minDaily || ceiling > type(uint64).max) revert LimitOutOfBounds();
+        if (ceiling > current && !callerIsSuperAdmin) revert RaiseNeedsSuperAdmin();
+        emit MerchantDailyCeilingSet(ceiling);
+        return ceiling;
     }
 
     /// @notice Set the range, and return `dailyLimit` pulled inside it (the

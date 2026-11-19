@@ -66,8 +66,8 @@ interface IOrderFlow {
     ///      `redactTransId` is the last 4 digits of the payer's bank transfer.
     function raiseDispute(uint256 orderId, uint256 redactTransId) external;
 
-    /// @notice Appeals an open dispute to the next tier (DisputeFacet,
-    ///         live on Base mainnet since 9 Nov 2026). `order.user` only —
+    /// @notice Appeals an open dispute to the next tier (routed to the
+    ///         OrderProcessorFacet; live on Base mainnet since 9 Nov 2026). `order.user` only —
     ///         anyone else reverts NotDisputeUser() (0x69ac4b4e).
     /// @dev Allowed while a tier-1/2 decision is pending and its appeal window
     ///      is open, or when the current tier missed its decision SLA. Not at

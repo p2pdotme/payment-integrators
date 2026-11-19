@@ -257,6 +257,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         it (limit 0 = back on the global `dailyLimit`). Emitted by
     ///         MerchantRegistryLib; declared here for the ABI.
     event MerchantDailyLimitSet(address indexed merchant, uint256 limit);
+    /// @notice The per-merchant ceiling changed. Emitted by MerchantRegistryLib;
+    ///         declared here for the ABI.
+    event MerchantDailyCeilingSet(uint256 ceiling);
     /// @notice An owner (lowering) or the super-admin changed the range the
     ///         limits must stay within.
     event LimitBoundsSet(uint256 minDaily, uint256 maxDaily, uint256 minCap, uint256 maxCap);
@@ -545,6 +548,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         `limitBounds`, or the global one) is `getDailyTxInfo(m).limit`.
     mapping(address => uint256) public merchantDailyLimit;
 
+    /// @notice The ceiling every merchant's OWN daily limit must stay under —
+    ///         apart from `limitBounds.maxDaily`, the global limit's (review
+    ///         round 3, note 1): giving one merchant more than the global maximum
+    ///         no longer widens the global range for every MANAGER. Starts at
+    ///         DAILY_TX_LIMIT. Owners lower it, only the super-admin raises it
+    ///         (setMerchantDailyCeiling); lowering it applies at once.
+    uint256 public merchantDailyCeiling;
+
     /// @notice The link relayer (the LinkRouter): the only caller of
     ///         relayerPlaceOrder / relayerMarkPaid / relayerCancelOrder.
     ///         address(0) = link orders off. Set by the super-admin only
@@ -564,7 +575,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///                        support staff who only need to SEE merchant activity.
     ///         • SUPPORT (2): + freeze / unfreeze a merchant (the safety switch).
     ///         • MANAGER (3): + config — setPerTxCap, setDailyLimit,
-    ///                        setMerchantDailyLimit, setTrustedRelayer.
+    ///                        setMerchantDailyLimit (under the owners'
+    ///                        merchantDailyCeiling), setTrustedRelayer.
     ///         • FINANCE (4): + money recovery — adminAbortWithdrawal, adminForceSettle.
     ///         The OWNER sits above all tiers (implicitly FINANCE) and is the ONLY
     ///         one who can assign roles, add/remove admins, or transfer ownership.
@@ -765,6 +777,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             1e6,
             uint64(PER_TX_CAP_DEFAULT)
         );
+        merchantDailyCeiling = DAILY_TX_LIMIT; // own limits start under the same 25
         settlementPeriod = SETTLEMENT_PERIOD; // live lock starts at the default (10 min)
         // Deploy the canonical UserProxy implementation. Every per-user clone
         // is a `cloneDeterministicWithImmutableArgs` of this address, with
@@ -1561,6 +1574,18 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev Permissionless: it frees only what the rules already say is free. A
     ///      won dispute never reaches here — it completes the order, and
     ///      onOrderComplete clears the binding with the use still counted.
+    ///      The relayer's housekeeping calls it once a judged order stays
+    ///      cancelled, finalizing a lost dispute on the Diamond first (a USER
+    ///      ruling keeps the dispute RAISED until finalized).
+    ///
+    ///      KNOWN EDGE (review #118, round 2): p2p.me's admin can reopen a
+    ///      cancelled order with no time limit. A reopen AFTER this release
+    ///      completes the order with the binding already gone, so the merchant
+    ///      is credited but the link reads one use fewer and keeps the strike:
+    ///      a single-use link could take one more payment. It needs a manual
+    ///      admin action past p2p.me's window; support corrects the link (revoke
+    ///      and recreate) when it happens. Likewise a dispute nobody ever
+    ///      settles keeps holding the use; the merchant can revoke the link.
     function releaseLinkClaim(uint256 orderId) external {
         bytes32 linkId = orderToLink[orderId];
         if (linkId == bytes32(0)) revert LinkNotFound();
@@ -2333,15 +2358,35 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     /// @notice Give one merchant their own daily order limit, or clear it
     ///         (limit = 0) so they follow the global `dailyLimit` again. Same
-    ///         tier and the same range as the global limit: inside limitBounds
-    ///         [minDaily, maxDaily], so a MANAGER can move it but never past the
-    ///         ceiling the owners set. Applies from the next order. The library
-    ///         emits `MerchantDailyLimitSet(merchant, limit)`.
+    ///         tier as the global limit, inside [minDaily, merchantDailyCeiling]:
+    ///         a MANAGER can move it but never past the ceiling the owners set.
+    ///         Applies from the next order. The library emits
+    ///         `MerchantDailyLimitSet(merchant, limit)`.
     function setMerchantDailyLimit(
         address merchant,
         uint256 limit
     ) external onlyRole(Role.MANAGER) {
-        MerchantRegistryLib.setMerchantDailyLimit(merchantDailyLimit, limitBounds, merchant, limit);
+        MerchantRegistryLib.setMerchantDailyLimit(
+            merchantDailyLimit,
+            limitBounds,
+            merchantDailyCeiling,
+            merchant,
+            limit
+        );
+    }
+
+    /// @notice Owners and the super-admin: set the ceiling for merchants' own
+    ///         daily limits. Any owner may LOWER it — it applies to every own
+    ///         limit at once — but only the super-admin may RAISE it
+    ///         (RaiseNeedsSuperAdmin), the same rule as setLimitBounds. Never below
+    ///         minDaily. Emits `MerchantDailyCeilingSet(ceiling)`.
+    function setMerchantDailyCeiling(uint256 ceiling) external onlyOwner {
+        merchantDailyCeiling = MerchantRegistryLib.setMerchantCeiling(
+            limitBounds,
+            merchantDailyCeiling,
+            ceiling,
+            msg.sender == superAdmin
+        );
     }
 
     /// @notice Owners and the super-admin: set the range the limits must stay
@@ -2822,7 +2867,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev The daily order limit that applies to `merchant` (MerchantRegistryLib).
     function _dailyLimitOf(address merchant) private view returns (uint256) {
         return
-            MerchantRegistryLib.dailyLimitOf(merchantDailyLimit, limitBounds, merchant, dailyLimit);
+            MerchantRegistryLib.dailyLimitOf(
+                merchantDailyLimit,
+                limitBounds,
+                merchantDailyCeiling,
+                merchant,
+                dailyLimit
+            );
     }
 
     /// @notice The merchant's offramp currency as a readable code ("INR",

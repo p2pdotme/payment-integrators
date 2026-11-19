@@ -41,6 +41,7 @@ const DIAMOND_ABI = [
   "function owner() view returns (address)",
   "function registerIntegrator(address,bool,address)",
   "function setIntegratorCancelCallback(address,bool)",
+  "function facetAddress(bytes4) view returns (address)",
   "function cancelOrder(uint256)",
   "function acceptOrder(uint256,string,string)",
   "function getOrdersById(uint256) view returns (tuple(uint256 amount,uint256 fiatAmount,uint256 placedTimestamp,uint256 completedTimestamp,uint256 userCompletedTimestamp,address acceptedMerchant,address user,address recipientAddr,string pubkey,string encUpi,bool userCompleted,uint8 status,uint8 orderType,tuple(uint8 raisedBy,uint8 status,uint256 redactTransId,uint256 accountNumber) disputeInfo,uint256 id,string userPubKey,string encMerchantUpi,uint256 acceptedAccountNo,uint256[] assignedAccountNos,bytes32 currency,uint256 preferredPaymentChannelConfigId,uint256 circleId))",
@@ -136,6 +137,28 @@ async function main() {
   );
 
   console.log("\n2. Whitelist on the REAL Diamond (fork only: impersonating its owner)");
+  // Base mainnet's Diamond now routes only registerIntegrator(address,bool,
+  // address,bool), and a registration needs a co-sign before it executes; the
+  // 3-argument form and setIntegratorCancelCallback are gone there (review
+  // #118, round 3, note 3). This script whitelists the old way, so it runs on
+  // Base Sepolia forks: say so plainly on a Diamond that has moved on, rather
+  // than failing on an unknown selector.
+  const routes = async (signature: string): Promise<boolean | null> => {
+    try {
+      return (await diamond.facetAddress(ethers.id(signature).slice(0, 10))) !== ethers.ZeroAddress;
+    } catch {
+      return null;
+    }
+  };
+  if (
+    (await routes("registerIntegrator(address,bool,address)")) === false &&
+    (await routes("registerIntegrator(address,bool,address,bool)")) === true
+  ) {
+    throw new Error(
+      "This Diamond registers integrators with registerIntegrator(address,bool,address,bool) and a co-sign (Base mainnet since Nov 2026). " +
+        "This script whitelists the old way and runs on Base Sepolia forks only; for a mainnet fork use the mainnet fork procedure."
+    );
+  }
   const dAdmin = await as(await diamond.owner());
   await tx(diamond.connect(dAdmin).registerIntegrator(IA, false, await I.proxyImpl()));
   await tx(diamond.connect(dAdmin).setIntegratorCancelCallback(IA, true));
@@ -294,10 +317,6 @@ async function main() {
       () => I.connect(stranger).linkDispute(LINK, o1, LAST4, false),
       "a stranger naming the link on the integrator directly (acts as itself)"
     );
-    await refused(
-      () => I.connect(otherMerchant).linkDispute(ethers.ZeroHash, o1, LAST4, false),
-      "another merchant disputing this merchant's order"
-    );
 
     check(
       (await router.disputeDigest(LINK, o1, LAST4)) ===
@@ -332,6 +351,12 @@ async function main() {
       "the merchant before 6 hours (the customer goes first)"
     );
     await warp(6 * 3600);
+    // Past the 6 hours, so what refuses it is the Diamond rejecting another
+    // merchant's proxy, not DisputeTooEarly (review #118, round 2, nit).
+    await refused(
+      () => I.connect(otherMerchant).linkDispute(ethers.ZeroHash, o2, 1234n, false),
+      "another merchant disputing this merchant's order (past 6 h: the Diamond refuses their proxy)"
+    );
     await tx(I.connect(merchant).linkDispute(ethers.ZeroHash, o2, 1234n, false));
     const d2 = (await order(o2)).disputeInfo;
     check(

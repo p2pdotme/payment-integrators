@@ -522,25 +522,60 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(4n);
     });
 
-    it("must stay inside the range the owners set; narrowing the range pulls it in at once", async function () {
+    it("must stay under the owners' per-merchant ceiling; lowering it pulls every own limit in at once", async function () {
+      expect(await integrator.merchantDailyCeiling()).to.equal(25n); // starts at DAILY_TX_LIMIT
       await expect(
         integrator.setMerchantDailyLimit(merchant1.address, 26)
-      ).to.be.revertedWithCustomError(integrator, "LimitOutOfBounds"); // max is 25 to start
-      await integrator.setLimitBounds(1, 100, USDC(1), USDC(100));
+      ).to.be.revertedWithCustomError(integrator, "LimitOutOfBounds");
+      await expect(integrator.setMerchantDailyCeiling(100))
+        .to.emit(integrator, "MerchantDailyCeilingSet")
+        .withArgs(100);
       await integrator.setMerchantDailyLimit(merchant1.address, 80);
-      // An owner lowers the max in an emergency: the merchant's own limit obeys it
-      // straight away, with no admin having to find and reset it.
-      await integrator.setLimitBounds(1, 10, USDC(1), USDC(100));
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(80n);
+      // An owner lowers the ceiling in an emergency: the merchant's own limit
+      // obeys it straight away, with no admin having to find and reset it.
+      await integrator.setMerchantDailyCeiling(10);
       expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(10n);
       await fill(merchant1.address, 10);
       await expect(nextOrder(merchant1.address)).to.be.revertedWithCustomError(
         integrator,
         "DailyLimitReached"
       );
-      // …and raising a minimum lifts a too-low one the same way.
+      // …and raising the minimum lifts a too-low one the same way.
       await integrator.setMerchantDailyLimit(merchant2.address, 2);
-      await integrator.setLimitBounds(5, 10, USDC(1), USDC(100));
+      await integrator.setLimitBounds(5, 25, USDC(1), USDC(100));
       expect((await integrator.getDailyTxInfo(merchant2.address))[1]).to.equal(5n);
+    });
+
+    it("review round 3, note 1: one merchant above the global maximum does not widen the global range", async function () {
+      await integrator.setMerchantDailyCeiling(100); // the super-admin (owner) raises it
+      await integrator.setRole(attacker.address, 3); // a MANAGER
+      await integrator.connect(attacker).setMerchantDailyLimit(merchant1.address, 100);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(100n);
+      // The global limit, and every other merchant, still stop at maxDaily (25).
+      await expect(integrator.connect(attacker).setDailyLimit(100)).to.be.revertedWithCustomError(
+        integrator,
+        "LimitOutOfBounds"
+      );
+      expect((await integrator.getDailyTxInfo(merchant2.address))[1]).to.equal(25n);
+      expect((await integrator.limitBounds())[1]).to.equal(25n);
+    });
+
+    it("only the super-admin raises the ceiling; any owner lowers it; never below minDaily", async function () {
+      await integrator.addOwner(attacker.address); // an owner, not the super-admin
+      await expect(
+        integrator.connect(attacker).setMerchantDailyCeiling(30)
+      ).to.be.revertedWithCustomError(integrator, "RaiseNeedsSuperAdmin");
+      await integrator.connect(attacker).setMerchantDailyCeiling(20);
+      expect(await integrator.merchantDailyCeiling()).to.equal(20n);
+      await expect(
+        integrator.connect(merchant1).setMerchantDailyCeiling(10)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      await integrator.setLimitBounds(5, 25, USDC(1), USDC(100));
+      await expect(integrator.setMerchantDailyCeiling(4)).to.be.revertedWithCustomError(
+        integrator,
+        "LimitOutOfBounds"
+      );
     });
 
     it("MANAGER and above only, and never the zero address", async function () {
