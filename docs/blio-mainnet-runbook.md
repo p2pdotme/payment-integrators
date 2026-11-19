@@ -32,6 +32,10 @@ verificada no caduca de su lado.
 
 ## 2. Checklist previo
 
+- [ ] p2p confirma **qué etiqueta exacta `bytes32` manda el widget** por país
+      (`VES`, `BRL`, `INR`…). El constructor solo habilita `bytes32("INR")` y el
+      wildcard `bytes32(0)`; cualquier otra revierte `CurrencyNotAllowed` en el
+      primer pedido. Se enciende con `setCurrencyAllowed` (en mainnet, por la Safe).
 - [ ] p2p confirma **divisas** permitidas y el whitelist del integrador en mainnet.
 - [ ] p2p confirma el **tenant** de producción. Los tenants están atados a la
       **dirección del contrato**: hay que pedir tenants nuevos de liveness y
@@ -68,10 +72,10 @@ env -u DEPLOYER_PRIVATE_KEY DRY_RUN=1 \
   DEPLOY_OWNER=0xFB25b3BFc8eCEA01eC70763f92fBc8B3079bdf47 \
   LIVENESS_ATTESTOR=0x6cC780E44f9Ac850e6D6B8f52A5663286F1A2978 \
   KYC_ATTESTOR=0xA0bE015133e4dc63c96EBFB6729D34050Ef33Eda \
-  npx hardhat run scripts/deploy-blio.ts --network base
+  ./node_modules/.bin/hardhat run scripts/deploy-blio.ts --network base
 
-# 2) Deploy real
-npx hardhat run scripts/deploy-blio.ts --network base
+# 2) Deploy real (en este servidor `npx` no existe: usa el binario local)
+./node_modules/.bin/hardhat run scripts/deploy-blio.ts --network base
 ```
 
 El script imprime la **dirección del integrador**, el `proxyImpl`, el **hash del
@@ -87,10 +91,17 @@ pero ese paso no es nuestro).
 ## 4. Después del deploy
 
 - [ ] Verificar el contrato en Blockscout (Base) con el comando que imprime el script.
-- [ ] Comparar el `bytecode hash` impreso con el de la corrida de `hardhat test`
-      y confirmar `runtime size <= 24576`.
-- [ ] Enviar a p2p la dirección para el **whitelist** y pedir los **tenants
-      nuevos** (liveness y pasaporte) atados a esa dirección.
+- [ ] Comparar el runtime con `eth_getCode` y confirmar `runtime size <= 24576`.
+      El hash que imprime el script es el del runtime **con las inmutables ya
+      puestas**: nunca coincide con `keccak(deployedBytecode)` del artefacto. Y el
+      de **mainnet será otro** (chainId 8453 y direcciones distintas): hay que
+      mandárselo a p2p después del deploy.
+- [ ] Enviar a p2p la dirección **y su `proxyImpl`** para el **whitelist** y
+      pedir los **tenants nuevos** (liveness y pasaporte) atados a esa dirección.
+      ⚠️ El `proxyImpl` de mainnet es **distinto** del de Sepolia
+      (`address(new UserProxy())` en el constructor): el Diamond lo re-deriva y
+      exige el registrado. Si p2p registra el de Sepolia, **todo `placeB2BOrder`
+      revierte** y el integrador queda muerto: hay que redesplegar.
 - [ ] Configurar el Worker de producción:
       `P2P_CHAIN_ID=8453`, `P2P_INTEGRATOR_ADDRESS`, `P2P_DIAMOND_ADDRESS`,
       `P2P_TREASURY_ADDRESS`, `P2P_RPC_URL`, `P2P_LIVENESS_*`, `P2P_KYC_*`.
@@ -126,9 +137,11 @@ end-to-end del checkout antes de mainnet.
   (`0xFB25…df47`, Safe v1.5.0 **2-de-3**), así que el `treasury()` del
   integrador y el `P2P_TREASURY_ADDRESS` del Worker coinciden en las dos
   cadenas y el USDC liquidado en Sepolia también es recuperable.
-- El integrador viejo (`0x415627D9…`) tenía `treasury = 0x58B1…`, que **no
-  coincide** con la Safe: `verifyP2PTreasury` bloqueaba la entrega de Premium en
-  staging. El nuevo apunta a la Safe y lo arregla.
+- El integrador viejo (`0x415627D9…`, 10.523 B) **no tiene** el ancla de liveness
+  (`livenessNullifier`): en staging siguen vivos el exploit de la segunda wallet y
+  el `limit == 0`. Su `treasury()` **sí es la Safe** (`0x58B1…` es su `owner()`),
+  así que la tesorería nunca fue el problema: el motivo del redespliegue es el
+  **código**, no la liquidación.
 - El `owner` en Sepolia es la **EOA del deployer** para iterar rápido; antes de
   mainnet se puede pasar a la Safe con `transferOwnership` + `acceptOwnership`
   (2 de 3 firmas) para ensayar el flujo real.

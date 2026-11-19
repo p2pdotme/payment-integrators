@@ -22,7 +22,7 @@ El repo **no tiene `foundry.toml`**: `forge` no sirve aquí, todo va por Hardhat
 
 ## Estado (18-11-2026)
 - Código: **`1ee7a69`** (este documento llega en el commit siguiente).
-- Suite de blio: **76 tests**; repo completo: **1.046 passing / 45 pending**.
+- Suite de blio: **79 tests**; repo completo: **1.046 passing / 45 pending**.
 - Tamaño desplegado: **10.694 B** (límite EIP-170: 24.576 B).
 
 ## Valores fijos de Base mainnet
@@ -77,7 +77,8 @@ contrato van dentro del dominio EIP-712, no en la clave.
 - **Egress:** decidir API key/HMAC en el endpoint de screening o proxy por un host
   propio (los Workers de Cloudflare no tienen salida fija).
 - **Clave de cifrado del screening:** la envía p2p.
-- **Deploy Sepolia** (dirección nueva, tenants nuevos) y, tras el E2E, **mainnet**.
+- Deploy **Sepolia**: **hecho** (`0xb63Ba8…`); pendientes el registro de p2p
+  y los tenants nuevos. Después del E2E, **mainnet**.
 
 ## Comandos
 ```bash
