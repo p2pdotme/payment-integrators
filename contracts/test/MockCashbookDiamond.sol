@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.28;
+
+import { MockDiamond } from "./MockDiamond.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @notice MockDiamond plus the merchant-side surface CashbookRampIntegrator calls:
+ *         registerFor / stakeFor (an integrator opening or topping up someone
+ *         else's merchant account, pulling the USDC from the integrator), the
+ *         merchant read, the stake floor, the max buy, the merchant blacklist,
+ *         the unstake flag and the order's integrator.
+ *
+ *         registerFor / stakeFor are not on contracts-v4 `dev` yet (they are
+ *         proposed in p2pdotme/contracts-v4 "feat(onboard): let anyone register
+ *         or stake for a merchant"). Their reverts here mirror that branch:
+ *         MerchantAlreadyRegistered on a second register, StakeAmountTooLow below
+ *         the floor, and only an active integrator may call either.
+ *
+ *         NOT modelled: the Diamond's shared reentrancy lock. On the real
+ *         Diamond, completeOrder holds it while it calls onOrderComplete, so a
+ *         registerFor from inside the hook reverts. This mock would allow it,
+ *         which is why the integrator's own design (record in the hook, stake in
+ *         a second transaction) is proven on a fork, not here.
+ */
+contract MockCashbookDiamond is MockDiamond {
+    using SafeERC20 for IERC20;
+
+    error NotActiveIntegrator();
+    error MerchantAlreadyRegistered();
+    error MerchantNotRegistered();
+    error StakeAmountTooLow();
+    error CurrencyMismatch();
+
+    struct MerchantDetails {
+        uint256 stake;
+        bool isOnline;
+        uint256 totalVolume;
+        uint256 withdrawnAmount;
+        uint256 lastVolumeResetTimestamp;
+        uint256 accruedFees;
+        bool isRegistered;
+        bytes32 currency;
+    }
+
+    struct StakeConfigHead {
+        uint256 minCircleAdminP2PStake;
+        uint256 minMerchantUSDCStake;
+    }
+
+    mapping(address => MerchantDetails) internal merchants;
+    mapping(address => uint256) public merchantCircle;
+    mapping(bytes32 => uint256) public floorOf;
+    mapping(bytes32 => uint256) public maxBuyOf;
+    mapping(address => bool) public merchantBlacklisted;
+    mapping(address => bool) public unstakeRequested;
+
+    event MockRegisteredFor(address merchant, uint256 circleId, uint256 stake, bytes32 currency);
+    event MockStakedFor(address merchant, uint256 amount, bytes32 currency);
+
+    constructor(address _usdc) MockDiamond(_usdc) {}
+
+    // ─── Test setters ─────────────────────────────────────────────────
+
+    function setFloor(bytes32 currency, uint256 floor) external {
+        floorOf[currency] = floor;
+    }
+
+    function setMaxBuy(bytes32 currency, uint256 max) external {
+        maxBuyOf[currency] = max;
+    }
+
+    function setMerchantBlacklisted(address merchant, bool v) external {
+        merchantBlacklisted[merchant] = v;
+    }
+
+    function setUnstakeRequested(address merchant, bool v) external {
+        unstakeRequested[merchant] = v;
+    }
+
+    /// @notice An account opened somewhere else (merchant-app, another integrator).
+    function setMerchant(address merchant, uint256 stake, bytes32 currency) external {
+        merchants[merchant] = MerchantDetails(stake, true, 0, 0, 0, 0, true, currency);
+    }
+
+    /// @notice Rewrite a BUY's recipient, to model an order no honest path makes.
+    function setOrderRecipient(uint256 orderId, address recipientAddr) external {
+        orders[orderId].recipientAddr = recipientAddr;
+    }
+
+    // ─── The surface the integrator calls ─────────────────────────────
+
+    function registerFor(
+        address merchant,
+        uint256 circleId,
+        uint256 stakeAmount,
+        string calldata /* telegramId */,
+        bytes32 currency
+    ) external {
+        if (!activeIntegrators[msg.sender]) revert NotActiveIntegrator();
+        if (merchants[merchant].isRegistered) revert MerchantAlreadyRegistered();
+        if (stakeAmount < floorOf[currency]) revert StakeAmountTooLow();
+        usdc.safeTransferFrom(msg.sender, address(this), stakeAmount);
+        merchants[merchant] = MerchantDetails(stakeAmount, true, 0, 0, 0, 0, true, currency);
+        merchantCircle[merchant] = circleId;
+        emit MockRegisteredFor(merchant, circleId, stakeAmount, currency);
+    }
+
+    function stakeFor(address merchant, uint256 stakeAmount, bytes32 currency) external {
+        if (!activeIntegrators[msg.sender]) revert NotActiveIntegrator();
+        MerchantDetails storage m = merchants[merchant];
+        if (!m.isRegistered) revert MerchantNotRegistered();
+        if (m.currency != currency) revert CurrencyMismatch();
+        usdc.safeTransferFrom(msg.sender, address(this), stakeAmount);
+        m.stake += stakeAmount;
+        emit MockStakedFor(merchant, stakeAmount, currency);
+    }
+
+    function getMerchantDetails(address merchant) external view returns (MerchantDetails memory) {
+        return merchants[merchant];
+    }
+
+    function getStakeConfig(bytes32 currency) external view returns (StakeConfigHead memory) {
+        return StakeConfigHead(0, floorOf[currency]);
+    }
+
+    function getMaxBuyTxLimit(bytes32 currency) external view returns (uint256) {
+        return maxBuyOf[currency];
+    }
+
+    function isBlacklisted(address merchant) external view returns (bool) {
+        return merchantBlacklisted[merchant];
+    }
+
+    function getUnstakeRequested(address merchant) external view returns (bool) {
+        return unstakeRequested[merchant];
+    }
+
+    function getOrderIntegrator(uint256 orderId) external view returns (address) {
+        return orders[orderId].integrator;
+    }
+}

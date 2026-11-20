@@ -17,6 +17,7 @@ This repository is the canonical home for:
 | Name | Location | Network | Status | Whitelisted address |
 |---|---|---|---|---|
 | LotPot | `contracts/integrators/lotpot/LotPotCheckoutIntegrator.sol` | Base mainnet | Production | [`0xb901c3399ED225e4C6c7bfbd8DABA16BBF340132`](https://basescan.org/address/0xb901c3399ED225e4C6c7bfbd8DABA16BBF340132) |
+| Cashbook | `contracts/integrators/cashbook/CashbookRampIntegrator.sol` | — | In review (not whitelisted) | n/a |
 | Example | `contracts/integrators/ExampleIntegrator.sol` | — | Reference (not whitelisted) | n/a |
 
 > PR merge ≠ whitelisting. The Diamond holds an explicit allowlist that gates which integrator contracts can place B2B orders. See [docs/WHITELISTING.md](docs/WHITELISTING.md).
