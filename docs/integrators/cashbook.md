@@ -13,7 +13,7 @@ whitelisted.
 | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Deposit  | A B2B **BUY**. The USDC lands on this contract and is staked into the person's **own** merchant account on the Diamond: `registerFor` the first time, `stakeFor` after. |
 | Withdraw | A B2B **SELL** with `order.user` = the person, for an account opened here. The Diamond pulls the USDC from the person's **wallet**, not their stake.                    |
-| Rewards  | cashbook's own USDC from a pool, staked into an account opened here by a rewarder key the owner sets, at most 10 USDC per account in total.                             |
+| Rewards  | cashbook's own USDC from a pool, staked by the owner in batches into accounts opened here, at most 10 USDC per account in total.                                        |
 
 The merchant account belongs to the person's address, not to a proxy and not to
 this contract. Once staked, the money is theirs on the Diamond like any other
@@ -57,16 +57,16 @@ currency), `getStakeConfig` (the stake floor),
    account. Every argument comes from the order and stored state, so a caller can
    trigger it but not steer it.
 4. **Rewarded (optional).** cashbook's backend decides who earns a reward and
-   when; its rewarder key calls `rewardStake(person, amount)`, which stakes
-   `amount` from the reward pool into the person's account. It is ordinary
-   stake from then on.
+   when; the owner calls `rewardStake(people, amounts)`, which stakes each
+   amount from the reward pool into that person's account. It is ordinary stake
+   from then on.
 5. **Withdraw.** Money reaches the person's wallet only through the Diamond:
    an approved unstake (a full exit; there is no partial unstake) or claimed
    merchant rewards (the Diamond's per-task earnings, not this contract's
-   rewards, which are only ever staked). `withdrawFiat(amount, currency,
-circleId, …)` then places a SELL, and the person's smart account approves
-   USDC to the Diamond and calls `setSellOrderUpi`, which pulls it from their
-   wallet.
+   rewards, which are only ever staked). Then
+   `withdrawFiat(amount, currency, circleId, …)` places a SELL, and the
+   person's smart account approves USDC to the Diamond and calls
+   `setSellOrderUpi`, which pulls it from their wallet.
 
 **Why steps 2 and 3 are separate transactions.** `completeOrder` holds the
 Diamond's shared reentrancy lock while it calls the hook, and `registerFor` /
@@ -123,18 +123,22 @@ only limits on either flow:
 
 - `fundRewards(amount)`: anyone adds USDC to the single `rewardPool` (approve
   first). Zero is refused.
-- `setRewarder(address)` (owner): the only address that may pay rewards. 0, the
-  default, means nobody.
-- `rewardStake(person, amount)` (rewarder only): stakes `amount` from the pool
-  into the person's account with `stakeFor`, in the account's currency, with an
-  exact allowance reset to 0 after. Refused for a zero amount, an account not
-  opened here (`NoSeat`), more than the pool (`RewardPoolShort`), or a lifetime
-  total over `MAX_REWARD_PER_ACCOUNT` = 10 USDC (`RewardCapReached`, tracked in
-  `rewarded[person]`). The Diamond's stake rules still apply (blacklist, pending
-  unstake, floor); a refused reward reverts and nothing moves.
-- Who earns a reward and when is decided off chain. The contract only bounds
-  what a rewarder key can move: a leaked key can pay at most 10 USDC into each
-  account opened here, never to a wallet.
+- `rewardStake(people[], amounts[])` (owner only, a batch): stakes each
+  `amounts[i]` from the pool into `people[i]`'s account with `stakeFor`, in that
+  account's own currency. One exact allowance for the batch total, reset to 0
+  after.
+- Refused as a whole: an empty batch or lists of different lengths
+  (`LengthMismatch`), a total over the pool (`RewardPoolShort`, checked before
+  any item). Per item: a zero amount (`InvalidAmount`), an account not opened
+  here (`NoSeat`), or a lifetime total over `MAX_REWARD_PER_ACCOUNT` = 10 USDC
+  (`RewardCapReached`, tracked in `rewarded[person]`; a person listed twice
+  counts twice).
+- All or nothing: any refusal, including the Diamond's stake rules (blacklist,
+  pending unstake, floor) on any one account, reverts the whole batch and
+  nothing moves.
+- Who earns a reward and when is decided off chain. The contract bounds what
+  the owner can pay: at most 10 USDC into each account opened here, never to a
+  wallet.
 - A reward is ordinary stake and leaves with the account on unstake.
 
 ## Operations
@@ -146,14 +150,12 @@ only limits on either flow:
   - `setCircle(currency, circleId)`: the circle new accounts open in. 0 stops new
     accounts in that currency. Deposits are matched in whatever circle the caller
     names; only the account's circle is fixed.
-  - `setRewarder(address)` and `withdrawRewards(amount)` (pool only, paid to the
-    owner).
+  - `rewardStake(people, amounts)` (see Rewards) and `withdrawRewards(amount)`
+    (pool only, paid to the owner).
   - The owner cannot touch `pendingStake` or any order.
 - **Keeper:** watches `DepositDelivered` and calls `stakeDeposit(orderId)`. It
   needs gas and nothing else. `stakeDeposit` is permissionless, so the person
   never depends on it.
-- **Rewarder:** a separate key, set by the owner, that calls `rewardStake`. Not
-  permissionless, and capped per account.
 - Accounts opened here have an empty `telegramId`.
 
 ## Maintainer

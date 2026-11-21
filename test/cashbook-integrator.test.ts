@@ -18,8 +18,9 @@ import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
  *     amount, the currency and the circle all come from stored state.
  *   - every deposit must leave the account at the Diamond's stake floor, so no
  *     money waits on a stake the Diamond would refuse.
- *   - rewards come only from the reward pool, only from the rewarder, only
+ *   - rewards come only from the reward pool, only in an owner batch, only
  *     into an account opened here, and at most MAX_REWARD_PER_ACCOUNT each.
+ *     A batch is all or nothing.
  *   - B2B orders skip the Diamond's per-person limits, so the per-tx caps and
  *     daily counts here are the only ones; both directions have them.
  *
@@ -31,7 +32,7 @@ describe("CashbookRampIntegrator", function () {
   let alice: SignerWithAddress;
   let bob: SignerWithAddress;
   let stranger: SignerWithAddress;
-  let rewarder: SignerWithAddress;
+  let carol: SignerWithAddress;
 
   let usdc: any;
   let diamond: any;
@@ -60,7 +61,7 @@ describe("CashbookRampIntegrator", function () {
   }
 
   beforeEach(async function () {
-    [owner, alice, bob, stranger, rewarder] = await ethers.getSigners();
+    [owner, alice, bob, stranger, carol] = await ethers.getSigners();
     usdc = await (await ethers.getContractFactory("MockUSDC")).deploy();
     diamond = await (
       await ethers.getContractFactory("MockCashbookDiamond")
@@ -147,14 +148,13 @@ describe("CashbookRampIntegrator", function () {
       expect(await integrator.MAX_DEPOSITS_PER_DAY()).to.equal(5n);
       expect(await integrator.MAX_WITHDRAWALS_PER_DAY()).to.equal(5n);
       expect(await integrator.MAX_REWARD_PER_ACCOUNT()).to.equal(MAX_REWARD);
-      expect(await integrator.rewarder()).to.equal(ethers.ZeroAddress);
     });
   });
 
   describe("access control", function () {
-    it("only the owner sets circles and the rewarder, or withdraws the pool", async function () {
+    it("only the owner sets circles, pays rewards, or withdraws the pool", async function () {
       const c = integrator.connect(stranger);
-      await expect(c.setRewarder(stranger.address)).to.be.revertedWithCustomError(
+      await expect(c.rewardStake([alice.address], [1])).to.be.revertedWithCustomError(
         integrator,
         "OwnableUnauthorizedAccount"
       );
@@ -184,7 +184,7 @@ describe("CashbookRampIntegrator", function () {
       );
       await integrator.connect(bob).acceptOwnership();
       expect(await integrator.owner()).to.equal(bob.address);
-      await expect(integrator.setRewarder(bob.address)).to.be.revertedWithCustomError(
+      await expect(integrator.setCircle(INR, 2)).to.be.revertedWithCustomError(
         integrator,
         "OwnableUnauthorizedAccount"
       );
@@ -204,17 +204,9 @@ describe("CashbookRampIntegrator", function () {
   });
 
   describe("owner settings", function () {
-    it("setRewarder and setCircle store and emit", async function () {
-      await expect(integrator.setRewarder(rewarder.address))
-        .to.emit(integrator, "RewarderSet")
-        .withArgs(rewarder.address);
+    it("setCircle stores and emits", async function () {
       await expect(integrator.setCircle(BRL, 2)).to.emit(integrator, "CircleSet").withArgs(BRL, 2);
-      expect(await integrator.rewarder()).to.equal(rewarder.address);
       expect(await integrator.circleOf(BRL)).to.equal(2n);
-      await expect(integrator.setRewarder(ethers.ZeroAddress))
-        .to.emit(integrator, "RewarderSet")
-        .withArgs(ethers.ZeroAddress);
-      expect(await integrator.rewarder()).to.equal(ethers.ZeroAddress);
     });
 
     it("withdrawRewards takes only the pool, never pending stake", async function () {
@@ -587,161 +579,194 @@ describe("CashbookRampIntegrator", function () {
   });
 
   describe("rewardStake", function () {
-    /** Everything a refused reward must leave untouched. */
-    async function snapshot(who: SignerWithAddress) {
-      return [
+    /** Everything a refused batch must leave untouched. */
+    async function snapshot(who: SignerWithAddress[]) {
+      const out: bigint[] = [
         await integrator.rewardPool(),
-        await integrator.rewarded(who.address),
-        (await diamond.getMerchantDetails(who.address)).stake,
         await usdc.allowance(iAddr, dAddr),
         await usdc.balanceOf(iAddr),
         await usdc.balanceOf(dAddr),
       ];
+      for (const u of who) {
+        out.push(await integrator.rewarded(u.address));
+        out.push((await diamond.getMerchantDetails(u.address)).stake);
+      }
+      return out;
     }
 
-    it("refuses anyone but the rewarder; with none set, nobody", async function () {
-      await open(alice);
-      // rewarder 0 (the default): nobody, not even the owner
-      await expect(integrator.rewardStake(alice.address, USDC(1))).to.be.revertedWithCustomError(
-        integrator,
-        "NotRewarder"
+    const reward = (who: SignerWithAddress[], amounts: bigint[]) =>
+      integrator.rewardStake(
+        who.map((u) => u.address),
+        amounts
       );
-      await integrator.setRewarder(rewarder.address);
-      for (const who of [owner, stranger, alice]) {
+
+    it("refuses anyone but the owner", async function () {
+      await open(alice);
+      for (const who of [stranger, alice]) {
         await expect(
-          integrator.connect(who).rewardStake(alice.address, USDC(1))
-        ).to.be.revertedWithCustomError(integrator, "NotRewarder");
+          integrator.connect(who).rewardStake([alice.address], [USDC(1)])
+        ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       }
-      await expect(integrator.connect(rewarder).rewardStake(alice.address, USDC(1))).to.not.be
-        .reverted;
-      // set back to 0: the old rewarder is refused too
-      await integrator.setRewarder(ethers.ZeroAddress);
+    });
+
+    it("refuses an empty batch, or lists of different lengths", async function () {
+      await open(alice);
+      await expect(reward([], [])).to.be.revertedWithCustomError(integrator, "LengthMismatch");
+      await expect(reward([alice], [])).to.be.revertedWithCustomError(integrator, "LengthMismatch");
+      await expect(reward([alice], [USDC(1), USDC(1)])).to.be.revertedWithCustomError(
+        integrator,
+        "LengthMismatch"
+      );
+    });
+
+    it("refuses a zero amount", async function () {
+      await open(alice);
+      await expect(reward([alice], [0n])).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidAmount"
+      );
+    });
+
+    it("refuses an account not opened here", async function () {
+      // no account at all
+      await expect(reward([bob], [USDC(1)])).to.be.revertedWithCustomError(integrator, "NoSeat");
+      // an account opened elsewhere (merchant-app, another integrator)
+      await diamond.setMerchant(bob.address, FLOOR, INR);
+      await expect(reward([bob], [USDC(1)])).to.be.revertedWithCustomError(integrator, "NoSeat");
+      // delivered here but not yet staked: still no account opened here
+      await deposit(alice, FLOOR);
+      await settle(1);
+      await expect(reward([alice], [USDC(1)])).to.be.revertedWithCustomError(integrator, "NoSeat");
+      await holds([alice, bob]);
+    });
+
+    it("caps each account's lifetime total at MAX_REWARD_PER_ACCOUNT", async function () {
+      await open(alice);
+      await expect(reward([alice], [MAX_REWARD + 1n])).to.be.revertedWithCustomError(
+        integrator,
+        "RewardCapReached"
+      );
+      await expect(reward([alice], [USDC(6)])).to.not.be.reverted;
+      await expect(reward([alice], [USDC(5)])).to.be.revertedWithCustomError(
+        integrator,
+        "RewardCapReached"
+      );
+      await expect(reward([alice], [USDC(4)])).to.not.be.reverted;
+      expect(await integrator.rewarded(alice.address)).to.equal(MAX_REWARD);
+      await expect(reward([alice], [1n])).to.be.revertedWithCustomError(
+        integrator,
+        "RewardCapReached"
+      );
+      // another account's cap is its own
+      await open(bob);
+      await expect(reward([bob], [MAX_REWARD])).to.not.be.reverted;
+      expect(await integrator.rewardPool()).to.equal(POOL - 2n * MAX_REWARD);
+      await holds([alice, bob]);
+    });
+
+    it("the same account twice counts twice: crossing the cap reverts the whole batch", async function () {
+      await open(alice);
+      await open(bob);
+      const before = await snapshot([alice, bob]);
       await expect(
-        integrator.connect(rewarder).rewardStake(alice.address, USDC(1))
-      ).to.be.revertedWithCustomError(integrator, "NotRewarder");
+        reward([bob, alice, alice], [USDC(2), USDC(6), USDC(5)])
+      ).to.be.revertedWithCustomError(integrator, "RewardCapReached");
+      expect(await snapshot([alice, bob])).to.deep.equal(before);
+      // within the cap, the same account twice is fine
+      await expect(reward([alice, alice], [USDC(6), USDC(4)])).to.not.be.reverted;
+      expect(await integrator.rewarded(alice.address)).to.equal(MAX_REWARD);
+      await holds([alice, bob]);
     });
 
-    describe("with a rewarder set", function () {
-      beforeEach(async function () {
-        await integrator.setRewarder(rewarder.address);
-      });
+    it("refuses a batch whose sum is more than the pool, even when pending stake would cover it", async function () {
+      await open(alice);
+      await open(bob);
+      await integrator.withdrawRewards(POOL - USDC(3));
+      // carol's delivered, unstaked deposit sits on the contract beside the pool
+      await deposit(carol, FLOOR);
+      await settle(3);
+      expect(await usdc.balanceOf(iAddr)).to.equal(USDC(3) + FLOOR);
+      // each item fits the pool, the sum does not
+      await expect(reward([alice, bob], [USDC(2), USDC(2)])).to.be.revertedWithCustomError(
+        integrator,
+        "RewardPoolShort"
+      );
+      await expect(reward([alice, bob], [USDC(2), USDC(1)])).to.not.be.reverted;
+      expect(await integrator.rewardPool()).to.equal(0n);
+      expect(await integrator.pendingStake(carol.address)).to.equal(FLOOR);
+      await holds([alice, bob, carol]);
+    });
 
-      const reward = (who: SignerWithAddress, amount: bigint) =>
-        integrator.connect(rewarder).rewardStake(who.address, amount);
-
-      it("refuses a zero amount", async function () {
-        await open(alice);
-        await expect(reward(alice, 0n)).to.be.revertedWithCustomError(integrator, "InvalidAmount");
-      });
-
-      it("refuses an account not opened here", async function () {
-        // no account at all
-        await expect(reward(bob, USDC(1))).to.be.revertedWithCustomError(integrator, "NoSeat");
-        // an account opened elsewhere (merchant-app, another integrator)
-        await diamond.setMerchant(bob.address, FLOOR, INR);
-        await expect(reward(bob, USDC(1))).to.be.revertedWithCustomError(integrator, "NoSeat");
-        // delivered here but not yet staked: still no account opened here
-        await deposit(alice, FLOOR);
-        await settle(1);
-        await expect(reward(alice, USDC(1))).to.be.revertedWithCustomError(integrator, "NoSeat");
-        await holds([alice, bob]);
-      });
-
-      it("caps each account's lifetime total at MAX_REWARD_PER_ACCOUNT", async function () {
-        await open(alice);
-        await expect(reward(alice, MAX_REWARD + 1n)).to.be.revertedWithCustomError(
-          integrator,
-          "RewardCapReached"
+    it("a batch stakes each amount into its own account, in that account's currency", async function () {
+      await integrator.setCircle(BRL, 2);
+      await open(alice);
+      await open(bob, BRL);
+      await open(carol);
+      // someone else's delivered, unstaked deposit must not move
+      const dave = stranger;
+      await deposit(dave, FLOOR);
+      await settle(4);
+      const dBefore = await usdc.balanceOf(dAddr);
+      const people = [alice, bob, carol];
+      const amounts = [USDC(6), USDC(3), USDC(1)];
+      const total = USDC(10);
+      await expect(reward(people, amounts))
+        .to.emit(diamond, "MockStakedFor")
+        .withArgs(alice.address, USDC(6), INR)
+        .and.to.emit(diamond, "MockStakedFor")
+        .withArgs(bob.address, USDC(3), BRL)
+        .and.to.emit(diamond, "MockStakedFor")
+        .withArgs(carol.address, USDC(1), INR)
+        .and.to.emit(integrator, "Rewarded")
+        .withArgs(alice.address, USDC(6))
+        .and.to.emit(integrator, "Rewarded")
+        .withArgs(bob.address, USDC(3))
+        .and.to.emit(integrator, "Rewarded")
+        .withArgs(carol.address, USDC(1));
+      for (let i = 0; i < people.length; i++) {
+        expect((await diamond.getMerchantDetails(people[i].address)).stake).to.equal(
+          FLOOR + amounts[i]
         );
-        await expect(reward(alice, USDC(6))).to.not.be.reverted;
-        await expect(reward(alice, USDC(5))).to.be.revertedWithCustomError(
-          integrator,
-          "RewardCapReached"
-        );
-        await expect(reward(alice, USDC(4))).to.not.be.reverted;
-        expect(await integrator.rewarded(alice.address)).to.equal(MAX_REWARD);
-        await expect(reward(alice, 1n)).to.be.revertedWithCustomError(
-          integrator,
-          "RewardCapReached"
-        );
-        // another account's cap is its own
-        await open(bob);
-        await expect(reward(bob, MAX_REWARD)).to.not.be.reverted;
-        expect(await integrator.rewardPool()).to.equal(POOL - 2n * MAX_REWARD);
-        await holds([alice, bob]);
-      });
-
-      it("refuses more than the pool, even when pending stake would cover it", async function () {
-        await open(alice);
-        await integrator.withdrawRewards(POOL - USDC(3));
-        // bob's delivered, unstaked deposit sits on the contract beside the pool
-        await deposit(bob, FLOOR);
-        await settle(2);
-        expect(await usdc.balanceOf(iAddr)).to.equal(USDC(3) + FLOOR);
-        await expect(reward(alice, USDC(4))).to.be.revertedWithCustomError(
-          integrator,
-          "RewardPoolShort"
-        );
-        await expect(reward(alice, USDC(3))).to.not.be.reverted;
-        expect(await integrator.rewardPool()).to.equal(0n);
-        expect(await integrator.pendingStake(bob.address)).to.equal(FLOOR);
-        await holds([alice, bob]);
-      });
-
-      it("stakes exactly the amount into the account, from the pool", async function () {
-        await open(alice);
-        await deposit(bob, FLOOR);
-        await settle(2);
-        const dBefore = await usdc.balanceOf(dAddr);
-        await expect(reward(alice, USDC(6)))
-          .to.emit(diamond, "MockStakedFor")
-          .withArgs(alice.address, USDC(6), INR)
-          .and.to.emit(integrator, "Rewarded")
-          .withArgs(alice.address, USDC(6));
-        expect((await diamond.getMerchantDetails(alice.address)).stake).to.equal(FLOOR + USDC(6));
-        expect(await usdc.balanceOf(dAddr)).to.equal(dBefore + USDC(6));
-        expect(await integrator.rewardPool()).to.equal(POOL - USDC(6));
-        expect(await integrator.rewarded(alice.address)).to.equal(USDC(6));
-        expect(await integrator.pendingStake(bob.address)).to.equal(FLOOR);
-        expect(await usdc.allowance(iAddr, dAddr)).to.equal(0n);
-        await holds([alice, bob]);
-      });
-
-      it("stakes in the account's own currency", async function () {
-        await integrator.setCircle(BRL, 2);
-        await open(alice, BRL);
-        await expect(reward(alice, USDC(2)))
-          .to.emit(diamond, "MockStakedFor")
-          .withArgs(alice.address, USDC(2), BRL);
-      });
-
-      for (const [why, setup, error] of [
-        [
-          "a pending unstake",
-          (a: string) => diamond.setUnstakeRequested(a, true),
-          "UnstakeRequestPending",
-        ],
-        [
-          "the merchant blacklist",
-          (a: string) => diamond.setMerchantBlacklisted(a, true),
-          "MerchantBlacklisted",
-        ],
-        [
-          "an account slashed below the floor",
-          (a: string) => diamond.setMerchant(a, USDC(40), INR),
-          "StakeAmountTooLow",
-        ],
-      ] as const) {
-        it(`a Diamond refusal (${why}) reverts and nothing moves`, async function () {
-          await open(alice);
-          await setup(alice.address);
-          const before = await snapshot(alice);
-          await expect(reward(alice, USDC(5))).to.be.revertedWithCustomError(diamond, error);
-          expect(await snapshot(alice)).to.deep.equal(before);
-          await holds([alice]);
-        });
+        expect(await integrator.rewarded(people[i].address)).to.equal(amounts[i]);
       }
+      expect(await usdc.balanceOf(dAddr)).to.equal(dBefore + total);
+      expect(await integrator.rewardPool()).to.equal(POOL - total);
+      expect(await integrator.pendingStake(dave.address)).to.equal(FLOOR);
+      expect(await usdc.allowance(iAddr, dAddr)).to.equal(0n);
+      await holds([alice, bob, carol, dave]);
     });
+
+    for (const [why, setup, error] of [
+      [
+        "a pending unstake",
+        (a: string) => diamond.setUnstakeRequested(a, true),
+        "UnstakeRequestPending",
+      ],
+      [
+        "the merchant blacklist",
+        (a: string) => diamond.setMerchantBlacklisted(a, true),
+        "MerchantBlacklisted",
+      ],
+      [
+        "an account slashed below the floor",
+        (a: string) => diamond.setMerchant(a, USDC(40), INR),
+        "StakeAmountTooLow",
+      ],
+    ] as const) {
+      it(`a Diamond refusal mid-batch (${why}) reverts everything`, async function () {
+        await open(alice);
+        await open(bob);
+        await open(carol);
+        await setup(bob.address);
+        const before = await snapshot([alice, bob, carol]);
+        // alice is staked first, bob is refused, carol never runs
+        await expect(
+          reward([alice, bob, carol], [USDC(2), USDC(2), USDC(2)])
+        ).to.be.revertedWithCustomError(diamond, error);
+        expect(await snapshot([alice, bob, carol])).to.deep.equal(before);
+        await holds([alice, bob, carol]);
+      });
+    }
   });
 
   describe("withdrawFiat", function () {

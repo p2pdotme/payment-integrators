@@ -41,12 +41,11 @@ pragma solidity ^0.8.28;
    take the same lock, so staking from inside the hook always reverts.
 
    REWARDS: cashbook's own USDC, added to an account's stake. Anyone may fund
-   the pool (fundRewards). Only the rewarder, an address the owner sets, may
-   pay from it (rewardStake), only into an account opened here, and at most
+   the pool (fundRewards). Only the owner pays from it (rewardStake, a batch
+   of accounts and amounts), only into accounts opened here, and at most
    MAX_REWARD_PER_ACCOUNT per account over its lifetime. Who earns a reward
-   and when is decided off chain (cashbook's backend); this contract only
-   bounds what a rewarder key can move. A reward is ordinary stake and leaves
-   with the account on unstake.
+   and when is decided off chain (cashbook's backend). A reward is ordinary
+   stake and leaves with the account on unstake.
 
    WITHDRAW: merchant money out to a bank (a B2B SELL)
      withdrawFiat places a SELL with order.user = the person, only for an
@@ -159,7 +158,7 @@ interface IRmUserBlacklist {
 /// @dev Ownership is OpenZeppelin's Ownable2Step: the owner proposes a new owner
 ///      (transferOwnership) and it only takes effect when that address accepts
 ///      (acceptOwnership), so a mistyped address can never take the role. The
-///      owner's only powers are setCircle, setRewarder and withdrawRewards.
+///      owner's only powers are setCircle, rewardStake and withdrawRewards.
 contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
 
@@ -201,8 +200,8 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error DepositAlreadyStaked();
     /// @notice The delivery has already been credited.
     error OrderAlreadyFulfilled();
-    /// @notice rewardStake was called by someone other than the rewarder.
-    error NotRewarder();
+    /// @notice rewardStake: no accounts, or accounts and amounts of different lengths.
+    error LengthMismatch();
     /// @notice The reward would take the account past MAX_REWARD_PER_ACCOUNT.
     error RewardCapReached();
     /// @notice The reward pool holds less than asked.
@@ -230,8 +229,6 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @param paid   what the person paid in (their pending deposits).
     /// @param opened true when this stake opened the account (registerFor).
     event DepositStaked(uint256 indexed orderId, address indexed user, uint256 paid, bool opened);
-    /// @notice The owner set the address allowed to pay rewards (0 = none).
-    event RewarderSet(address indexed rewarder);
     /// @notice The owner set the circle new accounts in `currency` open in.
     event CircleSet(bytes32 indexed currency, uint256 circleId);
     /// @notice Someone added to the reward pool.
@@ -257,7 +254,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice Withdrawals one person may place in a UTC day.
     uint256 public constant MAX_WITHDRAWALS_PER_DAY = 5;
     /// @notice The most rewards one account can ever receive (USDC, 6 decimals),
-    ///         so a leaked rewarder key cannot pour the pool into one account.
+    ///         so a mistaken batch cannot pour the pool into one account.
     uint256 public constant MAX_REWARD_PER_ACCOUNT = 10e6;
 
     // ─── Immutables ───────────────────────────────────────────────────
@@ -285,8 +282,6 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         account's circle; the deposit order itself is matched in whatever
     ///         circle depositFiat names. 0 = not set (circle ids start at 1).
     mapping(bytes32 => uint256) public circleOf;
-    /// @notice The only address that may pay rewards. 0 = nobody.
-    address public rewarder;
     /// @notice Reward money not yet paid. Anyone may add to it.
     uint256 public rewardPool;
     /// @notice Rewards paid into each account so far (at most MAX_REWARD_PER_ACCOUNT).
@@ -316,7 +311,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
 
     /// @param _diamond           the p2p.me Diamond
     /// @param _usdc              the Diamond's USDC
-    /// @param _owner             sets circles and the rewarder, withdraws the pool (a
+    /// @param _owner             sets circles, pays rewards, withdraws the pool (a
     ///                           Safe on mainnet). It can never touch pendingStake
     ///                           or any order.
     /// @param _reputationManager the Diamond's getReputationManager(), or 0 for none
@@ -338,12 +333,6 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice Always reverts CannotRenounce: ownership only moves.
     function renounceOwnership() public pure override {
         revert CannotRenounce();
-    }
-
-    /// @notice Set the address allowed to pay rewards; 0 turns rewards off.
-    function setRewarder(address _rewarder) external onlyOwner {
-        rewarder = _rewarder;
-        emit RewarderSet(_rewarder);
     }
 
     /// @notice Set the circle accounts opening in `currency` register in. Applies
@@ -376,24 +365,36 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         emit RewardsFunded(msg.sender, amount);
     }
 
-    /// @notice Stake `amount` from the pool into `user`'s account. Only the
-    ///         rewarder, only for an account opened here, and at most
-    ///         MAX_REWARD_PER_ACCOUNT per account in total. The Diamond's
-    ///         stakeFor still applies its own rules (not blacklisted, no pending
-    ///         unstake, at or above the minimum stake), so a refused reward
-    ///         reverts and nothing moves.
-    function rewardStake(address user, uint256 amount) external nonReentrant {
-        if (msg.sender != rewarder) revert NotRewarder(); // rewarder 0: nobody
-        if (amount == 0) revert InvalidAmount();
-        if (!openedHere[user]) revert NoSeat();
-        if (rewarded[user] + amount > MAX_REWARD_PER_ACCOUNT) revert RewardCapReached();
-        if (amount > rewardPool) revert RewardPoolShort();
-        rewardPool -= amount;
-        rewarded[user] += amount;
-        usdc.forceApprove(address(diamond), amount);
-        diamond.stakeFor(user, amount, diamond.getMerchantDetails(user).currency);
+    /// @notice Stake `amounts[i]` from the pool into `users[i]`'s account, for
+    ///         each i. Owner only, only accounts opened here, and at most
+    ///         MAX_REWARD_PER_ACCOUNT per account in total (a person listed twice
+    ///         counts twice). All or nothing: any refusal here or by the
+    ///         Diamond's stakeFor (blacklisted, pending unstake, below the minimum
+    ///         stake) reverts the whole batch and nothing moves.
+    function rewardStake(
+        address[] calldata users,
+        uint256[] calldata amounts
+    ) external onlyOwner nonReentrant {
+        uint256 n = users.length;
+        if (n == 0 || n != amounts.length) revert LengthMismatch();
+        uint256 total;
+        for (uint256 i; i < n; ++i) total += amounts[i];
+        if (total > rewardPool) revert RewardPoolShort();
+        rewardPool -= total;
+
+        // Exact allowance for the batch, reset after: pendingStake is here too.
+        usdc.forceApprove(address(diamond), total);
+        for (uint256 i; i < n; ++i) {
+            address user = users[i];
+            uint256 amount = amounts[i];
+            if (amount == 0) revert InvalidAmount();
+            if (!openedHere[user]) revert NoSeat();
+            if (rewarded[user] + amount > MAX_REWARD_PER_ACCOUNT) revert RewardCapReached();
+            rewarded[user] += amount;
+            diamond.stakeFor(user, amount, diamond.getMerchantDetails(user).currency);
+            emit Rewarded(user, amount);
+        }
         usdc.forceApprove(address(diamond), 0);
-        emit Rewarded(user, amount);
     }
 
     // ─── Views ────────────────────────────────────────────────────────
