@@ -9,11 +9,11 @@ whitelisted.
 
 ## What it does
 
-|          |                                                                                                                                                                         |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Deposit  | A B2B **BUY**. The USDC lands on this contract and is staked into the person's **own** merchant account on the Diamond: `registerFor` the first time, `stakeFor` after. |
-| Withdraw | A B2B **SELL** with `order.user` = the person, for an account opened here. The Diamond pulls the USDC from the person's **wallet**, not their stake.                    |
-| Rewards  | cashbook's own USDC from a pool, staked by the owner in batches into accounts opened here, at most 10 USDC per account in total.                                        |
+|          |                                                                                                                                                                                                       |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Deposit  | A B2B **BUY**. The USDC lands on this contract and is staked into the person's **own** merchant account on the Diamond: `registerFor` the first time, `stakeFor` after.                               |
+| Withdraw | A B2B **SELL** with `order.user` = the person, for any merchant account, opened here or not, with no amount or count limit. The Diamond pulls the USDC from the person's **wallet**, not their stake. |
+| Rewards  | cashbook's own USDC from a pool, staked by the owner in batches into accounts opened here, at most 10 USDC per account in total.                                                                      |
 
 The merchant account belongs to the person's address, not to a proxy and not to
 this contract. Once staked, the money is theirs on the Diamond like any other
@@ -39,7 +39,7 @@ reverts, and the USDC waits on this contract.
 
 Also read from the Diamond: `getMerchantDetails` (stake, `isRegistered`,
 currency), `getStakeConfig` (the stake floor),
-`getMaxBuyTxLimit`, `getMaxSellTxLimit`, `isBlacklisted`, `getUnstakeRequested`,
+`getMaxBuyTxLimit`, `isBlacklisted`, `getUnstakeRequested`,
 `getOrdersById`, `getOrderIntegrator`.
 
 ## Lifecycle (the person's view)
@@ -101,12 +101,11 @@ the Diamond refuses after delivery leaves it waiting:
 
 B2B placement skips the Diamond's RP per-tx limit, daily and monthly counts,
 yearly volume and blacklist (`OrderFlowFacet.placeOrderForB2B`), so these are the
-only limits on either flow:
+only limits on deposits. Withdrawals have none: they sell USDC already in the
+person's wallet.
 
 - **Per deposit:** at most `getMaxBuyTxLimit(currency)`; 0 closes the currency.
-- **Per withdrawal:** at most `getMaxSellTxLimit(currency)`; 0 closes it.
-- **Per day:** `MAX_DEPOSITS_PER_DAY` = 5 and `MAX_WITHDRAWALS_PER_DAY` = 5 per
-  person, per UTC day. Every placed order counts, cancelled or not.
+- **Per day:** `MAX_DEPOSITS_PER_DAY` = 5 per person, per UTC day. Every placed order counts, cancelled or not.
 - **Stake floor:** every deposit reverts `BelowStakeFloor` unless the account's
   stake, plus what is pending, plus the deposit reaches
   `getStakeConfig(currency).minMerchantUSDCStake`. The Diamond's stake enforces
@@ -115,7 +114,7 @@ only limits on either flow:
 - **Refused before any money moves:** the merchant blacklist (both flows),
   ReputationManager's user blacklist (deposits), a currency other than the
   account's or the first deposit's, a pending unstake, an opening in a currency
-  with no circle set, and a withdrawal by an account not opened here.
+  with no circle set, and a withdrawal by someone with no merchant account.
 - **Not enforced here:** no per-person total, and nothing ties an address to a
   person, so the daily counts do not stop someone using many addresses.
 

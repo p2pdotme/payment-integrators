@@ -48,9 +48,10 @@ pragma solidity ^0.8.28;
    stake and leaves with the account on unstake.
 
    WITHDRAW: merchant money out to a bank (a B2B SELL)
-     withdrawFiat places a SELL with order.user = the person, only for an
-     account opened here. The Diamond pulls the USDC from the person's WALLET
-     at setSellOrderUpi, not from their stake: what they sell is what reached
+     withdrawFiat places a SELL with order.user = the person, for any
+     merchant account, opened here or not: it is their own USDC. The Diamond
+     pulls the USDC from the person's WALLET at setSellOrderUpi, not from
+     their stake: what they sell is what reached
      their wallet from the Diamond (an approved unstake, or the merchant
      earnings it pays out). This contract's rewards only ever become stake.
 
@@ -59,8 +60,9 @@ pragma solidity ^0.8.28;
      deposit   at most getMaxBuyTxLimit(currency) each, MAX_DEPOSITS_PER_DAY a
                day per person; refused for the Diamond's merchant blacklist and
                ReputationManager's user blacklist.
-     withdraw  at most getMaxSellTxLimit(currency) each, MAX_WITHDRAWALS_PER_DAY
-               a day per person; refused for the merchant blacklist.
+     withdraw  no amount or count limit (it sells USDC already in the
+               person's wallet); any merchant account, opened here or
+               not; refused for the merchant blacklist.
    A day is a UTC day. Every placed order counts, cancelled or not. These are
    per address: they do not stop someone using many addresses.
 
@@ -137,8 +139,6 @@ interface IP2PDiamond {
     function getStakeConfig(bytes32 currency) external view returns (StakeConfigHead memory);
     /// @dev The largest single BUY allowed in `currency`; 0 closes the currency.
     function getMaxBuyTxLimit(bytes32 currency) external view returns (uint256);
-    /// @dev The largest single SELL allowed in `currency`; 0 closes the currency.
-    function getMaxSellTxLimit(bytes32 currency) external view returns (uint256);
     /// @dev The MERCHANT blacklist (only a registered merchant can be on it).
     function isBlacklisted(address merchant) external view returns (bool);
     function getUnstakeRequested(address merchant) external view returns (bool);
@@ -177,7 +177,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error InvalidAddress();
     /// @notice An amount was zero.
     error InvalidAmount();
-    /// @notice Above the Diamond's getMaxBuyTxLimit / getMaxSellTxLimit.
+    /// @notice Above the Diamond's getMaxBuyTxLimit.
     error AmountExceedsCap();
     /// @notice The person already has an account, or earlier deposits, in a
     ///         different currency; the deposit could never be staked into it.
@@ -188,9 +188,10 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error MerchantBlacklisted();
     /// @notice On ReputationManager's user blacklist.
     error UserBlacklisted();
-    /// @notice withdrawFiat needs a merchant account opened by this contract.
+    /// @notice withdrawFiat needs a merchant account on the Diamond;
+    ///         rewardStake needs one opened by this contract.
     error NoSeat();
-    /// @notice The person has placed today's maximum number of deposits or withdrawals.
+    /// @notice The person has placed today's maximum number of deposits.
     error DailyLimitReached();
     /// @notice The order was not placed by this integrator, or not paid to it.
     error NotOurs();
@@ -251,8 +252,6 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice Deposits one person may place in a UTC day (the Diamond's own
     ///         per-buyer daily count, which B2B placement skips).
     uint256 public constant MAX_DEPOSITS_PER_DAY = 5;
-    /// @notice Withdrawals one person may place in a UTC day.
-    uint256 public constant MAX_WITHDRAWALS_PER_DAY = 5;
     /// @notice The most rewards one account can ever receive (USDC, 6 decimals),
     ///         so a mistaken batch cannot pour the pool into one account.
     uint256 public constant MAX_REWARD_PER_ACCOUNT = 10e6;
@@ -293,12 +292,11 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         the account opens in it. Never changes.
     mapping(address => bytes32) public currencyOf;
     /// @notice The account was opened by this contract (registerFor). Only these
-    ///         may withdraw here.
+    ///         may be paid rewards.
     mapping(address => bool) public openedHere;
 
-    /// @notice Orders placed per person per UTC day (block.timestamp / 1 days).
+    /// @notice Deposits placed per person per UTC day (block.timestamp / 1 days).
     mapping(address => mapping(uint256 => uint256)) public depositsOn;
-    mapping(address => mapping(uint256 => uint256)) public withdrawalsOn;
 
     /// @notice Deliveries already added to pendingStake, so none counts twice
     ///         (the hook and reconcileDelivery can both see the same order).
@@ -490,9 +488,9 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice Cash out: place a SELL of USDC in your wallet to your bank. The
     ///         Diamond pulls it from your wallet at setSellOrderUpi (not from
     ///         your stake), and a refund goes back to you.
-    /// @dev    Only for an account opened here, at most the Diamond's max sell
-    ///         per order and MAX_WITHDRAWALS_PER_DAY a day, and never for an
-    ///         account on the merchant blacklist.
+    /// @dev    Any merchant account, opened here or not, any amount: the USDC
+    ///         is already theirs. Not a general USDC exit (no account: NoSeat),
+    ///         and never for the merchant blacklist, which B2B placement skips.
     function withdrawFiat(
         uint256 amount,
         bytes32 currency,
@@ -503,10 +501,8 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         bytes32 ref
     ) external nonReentrant returns (uint256 orderId) {
         if (amount == 0) revert InvalidAmount();
-        if (!openedHere[msg.sender]) revert NoSeat();
+        if (!diamond.getMerchantDetails(msg.sender).isRegistered) revert NoSeat();
         if (diamond.isBlacklisted(msg.sender)) revert MerchantBlacklisted();
-        _countToday(withdrawalsOn, MAX_WITHDRAWALS_PER_DAY);
-        if (amount > diamond.getMaxSellTxLimit(currency)) revert AmountExceedsCap();
         orderId = _placeFromProxy(
             abi.encodeCall(
                 IB2BGateway.placeB2BSellOrder,
@@ -645,9 +641,9 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         }
     }
 
-    /// @dev On ReputationManager's user blacklist. Checked for deposits only:
-    ///      withdrawals check the merchant blacklist, since only an account
-    ///      opened here may withdraw.
+    /// @dev On ReputationManager's user blacklist. Checked for deposits only,
+    ///      as the Diamond's own rule stops BUYs only: a blacklisted user can
+    ///      still take their money out.
     function _userBlacklisted(address user) internal view returns (bool) {
         if (address(reputationManager) == address(0)) return false;
         (, , bool blacklisted) = reputationManager.rmusers(user);

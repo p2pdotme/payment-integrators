@@ -146,7 +146,6 @@ describe("CashbookRampIntegrator", function () {
       expect(await ethers.provider.getCode(await integrator.proxyImpl())).to.not.equal("0x");
       expect(await integrator.owner()).to.equal(owner.address);
       expect(await integrator.MAX_DEPOSITS_PER_DAY()).to.equal(5n);
-      expect(await integrator.MAX_WITHDRAWALS_PER_DAY()).to.equal(5n);
       expect(await integrator.MAX_REWARD_PER_ACCOUNT()).to.equal(MAX_REWARD);
     });
   });
@@ -770,12 +769,17 @@ describe("CashbookRampIntegrator", function () {
   });
 
   describe("withdrawFiat", function () {
-    it("refuses a zero amount, or an account not opened here", async function () {
+    it("refuses a zero amount, or someone with no merchant account", async function () {
       await expect(withdraw(alice, 0n)).to.be.revertedWithCustomError(integrator, "InvalidAmount");
       await expect(withdraw(alice, USDC(10))).to.be.revertedWithCustomError(integrator, "NoSeat");
-      // a merchant opened elsewhere (merchant-app, another integrator)
+    });
+
+    it("serves an account opened elsewhere (merchant-app, another integrator)", async function () {
       await diamond.setMerchant(alice.address, FLOOR, INR);
-      await expect(withdraw(alice, USDC(10))).to.be.revertedWithCustomError(integrator, "NoSeat");
+      expect(await integrator.openedHere(alice.address)).to.equal(false);
+      await expect(withdraw(alice, USDC(10)))
+        .to.emit(integrator, "WithdrawalPlaced")
+        .withArgs(1, alice.address, USDC(10), INR, REF);
     });
 
     it("places a SELL with user = the person, and holds nothing", async function () {
@@ -798,30 +802,17 @@ describe("CashbookRampIntegrator", function () {
       );
     });
 
-    it("refuses more than the Diamond's max sell; a max of 0 closes the currency", async function () {
+    it("serves a user on ReputationManager's blacklist (it stops BUYs only)", async function () {
       await open(alice);
-      await expect(withdraw(alice, MAX_SELL + 1n)).to.be.revertedWithCustomError(
-        integrator,
-        "AmountExceedsCap"
-      );
-      await expect(withdraw(alice, MAX_SELL)).to.not.be.reverted;
-      await diamond.setMaxSell(INR, 0);
-      await expect(withdraw(alice, USDC(1))).to.be.revertedWithCustomError(
-        integrator,
-        "AmountExceedsCap"
-      );
+      await rm.setBlacklisted(alice.address, true);
+      await expect(withdraw(alice, USDC(10))).to.not.be.reverted;
     });
 
-    it("refuses a sixth withdrawal in one UTC day, counted apart from deposits", async function () {
-      await open(alice); // one deposit today
+    it("has no amount or count limit: above the Diamond's max sell, six in a day", async function () {
+      await open(alice);
+      await diamond.setMaxSell(INR, 0);
+      await expect(withdraw(alice, MAX_SELL + 1n)).to.not.be.reverted;
       for (let i = 0; i < 5; i++) await withdraw(alice, USDC(1));
-      await expect(withdraw(alice, USDC(1))).to.be.revertedWithCustomError(
-        integrator,
-        "DailyLimitReached"
-      );
-      expect(await integrator.depositsOn(alice.address, await today())).to.equal(1n);
-      await nextDay();
-      await expect(withdraw(alice, USDC(1))).to.not.be.reverted;
     });
   });
 });
