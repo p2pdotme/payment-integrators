@@ -77,7 +77,9 @@ pragma solidity ^0.8.28;
    delivery before the owner withdraws or rewards.
    A person's pending USDC never moves from here to anyone but the Diamond,
    as their stake; it reaches their wallet only through the Diamond's own
-   unstake. withdraw reaches only the free balance.
+   unstake. withdraw reaches only the free balance. If the Diamond refuses the
+   stake (a blacklist, a pending unstake, a full circle), the money waits here,
+   still theirs, and stakeDeposit lands it once the refusal is lifted.
    ═══════════════════════════════════════════════════════════════════════ */
 
 import { IP2PIntegrator } from "../../interfaces/IP2PIntegrator.sol";
@@ -124,7 +126,7 @@ interface IP2PDiamond {
     }
 
     /// @dev Opens `merchant`'s account and pulls the stake from msg.sender (us).
-    ///      Only an active B2B integrator may call it.
+    ///      Open to any caller; the Diamond checks `merchant`'s blacklist.
     function registerFor(
         address merchant,
         uint256 circleId,
@@ -134,7 +136,7 @@ interface IP2PDiamond {
     ) external;
 
     /// @dev Adds to `merchant`'s existing account, pulling from msg.sender (us).
-    ///      Only an active B2B integrator may call it. Reverts below the floor,
+    ///      Open to any caller. Reverts below the floor,
     ///      on a pending unstake, on the merchant blacklist, in a paused circle.
     function stakeFor(address merchant, uint256 stakeAmount, bytes32 currency) external;
 
