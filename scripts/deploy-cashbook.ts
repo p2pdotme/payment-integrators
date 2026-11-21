@@ -101,7 +101,7 @@ async function main() {
   console.log("\n=== Then, from the owner ===");
   console.log("setCircle(currency, circleId)   per currency, before any opening deposit");
   console.log("fundRewards(amount)             anyone, after approving USDC");
-  console.log("rewardStake(people[], amounts[])  owner, in batches; ≤ 10 USDC per account");
+  console.log("rewardStake(people[], amounts[])  owner, in batches");
 
   console.log("\n=== Verify ===");
   console.log(

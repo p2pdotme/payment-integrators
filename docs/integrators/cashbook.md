@@ -13,7 +13,7 @@ whitelisted.
 | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Deposit  | A B2B **BUY**. The USDC lands on this contract and is staked into the person's **own** merchant account on the Diamond: `registerFor` the first time, `stakeFor` after.                               |
 | Withdraw | A B2B **SELL** with `order.user` = the person, for any merchant account, opened here or not, with no amount or count limit. The Diamond pulls the USDC from the person's **wallet**, not their stake. |
-| Rewards  | cashbook's own USDC from a pool, staked by the owner in batches into accounts opened here, at most 10 USDC per account in total.                                                                      |
+| Rewards  | cashbook's own USDC from a pool, staked by the owner in batches into accounts opened here.                                                                                                            |
 
 The merchant account belongs to the person's address, not to a proxy and not to
 this contract. Once staked, the money is theirs on the Diamond like any other
@@ -129,15 +129,13 @@ person's wallet.
 - Refused as a whole: an empty batch or lists of different lengths
   (`LengthMismatch`), a total over the pool (`RewardPoolShort`, checked before
   any item). Per item: a zero amount (`InvalidAmount`), an account not opened
-  here (`NoSeat`), or a lifetime total over `MAX_REWARD_PER_ACCOUNT` = 10 USDC
-  (`RewardCapReached`, tracked in `rewarded[person]`; a person listed twice
-  counts twice).
+  here (`NoSeat`). No per-account cap; `rewarded[person]` records what each has
+  received.
 - All or nothing: any refusal, including the Diamond's stake rules (blacklist,
   pending unstake, floor) on any one account, reverts the whole batch and
   nothing moves.
-- Who earns a reward and when is decided off chain. The contract bounds what
-  the owner can pay: at most 10 USDC into each account opened here, never to a
-  wallet.
+- Who earns a reward, how much and when is decided off chain. The owner can pay
+  only into accounts opened here, never to a wallet.
 - A reward is ordinary stake and leaves with the account on unstake.
 
 ## Operations

@@ -42,9 +42,9 @@ pragma solidity ^0.8.28;
 
    REWARDS: cashbook's own USDC, added to an account's stake. Anyone may fund
    the pool (fundRewards). Only the owner pays from it (rewardStake, a batch
-   of accounts and amounts), only into accounts opened here, and at most
-   MAX_REWARD_PER_ACCOUNT per account over its lifetime. Who earns a reward
-   and when is decided off chain (cashbook's backend). A reward is ordinary
+   of accounts and amounts), only into accounts opened here. Who earns a reward
+   and how much
+   is decided off chain (cashbook's backend). A reward is ordinary
    stake and leaves with the account on unstake.
 
    WITHDRAW: merchant money out to a bank (a B2B SELL)
@@ -203,8 +203,6 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error OrderAlreadyFulfilled();
     /// @notice rewardStake: no accounts, or accounts and amounts of different lengths.
     error LengthMismatch();
-    /// @notice The reward would take the account past MAX_REWARD_PER_ACCOUNT.
-    error RewardCapReached();
     /// @notice The reward pool holds less than asked.
     error RewardPoolShort();
     /// @notice An opening deposit in a currency with no cashbook circle set.
@@ -252,9 +250,6 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice Deposits one person may place in a UTC day (the Diamond's own
     ///         per-buyer daily count, which B2B placement skips).
     uint256 public constant MAX_DEPOSITS_PER_DAY = 5;
-    /// @notice The most rewards one account can ever receive (USDC, 6 decimals),
-    ///         so a mistaken batch cannot pour the pool into one account.
-    uint256 public constant MAX_REWARD_PER_ACCOUNT = 10e6;
 
     // ─── Immutables ───────────────────────────────────────────────────
 
@@ -283,7 +278,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     mapping(bytes32 => uint256) public circleOf;
     /// @notice Reward money not yet paid. Anyone may add to it.
     uint256 public rewardPool;
-    /// @notice Rewards paid into each account so far (at most MAX_REWARD_PER_ACCOUNT).
+    /// @notice Rewards paid into each account so far: a record, not a limit.
     mapping(address => uint256) public rewarded;
     /// @notice Per person: USDC delivered here and not yet staked. It can only
     ///         leave as that person's stake on the Diamond.
@@ -364,9 +359,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     }
 
     /// @notice Stake `amounts[i]` from the pool into `users[i]`'s account, for
-    ///         each i. Owner only, only accounts opened here, and at most
-    ///         MAX_REWARD_PER_ACCOUNT per account in total (a person listed twice
-    ///         counts twice). All or nothing: any refusal here or by the
+    ///         each i. Owner only, only accounts opened here. All or nothing: any refusal here or by the
     ///         Diamond's stakeFor (blacklisted, pending unstake, below the minimum
     ///         stake) reverts the whole batch and nothing moves.
     function rewardStake(
@@ -387,7 +380,6 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
             uint256 amount = amounts[i];
             if (amount == 0) revert InvalidAmount();
             if (!openedHere[user]) revert NoSeat();
-            if (rewarded[user] + amount > MAX_REWARD_PER_ACCOUNT) revert RewardCapReached();
             rewarded[user] += amount;
             diamond.stakeFor(user, amount, diamond.getMerchantDetails(user).currency);
             emit Rewarded(user, amount);

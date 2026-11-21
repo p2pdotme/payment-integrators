@@ -19,7 +19,7 @@ import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
  *   - every deposit must leave the account at the Diamond's stake floor, so no
  *     money waits on a stake the Diamond would refuse.
  *   - rewards come only from the reward pool, only in an owner batch, only
- *     into an account opened here, and at most MAX_REWARD_PER_ACCOUNT each.
+ *     into an account opened here.
  *     A batch is all or nothing.
  *   - B2B orders skip the Diamond's per-person limits, so the per-tx caps and
  *     daily counts here are the only ones; both directions have them.
@@ -51,7 +51,7 @@ describe("CashbookRampIntegrator", function () {
   const MAX_BUY = USDC(400);
   const MAX_SELL = USDC(300);
   const POOL = USDC(50);
-  const MAX_REWARD = USDC(10);
+  const REWARD = USDC(10);
 
   async function deployIntegrator(rmAddr: string) {
     const f = await ethers.getContractFactory("CashbookRampIntegrator");
@@ -146,7 +146,6 @@ describe("CashbookRampIntegrator", function () {
       expect(await ethers.provider.getCode(await integrator.proxyImpl())).to.not.equal("0x");
       expect(await integrator.owner()).to.equal(owner.address);
       expect(await integrator.MAX_DEPOSITS_PER_DAY()).to.equal(5n);
-      expect(await integrator.MAX_REWARD_PER_ACCOUNT()).to.equal(MAX_REWARD);
     });
   });
 
@@ -639,41 +638,11 @@ describe("CashbookRampIntegrator", function () {
       await holds([alice, bob]);
     });
 
-    it("caps each account's lifetime total at MAX_REWARD_PER_ACCOUNT", async function () {
+    it("has no per-account cap; the same account twice counts twice", async function () {
       await open(alice);
-      await expect(reward([alice], [MAX_REWARD + 1n])).to.be.revertedWithCustomError(
-        integrator,
-        "RewardCapReached"
-      );
-      await expect(reward([alice], [USDC(6)])).to.not.be.reverted;
-      await expect(reward([alice], [USDC(5)])).to.be.revertedWithCustomError(
-        integrator,
-        "RewardCapReached"
-      );
-      await expect(reward([alice], [USDC(4)])).to.not.be.reverted;
-      expect(await integrator.rewarded(alice.address)).to.equal(MAX_REWARD);
-      await expect(reward([alice], [1n])).to.be.revertedWithCustomError(
-        integrator,
-        "RewardCapReached"
-      );
-      // another account's cap is its own
-      await open(bob);
-      await expect(reward([bob], [MAX_REWARD])).to.not.be.reverted;
-      expect(await integrator.rewardPool()).to.equal(POOL - 2n * MAX_REWARD);
-      await holds([alice, bob]);
-    });
-
-    it("the same account twice counts twice: crossing the cap reverts the whole batch", async function () {
-      await open(alice);
-      await open(bob);
-      const before = await snapshot([alice, bob]);
-      await expect(
-        reward([bob, alice, alice], [USDC(2), USDC(6), USDC(5)])
-      ).to.be.revertedWithCustomError(integrator, "RewardCapReached");
-      expect(await snapshot([alice, bob])).to.deep.equal(before);
-      // within the cap, the same account twice is fine
-      await expect(reward([alice, alice], [USDC(6), USDC(4)])).to.not.be.reverted;
-      expect(await integrator.rewarded(alice.address)).to.equal(MAX_REWARD);
+      await expect(reward([alice, alice], [REWARD, REWARD])).to.not.be.reverted;
+      expect(await integrator.rewarded(alice.address)).to.equal(2n * REWARD);
+      expect(await integrator.rewardPool()).to.equal(POOL - 2n * REWARD);
       await holds([alice, bob]);
     });
 
