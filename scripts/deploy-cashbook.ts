@@ -100,7 +100,7 @@ async function main() {
 
   console.log("\n=== Then, from the owner ===");
   console.log("setCircle(currency, circleId)   per currency, before any opening deposit");
-  console.log("setBonus(currency, amount)      optional; 0 = no bonus");
+  console.log("setBonus(currency, amount, vestVolume)  optional; 0 = no bonus");
   console.log("fundBonus(currency, amount)     anyone, after approving USDC");
 
   console.log("\n=== Verify ===");

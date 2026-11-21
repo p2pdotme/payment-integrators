@@ -16,7 +16,9 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  *         proposed in p2pdotme/contracts-v4 "feat(onboard): let anyone register
  *         or stake for a merchant"). Their reverts here mirror that branch:
  *         MerchantAlreadyRegistered on a second register, StakeAmountTooLow below
- *         the floor, and only an active integrator may call either.
+ *         the floor, and only an active integrator may call either. Both
+ *         also apply _stake's own checks: the merchant blacklist, a pending
+ *         unstake, and stake + amount at least the floor (a top-up too).
  *
  *         NOT modelled: the Diamond's shared reentrancy lock. On the real
  *         Diamond, completeOrder holds it while it calls onOrderComplete, so a
@@ -32,6 +34,8 @@ contract MockCashbookDiamond is MockDiamond {
     error MerchantNotRegistered();
     error StakeAmountTooLow();
     error CurrencyMismatch();
+    error MerchantBlacklisted();
+    error UnstakeRequestPending();
 
     struct MerchantDetails {
         uint256 stake;
@@ -53,6 +57,7 @@ contract MockCashbookDiamond is MockDiamond {
     mapping(address => uint256) public merchantCircle;
     mapping(bytes32 => uint256) public floorOf;
     mapping(bytes32 => uint256) public maxBuyOf;
+    mapping(bytes32 => uint256) public maxSellOf;
     mapping(address => bool) public merchantBlacklisted;
     mapping(address => bool) public unstakeRequested;
 
@@ -69,6 +74,15 @@ contract MockCashbookDiamond is MockDiamond {
 
     function setMaxBuy(bytes32 currency, uint256 max) external {
         maxBuyOf[currency] = max;
+    }
+
+    function setMaxSell(bytes32 currency, uint256 max) external {
+        maxSellOf[currency] = max;
+    }
+
+    /// @notice The Diamond's running volume for a merchant (MerchantRegistryFacet).
+    function setVolume(address merchant, uint256 volume) external {
+        merchants[merchant].totalVolume = volume;
     }
 
     function setMerchantBlacklisted(address merchant, bool v) external {
@@ -100,6 +114,7 @@ contract MockCashbookDiamond is MockDiamond {
     ) external {
         if (!activeIntegrators[msg.sender]) revert NotActiveIntegrator();
         if (merchants[merchant].isRegistered) revert MerchantAlreadyRegistered();
+        if (merchantBlacklisted[merchant]) revert MerchantBlacklisted();
         if (stakeAmount < floorOf[currency]) revert StakeAmountTooLow();
         usdc.safeTransferFrom(msg.sender, address(this), stakeAmount);
         merchants[merchant] = MerchantDetails(stakeAmount, true, 0, 0, 0, 0, true, currency);
@@ -111,6 +126,9 @@ contract MockCashbookDiamond is MockDiamond {
         if (!activeIntegrators[msg.sender]) revert NotActiveIntegrator();
         MerchantDetails storage m = merchants[merchant];
         if (!m.isRegistered) revert MerchantNotRegistered();
+        if (merchantBlacklisted[merchant]) revert MerchantBlacklisted();
+        if (unstakeRequested[merchant]) revert UnstakeRequestPending();
+        if (m.stake + stakeAmount < floorOf[currency]) revert StakeAmountTooLow();
         if (m.currency != currency) revert CurrencyMismatch();
         usdc.safeTransferFrom(msg.sender, address(this), stakeAmount);
         m.stake += stakeAmount;
@@ -127,6 +145,10 @@ contract MockCashbookDiamond is MockDiamond {
 
     function getMaxBuyTxLimit(bytes32 currency) external view returns (uint256) {
         return maxBuyOf[currency];
+    }
+
+    function getMaxSellTxLimit(bytes32 currency) external view returns (uint256) {
+        return maxSellOf[currency];
     }
 
     function isBlacklisted(address merchant) external view returns (bool) {
