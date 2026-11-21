@@ -13,7 +13,7 @@ whitelisted.
 | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Deposit  | A B2B **BUY**. The USDC lands on this contract and is staked into the person's **own** merchant account on the Diamond: `registerFor` the first time, `stakeFor` after.                               |
 | Withdraw | A B2B **SELL** with `order.user` = the person, for any merchant account, opened here or not, with no amount or count limit. The Diamond pulls the USDC from the person's **wallet**, not their stake. |
-| Rewards  | cashbook's own USDC, sent to this contract by a plain transfer, staked by the owner in batches into accounts opened here, from the free balance only.                                                 |
+| Rewards  | cashbook's own USDC, sent to this contract by a plain transfer, staked by the owner in batches into any merchant account, from the free balance only.                                                 |
 
 The merchant account belongs to the person's address, not to a proxy and not to
 this contract. Once staked, the money is theirs on the Diamond like any other
@@ -137,14 +137,19 @@ person's wallet.
   after.
 - Refused as a whole: an empty batch or lists of different lengths
   (`LengthMismatch`), a total over `available(usdc)` (`InsufficientFree`,
-  checked before any item), so a batch can never spend people's pending stake. Per item: a zero amount (`InvalidAmount`), an account not opened
-  here (`NoSeat`). No per-account cap; `rewarded[person]` records what each has
-  received.
+  checked before any item), so a batch can never spend people's pending stake.
+  Per item: a zero amount (`InvalidAmount`), or an account that is not a
+  registered merchant (`NoSeat`), which includes someone whose deposit is
+  delivered but not yet staked. Any registered merchant qualifies, opened here
+  or not. No per-account cap.
 - All or nothing: any refusal, including the Diamond's stake rules (blacklist,
   pending unstake, floor) on any one account, reverts the whole batch and
   nothing moves.
 - Who earns a reward, how much and when is decided off chain. The owner can pay
-  only into accounts opened here, never to a wallet.
+  only into a merchant account's stake, never to a wallet.
+- The contract keeps no record of either. Who opened an account through cashbook
+  is `DepositStaked(…, opened = true)`; what each account was paid is the sum of
+  its `Rewarded(user, amount)` events.
 - A reward is ordinary stake and leaves with the account on unstake.
 
 ## Operations

@@ -42,7 +42,7 @@ pragma solidity ^0.8.28;
 
    REWARDS: cashbook's own USDC, added to an account's stake. Fund it by a
    plain transfer to this contract. Only the owner pays it out (rewardStake,
-   a batch of accounts and amounts), only into accounts opened here, and only
+   a batch of accounts and amounts), into any merchant account, and only
    from the free balance (below). Who earns a reward and how much is decided
    off chain (cashbook's backend). A reward is ordinary stake and leaves with
    the account on unstake.
@@ -193,8 +193,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error MerchantBlacklisted();
     /// @notice On ReputationManager's user blacklist.
     error UserBlacklisted();
-    /// @notice withdrawFiat needs a merchant account on the Diamond;
-    ///         rewardStake needs one opened by this contract.
+    /// @notice withdrawFiat and rewardStake need a merchant account on the Diamond.
     error NoSeat();
     /// @notice The person has placed today's maximum number of deposits.
     error DailyLimitReached();
@@ -281,17 +280,12 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     mapping(bytes32 => uint256) public circleOf;
     /// @notice Σ pendingStake: the USDC here that belongs to people.
     uint256 public totalPending;
-    /// @notice Rewards paid into each account so far: a record, not a limit.
-    mapping(address => uint256) public rewarded;
     /// @notice Per person: USDC delivered here and not yet staked. It can only
     ///         leave as that person's stake on the Diamond.
     mapping(address => uint256) public pendingStake;
     /// @notice The currency of a person's first deposit made with no account;
     ///         the account opens in it. Never changes.
     mapping(address => bytes32) public currencyOf;
-    /// @notice The account was opened by this contract (registerFor). Only these
-    ///         may be paid rewards.
-    mapping(address => bool) public openedHere;
 
     /// @notice Deposits placed per person per UTC day (block.timestamp / 1 days).
     mapping(address => mapping(uint256 => uint256)) public depositsOn;
@@ -354,9 +348,11 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     // ─── Rewards ──────────────────────────────────────────────────────
 
     /// @notice Stake `amounts[i]` of free USDC into `users[i]`'s account, for
-    ///         each i. Owner only, only accounts opened here. All or nothing: any refusal here or by the
-    ///         Diamond's stakeFor (blacklisted, pending unstake, below the minimum
-    ///         stake) reverts the whole batch and nothing moves.
+    ///         each i. Owner only, any merchant account, opened here or not.
+    ///         Who opened here is DepositStaked(…, opened = true) and what each
+    ///         was paid is Rewarded: read them from the events. All or nothing:
+    ///         any refusal here or by the Diamond's stakeFor (blacklisted,
+    ///         pending unstake, below the minimum stake) reverts the whole batch.
     function rewardStake(
         address[] calldata users,
         uint256[] calldata amounts
@@ -373,9 +369,9 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
             address user = users[i];
             uint256 amount = amounts[i];
             if (amount == 0) revert InvalidAmount();
-            if (!openedHere[user]) revert NoSeat();
-            rewarded[user] += amount;
-            diamond.stakeFor(user, amount, diamond.getMerchantDetails(user).currency);
+            IP2PDiamond.MerchantDetails memory m = diamond.getMerchantDetails(user);
+            if (!m.isRegistered) revert NoSeat();
+            diamond.stakeFor(user, amount, m.currency);
             emit Rewarded(user, amount);
         }
         usdc.forceApprove(address(diamond), 0);
@@ -591,7 +587,6 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
             uint256 circle = circleOf[cur];
             if (circle == 0) revert CircleNotSet(); // unset since the deposit: set it, then retry
             diamond.registerFor(user, circle, paid, "", cur);
-            openedHere[user] = true;
         }
         usdc.forceApprove(address(diamond), 0);
 

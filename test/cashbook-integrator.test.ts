@@ -20,7 +20,9 @@ import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
  *     money waits on a stake the Diamond would refuse.
  *   - the owner moves only the free balance (any token, and USDC above
  *     totalPending): withdraw, or rewardStake in an all-or-nothing batch into
- *     accounts opened here. Rewards are funded by a plain transfer.
+ *     any registered merchant account. Rewards are funded by a plain transfer.
+ *     Who opened here (DepositStaked opened = true) and what each was paid
+ *     (Rewarded) are read from events; the contract keeps neither.
  *   - B2B orders skip the Diamond's per-person limits, so the per-tx cap and
  *     daily count on deposits here are the only ones.
  *
@@ -533,11 +535,9 @@ describe("CashbookRampIntegrator", function () {
       expect(m.stake).to.equal(FLOOR);
       expect(await diamond.merchantCircle(alice.address)).to.equal(CIRCLE);
       expect(await integrator.pendingStake(alice.address)).to.equal(0n);
-      expect(await integrator.openedHere(alice.address)).to.equal(true);
       // opening takes nothing from the free balance
       expect(await integrator.available(uAddr)).to.equal(POOL);
       expect(await integrator.totalPending()).to.equal(0n);
-      expect(await integrator.rewarded(alice.address)).to.equal(0n);
       expect(await usdc.allowance(iAddr, dAddr)).to.equal(0n);
       await holds([alice]);
     });
@@ -563,14 +563,13 @@ describe("CashbookRampIntegrator", function () {
       await holds([alice]);
     });
 
-    it("an account opened elsewhere meanwhile: a top-up, not openedHere", async function () {
+    it("an account opened elsewhere meanwhile: a top-up, opened = false", async function () {
       await deposit(alice, FLOOR);
       await settle(1);
       await diamond.setMerchant(alice.address, FLOOR, INR);
       await expect(integrator.stakeDeposit(1))
         .to.emit(integrator, "DepositStaked")
         .withArgs(1, alice.address, FLOOR, false);
-      expect(await integrator.openedHere(alice.address)).to.equal(false);
       await holds([alice]);
     });
 
@@ -639,10 +638,7 @@ describe("CashbookRampIntegrator", function () {
         await usdc.balanceOf(iAddr),
         await usdc.balanceOf(dAddr),
       ];
-      for (const u of who) {
-        out.push(await integrator.rewarded(u.address));
-        out.push((await diamond.getMerchantDetails(u.address)).stake);
-      }
+      for (const u of who) out.push((await diamond.getMerchantDetails(u.address)).stake);
       return out;
     }
 
@@ -679,23 +675,41 @@ describe("CashbookRampIntegrator", function () {
       );
     });
 
-    it("refuses an account not opened here", async function () {
+    it("refuses someone with no merchant account", async function () {
       // no account at all
       await expect(reward([bob], [USDC(1)])).to.be.revertedWithCustomError(integrator, "NoSeat");
-      // an account opened elsewhere (merchant-app, another integrator)
-      await diamond.setMerchant(bob.address, FLOOR, INR);
-      await expect(reward([bob], [USDC(1)])).to.be.revertedWithCustomError(integrator, "NoSeat");
-      // delivered here but not yet staked: still no account opened here
+      // delivered here but not yet staked: still no account
       await deposit(alice, FLOOR);
       await settle(1);
       await expect(reward([alice], [USDC(1)])).to.be.revertedWithCustomError(integrator, "NoSeat");
-      await holds([alice, bob]);
+      // one unregistered account fails the whole batch
+      await open(carol);
+      await expect(reward([carol, bob], [USDC(1), USDC(1)])).to.be.revertedWithCustomError(
+        integrator,
+        "NoSeat"
+      );
+      expect((await diamond.getMerchantDetails(carol.address)).stake).to.equal(FLOOR);
+      await holds([alice, bob, carol]);
+    });
+
+    it("rewards an account opened elsewhere, in its own currency", async function () {
+      // merchant-app or another integrator opened it; cashbook never staked it
+      await diamond.setMerchant(bob.address, FLOOR, BRL);
+      await expect(reward([bob], [USDC(2)]))
+        .to.emit(diamond, "MockStakedFor")
+        .withArgs(bob.address, USDC(2), BRL)
+        .and.to.emit(integrator, "Rewarded")
+        .withArgs(bob.address, USDC(2));
+      expect((await diamond.getMerchantDetails(bob.address)).stake).to.equal(FLOOR + USDC(2));
+      expect(await integrator.available(uAddr)).to.equal(POOL - USDC(2));
+      expect(await usdc.allowance(iAddr, dAddr)).to.equal(0n);
+      await holds([bob]);
     });
 
     it("has no per-account cap; the same account twice counts twice", async function () {
       await open(alice);
       await expect(reward([alice, alice], [REWARD, REWARD])).to.not.be.reverted;
-      expect(await integrator.rewarded(alice.address)).to.equal(2n * REWARD);
+      expect((await diamond.getMerchantDetails(alice.address)).stake).to.equal(FLOOR + 2n * REWARD);
       expect(await integrator.available(uAddr)).to.equal(POOL - 2n * REWARD);
       await holds([alice, bob]);
     });
@@ -750,7 +764,6 @@ describe("CashbookRampIntegrator", function () {
         expect((await diamond.getMerchantDetails(people[i].address)).stake).to.equal(
           FLOOR + amounts[i]
         );
-        expect(await integrator.rewarded(people[i].address)).to.equal(amounts[i]);
       }
       expect(await usdc.balanceOf(dAddr)).to.equal(dBefore + total);
       expect(await integrator.available(uAddr)).to.equal(POOL - total);
@@ -800,7 +813,6 @@ describe("CashbookRampIntegrator", function () {
 
     it("serves an account opened elsewhere (merchant-app, another integrator)", async function () {
       await diamond.setMerchant(alice.address, FLOOR, INR);
-      expect(await integrator.openedHere(alice.address)).to.equal(false);
       await expect(withdraw(alice, USDC(10)))
         .to.emit(integrator, "WithdrawalPlaced")
         .withArgs(1, alice.address, USDC(10), INR, REF);
