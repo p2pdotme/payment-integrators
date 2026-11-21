@@ -80,11 +80,6 @@ contract MockCashbookDiamond is MockDiamond {
         maxSellOf[currency] = max;
     }
 
-    /// @notice The Diamond's running volume for a merchant (MerchantRegistryFacet).
-    function setVolume(address merchant, uint256 volume) external {
-        merchants[merchant].totalVolume = volume;
-    }
-
     function setMerchantBlacklisted(address merchant, bool v) external {
         merchantBlacklisted[merchant] = v;
     }

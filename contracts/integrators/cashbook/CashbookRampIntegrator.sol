@@ -40,22 +40,20 @@ pragma solidity ^0.8.28;
    shared reentrancy lock while it calls our hook, and registerFor/stakeFor
    take the same lock, so staking from inside the hook always reverts.
 
-   THE BONUS: a fixed USDC amount per currency (bonus[currency], set by the
-   owner with the volume it vests at), paid from that currency's pool
-   (bonusPool[currency], which anyone may fund). The person pays the full
-   minimum stake; the bonus is never part of it. When stakeDeposit opens an
-   account here, the bonus is set aside from the pool (if the pool covers it).
-   vestBonus stakes it into the account once the account's totalVolume on the
-   Diamond reaches the volume set aside with it. forfeitBonus returns it to
-   the pool if the account asks to unstake or is blacklisted first. A vested
-   bonus is ordinary stake and leaves with the account on unstake: the gate is
-   real volume, not a lock.
+   REWARDS: cashbook's own USDC, added to an account's stake. Anyone may fund
+   the pool (fundRewards). Only the rewarder, an address the owner sets, may
+   pay from it (rewardStake), only into an account opened here, and at most
+   MAX_REWARD_PER_ACCOUNT per account over its lifetime. Who earns a reward
+   and when is decided off chain (cashbook's backend); this contract only
+   bounds what a rewarder key can move. A reward is ordinary stake and leaves
+   with the account on unstake.
 
    WITHDRAW: merchant money out to a bank (a B2B SELL)
      withdrawFiat places a SELL with order.user = the person, only for an
      account opened here. The Diamond pulls the USDC from the person's WALLET
      at setSellOrderUpi, not from their stake: what they sell is what reached
-     their wallet from the Diamond (an approved unstake, claimed rewards).
+     their wallet from the Diamond (an approved unstake, or the merchant
+     earnings it pays out). This contract's rewards only ever become stake.
 
    LIMITS (B2B orders skip the Diamond's RP per-tx, count, volume and
    blacklist checks, so these are the only ones that apply):
@@ -70,8 +68,8 @@ pragma solidity ^0.8.28;
    MONEY HELD HERE, and the only ways it leaves:
      pendingStake      people's delivered deposits → only into the Diamond, as
                        that person's own stake
-     vesting bonuses   → into the account it was set aside for, or back to the pool
-     bonusPool         → into a vesting bonus, or to the owner (withdrawBonus)
+     rewardPool        → into an account's stake (rewardStake), or to the owner
+                         (withdrawRewards)
    USDC never moves from here to a person. It can reach their wallet only
    through the Diamond's own unstake.
    ═══════════════════════════════════════════════════════════════════════ */
@@ -161,7 +159,7 @@ interface IRmUserBlacklist {
 /// @dev Ownership is OpenZeppelin's Ownable2Step: the owner proposes a new owner
 ///      (transferOwnership) and it only takes effect when that address accepts
 ///      (acceptOwnership), so a mistyped address can never take the role. The
-///      owner's only powers are setCircle, setBonus and withdrawBonus.
+///      owner's only powers are setCircle, setRewarder and withdrawRewards.
 contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
 
@@ -203,14 +201,12 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error DepositAlreadyStaked();
     /// @notice The delivery has already been credited.
     error OrderAlreadyFulfilled();
-    /// @notice No bonus is set aside for this person.
-    error NoVestingBonus();
-    /// @notice The account's totalVolume has not reached the bonus's vest volume.
-    error NotVested();
-    /// @notice forfeitBonus: the account is neither unstaking nor blacklisted.
-    error NotForfeitable();
-    /// @notice withdrawBonus asked for more than the pool.
-    error BonusPoolShort();
+    /// @notice rewardStake was called by someone other than the rewarder.
+    error NotRewarder();
+    /// @notice The reward would take the account past MAX_REWARD_PER_ACCOUNT.
+    error RewardCapReached();
+    /// @notice The reward pool holds less than asked.
+    error RewardPoolShort();
     /// @notice An opening deposit in a currency with no cashbook circle set.
     error CircleNotSet();
 
@@ -234,20 +230,16 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @param paid   what the person paid in (their pending deposits).
     /// @param opened true when this stake opened the account (registerFor).
     event DepositStaked(uint256 indexed orderId, address indexed user, uint256 paid, bool opened);
-    /// @notice The owner set a currency's opening bonus and the volume it vests at.
-    event BonusSet(bytes32 indexed currency, uint256 amount, uint256 vestVolume);
+    /// @notice The owner set the address allowed to pay rewards (0 = none).
+    event RewarderSet(address indexed rewarder);
     /// @notice The owner set the circle new accounts in `currency` open in.
     event CircleSet(bytes32 indexed currency, uint256 circleId);
-    /// @notice Someone added to a currency's bonus pool.
-    event BonusFunded(address indexed from, bytes32 indexed currency, uint256 amount);
+    /// @notice Someone added to the reward pool.
+    event RewardsFunded(address indexed from, uint256 amount);
     /// @notice The owner took pool money back.
-    event BonusWithdrawn(bytes32 indexed currency, address indexed to, uint256 amount);
-    /// @notice An account opened here; its bonus was set aside from the pool.
-    event BonusSetAside(address indexed user, uint256 amount, uint256 vestVolume);
-    /// @notice A set-aside bonus was staked into the account.
-    event BonusVested(address indexed user, uint256 amount);
-    /// @notice A set-aside bonus went back to its pool (unstaking or blacklisted).
-    event BonusForfeited(address indexed user, uint256 amount);
+    event RewardsWithdrawn(address indexed to, uint256 amount);
+    /// @notice A reward was staked into `user`'s account.
+    event Rewarded(address indexed user, uint256 amount);
     /// @notice A withdrawal (B2B SELL) was placed. `ref` is the app's own reference.
     event WithdrawalPlaced(
         uint256 indexed orderId,
@@ -264,6 +256,9 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     uint256 public constant MAX_DEPOSITS_PER_DAY = 5;
     /// @notice Withdrawals one person may place in a UTC day.
     uint256 public constant MAX_WITHDRAWALS_PER_DAY = 5;
+    /// @notice The most rewards one account can ever receive (USDC, 6 decimals),
+    ///         so a leaked rewarder key cannot pour the pool into one account.
+    uint256 public constant MAX_REWARD_PER_ACCOUNT = 10e6;
 
     // ─── Immutables ───────────────────────────────────────────────────
 
@@ -290,12 +285,12 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         account's circle; the deposit order itself is matched in whatever
     ///         circle depositFiat names. 0 = not set (circle ids start at 1).
     mapping(bytes32 => uint256) public circleOf;
-    /// @notice USDC set aside for an account that opens here in `currency`. 0 = no bonus.
-    mapping(bytes32 => uint256) public bonus;
-    /// @notice The Diamond totalVolume (USDC) at which that bonus vests.
-    mapping(bytes32 => uint256) public vestVolume;
-    /// @notice Bonus money per currency not yet set aside. Anyone may add to it.
-    mapping(bytes32 => uint256) public bonusPool;
+    /// @notice The only address that may pay rewards. 0 = nobody.
+    address public rewarder;
+    /// @notice Reward money not yet paid. Anyone may add to it.
+    uint256 public rewardPool;
+    /// @notice Rewards paid into each account so far (at most MAX_REWARD_PER_ACCOUNT).
+    mapping(address => uint256) public rewarded;
     /// @notice Per person: USDC delivered here and not yet staked. It can only
     ///         leave as that person's stake on the Diamond.
     mapping(address => uint256) public pendingStake;
@@ -305,14 +300,6 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice The account was opened by this contract (registerFor). Only these
     ///         may withdraw here.
     mapping(address => bool) public openedHere;
-
-    /// @notice A bonus set aside for an account opened here: the amount, and the
-    ///         totalVolume it vests at (fixed when it was set aside).
-    struct Vesting {
-        uint256 amount;
-        uint256 volume;
-    }
-    mapping(address => Vesting) public vesting;
 
     /// @notice Orders placed per person per UTC day (block.timestamp / 1 days).
     mapping(address => mapping(uint256 => uint256)) public depositsOn;
@@ -329,9 +316,9 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
 
     /// @param _diamond           the p2p.me Diamond
     /// @param _usdc              the Diamond's USDC
-    /// @param _owner             sets circles and bonuses, withdraws the pool (a Safe
-    ///                           on mainnet). It can never touch pendingStake, a
-    ///                           vesting bonus or any order.
+    /// @param _owner             sets circles and the rewarder, withdraws the pool (a
+    ///                           Safe on mainnet). It can never touch pendingStake
+    ///                           or any order.
     /// @param _reputationManager the Diamond's getReputationManager(), or 0 for none
     constructor(
         address _diamond,
@@ -353,14 +340,10 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         revert CannotRenounce();
     }
 
-    /// @notice Set the bonus an account opening here in `currency` gets, and the
-    ///         Diamond totalVolume (USDC) it vests at. Applies to accounts opened
-    ///         from now on; a bonus already set aside keeps its terms. An amount
-    ///         of 0 turns the bonus off.
-    function setBonus(bytes32 currency, uint256 amount, uint256 volume) external onlyOwner {
-        bonus[currency] = amount;
-        vestVolume[currency] = volume;
-        emit BonusSet(currency, amount, volume);
+    /// @notice Set the address allowed to pay rewards; 0 turns rewards off.
+    function setRewarder(address _rewarder) external onlyOwner {
+        rewarder = _rewarder;
+        emit RewarderSet(_rewarder);
     }
 
     /// @notice Set the circle accounts opening in `currency` register in. Applies
@@ -373,56 +356,44 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         emit CircleSet(currency, circleId);
     }
 
-    /// @notice Take pool money back, to the owner. It can never reach
-    ///         pendingStake or a vesting bonus: only bonusPool is debited.
-    function withdrawBonus(bytes32 currency, uint256 amount) external onlyOwner nonReentrant {
+    /// @notice Take reward pool money back, to the owner. Only rewardPool is
+    ///         debited, never pendingStake.
+    function withdrawRewards(uint256 amount) external onlyOwner nonReentrant {
         if (amount == 0) revert InvalidAmount();
-        if (amount > bonusPool[currency]) revert BonusPoolShort();
-        bonusPool[currency] -= amount;
+        if (amount > rewardPool) revert RewardPoolShort();
+        rewardPool -= amount;
         usdc.safeTransfer(msg.sender, amount);
-        emit BonusWithdrawn(currency, msg.sender, amount);
+        emit RewardsWithdrawn(msg.sender, amount);
     }
 
-    // ─── Bonus ────────────────────────────────────────────────────────
+    // ─── Rewards ──────────────────────────────────────────────────────
 
-    /// @notice Add USDC to a currency's bonus pool. Anyone may call (approve first).
-    function fundBonus(bytes32 currency, uint256 amount) external nonReentrant {
+    /// @notice Add USDC to the reward pool. Anyone may call (approve first).
+    function fundRewards(uint256 amount) external nonReentrant {
         if (amount == 0) revert InvalidAmount();
         usdc.safeTransferFrom(msg.sender, address(this), amount);
-        bonusPool[currency] += amount;
-        emit BonusFunded(msg.sender, currency, amount);
+        rewardPool += amount;
+        emit RewardsFunded(msg.sender, amount);
     }
 
-    /// @notice Stake `user`'s set-aside bonus into their account, once its
-    ///         totalVolume on the Diamond has reached the bonus's vest volume.
-    ///         Anyone may call. The Diamond's stakeFor still applies its rules
-    ///         (no pending unstake, not blacklisted, circle not paused), so a
-    ///         refused vest reverts and the bonus stays set aside.
-    function vestBonus(address user) external nonReentrant {
-        Vesting memory v = vesting[user];
-        if (v.amount == 0) revert NoVestingBonus();
-        IP2PDiamond.MerchantDetails memory m = diamond.getMerchantDetails(user);
-        if (m.totalVolume < v.volume) revert NotVested();
-        delete vesting[user];
-        usdc.forceApprove(address(diamond), v.amount);
-        diamond.stakeFor(user, v.amount, m.currency);
+    /// @notice Stake `amount` from the pool into `user`'s account. Only the
+    ///         rewarder, only for an account opened here, and at most
+    ///         MAX_REWARD_PER_ACCOUNT per account in total. The Diamond's
+    ///         stakeFor still applies its own rules (not blacklisted, no pending
+    ///         unstake, at or above the minimum stake), so a refused reward
+    ///         reverts and nothing moves.
+    function rewardStake(address user, uint256 amount) external nonReentrant {
+        if (msg.sender != rewarder) revert NotRewarder(); // rewarder 0: nobody
+        if (amount == 0) revert InvalidAmount();
+        if (!openedHere[user]) revert NoSeat();
+        if (rewarded[user] + amount > MAX_REWARD_PER_ACCOUNT) revert RewardCapReached();
+        if (amount > rewardPool) revert RewardPoolShort();
+        rewardPool -= amount;
+        rewarded[user] += amount;
+        usdc.forceApprove(address(diamond), amount);
+        diamond.stakeFor(user, amount, diamond.getMerchantDetails(user).currency);
         usdc.forceApprove(address(diamond), 0);
-        emit BonusVested(user, v.amount);
-    }
-
-    /// @notice Return `user`'s set-aside bonus to its pool, because the account
-    ///         asked to unstake or is on the merchant blacklist before it
-    ///         vested. Anyone may call, so a bonus nobody will earn never stays
-    ///         locked away from the pool.
-    function forfeitBonus(address user) external nonReentrant {
-        uint256 amount = vesting[user].amount;
-        if (amount == 0) revert NoVestingBonus();
-        if (!diamond.getUnstakeRequested(user) && !diamond.isBlacklisted(user)) {
-            revert NotForfeitable();
-        }
-        delete vesting[user];
-        bonusPool[currencyOf[user]] += amount;
-        emit BonusForfeited(user, amount);
+        emit Rewarded(user, amount);
     }
 
     // ─── Views ────────────────────────────────────────────────────────
@@ -605,9 +576,8 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
 
     /// @notice Stake everything `orderId`'s person has pending into their own
     ///         merchant account. No account yet: registerFor in currencyOf[person]
-    ///         and circleOf[it], never the named order's currency or circle, and
-    ///         the bonus is set aside to vest. Account exists: stakeFor, in its
-    ///         own currency.
+    ///         and circleOf[it], never the named order's currency or circle.
+    ///         Account exists: stakeFor, in its own currency.
     /// @dev    Callable by anyone, so the person never depends on our keeper
     ///         being up. Every argument comes from the Diamond's order and this
     ///         contract's state, so a caller can trigger it but never steer it.
@@ -629,21 +599,10 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
             if (circle == 0) revert CircleNotSet(); // unset since the deposit: set it, then retry
             diamond.registerFor(user, circle, paid, "", cur);
             openedHere[user] = true;
-            _setAside(user, cur);
         }
         usdc.forceApprove(address(diamond), 0);
 
         emit DepositStaked(orderId, user, paid, !seat.isRegistered);
-    }
-
-    /// @dev Set `cur`'s bonus aside for `user`'s new account, if the pool covers
-    ///      it. A short pool opens the account with no bonus rather than block it.
-    function _setAside(address user, bytes32 cur) internal {
-        uint256 b = bonus[cur];
-        if (b == 0 || bonusPool[cur] < b) return;
-        bonusPool[cur] -= b;
-        vesting[user] = Vesting(b, vestVolume[cur]);
-        emit BonusSetAside(user, b, vestVolume[cur]);
     }
 
     // ─── Limits ───────────────────────────────────────────────────────
