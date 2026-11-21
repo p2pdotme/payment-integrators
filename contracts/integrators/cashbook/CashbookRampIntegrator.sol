@@ -144,6 +144,9 @@ interface IP2PDiamond {
     function getStakeConfig(bytes32 currency) external view returns (StakeConfigHead memory);
     /// @dev The largest single BUY allowed in `currency`; 0 closes the currency.
     function getMaxBuyTxLimit(bytes32 currency) external view returns (uint256);
+    /// @dev The Diamond's own day key (OrderFlowHelper), the one its daily
+    ///      limits count by.
+    function getDayKey(uint256 ts) external view returns (uint256);
     /// @dev The MERCHANT blacklist (only a registered merchant can be on it).
     function isBlacklisted(address merchant) external view returns (bool);
     function getUnstakeRequested(address merchant) external view returns (bool);
@@ -287,7 +290,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         the account opens in it. Never changes.
     mapping(address => bytes32) public currencyOf;
 
-    /// @notice Deposits placed per person per UTC day (block.timestamp / 1 days).
+    /// @notice Deposits placed per person per day, keyed by the Diamond's getDayKey.
     mapping(address => mapping(uint256 => uint256)) public depositsOn;
 
     /// @notice Deliveries already added to pendingStake, so none counts twice
@@ -600,7 +603,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         mapping(address => mapping(uint256 => uint256)) storage counts,
         uint256 max
     ) internal {
-        uint256 day = block.timestamp / 1 days;
+        uint256 day = diamond.getDayKey(block.timestamp);
         uint256 n = counts[msg.sender][day];
         if (n >= max) revert DailyLimitReached();
         counts[msg.sender][day] = n + 1;

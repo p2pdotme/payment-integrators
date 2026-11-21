@@ -157,4 +157,9 @@ contract MockCashbookDiamond is MockDiamond {
     function getOrderIntegrator(uint256 orderId) external view returns (address) {
         return orders[orderId].integrator;
     }
+
+    /// @dev Mirrors the Diamond's OrderFlowHelper.getDayKey (ts / 1 days).
+    function getDayKey(uint256 ts) external pure returns (uint256) {
+        return ts / 1 days;
+    }
 }
