@@ -74,7 +74,8 @@ pragma solidity ^0.8.28;
                        account's stake (rewardStake)
    ⚠ A delivery whose completion hook did not run is not in totalPending until
    reconcileDelivery credits it, so it reads as free until then: credit every
-   delivery before the owner withdraws or rewards.
+   delivery before the owner withdraws or rewards (cashbook's backend
+   check-credited lists any that are not).
    A person's pending USDC never moves from here to anyone but the Diamond,
    as their stake; it reaches their wallet only through the Diamond's own
    unstake. withdraw reaches only the free balance. If the Diamond refuses the
