@@ -40,12 +40,12 @@ pragma solidity ^0.8.28;
    shared reentrancy lock while it calls our hook, and registerFor/stakeFor
    take the same lock, so staking from inside the hook always reverts.
 
-   REWARDS: cashbook's own USDC, added to an account's stake. Anyone may fund
-   the pool (fundRewards). Only the owner pays from it (rewardStake, a batch
-   of accounts and amounts), only into accounts opened here. Who earns a reward
-   and how much
-   is decided off chain (cashbook's backend). A reward is ordinary
-   stake and leaves with the account on unstake.
+   REWARDS: cashbook's own USDC, added to an account's stake. Fund it by a
+   plain transfer to this contract. Only the owner pays it out (rewardStake,
+   a batch of accounts and amounts), only into accounts opened here, and only
+   from the free balance (below). Who earns a reward and how much is decided
+   off chain (cashbook's backend). A reward is ordinary stake and leaves with
+   the account on unstake.
 
    WITHDRAW: merchant money out to a bank (a B2B SELL)
      withdrawFiat places a SELL with order.user = the person, for any
@@ -67,12 +67,17 @@ pragma solidity ^0.8.28;
    per address: they do not stop someone using many addresses.
 
    MONEY HELD HERE, and the only ways it leaves:
-     pendingStake      people's delivered deposits → only into the Diamond, as
-                       that person's own stake
-     rewardPool        → into an account's stake (rewardStake), or to the owner
-                         (withdrawRewards)
-   USDC never moves from here to a person. It can reach their wallet only
-   through the Diamond's own unstake.
+     pendingStake      people's delivered deposits (totalPending in all) →
+                       only into the Diamond, as that person's own stake
+     everything else   the free balance: any token, and USDC above
+                       totalPending → the owner (withdraw), or USDC into an
+                       account's stake (rewardStake)
+   ⚠ A delivery whose completion hook did not run is not in totalPending until
+   reconcileDelivery credits it, so it reads as free until then: credit every
+   delivery before the owner withdraws or rewards.
+   A person's pending USDC never moves from here to anyone but the Diamond,
+   as their stake; it reaches their wallet only through the Diamond's own
+   unstake. withdraw reaches only the free balance.
    ═══════════════════════════════════════════════════════════════════════ */
 
 import { IP2PIntegrator } from "../../interfaces/IP2PIntegrator.sol";
@@ -158,7 +163,7 @@ interface IRmUserBlacklist {
 /// @dev Ownership is OpenZeppelin's Ownable2Step: the owner proposes a new owner
 ///      (transferOwnership) and it only takes effect when that address accepts
 ///      (acceptOwnership), so a mistyped address can never take the role. The
-///      owner's only powers are setCircle, rewardStake and withdrawRewards.
+///      owner's only powers are setCircle, rewardStake and withdraw.
 contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
 
@@ -203,8 +208,8 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error OrderAlreadyFulfilled();
     /// @notice rewardStake: no accounts, or accounts and amounts of different lengths.
     error LengthMismatch();
-    /// @notice The reward pool holds less than asked.
-    error RewardPoolShort();
+    /// @notice More than the free balance (people's pending money is never free).
+    error InsufficientFree();
     /// @notice An opening deposit in a currency with no cashbook circle set.
     error CircleNotSet();
 
@@ -230,10 +235,8 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     event DepositStaked(uint256 indexed orderId, address indexed user, uint256 paid, bool opened);
     /// @notice The owner set the circle new accounts in `currency` open in.
     event CircleSet(bytes32 indexed currency, uint256 circleId);
-    /// @notice Someone added to the reward pool.
-    event RewardsFunded(address indexed from, uint256 amount);
-    /// @notice The owner took pool money back.
-    event RewardsWithdrawn(address indexed to, uint256 amount);
+    /// @notice The owner moved free money out.
+    event Withdrawn(address indexed token, address indexed to, uint256 amount);
     /// @notice A reward was staked into `user`'s account.
     event Rewarded(address indexed user, uint256 amount);
     /// @notice A withdrawal (B2B SELL) was placed. `ref` is the app's own reference.
@@ -276,8 +279,8 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         account's circle; the deposit order itself is matched in whatever
     ///         circle depositFiat names. 0 = not set (circle ids start at 1).
     mapping(bytes32 => uint256) public circleOf;
-    /// @notice Reward money not yet paid. Anyone may add to it.
-    uint256 public rewardPool;
+    /// @notice Σ pendingStake: the USDC here that belongs to people.
+    uint256 public totalPending;
     /// @notice Rewards paid into each account so far: a record, not a limit.
     mapping(address => uint256) public rewarded;
     /// @notice Per person: USDC delivered here and not yet staked. It can only
@@ -304,7 +307,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
 
     /// @param _diamond           the p2p.me Diamond
     /// @param _usdc              the Diamond's USDC
-    /// @param _owner             sets circles, pays rewards, withdraws the pool (a
+    /// @param _owner             sets circles, pays rewards, withdraws free money (a
     ///                           Safe on mainnet). It can never touch pendingStake
     ///                           or any order.
     /// @param _reputationManager the Diamond's getReputationManager(), or 0 for none
@@ -338,27 +341,19 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         emit CircleSet(currency, circleId);
     }
 
-    /// @notice Take reward pool money back, to the owner. Only rewardPool is
-    ///         debited, never pendingStake.
-    function withdrawRewards(uint256 amount) external onlyOwner nonReentrant {
+    /// @notice Send `amount` of `token` to `to`: any token, and USDC only up to
+    ///         the free balance, so people's pending money never leaves this way.
+    function withdraw(address token, address to, uint256 amount) external onlyOwner nonReentrant {
         if (amount == 0) revert InvalidAmount();
-        if (amount > rewardPool) revert RewardPoolShort();
-        rewardPool -= amount;
-        usdc.safeTransfer(msg.sender, amount);
-        emit RewardsWithdrawn(msg.sender, amount);
+        if (to == address(0)) revert InvalidAddress();
+        if (amount > available(token)) revert InsufficientFree();
+        IERC20(token).safeTransfer(to, amount);
+        emit Withdrawn(token, to, amount);
     }
 
     // ─── Rewards ──────────────────────────────────────────────────────
 
-    /// @notice Add USDC to the reward pool. Anyone may call (approve first).
-    function fundRewards(uint256 amount) external nonReentrant {
-        if (amount == 0) revert InvalidAmount();
-        usdc.safeTransferFrom(msg.sender, address(this), amount);
-        rewardPool += amount;
-        emit RewardsFunded(msg.sender, amount);
-    }
-
-    /// @notice Stake `amounts[i]` from the pool into `users[i]`'s account, for
+    /// @notice Stake `amounts[i]` of free USDC into `users[i]`'s account, for
     ///         each i. Owner only, only accounts opened here. All or nothing: any refusal here or by the
     ///         Diamond's stakeFor (blacklisted, pending unstake, below the minimum
     ///         stake) reverts the whole batch and nothing moves.
@@ -370,8 +365,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         if (n == 0 || n != amounts.length) revert LengthMismatch();
         uint256 total;
         for (uint256 i; i < n; ++i) total += amounts[i];
-        if (total > rewardPool) revert RewardPoolShort();
-        rewardPool -= total;
+        if (total > available(address(usdc))) revert InsufficientFree();
 
         // Exact allowance for the batch, reset after: pendingStake is here too.
         usdc.forceApprove(address(diamond), total);
@@ -388,6 +382,14 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     }
 
     // ─── Views ────────────────────────────────────────────────────────
+
+    /// @notice What the owner may move of `token`: all of it, except USDC that
+    ///         belongs to people (totalPending).
+    function available(address token) public view returns (uint256) {
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (token != address(usdc)) return bal;
+        return bal > totalPending ? bal - totalPending : 0;
+    }
 
     /// @notice Where `user`'s UserProxy lives (deployed or not). The Diamond
     ///         derives the same address to recognise our orders.
@@ -558,6 +560,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     function _credit(uint256 orderId, address user, uint256 amount) internal {
         credited[orderId] = true;
         pendingStake[user] += amount;
+        totalPending += amount;
         emit DepositDelivered(orderId, user, amount);
     }
 
@@ -576,6 +579,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         uint256 paid = pendingStake[user];
         if (paid == 0) revert DepositAlreadyStaked();
         pendingStake[user] = 0;
+        totalPending -= paid;
 
         IP2PDiamond.MerchantDetails memory seat = diamond.getMerchantDetails(user);
         // Exact allowance, reset after: this contract holds other people's money.

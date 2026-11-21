@@ -3,8 +3,8 @@ import { ethers } from "hardhat";
 /**
  * Deploy CashbookRampIntegrator.
  *
- * Deploys only. It does not register the integrator, set a circle, or fund the
- * reward pool: registration is the Diamond super admin's call, and the rest is
+ * Deploys only. It does not register the integrator, set a circle, or send
+ * reward USDC: registration is the Diamond super admin's call, and the rest is
  * the owner's (a Safe on mainnet) once it is registered.
  *
  * Usage:
@@ -15,7 +15,7 @@ import { ethers } from "hardhat";
  *   DIAMOND_ADDRESS     the p2p.me Diamond
  *   USDC_ADDRESS        the Diamond's USDC
  *   OWNER_ADDRESS       becomes the owner (Ownable2Step): setCircle, rewardStake
- *                       (batches), withdrawRewards. Never the deployer by default.
+ *                       (batches), withdraw. Never the deployer by default.
  *   REPUTATION_MANAGER  the Diamond's ReputationManager, for the user blacklist.
  *                       The zero address turns the check off; pass it explicitly.
  *
@@ -100,7 +100,7 @@ async function main() {
 
   console.log("\n=== Then, from the owner ===");
   console.log("setCircle(currency, circleId)   per currency, before any opening deposit");
-  console.log("fundRewards(amount)             anyone, after approving USDC");
+  console.log("fund rewards                    a plain USDC transfer to the integrator");
   console.log("rewardStake(people[], amounts[])  owner, in batches");
 
   console.log("\n=== Verify ===");

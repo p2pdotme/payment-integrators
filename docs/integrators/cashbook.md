@@ -13,7 +13,7 @@ whitelisted.
 | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Deposit  | A B2B **BUY**. The USDC lands on this contract and is staked into the person's **own** merchant account on the Diamond: `registerFor` the first time, `stakeFor` after.                               |
 | Withdraw | A B2B **SELL** with `order.user` = the person, for any merchant account, opened here or not, with no amount or count limit. The Diamond pulls the USDC from the person's **wallet**, not their stake. |
-| Rewards  | cashbook's own USDC from a pool, staked by the owner in batches into accounts opened here.                                                                                                            |
+| Rewards  | cashbook's own USDC, sent to this contract by a plain transfer, staked by the owner in batches into accounts opened here, from the free balance only.                                                 |
 
 The merchant account belongs to the person's address, not to a proxy and not to
 this contract. Once staked, the money is theirs on the Diamond like any other
@@ -58,8 +58,8 @@ currency), `getStakeConfig` (the stake floor),
    trigger it but not steer it.
 4. **Rewarded (optional).** cashbook's backend decides who earns a reward and
    when; the owner calls `rewardStake(people, amounts)`, which stakes each
-   amount from the reward pool into that person's account. It is ordinary stake
-   from then on.
+   amount of free USDC into that person's account. It is ordinary stake from
+   then on.
 5. **Withdraw.** Money reaches the person's wallet only through the Diamond:
    an approved unstake (a full exit; there is no partial unstake) or claimed
    merchant rewards (the Diamond's per-task earnings, not this contract's
@@ -76,16 +76,25 @@ Diamond that has both functions.
 
 ## Custody
 
-USDC held here, and the only ways it leaves:
+Money held here, and the only ways it leaves:
 
-| Held as                | Leaves only                                                                  |
-| ---------------------- | ---------------------------------------------------------------------------- |
-| `pendingStake[person]` | into the Diamond, as that person's stake                                     |
-| `rewardPool`           | into an account's stake (`rewardStake`), or to the owner (`withdrawRewards`) |
+| Held as                                                                                          | Leaves only                                                                             |
+| ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `pendingStake[person]` (`totalPending` in all)                                                   | into the Diamond, as that person's stake                                                |
+| everything else, the free balance: any token, and USDC above `totalPending` (`available(token)`) | to anyone the owner names (`withdraw`), or USDC into an account's stake (`rewardStake`) |
 
-**No function sends USDC to a person.** `UserProxy.sweepERC20` refuses the
-integrator's USDC as usual, though the proxy never holds any here: deposits pay
-this contract, and withdrawals pull from the person's wallet.
+There is no pool to fund: rewards are a plain USDC transfer to this contract,
+and anything sent here by mistake is free too. `available(usdc)` is the USDC
+balance minus `totalPending`, floored at 0.
+
+⚠ A delivery whose completion hook did not run is not in `totalPending` until
+`reconcileDelivery` credits it, so until then it reads as free. Credit every
+delivery before the owner withdraws or rewards.
+
+**No function sends a person's pending USDC anywhere but into their stake.**
+The owner's `withdraw` reaches only the free balance. `UserProxy.sweepERC20`
+refuses the integrator's USDC as usual, though the proxy never holds any here:
+deposits pay this contract, and withdrawals pull from the person's wallet.
 
 **Money that can stay here.** `pendingStake` leaves only as stake, so a stake
 the Diamond refuses after delivery leaves it waiting:
@@ -109,7 +118,7 @@ person's wallet.
 - **Stake floor:** every deposit reverts `BelowStakeFloor` unless the account's
   stake, plus what is pending, plus the deposit reaches
   `getStakeConfig(currency).minMerchantUSDCStake`. The Diamond's stake enforces
-  the same floor on a top-up, so a smaller one would wait here. The reward pool
+  the same floor on a top-up, so a smaller one would wait here. Free USDC here
   never counts toward it.
 - **Refused before any money moves:** the merchant blacklist (both flows),
   ReputationManager's user blacklist (deposits), a currency other than the
@@ -120,15 +129,15 @@ person's wallet.
 
 ## Rewards
 
-- `fundRewards(amount)`: anyone adds USDC to the single `rewardPool` (approve
-  first). Zero is refused.
+- Funding: transfer USDC to this contract. Nothing records it; it is simply
+  part of the free balance.
 - `rewardStake(people[], amounts[])` (owner only, a batch): stakes each
-  `amounts[i]` from the pool into `people[i]`'s account with `stakeFor`, in that
+  `amounts[i]` of free USDC into `people[i]`'s account with `stakeFor`, in that
   account's own currency. One exact allowance for the batch total, reset to 0
   after.
 - Refused as a whole: an empty batch or lists of different lengths
-  (`LengthMismatch`), a total over the pool (`RewardPoolShort`, checked before
-  any item). Per item: a zero amount (`InvalidAmount`), an account not opened
+  (`LengthMismatch`), a total over `available(usdc)` (`InsufficientFree`,
+  checked before any item), so a batch can never spend people's pending stake. Per item: a zero amount (`InvalidAmount`), an account not opened
   here (`NoSeat`). No per-account cap; `rewarded[person]` records what each has
   received.
 - All or nothing: any refusal, including the Diamond's stake rules (blacklist,
@@ -147,8 +156,11 @@ person's wallet.
   - `setCircle(currency, circleId)`: the circle new accounts open in. 0 stops new
     accounts in that currency. Deposits are matched in whatever circle the caller
     names; only the account's circle is fixed.
-  - `rewardStake(people, amounts)` (see Rewards) and `withdrawRewards(amount)`
-    (pool only, paid to the owner).
+  - `rewardStake(people, amounts)` (see Rewards).
+  - `withdraw(token, to, amount)`: sends up to `available(token)` to `to`. All
+    of any other token; USDC only above `totalPending`. Refused for 0
+    (`InvalidAmount`), `to` = 0 (`InvalidAddress`), or more than available
+    (`InsufficientFree`). Emits `Withdrawn(token, to, amount)`.
   - The owner cannot touch `pendingStake` or any order.
 - **Keeper:** watches `DepositDelivered` and calls `stakeDeposit(orderId)`. It
   needs gas and nothing else. `stakeDeposit` is permissionless, so the person
