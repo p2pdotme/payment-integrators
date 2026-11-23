@@ -9,11 +9,11 @@ whitelisted.
 
 ## What it does
 
-|          |                                                                                                                                                                                                       |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Deposit  | A B2B **BUY**. The USDC lands on this contract and is staked into the person's **own** merchant account on the Diamond: `registerFor` the first time, `stakeFor` after.                               |
-| Withdraw | A B2B **SELL** with `order.user` = the person, for any merchant account, opened here or not, with no amount or count limit. The Diamond pulls the USDC from the person's **wallet**, not their stake. |
-| Rewards  | cashbook's own USDC, sent to this contract by a plain transfer, staked by the owner in batches into any merchant account, from the free balance only.                                                 |
+|          |                                                                                                                                                                                                                                                 |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Deposit  | A B2B **BUY**. The USDC lands on this contract and is staked into the person's **own** merchant account on the Diamond: `registerFor` the first time, `stakeFor` after.                                                                         |
+| Withdraw | A B2B **SELL** with `order.user` = the person, for any merchant account, opened here or not, in that account's currency, within the per-order and daily limits below. The Diamond pulls the USDC from the person's **wallet**, not their stake. |
+| Rewards  | cashbook's own USDC, sent to this contract by a plain transfer, staked by the owner in batches into any merchant account, from the free balance only.                                                                                           |
 
 The merchant account belongs to the person's address, not to a proxy and not to
 this contract. Once staked, the money is theirs on the Diamond like any other
@@ -39,15 +39,17 @@ reverts, and the USDC waits on this contract.
 
 Also read from the Diamond: `getMerchantDetails` (stake, `isRegistered`,
 currency), `getStakeConfig` (the stake floor),
-`getMaxBuyTxLimit`, `isBlacklisted`, `getUnstakeRequested`,
+`getMaxBuyTxLimit`, `getMaxSellTxLimit`, `isBlacklisted`, `getUnstakeRequested`,
 `getOrdersById`, `getOrderIntegrator`.
 
 ## Lifecycle (the person's view)
 
 1. **Deposit.** `depositFiat(amount, currency, circleId, …)` places a BUY from
    the person's `UserProxy` with `user` = the person and `recipientAddr` = this
-   contract. The person pays a merchant in fiat. The first deposit with no
-   account binds the person to its currency for good; the account opens in it.
+   contract. The person pays a merchant in fiat. Someone with no account is
+   bound to the currency of their deposits while any of it is pending here; the
+   account opens in it. With nothing pending (say a first deposit was
+   cancelled) a new deposit may pick another currency.
 2. **Delivered.** The order completes; the Diamond sends the USDC here and calls
    `onOrderComplete`, which adds it to `pendingStake[person]` and emits
    `DepositDelivered`. If the hook never ran, anyone can call
@@ -110,11 +112,17 @@ the Diamond refuses after delivery leaves it waiting:
 
 B2B placement skips the Diamond's RP per-tx limit, daily and monthly counts,
 yearly volume and blacklist (`OrderFlowFacet.placeOrderForB2B`), so these are the
-only limits on deposits. Withdrawals have none: they sell USDC already in the
-person's wallet.
+only limits that apply. Withdrawals need them as much as deposits: every SELL
+sells USDC already in the seller's wallet, a merchant account is permanent, and
+opening one costs only a refundable floor, so without them `withdrawFiat` would
+be an uncapped offramp for USDC from any source.
 
 - **Per deposit:** at most `getMaxBuyTxLimit(currency)`; 0 closes the currency.
-- **Per day:** `MAX_DEPOSITS_PER_DAY` = 5 per person, per UTC day. Every placed order counts, cancelled or not.
+- **Per withdrawal:** at most `getMaxSellTxLimit(currency)`, in the account's
+  own currency only (so the cap cannot be shopped); 0 closes the currency.
+- **Per day:** `MAX_DEPOSITS_PER_DAY` = 5 deposits and, counted apart,
+  `MAX_WITHDRAWALS_PER_DAY` = 5 withdrawals per person, per UTC day (the
+  Diamond's `getDayKey`). Every placed order counts, cancelled or not.
 - **Stake floor:** every deposit reverts `BelowStakeFloor` unless the account's
   stake, plus what is pending, plus the deposit reaches
   `getStakeConfig(currency).minMerchantUSDCStake`. The Diamond's stake enforces
@@ -122,7 +130,7 @@ person's wallet.
   never counts toward it.
 - **Refused before any money moves:** the merchant blacklist (both flows),
   ReputationManager's user blacklist (deposits), a currency other than the
-  account's or the first deposit's, a pending unstake, an opening in a currency
+  account's or that of the deposits pending here, a pending unstake, an opening in a currency
   with no circle set, and a withdrawal by someone with no merchant account.
 - **Not enforced here:** no per-person total, and nothing ties an address to a
   person, so the daily counts do not stop someone using many addresses.

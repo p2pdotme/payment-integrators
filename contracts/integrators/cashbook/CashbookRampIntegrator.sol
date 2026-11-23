@@ -27,8 +27,9 @@ pragma solidity ^0.8.28;
         stake once staked (the account's stake, plus what is pending, plus this
         deposit), or it reverts BelowStakeFloor: the Diamond's stake refuses
         anything less, and the USDC would wait here. Someone with no account
-        is bound to the currency of their first deposit; the account opens in
-        it, whichever order id stakeDeposit is called with.
+        is bound to the currency of their deposits while any of it is pending
+        here; the account opens in it, whichever order id stakeDeposit is
+        called with. With nothing pending they may pick again.
      2. The order completes. The Diamond sends the USDC here and calls
         onOrderComplete, which adds it to pendingStake[person]. If that hook
         never ran, anyone can call reconcileDelivery to do the same.
@@ -49,20 +50,23 @@ pragma solidity ^0.8.28;
 
    WITHDRAW: merchant money out to a bank (a B2B SELL)
      withdrawFiat places a SELL with order.user = the person, for any
-     merchant account, opened here or not: it is their own USDC. The Diamond
-     pulls the USDC from the person's WALLET at setSellOrderUpi, not from
-     their stake: what they sell is what reached
-     their wallet from the Diamond (an approved unstake, or the merchant
-     earnings it pays out). This contract's rewards only ever become stake.
+     merchant account, opened here or not, in that account's currency. The
+     Diamond pulls the USDC from the person's WALLET at setSellOrderUpi, not
+     from their stake: what they sell is what reached their wallet from the
+     Diamond (an approved unstake, or the merchant earnings it pays out).
+     This contract's rewards only ever become stake.
 
    LIMITS (B2B orders skip the Diamond's RP per-tx, count, volume and
    blacklist checks, so these are the only ones that apply):
      deposit   at most getMaxBuyTxLimit(currency) each, MAX_DEPOSITS_PER_DAY a
                day per person; refused for the Diamond's merchant blacklist and
                ReputationManager's user blacklist.
-     withdraw  no amount or count limit (it sells USDC already in the
-               person's wallet); any merchant account, opened here or
-               not; refused for the merchant blacklist.
+     withdraw  at most getMaxSellTxLimit(currency) each, MAX_WITHDRAWALS_PER_DAY
+               a day per person, only in the account's own currency (so the
+               cap cannot be shopped); refused for the merchant blacklist.
+               These stand in for the consumer SELL limits B2B placement
+               skips: a merchant account is permanent and costs only a
+               refundable floor, so without them this is an uncapped offramp.
    A day is a UTC day. Every placed order counts, cancelled or not. These are
    per address: they do not stop someone using many addresses.
 
@@ -127,7 +131,8 @@ interface IP2PDiamond {
     }
 
     /// @dev Opens `merchant`'s account and pulls the stake from msg.sender (us).
-    ///      Open to any caller; the Diamond checks `merchant`'s blacklist.
+    ///      Only an active integrator may call it (onlyActiveIntegrator,
+    ///      contracts-v4 #518); the Diamond checks `merchant`'s blacklist.
     function registerFor(
         address merchant,
         uint256 circleId,
@@ -137,8 +142,9 @@ interface IP2PDiamond {
     ) external;
 
     /// @dev Adds to `merchant`'s existing account, pulling from msg.sender (us).
-    ///      Open to any caller. Reverts below the floor,
-    ///      on a pending unstake, on the merchant blacklist, in a paused circle.
+    ///      Only an active integrator may call it (onlyActiveIntegrator,
+    ///      contracts-v4 #518). Reverts below the floor, on a pending unstake,
+    ///      on the merchant blacklist, in a paused circle.
     function stakeFor(address merchant, uint256 stakeAmount, bytes32 currency) external;
 
     function getMerchantDetails(address merchant) external view returns (MerchantDetails memory);
@@ -147,6 +153,8 @@ interface IP2PDiamond {
     function getStakeConfig(bytes32 currency) external view returns (StakeConfigHead memory);
     /// @dev The largest single BUY allowed in `currency`; 0 closes the currency.
     function getMaxBuyTxLimit(bytes32 currency) external view returns (uint256);
+    /// @dev The largest single SELL allowed in `currency`; 0 closes the currency.
+    function getMaxSellTxLimit(bytes32 currency) external view returns (uint256);
     /// @dev The Diamond's own day key (OrderFlowHelper), the one its daily
     ///      limits count by.
     function getDayKey(uint256 ts) external view returns (uint256);
@@ -188,10 +196,11 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error InvalidAddress();
     /// @notice An amount was zero.
     error InvalidAmount();
-    /// @notice Above the Diamond's getMaxBuyTxLimit.
+    /// @notice Above the Diamond's getMaxBuyTxLimit / getMaxSellTxLimit.
     error AmountExceedsCap();
-    /// @notice The person already has an account, or earlier deposits, in a
-    ///         different currency; the deposit could never be staked into it.
+    /// @notice The person already has an account, or pending deposits, in a
+    ///         different currency (a deposit could never be staked into it), or
+    ///         a withdrawal names a currency other than the account's.
     error SeatCurrencyMismatch();
     /// @notice The person's account is mid-unstake; stakeFor would refuse the deposit.
     error UnstakePending();
@@ -201,7 +210,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error UserBlacklisted();
     /// @notice withdrawFiat and rewardStake need a merchant account on the Diamond.
     error NoSeat();
-    /// @notice The person has placed today's maximum number of deposits.
+    /// @notice The person has placed today's maximum number of deposits or withdrawals.
     error DailyLimitReached();
     /// @notice The order was not placed by this integrator, or not paid to it.
     error NotOurs();
@@ -258,6 +267,10 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice Deposits one person may place in a UTC day (the Diamond's own
     ///         per-buyer daily count, which B2B placement skips).
     uint256 public constant MAX_DEPOSITS_PER_DAY = 5;
+    /// @notice Withdrawals one person may place in a UTC day, counted apart from
+    ///         deposits (the Diamond's per-seller daily count, which B2B
+    ///         placement skips).
+    uint256 public constant MAX_WITHDRAWALS_PER_DAY = 5;
 
     // ─── Immutables ───────────────────────────────────────────────────
 
@@ -289,12 +302,16 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice Per person: USDC delivered here and not yet staked. It can only
     ///         leave as that person's stake on the Diamond.
     mapping(address => uint256) public pendingStake;
-    /// @notice The currency of a person's first deposit made with no account;
-    ///         the account opens in it. Never changes.
+    /// @notice The currency the account of someone with no account opens in:
+    ///         that of their deposits. Fixed while any of it is pending here; a
+    ///         deposit with nothing pending sets it again, so a cancelled first
+    ///         deposit does not lock it.
     mapping(address => bytes32) public currencyOf;
 
-    /// @notice Deposits placed per person per day, keyed by the Diamond's getDayKey.
+    /// @notice Deposits and withdrawals placed per person per day, keyed by the
+    ///         Diamond's getDayKey.
     mapping(address => mapping(uint256 => uint256)) public depositsOn;
+    mapping(address => mapping(uint256 => uint256)) public withdrawalsOn;
 
     /// @notice Deliveries already added to pendingStake, so none counts twice
     ///         (the hook and reconcileDelivery can both see the same order).
@@ -414,9 +431,9 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         would leave the account below the minimum stake, and (for an
     ///         existing account) a different currency or a pending unstake: the
     ///         cases the Diamond's stake would refuse after delivery, stranding
-    ///         the USDC here. With no account: a currency other than the first
-    ///         deposit's, or one with no circleOf. Circle state and capacity are
-    ///         checked by the Diamond when it stakes.
+    ///         the USDC here. With no account: a currency other than that of the
+    ///         money pending here, or one with no circleOf. Circle state and
+    ///         capacity are checked by the Diamond when it stakes.
     /// @param amount   USDC to buy (6 decimals)
     /// @param currency the on-chain currency code (e.g. "INR", "MEX" — not ISO "MXN")
     /// @param circleId the circle the order is matched in (any; the account
@@ -445,9 +462,13 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
             if (m.currency != currency) revert SeatCurrencyMismatch();
             if (diamond.getUnstakeRequested(msg.sender)) revert UnstakePending();
         } else {
-            bytes32 bound = currencyOf[msg.sender];
-            if (bound == bytes32(0)) currencyOf[msg.sender] = currency;
-            else if (bound != currency) revert SeatCurrencyMismatch();
+            /* Pending money opens the account in currencyOf, so it stays fixed
+               while any is here. With none, rebinding is safe: stakeDeposit reads
+               currencyOf at stake time and USDC carries no currency, so a late
+               delivery in the old currency still stakes (once the new floor is
+               met; until then it waits, and a further deposit tops it up). */
+            if (pendingStake[msg.sender] == 0) currencyOf[msg.sender] = currency;
+            else if (currencyOf[msg.sender] != currency) revert SeatCurrencyMismatch();
             if (circleOf[currency] == 0) revert CircleNotSet();
         }
         // m.stake is 0 with no account. Undelivered deposits do not count.
@@ -484,9 +505,10 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice Cash out: place a SELL of USDC in your wallet to your bank. The
     ///         Diamond pulls it from your wallet at setSellOrderUpi (not from
     ///         your stake), and a refund goes back to you.
-    /// @dev    Any merchant account, opened here or not, any amount: the USDC
-    ///         is already theirs. Not a general USDC exit (no account: NoSeat),
-    ///         and never for the merchant blacklist, which B2B placement skips.
+    /// @dev    Any merchant account, opened here or not, in its own currency, at
+    ///         most the Diamond's max sell per order and MAX_WITHDRAWALS_PER_DAY
+    ///         a day. Not a general USDC exit (no account: NoSeat), and never for
+    ///         the merchant blacklist, which B2B placement skips.
     function withdrawFiat(
         uint256 amount,
         bytes32 currency,
@@ -497,8 +519,12 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         bytes32 ref
     ) external nonReentrant returns (uint256 orderId) {
         if (amount == 0) revert InvalidAmount();
-        if (!diamond.getMerchantDetails(msg.sender).isRegistered) revert NoSeat();
+        IP2PDiamond.MerchantDetails memory m = diamond.getMerchantDetails(msg.sender);
+        if (!m.isRegistered) revert NoSeat();
+        if (m.currency != currency) revert SeatCurrencyMismatch();
         if (diamond.isBlacklisted(msg.sender)) revert MerchantBlacklisted();
+        _countToday(withdrawalsOn, MAX_WITHDRAWALS_PER_DAY);
+        if (amount > diamond.getMaxSellTxLimit(currency)) revert AmountExceedsCap();
         orderId = _placeFromProxy(
             abi.encodeCall(
                 IB2BGateway.placeB2BSellOrder,

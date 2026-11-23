@@ -154,6 +154,7 @@ describe("CashbookRampIntegrator", function () {
       expect(await ethers.provider.getCode(await integrator.proxyImpl())).to.not.equal("0x");
       expect(await integrator.owner()).to.equal(owner.address);
       expect(await integrator.MAX_DEPOSITS_PER_DAY()).to.equal(5n);
+      expect(await integrator.MAX_WITHDRAWALS_PER_DAY()).to.equal(5n);
     });
   });
 
@@ -424,15 +425,50 @@ describe("CashbookRampIntegrator", function () {
       await expect(deposit(alice, USDC(10))).to.not.emit(integrator, "UserProxyDeployed");
     });
 
-    it("someone with no account stays bound to their first deposit's currency", async function () {
+    it("someone with no account stays bound while money is pending here", async function () {
       await integrator.setCircle(BRL, 2);
       await deposit(alice, FLOOR);
-      await diamond.connect(alice).cancelOrder(1);
+      await settle(1);
       await expect(deposit(alice, FLOOR, BRL)).to.be.revertedWithCustomError(
         integrator,
         "SeatCurrencyMismatch"
       );
-      await expect(deposit(alice, FLOOR)).to.not.be.reverted;
+      await expect(deposit(alice, USDC(10))).to.not.be.reverted;
+      expect(await integrator.currencyOf(alice.address)).to.equal(INR);
+    });
+
+    it("a cancelled first deposit does not lock the currency", async function () {
+      await integrator.setCircle(BRL, 2);
+      await deposit(alice, FLOOR);
+      await diamond.connect(alice).cancelOrder(1);
+      await expect(deposit(alice, FLOOR, BRL)).to.not.be.reverted;
+      expect(await integrator.currencyOf(alice.address)).to.equal(BRL);
+    });
+
+    it("a late delivery in the old currency waits for the new floor; a deposit lands it", async function () {
+      await integrator.setCircle(BRL, 2);
+      await diamond.setFloor(BRL, USDC(250));
+      await deposit(alice, FLOOR); // 1: INR, still in flight
+      await deposit(alice, USDC(250), BRL); // 2: nothing pending, so it rebinds
+      await diamond.connect(alice).cancelOrder(2);
+      await settle(1); // the INR deposit lands, bound to BRL now
+      expect(await integrator.currencyOf(alice.address)).to.equal(BRL);
+      await expect(integrator.stakeDeposit(1)).to.be.revertedWithCustomError(
+        diamond,
+        "StakeAmountTooLow"
+      );
+      expect(await integrator.pendingStake(alice.address)).to.equal(FLOOR);
+      await holds([alice]);
+      // still theirs: a further deposit reaching the BRL floor stakes it all
+      await deposit(alice, USDC(150), BRL); // 3
+      await settle(3);
+      await expect(integrator.stakeDeposit(1))
+        .to.emit(integrator, "DepositStaked")
+        .withArgs(1, alice.address, USDC(250), true);
+      const m = await diamond.getMerchantDetails(alice.address);
+      expect(m.currency).to.equal(BRL);
+      expect(m.stake).to.equal(USDC(250));
+      await holds([alice]);
     });
   });
 
@@ -844,11 +880,43 @@ describe("CashbookRampIntegrator", function () {
       await expect(withdraw(alice, USDC(10))).to.not.be.reverted;
     });
 
-    it("has no amount or count limit: above the Diamond's max sell, six in a day", async function () {
+    it("refuses more than the Diamond's max sell; a max of 0 closes the currency", async function () {
       await open(alice);
+      await expect(withdraw(alice, MAX_SELL + 1n)).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsCap"
+      );
+      await expect(withdraw(alice, MAX_SELL)).to.not.be.reverted;
       await diamond.setMaxSell(INR, 0);
-      await expect(withdraw(alice, MAX_SELL + 1n)).to.not.be.reverted;
+      await expect(withdraw(alice, USDC(1))).to.be.revertedWithCustomError(
+        integrator,
+        "AmountExceedsCap"
+      );
+    });
+
+    it("refuses a currency other than the account's, so the cap cannot be shopped", async function () {
+      await open(alice);
+      await diamond.setMaxSell(BRL, MAX_SELL * 10n);
+      await expect(withdraw(alice, MAX_SELL + 1n, BRL)).to.be.revertedWithCustomError(
+        integrator,
+        "SeatCurrencyMismatch"
+      );
+    });
+
+    it("refuses a sixth withdrawal in one UTC day, counted apart from deposits", async function () {
+      await open(alice); // one deposit today
       for (let i = 0; i < 5; i++) await withdraw(alice, USDC(1));
+      await expect(withdraw(alice, USDC(1))).to.be.revertedWithCustomError(
+        integrator,
+        "DailyLimitReached"
+      );
+      expect(await integrator.depositsOn(alice.address, await today())).to.equal(1n);
+      expect(await integrator.withdrawalsOn(alice.address, await today())).to.equal(5n);
+      // a fully unstaked account (still registered) can still cash out
+      await diamond.setMerchant(bob.address, 0n, INR);
+      await expect(withdraw(bob, USDC(1))).to.not.be.reverted;
+      await nextDay();
+      await expect(withdraw(alice, USDC(1))).to.not.be.reverted;
     });
   });
 });
