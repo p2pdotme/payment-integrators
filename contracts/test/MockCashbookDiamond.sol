@@ -61,6 +61,11 @@ contract MockCashbookDiamond is MockDiamond {
     mapping(address => bool) public merchantBlacklisted;
     mapping(address => bool) public unstakeRequested;
 
+    /// @notice A call made back into `reenterTarget` from inside the Diamond
+    ///         calls the integrator makes mid-transaction, to prove its guard.
+    address public reenterTarget;
+    bytes public reenterData;
+
     event MockRegisteredFor(address merchant, uint256 circleId, uint256 stake, bytes32 currency);
     event MockStakedFor(address merchant, uint256 amount, bytes32 currency);
 
@@ -98,6 +103,26 @@ contract MockCashbookDiamond is MockDiamond {
         orders[orderId].recipientAddr = recipientAddr;
     }
 
+    /// @notice Every call below that the integrator makes while holding its
+    ///         reentrancy guard calls `target` with `data` first. 0 turns it off.
+    function setReenter(address target, bytes calldata data) external {
+        reenterTarget = target;
+        reenterData = data;
+    }
+
+    /// @dev A static call, so the view functions can use it too. The guard
+    ///      refuses before any state change, so it answers a static call the
+    ///      same as a call; the refusal is bubbled up unchanged.
+    function _reenter() internal view {
+        if (reenterTarget == address(0)) return;
+        (bool ok, bytes memory r) = reenterTarget.staticcall(reenterData);
+        if (!ok) {
+            assembly {
+                revert(add(r, 32), mload(r))
+            }
+        }
+    }
+
     // ─── The surface the integrator calls ─────────────────────────────
 
     function registerFor(
@@ -107,6 +132,7 @@ contract MockCashbookDiamond is MockDiamond {
         string calldata /* telegramId */,
         bytes32 currency
     ) external {
+        _reenter();
         if (!activeIntegrators[msg.sender]) revert NotActiveIntegrator();
         if (merchants[merchant].isRegistered) revert MerchantAlreadyRegistered();
         if (merchantBlacklisted[merchant]) revert MerchantBlacklisted();
@@ -118,6 +144,7 @@ contract MockCashbookDiamond is MockDiamond {
     }
 
     function stakeFor(address merchant, uint256 stakeAmount, bytes32 currency) external {
+        _reenter();
         if (!activeIntegrators[msg.sender]) revert NotActiveIntegrator();
         MerchantDetails storage m = merchants[merchant];
         if (!m.isRegistered) revert MerchantNotRegistered();
@@ -139,10 +166,12 @@ contract MockCashbookDiamond is MockDiamond {
     }
 
     function getMaxBuyTxLimit(bytes32 currency) external view returns (uint256) {
+        _reenter();
         return maxBuyOf[currency];
     }
 
     function getMaxSellTxLimit(bytes32 currency) external view returns (uint256) {
+        _reenter();
         return maxSellOf[currency];
     }
 
@@ -155,6 +184,7 @@ contract MockCashbookDiamond is MockDiamond {
     }
 
     function getOrderIntegrator(uint256 orderId) external view returns (address) {
+        _reenter();
         return orders[orderId].integrator;
     }
 

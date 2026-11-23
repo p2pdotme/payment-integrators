@@ -327,6 +327,41 @@ describe("CashbookRampIntegrator", function () {
       );
     });
 
+    it("exactly the max buy is allowed", async function () {
+      await diamond.setMerchant(alice.address, FLOOR, INR);
+      await expect(deposit(alice, MAX_BUY)).to.not.be.reverted;
+    });
+
+    it("a refused deposit does not use up the day's count", async function () {
+      await diamond.setMerchant(alice.address, FLOOR, INR);
+      for (let i = 0; i < 6; i++) {
+        await expect(deposit(alice, MAX_BUY + 1n)).to.be.revertedWithCustomError(
+          integrator,
+          "AmountExceedsCap"
+        );
+      }
+      expect(await integrator.depositsOn(alice.address, await today())).to.equal(0n);
+      for (let i = 0; i < 5; i++) await deposit(alice, USDC(1));
+    });
+
+    it("the day turns at the Diamond's day key, to the second", async function () {
+      await diamond.setMerchant(alice.address, FLOOR, INR);
+      const b = await ethers.provider.getBlock("latest");
+      const midnight = (Math.floor(b!.timestamp / 86400) + 2) * 86400;
+      for (let i = 6; i >= 2; i--) {
+        await ethers.provider.send("evm_setNextBlockTimestamp", [midnight - i]);
+        await deposit(alice, USDC(1));
+      }
+      await ethers.provider.send("evm_setNextBlockTimestamp", [midnight - 1]);
+      await expect(deposit(alice, USDC(1))).to.be.revertedWithCustomError(
+        integrator,
+        "DailyLimitReached"
+      );
+      await ethers.provider.send("evm_setNextBlockTimestamp", [midnight]);
+      await expect(deposit(alice, USDC(1))).to.not.be.reverted;
+      expect(await integrator.depositsOn(alice.address, BigInt(midnight / 86400))).to.equal(1n);
+    });
+
     it("an opening in a currency with no circle set", async function () {
       await expect(deposit(alice, FLOOR, BRL)).to.be.revertedWithCustomError(
         integrator,
@@ -847,6 +882,28 @@ describe("CashbookRampIntegrator", function () {
       await expect(withdraw(alice, USDC(10))).to.be.revertedWithCustomError(integrator, "NoSeat");
     });
 
+    it("money delivered here but not yet staked is not an account: refused until staked", async function () {
+      await deposit(alice, FLOOR);
+      await settle(1);
+      await expect(withdraw(alice, USDC(10))).to.be.revertedWithCustomError(integrator, "NoSeat");
+      await integrator.stakeDeposit(1);
+      await expect(withdraw(alice, USDC(10))).to.emit(integrator, "WithdrawalPlaced");
+    });
+
+    it("only for the caller's own account: a stranger cannot cash out someone else's", async function () {
+      await open(alice);
+      await expect(withdraw(stranger, USDC(10))).to.be.revertedWithCustomError(
+        integrator,
+        "NoSeat"
+      );
+      // the order is always the caller's: user = msg.sender
+      await diamond.setMerchant(stranger.address, FLOOR, INR);
+      await expect(withdraw(stranger, USDC(10)))
+        .to.emit(diamond, "MockSellOrderPlaced")
+        .withArgs(2, stranger.address, USDC(10), INR);
+      expect(await integrator.withdrawalsOn(alice.address, await today())).to.equal(0n);
+    });
+
     it("serves an account opened elsewhere (merchant-app, another integrator)", async function () {
       await diamond.setMerchant(alice.address, FLOOR, INR);
       await expect(withdraw(alice, USDC(10)))
@@ -894,6 +951,24 @@ describe("CashbookRampIntegrator", function () {
       );
     });
 
+    it("a refused withdrawal does not use up the day's count", async function () {
+      await open(alice);
+      for (let i = 0; i < 6; i++) {
+        await expect(withdraw(alice, MAX_SELL + 1n)).to.be.revertedWithCustomError(
+          integrator,
+          "AmountExceedsCap"
+        );
+      }
+      expect(await integrator.withdrawalsOn(alice.address, await today())).to.equal(0n);
+      for (let i = 0; i < 5; i++) await withdraw(alice, USDC(1));
+    });
+
+    it("only the merchant blacklist stops a cash out: a pending unstake does not", async function () {
+      await open(alice);
+      await diamond.setUnstakeRequested(alice.address, true);
+      await expect(withdraw(alice, USDC(10))).to.not.be.reverted;
+    });
+
     it("refuses a currency other than the account's, so the cap cannot be shopped", async function () {
       await open(alice);
       await diamond.setMaxSell(BRL, MAX_SELL * 10n);
@@ -917,6 +992,124 @@ describe("CashbookRampIntegrator", function () {
       await expect(withdraw(bob, USDC(1))).to.not.be.reverted;
       await nextDay();
       await expect(withdraw(alice, USDC(1))).to.not.be.reverted;
+    });
+  });
+
+  describe("the person's proxy", function () {
+    it("one per person, deployed once, used for both deposits and withdrawals", async function () {
+      const proxy = await integrator.proxyAddress(alice.address);
+      const tx = await deposit(alice, FLOOR);
+      await expect(tx).to.emit(integrator, "UserProxyDeployed").withArgs(alice.address, proxy);
+      await settle(1);
+      await integrator.stakeDeposit(1);
+      await expect(withdraw(alice, USDC(10))).to.not.emit(integrator, "UserProxyDeployed");
+      await expect(deposit(alice, USDC(10))).to.not.emit(integrator, "UserProxyDeployed");
+      expect(await integrator.proxyAddress(alice.address)).to.equal(proxy);
+      expect(await integrator.proxyAddress(bob.address)).to.not.equal(proxy);
+    });
+
+    it("a first withdrawal deploys it for an account opened elsewhere", async function () {
+      await diamond.setMerchant(bob.address, FLOOR, INR);
+      await expect(withdraw(bob, USDC(10)))
+        .to.emit(integrator, "UserProxyDeployed")
+        .withArgs(bob.address, await integrator.proxyAddress(bob.address));
+    });
+
+    it("nobody but the integrator can drive it, the person included", async function () {
+      await deposit(alice, FLOOR);
+      const proxy = await ethers.getContractAt(
+        "UserProxy",
+        await integrator.proxyAddress(alice.address)
+      );
+      const call = diamond.interface.encodeFunctionData("cancelOrder", [1]);
+      for (const who of [alice, stranger]) {
+        await expect(
+          proxy.connect(who).execute(dAddr, call, uAddr, 0)
+        ).to.be.revertedWithCustomError(proxy, "OnlyIntegrator");
+      }
+    });
+  });
+
+  describe("reentrancy: a call back in mid-transaction is refused", function () {
+    const inner = {
+      depositFiat: () =>
+        integrator.interface.encodeFunctionData("depositFiat", [
+          FLOOR,
+          INR,
+          ORDER_CIRCLE,
+          "pk",
+          0,
+          0,
+          REF,
+        ]),
+      withdrawFiat: () =>
+        integrator.interface.encodeFunctionData("withdrawFiat", [
+          USDC(1),
+          INR,
+          ORDER_CIRCLE,
+          "pk",
+          0,
+          0,
+          REF,
+        ]),
+      reconcileDelivery: () => integrator.interface.encodeFunctionData("reconcileDelivery", [1]),
+      stakeDeposit: () => integrator.interface.encodeFunctionData("stakeDeposit", [1]),
+    };
+
+    async function refused(outer: () => Promise<any>, call: string) {
+      await diamond.setReenter(iAddr, call);
+      await expect(outer()).to.be.revertedWithCustomError(
+        integrator,
+        "ReentrancyGuardReentrantCall"
+      );
+      await diamond.setReenter(ethers.ZeroAddress, "0x");
+    }
+
+    for (const name of Object.keys(inner) as (keyof typeof inner)[]) {
+      it(`stakeDeposit, re-entered through ${name}: nothing staked, the money still pending`, async function () {
+        await deposit(alice, FLOOR);
+        await settle(1);
+        await refused(() => integrator.stakeDeposit(1), inner[name]());
+        expect(await integrator.pendingStake(alice.address)).to.equal(FLOOR);
+        expect((await diamond.getMerchantDetails(alice.address)).isRegistered).to.equal(false);
+        await holds([alice]);
+        // the same call, not re-entered, still lands it
+        await expect(integrator.stakeDeposit(1)).to.emit(integrator, "DepositStaked");
+      });
+    }
+
+    it("depositFiat, re-entered: no order, no count", async function () {
+      await diamond.setMerchant(alice.address, FLOOR, INR);
+      await refused(() => deposit(alice, USDC(1)), inner.stakeDeposit());
+      expect(await diamond.nextOrderId()).to.equal(1n);
+      expect(await integrator.depositsOn(alice.address, await today())).to.equal(0n);
+    });
+
+    it("withdrawFiat, re-entered: no order, no count", async function () {
+      await diamond.setMerchant(alice.address, FLOOR, INR);
+      await refused(() => withdraw(alice, USDC(1)), inner.depositFiat());
+      expect(await diamond.nextOrderId()).to.equal(1n);
+      expect(await integrator.withdrawalsOn(alice.address, await today())).to.equal(0n);
+    });
+
+    it("reconcileDelivery, re-entered: nothing credited", async function () {
+      await deposit(alice, FLOOR);
+      await usdc.mint(dAddr, FLOOR);
+      await diamond.simulateOrderCompleteNoCallback(1);
+      await refused(() => integrator.reconcileDelivery(1), inner.withdrawFiat());
+      expect(await integrator.credited(1)).to.equal(false);
+      expect(await integrator.pendingStake(alice.address)).to.equal(0n);
+    });
+
+    it("rewardStake, re-entered: nothing paid, the allowance back to 0", async function () {
+      await open(alice);
+      await deposit(bob, FLOOR);
+      await settle(2);
+      await refused(() => integrator.rewardStake([alice.address], [USDC(1)]), inner.stakeDeposit());
+      expect(await integrator.available(uAddr)).to.equal(POOL);
+      expect(await usdc.allowance(iAddr, dAddr)).to.equal(0n);
+      expect(await integrator.pendingStake(bob.address)).to.equal(FLOOR);
+      await holds([alice, bob]);
     });
   });
 });
