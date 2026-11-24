@@ -356,6 +356,18 @@ describe("CashbookRampIntegrator", function () {
       expect(await integrator.consentCircleOf(alice.address)).to.equal(CIRCLE);
     });
 
+    /* The Diamond (OZ 5.0) does not unwrap ERC-6492, so neither may we: a
+       wrapper we accepted would reach registerFor and be refused there. */
+    it("an ERC-6492-wrapped signature, even a valid one inside", async function () {
+      const inner = await consent(alice);
+      const wrapped =
+        ethers.AbiCoder.defaultAbiCoder().encode(
+          ["address", "bytes", "bytes"],
+          [stranger.address, "0x1234", inner]
+        ) + "6492".repeat(16);
+      await expect(raw(alice, wrapped)).to.be.revertedWithCustomError(integrator, "ConsentInvalid");
+    });
+
     it("an existing account needs no consent", async function () {
       await open(alice);
       await expect(

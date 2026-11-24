@@ -326,8 +326,8 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         that of their latest deposit.
     mapping(address => bytes32) public currencyOf;
     /// @notice With no account: the person's signature for registerFor, from
-    ///         their latest deposit, and the circle it names. Cleared once the
-    ///         account opens.
+    ///         their latest deposit, and the circle it names. Cleared by the
+    ///         next stakeDeposit, whichever way it stakes.
     mapping(address => bytes) public consentOf;
     mapping(address => uint256) public consentCircleOf;
 
@@ -668,9 +668,12 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
                 currencyOf[user],
                 consentOf[user]
             );
-            delete consentOf[user];
-            delete consentCircleOf[user];
         }
+        /* Spent, or never needed: someone else may have opened the account with
+           an older consent of theirs (registerFor takes any caller), and then
+           this one stakes as a top-up in the account's own currency. */
+        delete consentOf[user];
+        delete consentCircleOf[user];
         usdc.forceApprove(address(diamond), 0);
 
         emit DepositStaked(orderId, user, paid, !seat.isRegistered);
