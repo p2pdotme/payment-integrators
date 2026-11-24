@@ -89,8 +89,37 @@ describe("CashbookRampIntegrator", function () {
     await usdc.transfer(iAddr, POOL);
   });
 
-  const deposit = (who: SignerWithAddress, amount: bigint, cur = INR) =>
-    integrator.connect(who).depositFiat(amount, cur, ORDER_CIRCLE, "pk", 0, 0, REF);
+  /** The person's consent for the account a deposit would open (#518): an
+   *  EIP-712 signature over registrationDigest(person, circleOf[cur], cur, ""). */
+  async function consent(who: SignerWithAddress, cur = INR, circle?: bigint) {
+    return who.signTypedData(
+      {
+        name: "P2PMerchantRegistration",
+        version: "1",
+        chainId: (await ethers.provider.getNetwork()).chainId,
+        verifyingContract: await diamond.getAddress(),
+      },
+      {
+        RegisterFor: [
+          { name: "merchant", type: "address" },
+          { name: "circleId", type: "uint256" },
+          { name: "currency", type: "bytes32" },
+          { name: "telegramId", type: "string" },
+        ],
+      },
+      {
+        merchant: who.address,
+        circleId: circle ?? (await integrator.circleOf(cur)),
+        currency: cur,
+        telegramId: "",
+      }
+    );
+  }
+
+  const deposit = async (who: SignerWithAddress, amount: bigint, cur = INR) =>
+    integrator
+      .connect(who)
+      .depositFiat(amount, cur, ORDER_CIRCLE, "pk", 0, 0, REF, await consent(who, cur));
 
   const withdraw = (who: SignerWithAddress, amount: bigint, cur = INR) =>
     integrator.connect(who).withdrawFiat(amount, cur, ORDER_CIRCLE, "pk", 0, 0, REF);
@@ -287,6 +316,54 @@ describe("CashbookRampIntegrator", function () {
   });
 
   describe("depositFiat: refused before any money moves", function () {
+    const raw = (who: SignerWithAddress, sig: string, cur = INR) =>
+      integrator.connect(who).depositFiat(FLOOR, cur, ORDER_CIRCLE, "pk", 0, 0, REF, sig);
+
+    /* #518: the Diamond opens an account only with the person's signature, so
+       an opening deposit without a good one would strand its delivery here. */
+    it("an opening deposit without the person's consent for that account", async function () {
+      await integrator.setCircle(BRL, 2);
+      const wrong = [
+        "0x",
+        "0x", // replaced below: alice's terms, signed by bob
+        await consent(alice, INR, 9n), // another circle
+        await consent(alice, BRL), // another currency
+      ];
+      // bob's signature names bob, so it can never be alice's consent
+      wrong[1] = await bob.signTypedData(
+        {
+          name: "P2PMerchantRegistration",
+          version: "1",
+          chainId: (await ethers.provider.getNetwork()).chainId,
+          verifyingContract: await diamond.getAddress(),
+        },
+        {
+          RegisterFor: [
+            { name: "merchant", type: "address" },
+            { name: "circleId", type: "uint256" },
+            { name: "currency", type: "bytes32" },
+            { name: "telegramId", type: "string" },
+          ],
+        },
+        { merchant: alice.address, circleId: CIRCLE, currency: INR, telegramId: "" }
+      );
+      for (const sig of wrong) {
+        await expect(raw(alice, sig)).to.be.revertedWithCustomError(integrator, "ConsentInvalid");
+      }
+      expect(await integrator.depositsOn(alice.address, await today())).to.equal(0n);
+      expect(await diamond.nextOrderId()).to.equal(1n);
+      await expect(raw(alice, await consent(alice))).to.not.be.reverted;
+      expect(await integrator.consentCircleOf(alice.address)).to.equal(CIRCLE);
+    });
+
+    it("an existing account needs no consent", async function () {
+      await open(alice);
+      await expect(
+        integrator.connect(alice).depositFiat(USDC(10), INR, ORDER_CIRCLE, "pk", 0, 0, REF, "0x")
+      ).to.not.be.reverted;
+      expect(await integrator.consentOf(alice.address)).to.equal("0x");
+    });
+
     it("a zero amount", async function () {
       await expect(deposit(alice, 0n)).to.be.revertedWithCustomError(integrator, "InvalidAmount");
     });
@@ -311,8 +388,11 @@ describe("CashbookRampIntegrator", function () {
       await rm.setBlacklisted(alice.address, true);
       const i = await deployIntegrator(ethers.ZeroAddress);
       await i.setCircle(INR, CIRCLE);
-      await expect(i.connect(alice).depositFiat(FLOOR, INR, ORDER_CIRCLE, "pk", 0, 0, REF)).to.not
-        .be.reverted;
+      await expect(
+        i
+          .connect(alice)
+          .depositFiat(FLOOR, INR, ORDER_CIRCLE, "pk", 0, 0, REF, await consent(alice, INR, CIRCLE))
+      ).to.not.be.reverted;
     });
 
     it("more than the Diamond's max buy; a max of 0 closes the currency", async function () {
@@ -585,7 +665,9 @@ describe("CashbookRampIntegrator", function () {
     it("reconcileDelivery refuses another integrator's order", async function () {
       const other = await deployIntegrator(ethers.ZeroAddress);
       await other.setCircle(INR, CIRCLE);
-      await other.connect(alice).depositFiat(FLOOR, INR, ORDER_CIRCLE, "pk", 0, 0, REF);
+      await other
+        .connect(alice)
+        .depositFiat(FLOOR, INR, ORDER_CIRCLE, "pk", 0, 0, REF, await consent(alice, INR, CIRCLE));
       await expect(integrator.reconcileDelivery(1)).to.be.revertedWithCustomError(
         integrator,
         "NotOurs"
@@ -670,17 +752,16 @@ describe("CashbookRampIntegrator", function () {
       await holds([alice]);
     });
 
-    it("waits, nothing lost, if the circle was unset after the deposit", async function () {
+    it("a circle changed after the deposit cannot void it: it opens where they signed", async function () {
       await deposit(alice, FLOOR);
       await settle(1);
       await integrator.setCircle(INR, 0);
-      await expect(integrator.stakeDeposit(1)).to.be.revertedWithCustomError(
-        integrator,
-        "CircleNotSet"
-      );
-      expect(await integrator.pendingStake(alice.address)).to.equal(FLOOR);
-      await integrator.setCircle(INR, CIRCLE);
-      await expect(integrator.stakeDeposit(1)).to.emit(integrator, "DepositStaked");
+      await expect(integrator.stakeDeposit(1))
+        .to.emit(diamond, "MockRegisteredFor")
+        .withArgs(alice.address, CIRCLE, FLOOR, INR);
+      // the consent is spent and cleared once the account opens
+      expect(await integrator.consentOf(alice.address)).to.equal("0x");
+      expect(await integrator.consentCircleOf(alice.address)).to.equal(0n);
     });
 
     it("a blacklisting after delivery blocks the stake and keeps the money pending", async function () {
@@ -1067,6 +1148,7 @@ describe("CashbookRampIntegrator", function () {
           0,
           0,
           REF,
+          "0x",
         ]),
       withdrawFiat: () =>
         integrator.interface.encodeFunctionData("withdrawFiat", [

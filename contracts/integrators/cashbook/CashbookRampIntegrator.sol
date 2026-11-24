@@ -34,8 +34,15 @@ pragma solidity ^0.8.28;
         never ran, anyone can call reconcileDelivery to do the same.
      3. stakeDeposit(orderId), callable by anyone (normally our keeper), stakes
         everything the person has pending into their own merchant account:
-        registerFor if the account does not exist yet (in currencyOf and
-        circleOf[it]), stakeFor if it does.
+        registerFor if the account does not exist yet (in currencyOf and the
+        circle the person signed for), stakeFor if it does.
+   CONSENT: the Diamond opens an account only with the merchant's own
+   EIP-712 signature over (merchant, circle, currency, telegram id) —
+   contracts-v4 #518. With no account, depositFiat takes that signature,
+   checks it against the Diamond's registrationDigest before any money
+   moves (so a bad one can never strand a delivery), and keeps it with the
+   circle it names; stakeDeposit hands it to registerFor. The latest
+   deposit's signature wins, with its currency.
    Steps 2 and 3 must be two transactions. completeOrder holds the Diamond's
    shared reentrancy lock while it calls our hook, and registerFor/stakeFor
    take the same lock, so staking from inside the hook always reverts.
@@ -96,6 +103,7 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 /// @notice The p2p.me Diamond functions this contract calls, and nothing more.
 interface IP2PDiamond {
@@ -130,15 +138,25 @@ interface IP2PDiamond {
     }
 
     /// @dev Opens `merchant`'s account and pulls the stake from msg.sender (us).
-    ///      Only an active integrator may call it (onlyActiveIntegrator,
-    ///      contracts-v4 #518); the Diamond checks `merchant`'s blacklist.
+    ///      Anyone may call it with `merchant`'s EIP-712 signature over
+    ///      registrationDigest(merchant, circleId, currency, telegramId)
+    ///      (contracts-v4 #518); the Diamond checks `merchant`'s blacklist.
     function registerFor(
         address merchant,
         uint256 circleId,
         uint256 stakeAmount,
         string calldata telegramId,
-        bytes32 currency
+        bytes32 currency,
+        bytes calldata signature
     ) external;
+
+    /// @dev The digest `merchant` signs for registerFor (ECDSA or ERC-1271).
+    function registrationDigest(
+        address merchant,
+        uint256 circleId,
+        bytes32 currency,
+        string calldata telegramId
+    ) external view returns (bytes32);
 
     /// @dev Adds to `merchant`'s existing account, pulling from msg.sender (us).
     ///      Only an active integrator may call it (onlyActiveIntegrator,
@@ -225,6 +243,9 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error InsufficientFree();
     /// @notice An opening deposit in a currency with no cashbook circle set.
     error CircleNotSet();
+    /// @notice An opening deposit without the person's signature for the
+    ///         account it would open (registrationDigest, circleOf[currency]).
+    error ConsentInvalid();
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -304,6 +325,11 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @notice The currency the account of someone with no account opens in:
     ///         that of their latest deposit.
     mapping(address => bytes32) public currencyOf;
+    /// @notice With no account: the person's signature for registerFor, from
+    ///         their latest deposit, and the circle it names. Cleared once the
+    ///         account opens.
+    mapping(address => bytes) public consentOf;
+    mapping(address => uint256) public consentCircleOf;
 
     /// @notice Deposits and withdrawals placed per person per day, keyed by the
     ///         Diamond's getDayKey.
@@ -428,9 +454,10 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         would leave the account below the minimum stake, and (for an
     ///         existing account) a different currency or a pending unstake: the
     ///         cases the Diamond's stake would refuse after delivery, stranding
-    ///         the USDC here. With no account: a currency other than that of the
-    ///         money pending here, or one with no circleOf. Circle state and
-    ///         capacity are checked by the Diamond when it stakes.
+    ///         the USDC here. With no account: a currency with no circleOf, or
+    ///         a consent that is not the person's
+    ///         signature for that account. Circle state and capacity are
+    ///         checked by the Diamond when it stakes.
     /// @param amount   USDC to buy (6 decimals)
     /// @param currency the on-chain currency code (e.g. "INR", "MEX" — not ISO "MXN")
     /// @param circleId the circle the order is matched in (any; the account
@@ -439,6 +466,11 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @param preferredPaymentChannelConfigId 0 for any payment channel
     /// @param fiatAmountLimit 0 for no limit on the fiat side
     /// @param ref      the app's own reference, echoed in DepositPlaced
+    /// @param consent  with no account: the person's signature over
+    ///                 diamond.registrationDigest(person, circleOf[currency],
+    ///                 currency, ""); ignored for an existing account. A smart
+    ///                 account sends its inner ERC-1271 signature, never an
+    ///                 ERC-6492 wrapper (the Diamond does not unwrap one).
     function depositFiat(
         uint256 amount,
         bytes32 currency,
@@ -446,7 +478,8 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         string calldata pubKey,
         uint256 preferredPaymentChannelConfigId,
         uint256 fiatAmountLimit,
-        bytes32 ref
+        bytes32 ref,
+        bytes calldata consent
     ) external nonReentrant returns (uint256 orderId) {
         if (amount == 0) revert InvalidAmount();
         if (diamond.isBlacklisted(msg.sender)) revert MerchantBlacklisted();
@@ -467,7 +500,20 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
                currency's floor: one more deposit in that currency always lets
                the pending money stake. Only the person can change their own. */
             currencyOf[msg.sender] = currency;
-            if (circleOf[currency] == 0) revert CircleNotSet();
+            uint256 circle = circleOf[currency];
+            if (circle == 0) revert CircleNotSet();
+            /* Checked here, against the Diamond's own digest, so a signature
+               registerFor would refuse never gets as far as a delivery. The
+               circle is kept with it: changing circleOf later cannot void it. */
+            if (
+                !SignatureChecker.isValidSignatureNow(
+                    msg.sender,
+                    diamond.registrationDigest(msg.sender, circle, currency, ""),
+                    consent
+                )
+            ) revert ConsentInvalid();
+            consentOf[msg.sender] = consent;
+            consentCircleOf[msg.sender] = circle;
         }
         // m.stake is 0 with no account. Undelivered deposits do not count.
         if (
@@ -594,7 +640,8 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
 
     /// @notice Stake everything `orderId`'s person has pending into their own
     ///         merchant account. No account yet: registerFor in currencyOf[person]
-    ///         and circleOf[it], never the named order's currency or circle.
+    ///         and the circle their consent names, with that consent; never the
+    ///         named order's currency or circle.
     ///         Account exists: stakeFor, in its own currency.
     /// @dev    Callable by anyone, so the person never depends on our keeper
     ///         being up. Every argument comes from the Diamond's order and this
@@ -613,10 +660,16 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         if (seat.isRegistered) {
             diamond.stakeFor(user, paid, seat.currency);
         } else {
-            bytes32 cur = currencyOf[user];
-            uint256 circle = circleOf[cur];
-            if (circle == 0) revert CircleNotSet(); // unset since the deposit: set it, then retry
-            diamond.registerFor(user, circle, paid, "", cur);
+            diamond.registerFor(
+                user,
+                consentCircleOf[user],
+                paid,
+                "",
+                currencyOf[user],
+                consentOf[user]
+            );
+            delete consentOf[user];
+            delete consentCircleOf[user];
         }
         usdc.forceApprove(address(diamond), 0);
 

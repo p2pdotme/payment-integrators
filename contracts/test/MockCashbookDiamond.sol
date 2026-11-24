@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import { MockDiamond } from "./MockDiamond.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 /**
  * @notice MockDiamond plus the merchant-side surface CashbookRampIntegrator calls:
@@ -16,9 +17,13 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  *         proposed in p2pdotme/contracts-v4 "feat(onboard): let anyone register
  *         or stake for a merchant"). Their reverts here mirror that branch:
  *         MerchantAlreadyRegistered on a second register, StakeAmountTooLow below
- *         the floor, and only an active integrator may call either. Both
- *         also apply _stake's own checks: the merchant blacklist, a pending
- *         unstake, and stake + amount at least the floor (a top-up too).
+ *         the floor, RegistrationNotSigned without the merchant's EIP-712
+ *         signature over registrationDigest (same domain and type as #518:
+ *         "P2PMerchantRegistration" v1, this chain, this contract; anyone may
+ *         call registerFor with it), and only an active integrator may call
+ *         stakeFor. Both also apply _stake's own checks: the merchant
+ *         blacklist, a pending unstake, and stake + amount at least the floor
+ *         (a top-up too).
  *
  *         NOT modelled: the Diamond's shared reentrancy lock. On the real
  *         Diamond, completeOrder holds it while it calls onOrderComplete, so a
@@ -30,6 +35,7 @@ contract MockCashbookDiamond is MockDiamond {
     using SafeERC20 for IERC20;
 
     error NotActiveIntegrator();
+    error RegistrationNotSigned();
     error MerchantAlreadyRegistered();
     error MerchantNotRegistered();
     error StakeAmountTooLow();
@@ -125,15 +131,53 @@ contract MockCashbookDiamond is MockDiamond {
 
     // ─── The surface the integrator calls ─────────────────────────────
 
+    function registrationDigest(
+        address merchant,
+        uint256 circleId,
+        bytes32 currency,
+        string memory telegramId
+    ) public view returns (bytes32) {
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                ),
+                keccak256(bytes("P2PMerchantRegistration")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(this)
+            )
+        );
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256(
+                    "RegisterFor(address merchant,uint256 circleId,bytes32 currency,string telegramId)"
+                ),
+                merchant,
+                circleId,
+                currency,
+                keccak256(bytes(telegramId))
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+    }
+
     function registerFor(
         address merchant,
         uint256 circleId,
         uint256 stakeAmount,
-        string calldata /* telegramId */,
-        bytes32 currency
+        string calldata telegramId,
+        bytes32 currency,
+        bytes calldata signature
     ) external {
         _reenter();
-        if (!activeIntegrators[msg.sender]) revert NotActiveIntegrator();
+        if (
+            !SignatureChecker.isValidSignatureNow(
+                merchant,
+                registrationDigest(merchant, circleId, currency, telegramId),
+                signature
+            )
+        ) revert RegistrationNotSigned();
         if (merchants[merchant].isRegistered) revert MerchantAlreadyRegistered();
         if (merchantBlacklisted[merchant]) revert MerchantBlacklisted();
         if (stakeAmount < floorOf[currency]) revert StakeAmountTooLow();
