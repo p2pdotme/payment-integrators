@@ -750,6 +750,20 @@ describe("MerchantTerminalIntegrator — payment links", function () {
       expect(used).to.equal(2n);
     });
 
+    it("a merchant's own daily limit (setMerchantDailyLimit) applies to link orders too", async function () {
+      await integrator.setDailyLimit(1);
+      await integrator.setMerchantDailyLimit(merchant1.address, 3);
+      await createLink(merchant1, LINK_A, linkAmount(1));
+      // Three pending reservations fit the merchant's own 3, not the global 1…
+      await payLink(LINK_A, 1);
+      await payLink(LINK_A, 1);
+      await payLink(LINK_A, 1);
+      await expectCallFailedWith(payLink(LINK_A, 1), "DailyLimitReached()");
+      // …and clearing it puts them back on the global limit.
+      await integrator.setMerchantDailyLimit(merchant1.address, 0);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(1n);
+    });
+
     it("marking a link order paid takes a slot, and a cancel after that gives it back", async function () {
       await integrator.setDailyLimit(5);
       await createLink(merchant1, LINK_A, linkAmount(1));

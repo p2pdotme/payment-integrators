@@ -13,6 +13,7 @@ import { MerchantRegistryLib } from "./MerchantRegistryLib.sol";
 import { MerchantTypes } from "./MerchantTypes.sol";
 import { SettlementLib } from "./SettlementLib.sol";
 import { MerchantImportLib } from "./MerchantImportLib.sol";
+import { LinkDisputeLib } from "./LinkDisputeLib.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
@@ -48,8 +49,8 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *         Limits enforced in validateOrder: a per-transaction cap of 50 USDC for
  *         INR merchants / 100 USDC default (perTxCap, admin-tunable via setPerTxCap)
  *         and DAILY_TX_LIMIT = 25 orders per merchant per UTC day (admin-tunable via
- *         setDailyLimit). The system proxy is carved out so withdrawals never hit
- *         merchant buy-side limits.
+ *         setDailyLimit, and per merchant via setMerchantDailyLimit). The system
+ *         proxy is carved out so withdrawals never hit merchant buy-side limits.
  */
 contract MerchantTerminalIntegrator is IP2PIntegrator {
     using SafeERC20 for IERC20;
@@ -84,6 +85,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      identifier namespace and the event MerchantFrozen keeps the
     ///      canonical name (the backend indexes events).
     error MerchantIsFrozen();
+    /// @dev p2p.me has blacklisted `user` (the merchant, or the merchant's
+    ///      proxy for a link order): it may not buy here, as it may not buy on
+    ///      p2p.me. Raised in MerchantRegistryLib.revertIfBlacklisted.
+    error UserBlacklisted(address user);
     error ExceedsPerTxCap();
     error DailyLimitReached();
     error InsufficientAvailableBalance();
@@ -110,6 +115,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error NotLinkOwner();
     error LinkOrdersDisabled();
     error OnlyTrustedRelayer();
+    /// @dev Disputes through this contract are for LINK orders only. A fiat
+    ///      withdrawal is also owned by the merchant's proxy, and a won dispute
+    ///      on it would strand the refund there (review #118, finding 1).
+    error NotALinkOrder();
+    /// @dev The merchant's own dispute opens MERCHANT_DISPUTE_DELAY after
+    ///      placement, so the customer gets the first chance (finding 2).
+    error DisputeTooEarly();
+    /// @dev releaseLinkClaim while the order can still be disputed: p2p.me's
+    ///      window is open, a dispute is open, or the order is not cancelled.
+    error ClaimStillDisputable();
     error Reentrancy();
     error UnknownWithdrawal();
     error WithdrawalNotCancellable();
@@ -124,6 +139,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error LimitOutOfBounds();
     /// @dev Raised by MerchantRegistryLib: only the super-admin may raise a max.
     error RaiseNeedsSuperAdmin();
+    /// @dev Raised by MerchantRegistryLib: setMerchantDailyLimit on address(0).
+    error InvalidMerchant();
     error WithdrawalInFlight();
     error FiatAlreadyDelivered();
     /// @dev deliverFiatPayout called on an order the Diamond no longer holds in
@@ -240,6 +257,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     event ExcessSkimmed(address indexed to, uint256 amount);
     event PerTxCapSet(bytes32 indexed currency, uint256 cap);
     event DailyLimitSet(uint256 newLimit);
+    /// @notice A MANAGER gave `merchant` their own daily order limit, or cleared
+    ///         it (limit 0 = back on the global `dailyLimit`). Emitted by
+    ///         MerchantRegistryLib; declared here for the ABI.
+    event MerchantDailyLimitSet(address indexed merchant, uint256 limit);
+    /// @notice The per-merchant ceiling changed. Emitted by MerchantRegistryLib;
+    ///         declared here for the ABI.
+    event MerchantDailyCeilingSet(uint256 ceiling);
     /// @notice An owner (lowering) or the super-admin changed the range the
     ///         limits must stay within.
     event LimitBoundsSet(uint256 minDaily, uint256 maxDaily, uint256 minCap, uint256 maxCap);
@@ -366,6 +390,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     uint8 internal constant STATUS_PAID = 2;
     uint8 internal constant STATUS_COMPLETED = 3;
     uint8 internal constant STATUS_CANCELLED = 4;
+    /// @dev Diamond `Dispute.status` while a dispute is open (0 = none).
+    uint8 internal constant DISPUTE_OPEN = 1;
+
+    /// @dev The merchant may file their own link dispute only this long after
+    ///      placement. The customer can file from 15 min, so they go first and
+    ///      the merchant cannot use up the order's one dispute with wrong digits.
+    uint256 internal constant MERCHANT_DISPUTE_DELAY = 6 hours;
+    /// @dev p2p.me's dispute window: a dispute can be raised up to 24 h after
+    ///      placement. Past it, a paid-then-cancelled link order cannot come
+    ///      back, so the link use it holds may be released (releaseLinkClaim).
+    uint256 internal constant DISPUTE_WINDOW = 24 hours;
 
     // ─── State ────────────────────────────────────────────────────────
 
@@ -511,6 +546,20 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         ceiling for MANAGERs: they can move a limit, not its max.
     MerchantTypes.LimitBounds public limitBounds;
 
+    /// @notice One merchant's own daily order limit, as a MANAGER set it with
+    ///         setMerchantDailyLimit. 0 = none: the merchant follows the global
+    ///         `dailyLimit`. The limit that APPLIES (this, pulled inside
+    ///         `limitBounds`, or the global one) is `getDailyTxInfo(m).limit`.
+    mapping(address => uint256) public merchantDailyLimit;
+
+    /// @notice The ceiling every merchant's OWN daily limit must stay under —
+    ///         apart from `limitBounds.maxDaily`, the global limit's (review
+    ///         round 3, note 1): giving one merchant more than the global maximum
+    ///         no longer widens the global range for every MANAGER. Starts at
+    ///         DAILY_TX_LIMIT. Owners lower it, only the super-admin raises it
+    ///         (setMerchantDailyCeiling); lowering it applies at once.
+    uint256 public merchantDailyCeiling;
+
     /// @notice The link relayer (the LinkRouter): the only caller of
     ///         relayerPlaceOrder / relayerMarkPaid / relayerCancelOrder.
     ///         address(0) = link orders off. Set by the super-admin only
@@ -529,7 +578,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         • VIEWER  (1): read-only — all views, no writes. For auditors /
     ///                        support staff who only need to SEE merchant activity.
     ///         • SUPPORT (2): + freeze / unfreeze a merchant (the safety switch).
-    ///         • MANAGER (3): + config — setPerTxCap, setDailyLimit, setTrustedRelayer.
+    ///         • MANAGER (3): + config — setPerTxCap, setDailyLimit,
+    ///                        setMerchantDailyLimit (under the owners'
+    ///                        merchantDailyCeiling), setTrustedRelayer.
     ///         • FINANCE (4): + money recovery — adminAbortWithdrawal, adminForceSettle.
     ///         The OWNER sits above all tiers (implicitly FINANCE) and is the ONLY
     ///         one who can assign roles, add/remove admins, or transfer ownership.
@@ -562,10 +613,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     uint256 private _locked = 1;
 
     modifier nonReentrant() {
-        if (_locked != 1) revert Reentrancy();
-        _locked = 2;
+        _enter();
         _;
         _locked = 1;
+    }
+
+    /// @dev The guard's check-and-take, out of line: a modifier body is copied
+    ///      into every function that uses it, and this one guards 21.
+    function _enter() private {
+        if (_locked != 1) revert Reentrancy();
+        _locked = 2;
     }
 
     /// @dev A SECOND, independent guard for the Diamond's callbacks.
@@ -589,10 +646,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     bool transient _cbLocked;
 
     modifier nonReentrantCallback() {
-        if (_cbLocked) revert Reentrancy();
-        _cbLocked = true;
+        _enterCallback();
         _;
         _cbLocked = false;
+    }
+
+    function _enterCallback() private {
+        if (_cbLocked) revert Reentrancy();
+        _cbLocked = true;
     }
 
     // ─── Break-glass pause ────────────────────────────────────────────
@@ -607,28 +668,44 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev Gate NEW-activity entry points. Recovery/admin/Diamond-callback paths
     ///      are deliberately NOT gated (see `paused`).
     modifier whenNotPaused() {
-        if (paused) revert Paused();
+        _whenNotPaused();
         _;
+    }
+
+    function _whenNotPaused() private view {
+        if (paused) revert Paused();
     }
 
     // ─── Access modifiers ─────────────────────────────────────────────
 
     modifier onlyDiamond() {
-        if (msg.sender != diamond) revert OnlyDiamond();
+        _onlyDiamond();
         _;
     }
 
+    function _onlyDiamond() private view {
+        if (msg.sender != diamond) revert OnlyDiamond();
+    }
+
     modifier onlyOwner() {
-        if (!isOwner[msg.sender]) revert OnlyOwner();
+        _onlyOwner();
         _;
+    }
+
+    function _onlyOwner() private view {
+        if (!isOwner[msg.sender]) revert OnlyOwner();
     }
 
     /// @dev Restricts an action to the single super-admin. Used for the root of
     ///      access control: owner-set management (add/remove owners) and role
     ///      assignment. Owners below the super-admin cannot perform these.
     modifier onlySuperAdmin() {
-        if (msg.sender != superAdmin) revert OnlySuperAdmin();
+        _onlySuperAdmin();
         _;
+    }
+
+    function _onlySuperAdmin() private view {
+        if (msg.sender != superAdmin) revert OnlySuperAdmin();
     }
 
     /// @dev Any owner's EFFECTIVE tier is FINANCE (the top admin tier), so a
@@ -641,9 +718,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      action at MANAGER also admits FINANCE and the owner. Reverts
     ///      NotAuthorized with the required and actual tiers for a clear panel msg.
     modifier onlyRole(Role min) {
+        _onlyRole(min);
+        _;
+    }
+
+    function _onlyRole(Role min) private view {
         Role have = _tier(msg.sender);
         if (uint8(have) < uint8(min)) revert NotAuthorized(uint8(min), uint8(have));
-        _;
     }
 
     /// @notice True if `who` can perform ANY admin action (an owner or any role).
@@ -700,6 +781,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             1e6,
             uint64(PER_TX_CAP_DEFAULT)
         );
+        merchantDailyCeiling = DAILY_TX_LIMIT; // own limits start under the same 25
         settlementPeriod = SETTLEMENT_PERIOD; // live lock starts at the default (10 min)
         // Deploy the canonical UserProxy implementation. Every per-user clone
         // is a `cloneDeterministicWithImmutableArgs` of this address, with
@@ -817,15 +899,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // Empty = keep the current handle (audit 2026-09 I-1). It used to revert,
         // which left a merchant who registered without a payout rail unable to
         // fix a typo in their shop name without also choosing one. A handle,
-        // once set, still can never be blanked back out.
-        if (encPayoutId.length != 0) m.encPayoutId = encPayoutId;
-        m.shopName = shopName;
-        // Editable for the same reason shopName is. It is REQUIRED at
-        // registration, so without this a merchant who mistyped their sector
-        // was stuck with it permanently and could not blank it either — an
-        // asymmetry with shopName that had no justification.
+        // once set, still can never be blanked back out (keepEmptyPayout).
+        //
+        // The sector is editable for the same reason shopName is. It is
+        // REQUIRED at registration, so without this a merchant who mistyped
+        // their sector was stuck with it permanently and could not blank it
+        // either — an asymmetry with shopName that had no justification.
         MerchantRegistryLib.validateSector(businessSector);
-        m.businessSector = businessSector;
+        MerchantRegistryLib.writeProfile(m, encPayoutId, shopName, businessSector, true);
         emit MerchantProfileUpdated(msg.sender, shopName);
     }
 
@@ -844,8 +925,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         _checkLengths(encPayoutId, shopName);
         // Field validation (canonical currency form, sector present) lives in
         // MerchantRegistryLib — pure, no state, and out of the integrator's
-        // bytecode, which is at the EIP-170 ceiling. The storage writes stay
-        // here so nothing about custody moves.
+        // bytecode, which is at the EIP-170 ceiling. So does the copy of the
+        // profile fields into storage (writeProfile, for size); everything
+        // about custody, and every check, stays here.
         MerchantRegistryLib.validateRegistration(currency, businessSector);
 
         MerchantTypes.Merchant storage m = merchants[msg.sender];
@@ -861,10 +943,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // there means they cannot withdraw until they do, which is the real
         // constraint. `updateProfile` still rejects an empty value, so this can
         // be filled in later but never blanked back out.
-        m.encPayoutId = encPayoutId;
-        m.shopName = shopName;
+        MerchantRegistryLib.writeProfile(m, encPayoutId, shopName, businessSector, false);
         m.currency = currency;
-        m.businessSector = businessSector;
         registered[msg.sender] = true;
         emit MerchantRegistered(msg.sender, shopName, currency, businessSector);
     }
@@ -930,6 +1010,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             if (_sellPlacement) return true;
             subject = proxyOwner;
         }
+        // Every BUY, POS or link: p2p.me's blacklist, which the Diamond does
+        // not apply to integrator orders. Withdrawals (SELL) returned above.
+        MerchantRegistryLib.revertIfBlacklisted(diamond, user, subject);
         // Link BUYs take a PENDING reservation instead of a counted slot: a link
         // order is placed the moment a visitor opens the pay page, and counting
         // it then let abandoned taps lock the merchant out of their own counter
@@ -950,12 +1033,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (amount > perTxCap(m.currency)) revert ExceedsPerTxCap();
 
         _rollDay(m);
+        // The merchant's own limit if a MANAGER set one, else the global one.
+        uint256 limit = _dailyLimitOf(subject);
         if (isLinkOrder) {
             // Reserve against the day's room; counted at mark-paid.
-            PaymentLinksLib.reservePending(linkPending, subject, m.dailyTxCount, dailyLimit);
+            PaymentLinksLib.reservePending(linkPending, subject, m.dailyTxCount, limit);
             return true;
         }
-        if (m.dailyTxCount >= dailyLimit) revert DailyLimitReached();
+        if (m.dailyTxCount >= limit) revert DailyLimitReached();
         m.dailyTxCount++;
         return true;
     }
@@ -1054,8 +1139,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // absent and unable to see why. The strike taken in relayerMarkPaid is
         // deliberately NOT released here: a marked-then-cancelled order is
         // exactly the false claim the counter exists to record.
+        //
+        // Only for a link order the customer never marked paid (its placement day
+        // still carries LINK_PENDING). A marked-paid one may be disputed and come
+        // back COMPLETED, so it keeps its use and its order→link binding: a won
+        // dispute then completes it through onOrderComplete (the use stays
+        // counted, the strike is released), and releaseLinkClaim gives the use
+        // back once the dispute window has passed. Releasing it here let a
+        // single-use link be paid twice while a dispute was open (review #118, 3).
         bytes32 linkId = orderToLink[orderId];
-        if (linkId != bytes32(0)) {
+        if (linkId != bytes32(0) && orderPlacementDay[orderId] & LINK_PENDING != 0) {
             PaymentLinksLib.PaymentLink storage cl = links[linkId];
             if (cl.uses != 0) cl.uses--;
             delete orderToLink[orderId];
@@ -1381,7 +1474,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function _relayForward(bytes32 linkId, uint256 orderId, bytes memory data) internal {
         if (msg.sender != trustedRelayer) revert OnlyTrustedRelayer();
         if (linkId == bytes32(0) || orderToLink[orderId] != linkId) revert LinkNotFound();
-        UserProxy(proxyAddress(links[linkId].owner)).execute(diamond, data, address(usdc), 0);
+        _viaProxy(links[linkId].owner, data);
+    }
+
+    /// @dev Calls the Diamond as `merchant`'s proxy — the `order.user` of every
+    ///      link order of theirs, and the only caller the Diamond accepts for it.
+    function _viaProxy(address merchant, bytes memory data) internal {
+        LinkDisputeLib.callDiamond(proxyAddress(merchant), diamond, address(usdc), data);
     }
 
     /// @notice Cancel a link order, on the absent merchant's behalf.
@@ -1407,6 +1506,111 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (!linkOrdersEnabled) revert LinkOrdersDisabled();
         _relayForward(linkId, orderId, abi.encodeCall(IOrderFlow.cancelOrder, (orderId)));
         emit LinkOrderCancelled(linkId, orderId);
+    }
+
+    /// @notice Raise, or appeal, the Diamond's dispute on a link order — the one
+    ///         dispute entry point, for both the customer and the merchant.
+    ///         (p2p.me's dispute ladder: circle -> country admin -> operations;
+    ///         an appeal moves a raised dispute up one tier.)
+    /// @param linkId The order's link — read only when the Router calls.
+    /// @param redactTransId Raise only: the last 4 digits of the customer's
+    ///        bank transfer. Ignored for an appeal.
+    /// @param appeal False to raise the dispute, true to appeal it.
+    /// @dev One function, not three, to keep the integrator under EIP-170.
+    ///
+    ///      WHO
+    ///        - The Router (`trustedRelayer`) acts for `linkId`'s owner, after
+    ///          checking the order's own customer signed it (LinkRouter.dispute
+    ///          / LinkRouter.appeal).
+    ///        - Any other caller acts as ITSELF, through its own proxy, so
+    ///          `linkId` is ignored and another merchant's order reverts on the
+    ///          Diamond. A frozen merchant cannot.
+    ///      The Diamond accepts both calls only from `order.user`, which for a
+    ///      link order is the merchant's proxy: this is the one route to it.
+    ///
+    ///      Not `_relayForward`: a dispute is for a CANCELLED order, and
+    ///      cancellation deletes `orderToLink`. The Router's own record matches
+    ///      order and link instead, and the Diamond refuses any proxy but the
+    ///      order's own.
+    ///
+    ///      A merchant RAISE only from MERCHANT_DISPUTE_DELAY after placement:
+    ///      the Diamond takes one dispute per order, and the customer — who can
+    ///      file from 15 min — must not lose theirs to a merchant filing first
+    ///      with other digits (review #118, finding 2). No delay on an appeal:
+    ///      it does not use up the order's one dispute.
+    ///
+    ///      Like mark-paid, neither paused nor kill-switch gated: it protects a
+    ///      customer who paid. Link orders only (withdrawals refused). The Diamond
+    ///      enforces the rest (cancelled after being marked paid, 15 min to 24 h
+    ///      after placement; an appeal only while one is due, never past tier 3).
+    ///      No event of its own: the Diamond records and emits it, and the Router
+    ///      emits `OrderDisputed` / `OrderAppealed`.
+    function linkDispute(
+        bytes32 linkId,
+        uint256 orderId,
+        uint256 redactTransId,
+        bool appeal
+    ) external nonReentrant {
+        address merchant = msg.sender;
+        if (merchant == trustedRelayer) {
+            merchant = links[linkId].owner;
+            if (merchant == address(0)) revert LinkNotFound();
+        } else {
+            if (merchants[merchant].isFrozen) revert MerchantIsFrozen();
+            if (
+                !appeal &&
+                block.timestamp < _diamondOrder(orderId).placedTimestamp + MERCHANT_DISPUTE_DELAY
+            ) revert DisputeTooEarly();
+        }
+        // Link orders only. A fiat withdrawal (SELL) is also owned by the
+        // merchant's proxy, and the Diamond would accept a dispute on it — but a
+        // won one refunds to the proxy with no path back to the merchant
+        // (review #118, finding 1). Withdrawal records are never deleted.
+        if (withdrawals[orderId].merchant != address(0)) revert NotALinkOrder();
+        _viaProxy(
+            merchant,
+            appeal
+                ? abi.encodeCall(IOrderFlow.appealDispute, (orderId))
+                : abi.encodeCall(IOrderFlow.raiseDispute, (orderId, redactTransId))
+        );
+    }
+
+    /// @notice Give back the link use a paid-then-cancelled order still holds,
+    ///         once that order can no longer be disputed: it is CANCELLED, p2p.me's
+    ///         dispute window has passed, and no dispute is open on it.
+    /// @dev Permissionless: it frees only what the rules already say is free. A
+    ///      won dispute never reaches here — it completes the order, and
+    ///      onOrderComplete clears the binding with the use still counted.
+    ///      The relayer's housekeeping calls it once a judged order stays
+    ///      cancelled, finalizing a lost dispute on the Diamond first (a USER
+    ///      ruling keeps the dispute RAISED until finalized).
+    ///
+    ///      KNOWN EDGE (review #118, round 2): p2p.me's admin can reopen a
+    ///      cancelled order with no time limit. A reopen AFTER this release
+    ///      completes the order with the binding already gone, so the merchant
+    ///      is credited but the link reads one use fewer and keeps the strike:
+    ///      a single-use link could take one more payment. It needs a manual
+    ///      admin action past p2p.me's window; support corrects the link (revoke
+    ///      and recreate) when it happens. Likewise a dispute nobody ever
+    ///      settles keeps holding the use; the merchant can revoke the link.
+    function releaseLinkClaim(uint256 orderId) external {
+        bytes32 linkId = orderToLink[orderId];
+        if (linkId == bytes32(0)) revert LinkNotFound();
+        IOrderFlow.OrderView memory o = _diamondOrder(orderId);
+        if (
+            o.status != STATUS_CANCELLED ||
+            block.timestamp < o.placedTimestamp + DISPUTE_WINDOW ||
+            o.disputeInfo.status == DISPUTE_OPEN
+        ) revert ClaimStillDisputable();
+        PaymentLinksLib.PaymentLink storage cl = links[linkId];
+        if (cl.uses != 0) cl.uses--;
+        delete orderToLink[orderId];
+    }
+
+    /// @dev The Diamond's record of `orderId`. One call site for every read of
+    ///      it: each inline external call carries its own encode/decode code.
+    function _diamondOrder(uint256 orderId) private view returns (IOrderFlow.OrderView memory) {
+        return IOrderFlow(diamond).getOrdersById(orderId);
     }
 
     /// @notice Whether a link can be paid right now — the pay page's precheck.
@@ -1630,7 +1834,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // `feeAdvanced`, so reconcile could only ever re-credit one of them),
         // relying solely on the Diamond to reject the stale setSellOrderUpi.
         // Enforce it here instead of trusting the facet's internal state checks.
-        uint8 preStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
+        uint8 preStatus = _diamondOrder(orderId).status;
         if (preStatus != STATUS_ACCEPTED) revert WithdrawalNotDeliverable();
 
         // CEI: set the replay flag before the external call; a revert rolls it
@@ -1680,7 +1884,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // Diamond actually moved the order to PAID. If it auto-cancelled, roll the
         // latch back so reconcileWithdrawal can make the merchant whole and the
         // event stream never reports a delivery that didn't happen.
-        uint8 postStatus = IOrderFlow(diamond).getOrdersById(orderId).status;
+        uint8 postStatus = _diamondOrder(orderId).status;
         // COMPLETED counts as delivered too: a Diamond that settles in the same
         // call has certainly delivered, and treating it as "moved nothing"
         // (the M-2 revert below) would make the withdrawal undeliverable
@@ -1744,7 +1948,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
 
-        IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
+        IOrderFlow.OrderView memory order = _diamondOrder(orderId);
         if (order.status != STATUS_CANCELLED) revert WithdrawalNotCancellable();
         // Refuse on any recorded dispute — a disputed order may have had fiat
         // delivered; leave those to off-chain/admin resolution.
@@ -1797,7 +2001,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
-        uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
+        uint8 status = _diamondOrder(orderId).status;
         if (status != STATUS_COMPLETED) revert WithdrawalNotCancellable();
         w.settled = true;
         MerchantTypes.Merchant storage m = merchants[w.merchant];
@@ -1853,7 +2057,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         // The Diamond must report this BUY COMPLETED — proof it really sent the
         // funds and finalised. Anything else is not a stranded-completion case.
-        IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
+        IOrderFlow.OrderView memory order = _diamondOrder(orderId);
         if (order.status != STATUS_COMPLETED) revert WithdrawalNotCancellable();
 
         MerchantTypes.Merchant storage m = merchants[merchant];
@@ -2159,6 +2363,39 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         emit DailyLimitSet(newLimit);
     }
 
+    /// @notice Give one merchant their own daily order limit, or clear it
+    ///         (limit = 0) so they follow the global `dailyLimit` again. Same
+    ///         tier as the global limit, inside [minDaily, merchantDailyCeiling]:
+    ///         a MANAGER can move it but never past the ceiling the owners set.
+    ///         Applies from the next order. The library emits
+    ///         `MerchantDailyLimitSet(merchant, limit)`.
+    function setMerchantDailyLimit(
+        address merchant,
+        uint256 limit
+    ) external onlyRole(Role.MANAGER) {
+        MerchantRegistryLib.setMerchantDailyLimit(
+            merchantDailyLimit,
+            limitBounds,
+            merchantDailyCeiling,
+            merchant,
+            limit
+        );
+    }
+
+    /// @notice Owners and the super-admin: set the ceiling for merchants' own
+    ///         daily limits. Any owner may LOWER it — it applies to every own
+    ///         limit at once — but only the super-admin may RAISE it
+    ///         (RaiseNeedsSuperAdmin), the same rule as setLimitBounds. Never below
+    ///         minDaily. Emits `MerchantDailyCeilingSet(ceiling)`.
+    function setMerchantDailyCeiling(uint256 ceiling) external onlyOwner {
+        merchantDailyCeiling = MerchantRegistryLib.setMerchantCeiling(
+            limitBounds,
+            merchantDailyCeiling,
+            ceiling,
+            msg.sender == superAdmin
+        );
+    }
+
     /// @notice Owners and the super-admin: set the range the limits must stay
     ///         within (review #4). Any owner may LOWER a max; only the
     ///         super-admin may RAISE one (RaiseNeedsSuperAdmin), so no single
@@ -2427,7 +2664,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (w.settled) revert WithdrawalAlreadySettled();
 
         // Only for orders the Diamond clawed back — never a completed payout.
-        uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
+        uint8 status = _diamondOrder(orderId).status;
         if (status != STATUS_CANCELLED) revert WithdrawalNotCancellable();
 
         w.settled = true;
@@ -2631,7 +2868,19 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         MerchantTypes.Merchant storage m = merchants[merchant];
         uint256 today = block.timestamp / 86400;
         usedToday = m.lastTxDate == today ? m.dailyTxCount : 0;
-        return (usedToday, dailyLimit);
+        return (usedToday, _dailyLimitOf(merchant));
+    }
+
+    /// @dev The daily order limit that applies to `merchant` (MerchantRegistryLib).
+    function _dailyLimitOf(address merchant) private view returns (uint256) {
+        return
+            MerchantRegistryLib.dailyLimitOf(
+                merchantDailyLimit,
+                limitBounds,
+                merchantDailyCeiling,
+                merchant,
+                dailyLimit
+            );
     }
 
     /// @notice The merchant's offramp currency as a readable code ("INR",

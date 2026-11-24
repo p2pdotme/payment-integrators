@@ -6,7 +6,7 @@ pragma solidity ^0.8.28;
  * @notice The payment-link surface of `MerchantTerminalIntegrator` that
  *         `LinkRouter` speaks to.
  *
- *         Only the three relayer entry points and the two link views are
+ *         Only the four relayer entry points and the link view are
  *         declared. The Router deliberately has no way to name anything else on
  *         the integrator — no withdrawal, no profile edit, no admin — so this
  *         interface IS the Router's maximum reach into custody code.
@@ -32,6 +32,17 @@ interface IMerchantTerminalLinks {
 
     /// @notice Cancel a link order. Same relayer gate.
     function relayerCancelOrder(bytes32 linkId, uint256 orderId) external;
+
+    /// @notice Raise (`appeal` false) or appeal (`appeal` true) the Diamond's
+    ///         dispute on a link order. From the Router (relayer gate) it acts
+    ///         for `linkId`'s owner; any other caller acts as itself, on its own
+    ///         link orders. `redactTransId` is used by a raise only.
+    function linkDispute(
+        bytes32 linkId,
+        uint256 orderId,
+        uint256 redactTransId,
+        bool appeal
+    ) external;
 
     /// @notice Full link record. The Router uses `owner` to authorise
     ///         registration, and `status`/`uses` for nothing — every link rule

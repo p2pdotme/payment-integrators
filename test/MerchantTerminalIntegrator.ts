@@ -465,6 +465,157 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     );
   });
 
+  describe("3d. a merchant's own daily limit (setMerchantDailyLimit)", function () {
+    const fill = async (who: string, n: number) => {
+      const diamond = await diamondSigner();
+      for (let i = 0; i < n; i++)
+        await integrator.connect(diamond).validateOrder(who, UNIT_PRICE, INR);
+    };
+    const nextOrder = async (who: string) => {
+      const diamond = await diamondSigner();
+      return integrator.connect(diamond).validateOrder(who, UNIT_PRICE, INR);
+    };
+
+    beforeEach(async function () {
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE, SECTOR);
+      await integrator.connect(merchant2).registerMerchant(UPI_2, "Shop Two", INR_CODE, SECTOR);
+    });
+
+    it("lets one merchant go past the global limit while everyone else stays on it", async function () {
+      await integrator.setLimitBounds(1, 1000, USDC(1), USDC(100));
+      await integrator.setDailyLimit(3);
+      await expect(integrator.setMerchantDailyLimit(merchant1.address, 5))
+        .to.emit(integrator, "MerchantDailyLimitSet")
+        .withArgs(merchant1.address, 5);
+      expect(await integrator.merchantDailyLimit(merchant1.address)).to.equal(5n);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(5n);
+      expect((await integrator.getDailyTxInfo(merchant2.address))[1]).to.equal(3n);
+
+      await fill(merchant1.address, 5);
+      await expect(nextOrder(merchant1.address)).to.be.revertedWithCustomError(
+        integrator,
+        "DailyLimitReached"
+      );
+      await fill(merchant2.address, 3);
+      await expect(nextOrder(merchant2.address)).to.be.revertedWithCustomError(
+        integrator,
+        "DailyLimitReached"
+      );
+    });
+
+    it("can also hold one merchant below the global limit", async function () {
+      await integrator.setMerchantDailyLimit(merchant1.address, 1);
+      await fill(merchant1.address, 1);
+      await expect(nextOrder(merchant1.address)).to.be.revertedWithCustomError(
+        integrator,
+        "DailyLimitReached"
+      );
+      await fill(merchant2.address, 2); // global 25: unaffected
+    });
+
+    it("0 clears it: the merchant follows the global limit again, including later changes", async function () {
+      await integrator.setMerchantDailyLimit(merchant1.address, 2);
+      await integrator.setMerchantDailyLimit(merchant1.address, 0);
+      expect(await integrator.merchantDailyLimit(merchant1.address)).to.equal(0n);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(25n);
+      await integrator.setDailyLimit(4);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(4n);
+    });
+
+    it("must stay under the owners' per-merchant ceiling; lowering it pulls every own limit in at once", async function () {
+      expect(await integrator.merchantDailyCeiling()).to.equal(25n); // starts at DAILY_TX_LIMIT
+      await expect(
+        integrator.setMerchantDailyLimit(merchant1.address, 26)
+      ).to.be.revertedWithCustomError(integrator, "LimitOutOfBounds");
+      await expect(integrator.setMerchantDailyCeiling(100))
+        .to.emit(integrator, "MerchantDailyCeilingSet")
+        .withArgs(100);
+      await integrator.setMerchantDailyLimit(merchant1.address, 80);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(80n);
+      // An owner lowers the ceiling in an emergency: the merchant's own limit
+      // obeys it straight away, with no admin having to find and reset it.
+      await integrator.setMerchantDailyCeiling(10);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(10n);
+      await fill(merchant1.address, 10);
+      await expect(nextOrder(merchant1.address)).to.be.revertedWithCustomError(
+        integrator,
+        "DailyLimitReached"
+      );
+      // …and raising the minimum lifts a too-low one the same way.
+      await integrator.setMerchantDailyLimit(merchant2.address, 2);
+      await integrator.setLimitBounds(5, 25, USDC(1), USDC(100));
+      expect((await integrator.getDailyTxInfo(merchant2.address))[1]).to.equal(5n);
+    });
+
+    it("review round 3, note 1: one merchant above the global maximum does not widen the global range", async function () {
+      await integrator.setMerchantDailyCeiling(100); // the super-admin (owner) raises it
+      await integrator.setRole(attacker.address, 3); // a MANAGER
+      await integrator.connect(attacker).setMerchantDailyLimit(merchant1.address, 100);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(100n);
+      // The global limit, and every other merchant, still stop at maxDaily (25).
+      await expect(integrator.connect(attacker).setDailyLimit(100)).to.be.revertedWithCustomError(
+        integrator,
+        "LimitOutOfBounds"
+      );
+      expect((await integrator.getDailyTxInfo(merchant2.address))[1]).to.equal(25n);
+      expect((await integrator.limitBounds())[1]).to.equal(25n);
+    });
+
+    it("only the super-admin raises the ceiling; any owner lowers it; never below minDaily", async function () {
+      await integrator.addOwner(attacker.address); // an owner, not the super-admin
+      await expect(
+        integrator.connect(attacker).setMerchantDailyCeiling(30)
+      ).to.be.revertedWithCustomError(integrator, "RaiseNeedsSuperAdmin");
+      await integrator.connect(attacker).setMerchantDailyCeiling(20);
+      expect(await integrator.merchantDailyCeiling()).to.equal(20n);
+      await expect(
+        integrator.connect(merchant1).setMerchantDailyCeiling(10)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      await integrator.setLimitBounds(5, 25, USDC(1), USDC(100));
+      await expect(integrator.setMerchantDailyCeiling(4)).to.be.revertedWithCustomError(
+        integrator,
+        "LimitOutOfBounds"
+      );
+    });
+
+    it("MANAGER and above only, and never the zero address", async function () {
+      await expect(
+        integrator.connect(attacker).setMerchantDailyLimit(merchant1.address, 5)
+      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await integrator.setRole(attacker.address, 2); // SUPPORT: can freeze, not set limits
+      await expect(
+        integrator.connect(attacker).setMerchantDailyLimit(merchant1.address, 5)
+      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await integrator.setRole(attacker.address, 3); // MANAGER
+      await integrator.connect(attacker).setMerchantDailyLimit(merchant1.address, 5);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[1]).to.equal(5n);
+      // A merchant cannot set their own.
+      await expect(
+        integrator.connect(merchant1).setMerchantDailyLimit(merchant1.address, 20)
+      ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
+      await expect(
+        integrator.setMerchantDailyLimit(ethers.ZeroAddress, 5)
+      ).to.be.revertedWithCustomError(integrator, "InvalidMerchant");
+    });
+
+    it("profile writes still behave the same after moving into the library", async function () {
+      // Registration stored the handle, name and sector…
+      const before = await integrator.merchants(merchant1.address);
+      expect(before.encPayoutId).to.equal(UPI_1);
+      expect(before.shopName).to.equal("Shop One");
+      // …an edit with an EMPTY handle keeps the old one, and changes the rest.
+      const OTHER = ethers.encodeBytes32String("Food");
+      await integrator.connect(merchant1).updateProfile("0x", "Renamed", OTHER);
+      const after = await integrator.merchants(merchant1.address);
+      expect(after.encPayoutId).to.equal(UPI_1);
+      expect(after.shopName).to.equal("Renamed");
+      expect(after.businessSector).to.equal(OTHER);
+      // …and a new handle replaces it.
+      await integrator.connect(merchant1).updateProfile(UPI_2, "Renamed", OTHER);
+      expect((await integrator.merchants(merchant1.address)).encPayoutId).to.equal(UPI_2);
+    });
+  });
+
   it("4. validateOrder reverts on the 26th transaction in the same day (25/day limit)", async function () {
     await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE, SECTOR);
     const diamond = await diamondSigner();

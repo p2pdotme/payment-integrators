@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import { MerchantTypes } from "./MerchantTypes.sol";
+import { IReputationManager, IReputationManagerGetter } from "../../interfaces/IReputationManager.sol";
 
 /**
  * @title MerchantRegistryLib
@@ -32,14 +33,21 @@ library MerchantRegistryLib {
     /// @dev Only the super-admin may raise a maximum. One stolen or careless
     ///      admin key must never be able to lift the ceiling on its own.
     error RaiseNeedsSuperAdmin();
+    error InvalidMerchant();
+    error UserBlacklisted(address user);
 
     event PerTxCapSet(bytes32 indexed currency, uint256 cap);
+    /// @dev limit 0 = cleared: the merchant follows the global `dailyLimit`.
+    event MerchantDailyLimitSet(address indexed merchant, uint256 limit);
+    /// @dev The ceiling every merchant's own daily limit must stay under.
+    event MerchantDailyCeilingSet(uint256 ceiling);
     event LimitBoundsSet(uint256 minDaily, uint256 maxDaily, uint256 minCap, uint256 maxCap);
 
     // ─── Merchant limits and their range (PR #108 review #4) ──────────
     //
     // Owners and the super-admin set a [min, max] range (setBounds); MANAGER
-    // admins and above set the limits inside it (setPerTxCap, checkDailyLimit).
+    // admins and above set the limits inside it (setPerTxCap, checkDailyLimit,
+    // setMerchantDailyLimit).
     // Any owner may LOWER a maximum — the safe direction, and fast in an
     // emergency — but only the super-admin may RAISE one. FINANCE admins do
     // not set the range at all: raising it is a risk decision, not money
@@ -81,6 +89,61 @@ library MerchantRegistryLib {
     ///         at least 1, so a 0 limit (which would block every order) never passes.
     function checkDailyLimit(MerchantTypes.LimitBounds storage b, uint256 limit) public view {
         if (limit < b.minDaily || limit > b.maxDaily) revert LimitOutOfBounds();
+    }
+
+    /// @notice Give one merchant their own daily order limit (limit > 0), or
+    ///         clear it (0) so they follow the global `dailyLimit` again. A set
+    ///         limit must be inside [minDaily, ceiling]: a MANAGER can move a
+    ///         merchant's limit but never past the ceiling the owners set.
+    /// @param ceiling The per-merchant ceiling (`merchantDailyCeiling`), its OWN
+    ///        maximum, apart from `maxDaily` (the contract PR's review, round 3,
+    ///        note 1): one merchant can be given more than the global maximum
+    ///        without widening the global limit's range for every MANAGER.
+    function setMerchantDailyLimit(
+        mapping(address => uint256) storage overrides,
+        MerchantTypes.LimitBounds storage b,
+        uint256 ceiling,
+        address merchant,
+        uint256 limit
+    ) public {
+        if (merchant == address(0)) revert InvalidMerchant();
+        if (limit != 0 && (limit < b.minDaily || limit > ceiling)) revert LimitOutOfBounds();
+        overrides[merchant] = limit;
+        emit MerchantDailyLimitSet(merchant, limit);
+    }
+
+    /// @notice `merchant`'s daily order limit: their own if one is set, else the
+    ///         global limit. An own limit is pulled inside [minDaily, ceiling] on
+    ///         read, so an owner lowering the ceiling in an emergency (or raising
+    ///         minDaily) takes effect at once for every merchant.
+    function dailyLimitOf(
+        mapping(address => uint256) storage overrides,
+        MerchantTypes.LimitBounds storage b,
+        uint256 ceiling,
+        address merchant,
+        uint256 globalLimit
+    ) public view returns (uint256 limit) {
+        limit = overrides[merchant];
+        if (limit == 0) return globalLimit;
+        if (limit > ceiling) limit = ceiling;
+        if (limit < b.minDaily) limit = b.minDaily;
+    }
+
+    /// @notice Validate a new per-merchant ceiling and return it (the caller
+    ///         stores it). The same rule as the limits' range (setBounds): any
+    ///         owner may LOWER it, only the super-admin may RAISE it, so no single
+    ///         admin key can lift what one merchant may take in a day. Never
+    ///         below minDaily.
+    function setMerchantCeiling(
+        MerchantTypes.LimitBounds storage b,
+        uint256 current,
+        uint256 ceiling,
+        bool callerIsSuperAdmin
+    ) public returns (uint256) {
+        if (ceiling < b.minDaily || ceiling > type(uint64).max) revert LimitOutOfBounds();
+        if (ceiling > current && !callerIsSuperAdmin) revert RaiseNeedsSuperAdmin();
+        emit MerchantDailyCeilingSet(ceiling);
+        return ceiling;
     }
 
     /// @notice Set the range, and return `dailyLimit` pulled inside it (the
@@ -204,6 +267,31 @@ library MerchantRegistryLib {
      *      contract that had 61 bytes of headroom. 31 characters covers every
      *      real label, and fromCurrency already decodes it for display.
      */
+    /**
+     * @notice Write a merchant's profile — payout handle, shop name, sector —
+     *         for registration and profile edits, after the integrator has
+     *         checked who may and validated the fields.
+     * @param keepEmptyPayout True for a profile edit: an empty handle keeps the
+     *        current one (a handle, once set, can never be blanked). False at
+     *        registration, where the handle is optional and stored as given.
+     * @dev Here rather than in the integrator for size only: the bytes/string
+     *      storage copy is one of its larger routines and these are its only two
+     *      callers. Reached by DELEGATECALL, so it writes the integrator's own
+     *      `merchants[...]` record exactly as the inline code did. No funds and
+     *      no checks move — only these three assignments.
+     */
+    function writeProfile(
+        MerchantTypes.Merchant storage m,
+        bytes calldata encPayoutId,
+        string calldata shopName,
+        bytes32 businessSector,
+        bool keepEmptyPayout
+    ) public {
+        if (!keepEmptyPayout || encPayoutId.length != 0) m.encPayoutId = encPayoutId;
+        m.shopName = shopName;
+        m.businessSector = businessSector;
+    }
+
     function validateSector(bytes32 businessSector) public pure {
         if (businessSector == bytes32(0)) revert BusinessSectorRequired();
         bool sectorNul = false;
@@ -213,6 +301,38 @@ library MerchantRegistryLib {
             } else if (sectorNul) {
                 revert BusinessSectorRequired();
             }
+        }
+    }
+
+    /// @dev p2p.me's user blacklist, for `validateOrder`. The Diamond checks
+    ///      it before a consumer BUY but skips it for integrator orders ("the
+    ///      integrator owns those checks via validateOrder",
+    ///      OrderFlowFacet.placeOrderForB2B), so without this a wallet p2p.me
+    ///      has blacklisted could keep buying through the integrator. It reads
+    ///      the record the Diamond reads (libOrderProcessorFacet.isUserBlacklisted),
+    ///      live, so a blacklisting or a lift on p2p.me applies from the next
+    ///      order. Here rather than inline for the integrator's EIP-170 ceiling.
+    ///
+    ///      `user` is order.user: the merchant for a POS sale, the merchant's
+    ///      proxy for a link order. Both it and `merchant` are checked.
+    ///
+    ///      A Diamond without the getter (Base Sepolia today) or with no
+    ///      ReputationManager set has no blacklist to apply: skipped. The catch
+    ///      cannot be forced by starving the getter of gas: it needs a few
+    ///      thousand, and the 1/64 left after it could not pay for the
+    ///      placement that follows. A ReputationManager that is set but does
+    ///      not answer stops the order, as it stops p2p.me's own BUYs.
+    function revertIfBlacklisted(address diamond, address user, address merchant) public view {
+        address rm;
+        try IReputationManagerGetter(diamond).getReputationManager() returns (address r) {
+            rm = r;
+        } catch {
+            return;
+        }
+        if (rm == address(0)) return;
+        if (IReputationManager(rm).rmusers(user).isBlacklisted) revert UserBlacklisted(user);
+        if (merchant != user && IReputationManager(rm).rmusers(merchant).isBlacklisted) {
+            revert UserBlacklisted(merchant);
         }
     }
 }
