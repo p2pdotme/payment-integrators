@@ -192,6 +192,29 @@ contract MockDiamond {
         forceOrderId = id;
     }
 
+    /* ── p2p.me's user blacklist (GetterFacet.getReputationManager) ───────
+     *
+     * Unset by default (address(0)): an integrator that reads the blacklist
+     * finds none, so existing suites are unaffected. `noReputationGetter`
+     * makes the getter revert the way a Diamond that does not route it does
+     * (Base Sepolia today).
+     */
+    address public reputationManager;
+    bool public noReputationGetter;
+
+    function setReputationManager(address rm) external {
+        reputationManager = rm;
+    }
+
+    function setNoReputationGetter(bool v) external {
+        noReputationGetter = v;
+    }
+
+    function getReputationManager() external view returns (address) {
+        require(!noReputationGetter, "Diamond: Function does not exist");
+        return reputationManager;
+    }
+
     function placeB2BOrder(
         address user,
         uint256 amount,

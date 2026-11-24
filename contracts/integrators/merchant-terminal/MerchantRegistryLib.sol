@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import { MerchantTypes } from "./MerchantTypes.sol";
+import { IReputationManager, IReputationManagerGetter } from "../../interfaces/IReputationManager.sol";
 
 /**
  * @title MerchantRegistryLib
@@ -33,6 +34,7 @@ library MerchantRegistryLib {
     ///      admin key must never be able to lift the ceiling on its own.
     error RaiseNeedsSuperAdmin();
     error InvalidMerchant();
+    error UserBlacklisted(address user);
 
     event PerTxCapSet(bytes32 indexed currency, uint256 cap);
     /// @dev limit 0 = cleared: the merchant follows the global `dailyLimit`.
@@ -299,6 +301,38 @@ library MerchantRegistryLib {
             } else if (sectorNul) {
                 revert BusinessSectorRequired();
             }
+        }
+    }
+
+    /// @dev p2p.me's user blacklist, for `validateOrder`. The Diamond checks
+    ///      it before a consumer BUY but skips it for integrator orders ("the
+    ///      integrator owns those checks via validateOrder",
+    ///      OrderFlowFacet.placeOrderForB2B), so without this a wallet p2p.me
+    ///      has blacklisted could keep buying through the integrator. It reads
+    ///      the record the Diamond reads (libOrderProcessorFacet.isUserBlacklisted),
+    ///      live, so a blacklisting or a lift on p2p.me applies from the next
+    ///      order. Here rather than inline for the integrator's EIP-170 ceiling.
+    ///
+    ///      `user` is order.user: the merchant for a POS sale, the merchant's
+    ///      proxy for a link order. Both it and `merchant` are checked.
+    ///
+    ///      A Diamond without the getter (Base Sepolia today) or with no
+    ///      ReputationManager set has no blacklist to apply: skipped. The catch
+    ///      cannot be forced by starving the getter of gas: it needs a few
+    ///      thousand, and the 1/64 left after it could not pay for the
+    ///      placement that follows. A ReputationManager that is set but does
+    ///      not answer stops the order, as it stops p2p.me's own BUYs.
+    function revertIfBlacklisted(address diamond, address user, address merchant) public view {
+        address rm;
+        try IReputationManagerGetter(diamond).getReputationManager() returns (address r) {
+            rm = r;
+        } catch {
+            return;
+        }
+        if (rm == address(0)) return;
+        if (IReputationManager(rm).rmusers(user).isBlacklisted) revert UserBlacklisted(user);
+        if (merchant != user && IReputationManager(rm).rmusers(merchant).isBlacklisted) {
+            revert UserBlacklisted(merchant);
         }
     }
 }

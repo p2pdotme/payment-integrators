@@ -85,6 +85,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      identifier namespace and the event MerchantFrozen keeps the
     ///      canonical name (the backend indexes events).
     error MerchantIsFrozen();
+    /// @dev p2p.me has blacklisted `user` (the merchant, or the merchant's
+    ///      proxy for a link order): it may not buy here, as it may not buy on
+    ///      p2p.me. Raised in MerchantRegistryLib.revertIfBlacklisted.
+    error UserBlacklisted(address user);
     error ExceedsPerTxCap();
     error DailyLimitReached();
     error InsufficientAvailableBalance();
@@ -1006,6 +1010,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             if (_sellPlacement) return true;
             subject = proxyOwner;
         }
+        // Every BUY, POS or link: p2p.me's blacklist, which the Diamond does
+        // not apply to integrator orders. Withdrawals (SELL) returned above.
+        MerchantRegistryLib.revertIfBlacklisted(diamond, user, subject);
         // Link BUYs take a PENDING reservation instead of a counted slot: a link
         // order is placed the moment a visitor opens the pay page, and counting
         // it then let abandoned taps lock the merchant out of their own counter
