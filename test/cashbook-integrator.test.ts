@@ -460,16 +460,19 @@ describe("CashbookRampIntegrator", function () {
       await expect(deposit(alice, USDC(10))).to.not.emit(integrator, "UserProxyDeployed");
     });
 
-    it("someone with no account stays bound while money is pending here", async function () {
+    it("with no account, the latest deposit picks the currency; pending money counts to its floor", async function () {
       await integrator.setCircle(BRL, 2);
+      await diamond.setFloor(BRL, USDC(250));
       await deposit(alice, FLOOR);
       await settle(1);
-      await expect(deposit(alice, FLOOR, BRL)).to.be.revertedWithCustomError(
+      // pending FLOOR + 100 is under the BRL floor, so nothing changes
+      await expect(deposit(alice, USDC(100), BRL)).to.be.revertedWithCustomError(
         integrator,
-        "SeatCurrencyMismatch"
+        "BelowStakeFloor"
       );
-      await expect(deposit(alice, USDC(10))).to.not.be.reverted;
       expect(await integrator.currencyOf(alice.address)).to.equal(INR);
+      await expect(deposit(alice, USDC(150), BRL)).to.not.be.reverted;
+      expect(await integrator.currencyOf(alice.address)).to.equal(BRL);
     });
 
     it("a cancelled first deposit does not lock the currency", async function () {
@@ -503,6 +506,29 @@ describe("CashbookRampIntegrator", function () {
       const m = await diamond.getMerchantDetails(alice.address);
       expect(m.currency).to.equal(BRL);
       expect(m.stake).to.equal(USDC(250));
+      await holds([alice]);
+    });
+
+    it("a late delivery in the old currency lands with one more deposit in that currency", async function () {
+      await integrator.setCircle(BRL, 2);
+      await diamond.setFloor(BRL, USDC(250));
+      await deposit(alice, FLOOR); // 1: INR, still in flight
+      await deposit(alice, USDC(250), BRL); // 2: picks BRL
+      await diamond.connect(alice).cancelOrder(2);
+      await settle(1); // the INR deposit lands while BRL is picked
+      await expect(integrator.stakeDeposit(1)).to.be.revertedWithCustomError(
+        diamond,
+        "StakeAmountTooLow"
+      );
+      // a small INR deposit picks INR again; pending already meets the INR floor
+      await deposit(alice, USDC(10)); // 3, never paid
+      expect(await integrator.currencyOf(alice.address)).to.equal(INR);
+      await expect(integrator.stakeDeposit(1))
+        .to.emit(integrator, "DepositStaked")
+        .withArgs(1, alice.address, FLOOR, true);
+      const m = await diamond.getMerchantDetails(alice.address);
+      expect(m.currency).to.equal(INR);
+      expect(m.stake).to.equal(FLOOR);
       await holds([alice]);
     });
   });

@@ -27,9 +27,8 @@ pragma solidity ^0.8.28;
         stake once staked (the account's stake, plus what is pending, plus this
         deposit), or it reverts BelowStakeFloor: the Diamond's stake refuses
         anything less, and the USDC would wait here. Someone with no account
-        is bound to the currency of their deposits while any of it is pending
-        here; the account opens in it, whichever order id stakeDeposit is
-        called with. With nothing pending they may pick again.
+        opens it in the currency of their latest deposit, whichever order id
+        stakeDeposit is called with.
      2. The order completes. The Diamond sends the USDC here and calls
         onOrderComplete, which adds it to pendingStake[person]. If that hook
         never ran, anyone can call reconcileDelivery to do the same.
@@ -462,13 +461,14 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
             if (m.currency != currency) revert SeatCurrencyMismatch();
             if (diamond.getUnstakeRequested(msg.sender)) revert UnstakePending();
         } else {
-            /* Pending money opens the account in currencyOf, so it stays fixed
-               while any is here. With none, rebinding is safe: stakeDeposit reads
-               currencyOf at stake time and USDC carries no currency, so a late
-               delivery in the old currency still stakes (once the new floor is
-               met; until then it waits, and a further deposit tops it up). */
-            if (pendingStake[msg.sender] == 0) currencyOf[msg.sender] = currency;
-            else if (currencyOf[msg.sender] != currency) revert SeatCurrencyMismatch();
+            /* The latest deposit picks the currency the account opens in.
+               stakeDeposit reads currencyOf at stake time and USDC carries no
+               currency, so pending money stakes in whichever is picked last. It
+               is safe because the floor check below counts what is pending
+               against this currency, and every delivered deposit met its own
+               currency's floor: one more deposit in that currency always lets
+               the pending money stake. Only the person can change their own. */
+            currencyOf[msg.sender] = currency;
             if (circleOf[currency] == 0) revert CircleNotSet();
         }
         // m.stake is 0 with no account. Undelivered deposits do not count.
