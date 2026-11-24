@@ -302,9 +302,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         leave as that person's stake on the Diamond.
     mapping(address => uint256) public pendingStake;
     /// @notice The currency the account of someone with no account opens in:
-    ///         that of their deposits. Fixed while any of it is pending here; a
-    ///         deposit with nothing pending sets it again, so a cancelled first
-    ///         deposit does not lock it.
+    ///         that of their latest deposit.
     mapping(address => bytes32) public currencyOf;
 
     /// @notice Deposits and withdrawals placed per person per day, keyed by the
