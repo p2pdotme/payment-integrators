@@ -51,11 +51,16 @@ currency), `getStakeConfig` (the stake floor),
    the latest deposit picks the currency the account opens in, in that
    currency's circle (`circleOf`), and it must carry their **consent**: their
    signature over `diamond.registrationDigest(person, circleOf[currency],
-currency, "")`, checked before any order is placed (`ConsentInvalid`).
-   A smart account sends its inner ERC-1271 signature, never an ERC-6492
-   wrapper (the Diamond does not unwrap one). The consent is kept with its
-   circle (`consentOf`, `consentCircleOf`), so a later `setCircle` cannot void
-   it. An existing account sends `0x`.
+currency, "", deadline)`, checked before any order is placed (`ConsentInvalid`).
+   The deadline must be at least `MIN_CONSENT_LIFE` (7 days) away, so a buy
+   that settles through a dispute still stakes. A smart account sends its
+   inner ERC-1271 signature, never an ERC-6492 wrapper (the Diamond does not
+   unwrap one). The consent is kept with its circle and deadline
+   (`consentOf`, `consentCircleOf`, `consentDeadlineOf`), so a later
+   `setCircle` cannot void it. If a delivery still lands after the deadline,
+   `stakeDeposit` reverts `RegistrationExpired` and the money stays pending;
+   the person calls `renewConsent(deadline, consent)` (signed for today's
+   `circleOf`), which moves no money. An existing account sends `0, 0x`.
 2. **Delivered.** The order completes; the Diamond sends the USDC here and calls
    `onOrderComplete`, which adds it to `pendingStake[person]` and emits
    `DepositDelivered`. If the hook never ran, anyone can call

@@ -36,6 +36,7 @@ contract MockCashbookDiamond is MockDiamond {
 
     error NotActiveIntegrator();
     error RegistrationNotSigned();
+    error RegistrationExpired();
     error MerchantAlreadyRegistered();
     error MerchantNotRegistered();
     error StakeAmountTooLow();
@@ -135,7 +136,8 @@ contract MockCashbookDiamond is MockDiamond {
         address merchant,
         uint256 circleId,
         bytes32 currency,
-        string memory telegramId
+        string memory telegramId,
+        uint256 deadline
     ) public view returns (bytes32) {
         bytes32 domainSeparator = keccak256(
             abi.encode(
@@ -151,12 +153,13 @@ contract MockCashbookDiamond is MockDiamond {
         bytes32 structHash = keccak256(
             abi.encode(
                 keccak256(
-                    "RegisterFor(address merchant,uint256 circleId,bytes32 currency,string telegramId)"
+                    "RegisterFor(address merchant,uint256 circleId,bytes32 currency,string telegramId,uint256 deadline)"
                 ),
                 merchant,
                 circleId,
                 currency,
-                keccak256(bytes(telegramId))
+                keccak256(bytes(telegramId)),
+                deadline
             )
         );
         return keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
@@ -168,13 +171,15 @@ contract MockCashbookDiamond is MockDiamond {
         uint256 stakeAmount,
         string calldata telegramId,
         bytes32 currency,
+        uint256 deadline,
         bytes calldata signature
     ) external {
         _reenter();
+        if (block.timestamp > deadline) revert RegistrationExpired();
         if (
             !SignatureChecker.isValidSignatureNow(
                 merchant,
-                registrationDigest(merchant, circleId, currency, telegramId),
+                registrationDigest(merchant, circleId, currency, telegramId, deadline),
                 signature
             )
         ) revert RegistrationNotSigned();

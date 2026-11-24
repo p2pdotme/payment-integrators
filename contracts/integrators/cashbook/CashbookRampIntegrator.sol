@@ -37,12 +37,15 @@ pragma solidity ^0.8.28;
         registerFor if the account does not exist yet (in currencyOf and the
         circle the person signed for), stakeFor if it does.
    CONSENT: the Diamond opens an account only with the merchant's own
-   EIP-712 signature over (merchant, circle, currency, telegram id) —
-   contracts-v4 #518. With no account, depositFiat takes that signature,
-   checks it against the Diamond's registrationDigest before any money
-   moves (so a bad one can never strand a delivery), and keeps it with the
-   circle it names; stakeDeposit hands it to registerFor. The latest
-   deposit's signature wins, with its currency.
+   EIP-712 signature over (merchant, circle, currency, telegram id,
+   deadline) — contracts-v4 #518. With no account, depositFiat takes that
+   signature, checks it against the Diamond's registrationDigest before any
+   money moves (so a bad one can never strand a delivery), and keeps it with
+   the circle and deadline it names; stakeDeposit hands it to registerFor.
+   The latest deposit's signature wins, with its currency. The deadline must
+   be at least MIN_CONSENT_LIFE away, so a delivery that settles through a
+   dispute still stakes; if one ever lands after it, the person signs again
+   with renewConsent, which moves no money.
    Steps 2 and 3 must be two transactions. completeOrder holds the Diamond's
    shared reentrancy lock while it calls our hook, and registerFor/stakeFor
    take the same lock, so staking from inside the hook always reverts.
@@ -139,14 +142,16 @@ interface IP2PDiamond {
 
     /// @dev Opens `merchant`'s account and pulls the stake from msg.sender (us).
     ///      Anyone may call it with `merchant`'s EIP-712 signature over
-    ///      registrationDigest(merchant, circleId, currency, telegramId)
-    ///      (contracts-v4 #518); the Diamond checks `merchant`'s blacklist.
+    ///      registrationDigest(merchant, circleId, currency, telegramId, deadline)
+    ///      (contracts-v4 #518), until `deadline`; the Diamond checks
+    ///      `merchant`'s blacklist.
     function registerFor(
         address merchant,
         uint256 circleId,
         uint256 stakeAmount,
         string calldata telegramId,
         bytes32 currency,
+        uint256 deadline,
         bytes calldata signature
     ) external;
 
@@ -155,7 +160,8 @@ interface IP2PDiamond {
         address merchant,
         uint256 circleId,
         bytes32 currency,
-        string calldata telegramId
+        string calldata telegramId,
+        uint256 deadline
     ) external view returns (bytes32);
 
     /// @dev Adds to `merchant`'s existing account, pulling from msg.sender (us).
@@ -243,9 +249,12 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     error InsufficientFree();
     /// @notice An opening deposit in a currency with no cashbook circle set.
     error CircleNotSet();
-    /// @notice An opening deposit without the person's signature for the
-    ///         account it would open (registrationDigest, circleOf[currency]).
+    /// @notice An opening deposit (or renewConsent) without the person's
+    ///         signature for the account it would open (registrationDigest,
+    ///         circleOf[currency]), or with a deadline under MIN_CONSENT_LIFE.
     error ConsentInvalid();
+    /// @notice renewConsent: the caller has an account, or no consent kept here.
+    error NothingToRenew();
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -291,6 +300,13 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         deposits (the Diamond's per-seller daily count, which B2B
     ///         placement skips).
     uint256 public constant MAX_WITHDRAWALS_PER_DAY = 5;
+    /// @notice The shortest consent depositFiat and renewConsent accept. A buy
+    ///         can settle days after it is placed: the dispute window runs 24 h
+    ///         from placement, resolution takes up to 72 h (tier 2) and the
+    ///         appeal window adds 24 h by default (contracts-v4
+    ///         OrderProcessorFacet DISPUTE_WINDOW_BUY_END, DEFAULT_DISPUTE_SLA_TIER2,
+    ///         DEFAULT_DISPUTE_APPEAL_WINDOW), plus keeper lag.
+    uint256 public constant MIN_CONSENT_LIFE = 7 days;
 
     // ─── Immutables ───────────────────────────────────────────────────
 
@@ -326,10 +342,12 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     ///         that of their latest deposit.
     mapping(address => bytes32) public currencyOf;
     /// @notice With no account: the person's signature for registerFor, from
-    ///         their latest deposit, and the circle it names. Cleared by the
-    ///         next stakeDeposit, whichever way it stakes.
+    ///         their latest deposit (or renewConsent), and the circle and
+    ///         deadline it names. Cleared by the next stakeDeposit, whichever
+    ///         way it stakes.
     mapping(address => bytes) public consentOf;
     mapping(address => uint256) public consentCircleOf;
+    mapping(address => uint256) public consentDeadlineOf;
 
     /// @notice Deposits and withdrawals placed per person per day, keyed by the
     ///         Diamond's getDayKey.
@@ -466,9 +484,13 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
     /// @param preferredPaymentChannelConfigId 0 for any payment channel
     /// @param fiatAmountLimit 0 for no limit on the fiat side
     /// @param ref      the app's own reference, echoed in DepositPlaced
+    /// @param consentDeadline with no account: the last second the consent is
+    ///                 valid, at least MIN_CONSENT_LIFE from now; ignored for an
+    ///                 existing account
     /// @param consent  with no account: the person's signature over
     ///                 diamond.registrationDigest(person, circleOf[currency],
-    ///                 currency, ""); ignored for an existing account. A smart
+    ///                 currency, "", consentDeadline); ignored for an existing
+    ///                 account. A smart
     ///                 account sends its inner ERC-1271 signature, never an
     ///                 ERC-6492 wrapper (the Diamond does not unwrap one).
     function depositFiat(
@@ -479,6 +501,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         uint256 preferredPaymentChannelConfigId,
         uint256 fiatAmountLimit,
         bytes32 ref,
+        uint256 consentDeadline,
         bytes calldata consent
     ) external nonReentrant returns (uint256 orderId) {
         if (amount == 0) revert InvalidAmount();
@@ -505,15 +528,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
             /* Checked here, against the Diamond's own digest, so a signature
                registerFor would refuse never gets as far as a delivery. The
                circle is kept with it: changing circleOf later cannot void it. */
-            if (
-                !SignatureChecker.isValidSignatureNow(
-                    msg.sender,
-                    diamond.registrationDigest(msg.sender, circle, currency, ""),
-                    consent
-                )
-            ) revert ConsentInvalid();
-            consentOf[msg.sender] = consent;
-            consentCircleOf[msg.sender] = circle;
+            _keepConsent(circle, currency, consentDeadline, consent);
         }
         // m.stake is 0 with no account. Undelivered deposits do not count.
         if (
@@ -636,6 +651,45 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
         emit DepositDelivered(orderId, user, amount);
     }
 
+    // ─── Consent ──────────────────────────────────────────────────────
+
+    /// @notice Replace your kept consent with a new one, for the circle your
+    ///         account would open in now (circleOf[currencyOf[you]]). The way
+    ///         out if a delivery lands after the old deadline. Moves no money.
+    /// @param deadline at least MIN_CONSENT_LIFE from now
+    /// @param consent  your signature over diamond.registrationDigest(you,
+    ///                 circleOf[currencyOf[you]], currencyOf[you], "", deadline)
+    function renewConsent(uint256 deadline, bytes calldata consent) external nonReentrant {
+        if (
+            consentOf[msg.sender].length == 0 || diamond.getMerchantDetails(msg.sender).isRegistered
+        ) revert NothingToRenew();
+        bytes32 currency = currencyOf[msg.sender];
+        uint256 circle = circleOf[currency];
+        if (circle == 0) revert CircleNotSet();
+        _keepConsent(circle, currency, deadline, consent);
+    }
+
+    /// @dev Check msg.sender's consent against the Diamond's digest and keep it
+    ///      with its circle and deadline.
+    function _keepConsent(
+        uint256 circle,
+        bytes32 currency,
+        uint256 deadline,
+        bytes calldata consent
+    ) internal {
+        if (
+            deadline < block.timestamp + MIN_CONSENT_LIFE ||
+            !SignatureChecker.isValidSignatureNow(
+                msg.sender,
+                diamond.registrationDigest(msg.sender, circle, currency, "", deadline),
+                consent
+            )
+        ) revert ConsentInvalid();
+        consentOf[msg.sender] = consent;
+        consentCircleOf[msg.sender] = circle;
+        consentDeadlineOf[msg.sender] = deadline;
+    }
+
     // ─── Stake ────────────────────────────────────────────────────────
 
     /// @notice Stake everything `orderId`'s person has pending into their own
@@ -666,6 +720,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
                 paid,
                 "",
                 currencyOf[user],
+                consentDeadlineOf[user],
                 consentOf[user]
             );
         }
@@ -674,6 +729,7 @@ contract CashbookRampIntegrator is IP2PIntegrator, ReentrancyGuard, Ownable2Step
            this one stakes as a top-up in the account's own currency. */
         delete consentOf[user];
         delete consentCircleOf[user];
+        delete consentDeadlineOf[user];
         usdc.forceApprove(address(diamond), 0);
 
         emit DepositStaked(orderId, user, paid, !seat.isRegistered);

@@ -89,9 +89,13 @@ describe("CashbookRampIntegrator", function () {
     await usdc.transfer(iAddr, POOL);
   });
 
+  /** A consent deadline far past any test's clock. */
+  const DEADLINE = 4102444800n; // 2100-01-01
+
   /** The person's consent for the account a deposit would open (#518): an
-   *  EIP-712 signature over registrationDigest(person, circleOf[cur], cur, ""). */
-  async function consent(who: SignerWithAddress, cur = INR, circle?: bigint) {
+   *  EIP-712 signature over registrationDigest(person, circleOf[cur], cur, "",
+   *  deadline). */
+  async function consent(who: SignerWithAddress, cur = INR, circle?: bigint, deadline = DEADLINE) {
     return who.signTypedData(
       {
         name: "P2PMerchantRegistration",
@@ -105,6 +109,7 @@ describe("CashbookRampIntegrator", function () {
           { name: "circleId", type: "uint256" },
           { name: "currency", type: "bytes32" },
           { name: "telegramId", type: "string" },
+          { name: "deadline", type: "uint256" },
         ],
       },
       {
@@ -112,6 +117,7 @@ describe("CashbookRampIntegrator", function () {
         circleId: circle ?? (await integrator.circleOf(cur)),
         currency: cur,
         telegramId: "",
+        deadline,
       }
     );
   }
@@ -119,7 +125,7 @@ describe("CashbookRampIntegrator", function () {
   const deposit = async (who: SignerWithAddress, amount: bigint, cur = INR) =>
     integrator
       .connect(who)
-      .depositFiat(amount, cur, ORDER_CIRCLE, "pk", 0, 0, REF, await consent(who, cur));
+      .depositFiat(amount, cur, ORDER_CIRCLE, "pk", 0, 0, REF, DEADLINE, await consent(who, cur));
 
   const withdraw = (who: SignerWithAddress, amount: bigint, cur = INR) =>
     integrator.connect(who).withdrawFiat(amount, cur, ORDER_CIRCLE, "pk", 0, 0, REF);
@@ -316,8 +322,8 @@ describe("CashbookRampIntegrator", function () {
   });
 
   describe("depositFiat: refused before any money moves", function () {
-    const raw = (who: SignerWithAddress, sig: string, cur = INR) =>
-      integrator.connect(who).depositFiat(FLOOR, cur, ORDER_CIRCLE, "pk", 0, 0, REF, sig);
+    const raw = (who: SignerWithAddress, sig: string, cur = INR, deadline = DEADLINE) =>
+      integrator.connect(who).depositFiat(FLOOR, cur, ORDER_CIRCLE, "pk", 0, 0, REF, deadline, sig);
 
     /* #518: the Diamond opens an account only with the person's signature, so
        an opening deposit without a good one would strand its delivery here. */
@@ -343,9 +349,16 @@ describe("CashbookRampIntegrator", function () {
             { name: "circleId", type: "uint256" },
             { name: "currency", type: "bytes32" },
             { name: "telegramId", type: "string" },
+            { name: "deadline", type: "uint256" },
           ],
         },
-        { merchant: alice.address, circleId: CIRCLE, currency: INR, telegramId: "" }
+        {
+          merchant: alice.address,
+          circleId: CIRCLE,
+          currency: INR,
+          telegramId: "",
+          deadline: DEADLINE,
+        }
       );
       for (const sig of wrong) {
         await expect(raw(alice, sig)).to.be.revertedWithCustomError(integrator, "ConsentInvalid");
@@ -368,10 +381,31 @@ describe("CashbookRampIntegrator", function () {
       await expect(raw(alice, wrapped)).to.be.revertedWithCustomError(integrator, "ConsentInvalid");
     });
 
+    /* A consent must outlive a buy that settles through a dispute. */
+    it("a consent deadline under MIN_CONSENT_LIFE, or not the one signed", async function () {
+      const life = await integrator.MIN_CONSENT_LIFE();
+      const t = BigInt((await ethers.provider.getBlock("latest"))!.timestamp) + 10n;
+      const short = t + life - 1n;
+      await ethers.provider.send("evm_setNextBlockTimestamp", [Number(t)]);
+      await expect(
+        raw(alice, await consent(alice, INR, undefined, short), INR, short)
+      ).to.be.revertedWithCustomError(integrator, "ConsentInvalid");
+      // signed for one deadline, sent with another
+      await expect(
+        raw(alice, await consent(alice), INR, DEADLINE + 1n)
+      ).to.be.revertedWithCustomError(integrator, "ConsentInvalid");
+      expect(await diamond.nextOrderId()).to.equal(1n);
+      const t2 = BigInt((await ethers.provider.getBlock("latest"))!.timestamp) + 10n;
+      await ethers.provider.send("evm_setNextBlockTimestamp", [Number(t2)]);
+      await expect(raw(alice, await consent(alice, INR, undefined, t2 + life), INR, t2 + life)).to
+        .not.be.reverted;
+      expect(await integrator.consentDeadlineOf(alice.address)).to.equal(t2 + life);
+    });
+
     it("an existing account needs no consent", async function () {
       await open(alice);
       await expect(
-        integrator.connect(alice).depositFiat(USDC(10), INR, ORDER_CIRCLE, "pk", 0, 0, REF, "0x")
+        integrator.connect(alice).depositFiat(USDC(10), INR, ORDER_CIRCLE, "pk", 0, 0, REF, 0, "0x")
       ).to.not.be.reverted;
       expect(await integrator.consentOf(alice.address)).to.equal("0x");
     });
@@ -403,7 +437,17 @@ describe("CashbookRampIntegrator", function () {
       await expect(
         i
           .connect(alice)
-          .depositFiat(FLOOR, INR, ORDER_CIRCLE, "pk", 0, 0, REF, await consent(alice, INR, CIRCLE))
+          .depositFiat(
+            FLOOR,
+            INR,
+            ORDER_CIRCLE,
+            "pk",
+            0,
+            0,
+            REF,
+            DEADLINE,
+            await consent(alice, INR, CIRCLE)
+          )
       ).to.not.be.reverted;
     });
 
@@ -679,7 +723,17 @@ describe("CashbookRampIntegrator", function () {
       await other.setCircle(INR, CIRCLE);
       await other
         .connect(alice)
-        .depositFiat(FLOOR, INR, ORDER_CIRCLE, "pk", 0, 0, REF, await consent(alice, INR, CIRCLE));
+        .depositFiat(
+          FLOOR,
+          INR,
+          ORDER_CIRCLE,
+          "pk",
+          0,
+          0,
+          REF,
+          DEADLINE,
+          await consent(alice, INR, CIRCLE)
+        );
       await expect(integrator.reconcileDelivery(1)).to.be.revertedWithCustomError(
         integrator,
         "NotOurs"
@@ -774,6 +828,72 @@ describe("CashbookRampIntegrator", function () {
       // the consent is spent and cleared once the account opens
       expect(await integrator.consentOf(alice.address)).to.equal("0x");
       expect(await integrator.consentCircleOf(alice.address)).to.equal(0n);
+    });
+
+    /* A delivery that lands after the consent's deadline is not stuck: the
+       person signs again with renewConsent, which moves no money. */
+    it("a consent that expired before delivery: refused, renewed, then it opens", async function () {
+      const life = await integrator.MIN_CONSENT_LIFE();
+      const t = BigInt((await ethers.provider.getBlock("latest"))!.timestamp) + 10n;
+      await ethers.provider.send("evm_setNextBlockTimestamp", [Number(t)]);
+      await integrator
+        .connect(alice)
+        .depositFiat(
+          FLOOR,
+          INR,
+          ORDER_CIRCLE,
+          "pk",
+          0,
+          0,
+          REF,
+          t + life,
+          await consent(alice, INR, undefined, t + life)
+        );
+      await settle(1);
+      await ethers.provider.send("evm_setNextBlockTimestamp", [Number(t + life + 1n)]);
+      await expect(integrator.stakeDeposit(1)).to.be.revertedWithCustomError(
+        diamond,
+        "RegistrationExpired"
+      );
+      expect(await integrator.pendingStake(alice.address)).to.equal(FLOOR);
+
+      // only the person, and only with a good signature for today's circle
+      const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+      const d = now + life + 100n;
+      await expect(
+        integrator.connect(bob).renewConsent(d, await consent(bob, INR, undefined, d))
+      ).to.be.revertedWithCustomError(integrator, "NothingToRenew");
+      await expect(
+        integrator.connect(alice).renewConsent(d, await consent(alice, INR, 9n, d))
+      ).to.be.revertedWithCustomError(integrator, "ConsentInvalid");
+      await expect(
+        integrator
+          .connect(alice)
+          .renewConsent(now + 10n, await consent(alice, INR, undefined, now + 10n))
+      ).to.be.revertedWithCustomError(integrator, "ConsentInvalid");
+      const before = await usdc.balanceOf(iAddr);
+      await integrator.connect(alice).renewConsent(d, await consent(alice, INR, undefined, d));
+      expect(await usdc.balanceOf(iAddr)).to.equal(before);
+      expect(await integrator.consentDeadlineOf(alice.address)).to.equal(d);
+
+      await expect(integrator.stakeDeposit(1))
+        .to.emit(integrator, "DepositStaked")
+        .withArgs(1, alice.address, FLOOR, true);
+      expect(await integrator.consentDeadlineOf(alice.address)).to.equal(0n);
+      await holds([alice]);
+    });
+
+    it("renewConsent: refused with an account, or with no circle to open in", async function () {
+      await open(alice);
+      await expect(
+        integrator.connect(alice).renewConsent(DEADLINE, await consent(alice))
+      ).to.be.revertedWithCustomError(integrator, "NothingToRenew");
+
+      await deposit(bob, FLOOR);
+      await integrator.setCircle(INR, 0);
+      await expect(
+        integrator.connect(bob).renewConsent(DEADLINE, await consent(bob, INR, CIRCLE))
+      ).to.be.revertedWithCustomError(integrator, "CircleNotSet");
     });
 
     it("a blacklisting after delivery blocks the stake and keeps the money pending", async function () {
@@ -1160,6 +1280,7 @@ describe("CashbookRampIntegrator", function () {
           0,
           0,
           REF,
+          0,
           "0x",
         ]),
       withdrawFiat: () =>
