@@ -19,9 +19,10 @@ import { ethers } from "hardhat";
  *   REPUTATION_MANAGER  the Diamond's ReputationManager, for the user blacklist.
  *                       The zero address turns the check off; pass it explicitly.
  *
- * Requires the Diamond to have registerFor / stakeFor (an integrator opening or
- * topping up a merchant account for someone else). Without them every
- * stakeDeposit reverts and delivered USDC waits on the contract until they exist.
+ * Requires the Diamond to have contracts-v4 #518: registerFor (with the
+ * merchant's signature), stakeFor and registrationDigest. Without them a first
+ * deposit reverts, and a top-up's stakeDeposit reverts with the delivered USDC
+ * waiting on the contract until they exist.
  */
 
 const PRESETS: Record<number, { label: string; diamond?: string; usdc?: string; rm?: string }> = {

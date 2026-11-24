@@ -30,34 +30,43 @@ it is stake for as long as the account is open.
 | USDC                               | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | the Diamond's |
 | ReputationManager (user blacklist) | `0xCF613e08EE1B4c2669DdCf06A7d22c9856f6Aa1D` | `0x0` (none)  |
 
-⚠ **The Diamond must have `registerFor` and `stakeFor`**: an active B2B integrator
-opening or topping up a merchant account for someone else, pulling the stake
-from the integrator. They are proposed in contracts-v4 ("feat(onboard): let
-anyone register or stake for a merchant") and are **not on the mainnet Diamond
-yet**. Until they are, deposits can be placed and delivered but `stakeDeposit`
-reverts, and the USDC waits on this contract.
+⚠ **The Diamond must have contracts-v4 #518**: `registerFor(…, signature)`
+opens a merchant account for anyone who brings that merchant's EIP-712
+signature (any caller), `stakeFor` tops one up (active B2B integrators only),
+and `registrationDigest` gives the digest to sign. Both pull the stake from the
+caller. They are **not on the mainnet Diamond yet**. Until they are, a first
+deposit reverts at `registrationDigest`, and a top-up can be placed and
+delivered but `stakeDeposit` reverts and the USDC waits on this contract.
 
 Also read from the Diamond: `getMerchantDetails` (stake, `isRegistered`,
 currency), `getStakeConfig` (the stake floor),
 `getMaxBuyTxLimit`, `getMaxSellTxLimit`, `isBlacklisted`, `getUnstakeRequested`,
-`getOrdersById`, `getOrderIntegrator`.
+`getOrdersById`, `getOrderIntegrator`, `registrationDigest`.
 
 ## Lifecycle (the person's view)
 
 1. **Deposit.** `depositFiat(amount, currency, circleId, …)` places a BUY from
    the person's `UserProxy` with `user` = the person and `recipientAddr` = this
-   contract. The person pays a merchant in fiat. Someone with no account is
-   bound to the currency of their deposits while any of it is pending here; the
-   account opens in it. With nothing pending (say a first deposit was
-   cancelled) a new deposit may pick another currency.
+   contract. The person pays a merchant in fiat. For someone with no account
+   the latest deposit picks the currency the account opens in, in that
+   currency's circle (`circleOf`), and it must carry their **consent**: their
+   signature over `diamond.registrationDigest(person, circleOf[currency],
+currency, "")`, checked before any order is placed (`ConsentInvalid`).
+   A smart account sends its inner ERC-1271 signature, never an ERC-6492
+   wrapper (the Diamond does not unwrap one). The consent is kept with its
+   circle (`consentOf`, `consentCircleOf`), so a later `setCircle` cannot void
+   it. An existing account sends `0x`.
 2. **Delivered.** The order completes; the Diamond sends the USDC here and calls
    `onOrderComplete`, which adds it to `pendingStake[person]` and emits
    `DepositDelivered`. If the hook never ran, anyone can call
    `reconcileDelivery(orderId)`.
 3. **Staked.** `stakeDeposit(orderId)`, callable by anyone (normally the
    operator's keeper), stakes everything the person has pending into their own
-   account. Every argument comes from the order and stored state, so a caller can
-   trigger it but not steer it.
+   account: `registerFor` with the stored consent the first time, `stakeFor`
+   in the account's own currency after that, then clears the stored consent.
+   Every argument comes from the order and stored state, so a caller can
+   trigger it but not steer it. A consent is public once sent, so someone may
+   open the account with it first; the pending USDC then stakes as a top-up.
 4. **Rewarded (optional).** cashbook's backend decides who earns a reward and
    when; the owner calls `rewardStake(people, amounts)`, which stakes each
    amount of free USDC into that person's account. It is ordinary stake from
