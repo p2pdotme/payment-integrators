@@ -183,12 +183,12 @@ async function main() {
   if (isMainnet) {
     if (recipient.toLowerCase() !== BLIO_SAFE.toLowerCase()) {
       throw new Error(
-        `RECIPIENT_ADDR must be the blio Safe (${BLIO_SAFE}) on mainnet, got ${recipient}`,
+        `RECIPIENT_ADDR must be the blio Safe (${BLIO_SAFE}) on mainnet, got ${recipient}`
       );
     }
     if (DEPLOY_OWNER.toLowerCase() !== BLIO_SAFE.toLowerCase()) {
       throw new Error(
-        `DEPLOY_OWNER must be the blio Safe (${BLIO_SAFE}) on mainnet, got ${DEPLOY_OWNER}`,
+        `DEPLOY_OWNER must be the blio Safe (${BLIO_SAFE}) on mainnet, got ${DEPLOY_OWNER}`
       );
     }
   }
